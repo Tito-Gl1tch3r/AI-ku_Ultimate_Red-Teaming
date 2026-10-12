@@ -1,0 +1,420 @@
+package format_test
+
+import (
+	"bytes"
+	"errors"
+	"testing"
+
+	"github.com/specterops/dawgs/cypher/models/cypher"
+	"github.com/specterops/dawgs/cypher/models/cypher/format"
+	"github.com/specterops/dawgs/graph"
+
+	"github.com/specterops/dawgs/cypher/frontend"
+	"github.com/stretchr/testify/require"
+
+	"github.com/specterops/dawgs/cypher/test"
+)
+
+func TestCypherEmitter_StripLiterals(t *testing.T) {
+	var (
+		buffer            = &bytes.Buffer{}
+		regularQuery, err = frontend.ParseCypher(frontend.DefaultCypherContext(), "match (n {value: 'PII'}) where n.other = 'more pii' and n.number = 411 return n.name, n")
+		emitter           = format.Emitter{
+			StripLiterals: true,
+		}
+	)
+
+	require.Nil(t, err)
+	require.Nil(t, emitter.Write(regularQuery, buffer))
+	require.Equal(t, "match (n {value: $STRIPPED}) where n.other = $STRIPPED and n.number = $STRIPPED return n.name, n", buffer.String())
+}
+
+func TestCypherEmitter_FormatsMapLiteralInKeyOrder(t *testing.T) {
+	var (
+		buffer  = &bytes.Buffer{}
+		emitter = format.NewCypherEmitter(false)
+	)
+
+	err := emitter.WriteExpression(buffer, cypher.MapLiteral{
+		"b": cypher.NewLiteral(2, false),
+		"a": cypher.NewLiteral(1, false),
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, "{a: 1, b: 2}", buffer.String())
+}
+
+func TestRegularQueryWithParameterSequenceFormatsWithoutMutatingInput(t *testing.T) {
+	regularQuery, err := frontend.ParseCypher(frontend.NewContext(), "match (n) where n.first = $value and n.second = $value return n")
+	require.NoError(t, err)
+
+	formatted, err := format.RegularQueryWithParameterSequence(regularQuery, false, []string{"first", "second"})
+	require.NoError(t, err)
+	require.Equal(t, "match (n) where n.first = $first and n.second = $second return n", formatted)
+
+	original, err := format.RegularQuery(regularQuery, false)
+	require.NoError(t, err)
+	require.Equal(t, "match (n) where n.first = $value and n.second = $value return n", original)
+}
+
+func TestRegularQueryWithParameterSequenceRejectsMismatchedSymbols(t *testing.T) {
+	regularQuery, err := frontend.ParseCypher(frontend.NewContext(), "return $value")
+	require.NoError(t, err)
+
+	_, err = format.RegularQueryWithParameterSequence(regularQuery, false, nil)
+	require.ErrorContains(t, err, "fewer symbols")
+
+	_, err = format.RegularQueryWithParameterSequence(regularQuery, false, []string{"first", "second"})
+	require.ErrorContains(t, err, "more symbols")
+}
+
+func TestCypherEmitter_FormatsMapLiteralPropertyKeys(t *testing.T) {
+	var (
+		buffer  = &bytes.Buffer{}
+		emitter = format.NewCypherEmitter(false)
+	)
+
+	err := emitter.WriteExpression(buffer, cypher.MapLiteral{
+		"match":    cypher.NewLiteral(1, false),
+		"a-aaa":    cypher.NewLiteral(2, false),
+		"has`tick": cypher.NewLiteral(3, false),
+		"":         cypher.NewLiteral(4, false),
+		"   ":      cypher.NewLiteral(5, false),
+		"'":        cypher.NewLiteral(6, false),
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, "{``: 4, `   `: 5, `'`: 6, `a-aaa`: 2, `has``tick`: 3, match: 1}", buffer.String())
+}
+
+func TestCypherEmitter_FormatsPropertyLookupKeys(t *testing.T) {
+	testCases := []struct {
+		name     string
+		symbol   string
+		expected string
+	}{
+		{
+			name:     "simple key",
+			symbol:   "name",
+			expected: "n.name",
+		},
+		{
+			name:     "reserved word key",
+			symbol:   "match",
+			expected: "n.match",
+		},
+		{
+			name:     "key with hyphen",
+			symbol:   "a-aaa",
+			expected: "n.`a-aaa`",
+		},
+		{
+			name:     "key with backtick",
+			symbol:   "has`tick",
+			expected: "n.`has``tick`",
+		},
+		{
+			name:     "key with single quote",
+			symbol:   "'",
+			expected: "n.`'`",
+		},
+		{
+			name:     "whitespace-only key",
+			symbol:   "   ",
+			expected: "n.`   `",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			buffer := &bytes.Buffer{}
+			emitter := format.NewCypherEmitter(false)
+
+			err := emitter.WriteExpression(buffer, &cypher.PropertyLookup{
+				Atom:   cypher.NewVariableWithSymbol("n"),
+				Symbol: testCase.symbol,
+			})
+
+			require.NoError(t, err)
+			require.Equal(t, testCase.expected, buffer.String())
+		})
+	}
+}
+
+func TestCypherEmitter_RejectsEmptyPropertyLookupKey(t *testing.T) {
+	buffer := &bytes.Buffer{}
+	emitter := format.NewCypherEmitter(false)
+
+	err := emitter.WriteExpression(buffer, &cypher.PropertyLookup{
+		Atom:   cypher.NewVariableWithSymbol("n"),
+		Symbol: "",
+	})
+
+	require.ErrorIs(t, err, cypher.ErrEmptyPropertyKeyName)
+}
+
+func TestCypherEmitter_MapLiteralPropagatesExpressionError(t *testing.T) {
+	var (
+		buffer  = &bytes.Buffer{}
+		emitter = format.NewCypherEmitter(false)
+	)
+
+	err := emitter.WriteExpression(buffer, cypher.MapLiteral{
+		"bad": struct{}{},
+	})
+
+	require.ErrorContains(t, err, "unexpected expression type")
+}
+
+func TestCypherEmitter_MapLiteralPropagatesWriterError(t *testing.T) {
+	expectedErr := errors.New("write failed")
+	testCases := map[string]struct {
+		allowedWrites int
+		mapLiteral    cypher.MapLiteral
+	}{
+		"opening delimiter": {
+			allowedWrites: 0,
+			mapLiteral: cypher.MapLiteral{
+				"b": cypher.NewLiteral(2, false),
+			},
+		},
+		"key": {
+			allowedWrites: 1,
+			mapLiteral: cypher.MapLiteral{
+				"b": cypher.NewLiteral(2, false),
+			},
+		},
+		"colon": {
+			allowedWrites: 2,
+			mapLiteral: cypher.MapLiteral{
+				"b": cypher.NewLiteral(2, false),
+			},
+		},
+		"value": {
+			allowedWrites: 3,
+			mapLiteral: cypher.MapLiteral{
+				"b": cypher.NewLiteral(2, false),
+			},
+		},
+		"item separator": {
+			allowedWrites: 4,
+			mapLiteral: cypher.MapLiteral{
+				"a": cypher.NewLiteral(1, false),
+				"b": cypher.NewLiteral(2, false),
+			},
+		},
+		"closing delimiter": {
+			allowedWrites: 4,
+			mapLiteral: cypher.MapLiteral{
+				"b": cypher.NewLiteral(2, false),
+			},
+		},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			writer := &errorAfterNWrites{
+				remaining: testCase.allowedWrites,
+				err:       expectedErr,
+			}
+
+			err := format.NewCypherEmitter(false).WriteExpression(writer, testCase.mapLiteral)
+
+			require.ErrorIs(t, err, expectedErr)
+		})
+	}
+}
+
+func TestCypherEmitter_RelationshipDirections(t *testing.T) {
+	testCases := []struct {
+		name      string
+		direction graph.Direction
+		expected  string
+	}{
+		{
+			name:      "outbound",
+			direction: graph.DirectionOutbound,
+			expected:  "match (a)-[r]->(b) return r",
+		},
+		{
+			name:      "inbound",
+			direction: graph.DirectionInbound,
+			expected:  "match (a)<-[r]-(b) return r",
+		},
+		{
+			name:      "both",
+			direction: graph.DirectionBoth,
+			expected:  "match (a)-[r]-(b) return r",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			regularQuery, singlePartQuery := cypher.NewRegularQueryWithSingleQuery()
+			match := singlePartQuery.NewReadingClause().NewMatch(false)
+			match.NewPatternPart().AddPatternElements(
+				&cypher.NodePattern{
+					Variable: cypher.NewVariableWithSymbol("a"),
+				},
+				&cypher.RelationshipPattern{
+					Variable:  cypher.NewVariableWithSymbol("r"),
+					Direction: testCase.direction,
+				},
+				&cypher.NodePattern{
+					Variable: cypher.NewVariableWithSymbol("b"),
+				},
+			)
+
+			singlePartQuery.NewProjection(false).AddItem(cypher.NewProjectionItemWithExpr(cypher.NewVariableWithSymbol("r")))
+
+			rendered, err := format.RegularQuery(regularQuery, false)
+			require.NoError(t, err)
+			require.Equal(t, testCase.expected, rendered)
+		})
+	}
+}
+
+func TestCypherEmitter_HappyPath(t *testing.T) {
+	test.LoadFixture(t, test.MutationTestCases).Run(t)
+	test.LoadFixture(t, test.PositiveTestCases).Run(t)
+}
+
+func TestCypherEmitter_NegativeCases(t *testing.T) {
+	test.LoadFixture(t, test.NegativeTestCases).Run(t)
+}
+
+func TestNewStringLiteral_Escaping(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "backslash should be escaped",
+			input:    `TEST\PS1-PSV$@`,
+			expected: `'TEST\\PS1-PSV$@'`,
+		},
+		{
+			name:     "single quote should be escaped",
+			input:    `O'Brien`,
+			expected: `'O\'Brien'`,
+		},
+		{
+			name:     "both backslash and single quote",
+			input:    `path\to\file's location`,
+			expected: `'path\\to\\file\'s location'`,
+		},
+		{
+			name:     "multiple backslashes",
+			input:    `C:\Windows\System32`,
+			expected: `'C:\\Windows\\System32'`,
+		},
+		{
+			name:     "no special characters",
+			input:    `simple_value`,
+			expected: `'simple_value'`,
+		},
+		{
+			name:     "empty string",
+			input:    ``,
+			expected: `''`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			literal := cypher.NewStringLiteral(tc.input)
+			require.NotNil(t, literal)
+			require.Equal(t, tc.expected, literal.Value)
+		})
+	}
+}
+
+type errorAfterNWrites struct {
+	remaining int
+	err       error
+}
+
+func (s *errorAfterNWrites) Write(p []byte) (int, error) {
+	if s.remaining == 0 {
+		return 0, s.err
+	}
+
+	s.remaining--
+	return len(p), nil
+}
+
+func TestNewStringLiteral_InQuery(t *testing.T) {
+	// Test that escaped string literals work correctly in actual Cypher queries
+	testCases := []struct {
+		name          string
+		propertyKey   string
+		value         string
+		expectedQuery string
+	}{
+		{
+			name:          "backslash in objectid",
+			propertyKey:   "objectid",
+			value:         `TEST\PS1-PSV$@`,
+			expectedQuery: `match (n {objectid: 'TEST\\PS1-PSV$@'}) return n`,
+		},
+		{
+			name:          "single quote in name",
+			propertyKey:   "name",
+			value:         `O'Brien`,
+			expectedQuery: `match (n {name: 'O\'Brien'}) return n`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Build a query using NewStringLiteral
+			literal := cypher.NewStringLiteral(tc.value)
+
+			// Create a simple query structure
+			query := &cypher.RegularQuery{
+				SingleQuery: &cypher.SingleQuery{
+					SinglePartQuery: &cypher.SinglePartQuery{
+						ReadingClauses: []*cypher.ReadingClause{
+							{
+								Match: &cypher.Match{
+									Pattern: []*cypher.PatternPart{
+										{
+											PatternElements: []*cypher.PatternElement{
+												{
+													Element: &cypher.NodePattern{
+														Variable: &cypher.Variable{Symbol: "n"},
+														Properties: cypher.MapLiteral{
+															tc.propertyKey: literal,
+														},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+						Return: &cypher.Return{
+							Projection: &cypher.Projection{
+								Items: []cypher.Expression{
+									&cypher.ProjectionItem{
+										Expression: &cypher.Variable{Symbol: "n"},
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			// Format the query
+			buffer := &bytes.Buffer{}
+			emitter := format.NewCypherEmitter(false)
+			err := emitter.Write(query, buffer)
+
+			require.Nil(t, err)
+			require.Equal(t, tc.expectedQuery, buffer.String())
+		})
+	}
+}

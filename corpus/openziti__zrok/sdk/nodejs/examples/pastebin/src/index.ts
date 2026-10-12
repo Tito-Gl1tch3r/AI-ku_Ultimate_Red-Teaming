@@ -1,0 +1,62 @@
+import {Command} from "commander";
+import {
+    AccessRequest,
+    createAccess,
+    createShare,
+    deleteAccess,
+    deleteShare,
+    dialer,
+    init,
+    listener,
+    loadRoot,
+    PRIVATE_SHARE_MODE,
+    setLogLevel,
+    ShareRequest,
+    TCP_TUNNEL_BACKEND_MODE,
+    write
+} from "@openziti/zrok2";
+import readlineSync = require('readline-sync');
+
+const copyto = async () => {
+    const text = readlineSync.question("enter some text: ");
+    const root = loadRoot();
+    setLogLevel(0);
+    await init(root)
+        .catch((err: Error) => {
+            console.log(err);
+            return process.exit(1);
+        });
+    const shr = await createShare(root, new ShareRequest(PRIVATE_SHARE_MODE, TCP_TUNNEL_BACKEND_MODE, "copyto"));
+
+    console.log("connect with 'pastefrom " + shr.shareToken + "'");
+
+    listener(shr, (data: any) => {
+        write(data.client, new TextEncoder().encode(text + "\n"));
+    });
+
+    process.on("SIGINT", async () => {
+        await deleteShare(root, shr);
+        process.exit(0);
+    });
+}
+
+const pastefrom = async (shareToken: string) => {
+    const root = loadRoot();
+    setLogLevel(0);
+    await init(root).catch((err: Error) => {
+        console.log(err);
+        return process.exit(1);
+    });
+    const acc = await createAccess(root, new AccessRequest(shareToken));
+
+    dialer(acc, () => {}, async (data: any) => {
+        console.log(new TextDecoder().decode(data));
+        await deleteAccess(root, acc);
+        process.exit(0);
+    });
+}
+
+const program = new Command();
+program.command("copyto").description("serve a copy buffer").action(copyto);
+program.command("pastefrom <shareToken>").description("receive a copy buffer").action(pastefrom);
+program.parse(process.argv);

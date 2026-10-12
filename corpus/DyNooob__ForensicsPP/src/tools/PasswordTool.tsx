@@ -1,0 +1,365 @@
+/**
+ * Forensics++ (ForensicsPP.com)
+ * Local-first browser forensics workbench
+ *
+ * Copyright (c) 2026 DyNooob. All rights reserved.
+ * Author: DyNooob
+ * Website: https://www.forensicspp.com
+ * Platform: DigiForensics.cn
+ * Project: https://github.com/DyNooob/ForensicsPP
+ *
+ * Forensics++ is an open-source, browser-side toolkit for CTF/MISC,
+ * lightweight forensic triage, encoding/decoding, metadata inspection,
+ * hashes, archive parsing, and local analysis.
+ *
+ * Do not use this project for unauthorized access, intrusion,
+ * privacy infringement, or unlawful activity.
+ *
+ * Released under the MIT License.
+ * Full source code: https://github.com/DyNooob/ForensicsPP
+ */
+
+import { copyText } from "../utils/clipboard";
+import React from "react";
+import CryptoJS from "crypto-js";
+import { AButton, AInputNumber, APasswordField, ASegmentedButton, ASegmentedGroup, InfoTable, ToolPanelHeader } from "../components/ui";
+import { copy } from "../i18n";
+import type { PasswordVerifyRow } from "../models";
+import { downloadTextFile } from "../utils/files";
+import { detectHashType } from "../utils/hash";
+import { confidenceLabel, generateHintLabel, identifyHash } from "../utils/hashIdentify";
+import { useStoredState } from "../utils/storage";
+
+export type PasswordToolServices = {
+  mysqlNativePassword: (password: string) => string;
+  randomSalt: (length?: number) => string;
+  verifyPasswordCandidates: (target: string, candidates: string[]) => Promise<PasswordVerifyRow[]>;
+  passwordRowsToCsv: (rows: PasswordVerifyRow[]) => string;
+};
+
+function bytesToBase64(bytes: Uint8Array) {
+  return btoa(Array.from(bytes, (byte) => String.fromCharCode(byte)).join(""));
+}
+
+async function djangoPbkdf2(password: string, salt: string, iterations = 390000) {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: new TextEncoder().encode(salt), iterations }, key, 256);
+  return `pbkdf2_sha256$${iterations}$${salt}$${bytesToBase64(new Uint8Array(bits))}`;
+}
+
+export function PasswordTool({ t, services, active = true }: { t: (typeof copy)["zh"]; services: PasswordToolServices; active?: boolean }) {
+  const { mysqlNativePassword, randomSalt, verifyPasswordCandidates, passwordRowsToCsv } = services;
+  const english = t.waiting === "Waiting";
+  const [mode, setMode] = React.useState<"generate" | "verify" | "sql" | "identify">("generate");
+  const [password, setPassword] = React.useState("");
+  const [identifyText, setIdentifyText] = React.useState("");
+  const [salt, setSalt] = React.useState(() => randomSalt());
+  const [rounds, setRounds] = useStoredState("password.rounds", 10);
+  const [pbkdf2Iterations, setPbkdf2Iterations] = useStoredState("password.pbkdf2Iterations", 390000);
+  const [quickGenerated, setQuickGenerated] = React.useState(false);
+  const [bcryptHash, setBcryptHash] = React.useState("");
+  const [pbkdf2Hash, setPbkdf2Hash] = React.useState("");
+  const [generatedView, setGeneratedView] = React.useState<"common" | "bcrypt" | "pbkdf2" | "">("");
+  const [targetHash, setTargetHash] = React.useState("");
+  const [candidatePasswords, setCandidatePasswords] = React.useState("");
+  const [verifyRows, setVerifyRows] = React.useState<PasswordVerifyRow[]>([]);
+  const [loading, setLoading] = React.useState<"bcrypt" | "pbkdf2" | "verify" | "">("");
+  const [error, setError] = React.useState("");
+  const [username, setUsername] = React.useState("");
+  const [table, setTable] = React.useState("users");
+  const [column, setColumn] = React.useState("password");
+  const [whereColumn, setWhereColumn] = React.useState("username");
+  const operationRef = React.useRef(0);
+
+  React.useEffect(() => {
+    if (active) return;
+    operationRef.current += 1;
+    setLoading("");
+  }, [active]);
+
+  const fastHashes = React.useMemo<Array<[string, string]>>(() => password && quickGenerated ? [
+    ["MD5", CryptoJS.MD5(password).toString()],
+    ["SHA-1", CryptoJS.SHA1(password).toString()],
+    ["SHA-256", CryptoJS.SHA256(password).toString()],
+    ["SHA-512", CryptoJS.SHA512(password).toString()],
+    ["SHA3-512", CryptoJS.SHA3(password, { outputLength: 512 }).toString()],
+    ["RIPEMD-160", CryptoJS.RIPEMD160(password).toString()],
+    ["MySQL 4.1", mysqlNativePassword(password)],
+    ["LDAP {SHA}", `{SHA}${CryptoJS.SHA1(password).toString(CryptoJS.enc.Base64)}`],
+    ...(salt ? [
+      ["MD5(salt + password)", CryptoJS.MD5(`${salt}${password}`).toString()] as [string, string],
+      ["MD5(password + salt)", CryptoJS.MD5(`${password}${salt}`).toString()] as [string, string],
+      ["SHA-256(salt + password)", CryptoJS.SHA256(`${salt}${password}`).toString()] as [string, string],
+      ["SHA-256(password + salt)", CryptoJS.SHA256(`${password}${salt}`).toString()] as [string, string]
+    ] : [])
+  ] : [], [mysqlNativePassword, password, quickGenerated, salt]);
+  const generatedHashes = React.useMemo<Array<[string, string]>>(() => [
+    ...fastHashes,
+    ...(bcryptHash ? [["bcrypt", bcryptHash] as [string, string]] : []),
+    ...(pbkdf2Hash ? [["Django PBKDF2-SHA256", pbkdf2Hash] as [string, string]] : [])
+  ], [bcryptHash, fastHashes, pbkdf2Hash]);
+  const visibleGeneratedHashes = React.useMemo<Array<[string, string]>>(() => {
+    if (generatedView === "common") return fastHashes;
+    if (generatedView === "bcrypt" && bcryptHash) return [["bcrypt", bcryptHash]];
+    if (generatedView === "pbkdf2" && pbkdf2Hash) return [["Django PBKDF2-SHA256", pbkdf2Hash]];
+    return [];
+  }, [bcryptHash, fastHashes, generatedView, pbkdf2Hash]);
+  const candidates = React.useMemo(() => candidatePasswords.split(/\r?\n/).map((item) => item.trim()).filter(Boolean), [candidatePasswords]);
+  const matchedCount = verifyRows.filter((row) => row.matched).length;
+  const targetType = detectHashType(targetHash) || verifyRows[0]?.hashType || "--";
+  const md5 = fastHashes.find(([label]) => label === "MD5")?.[1] ?? "";
+  const escapedPassword = password.replace(/'/g, "''");
+  const escapedUsername = username.replace(/'/g, "''");
+  const sqlTemplates = React.useMemo<Array<[string, string]>>(() => [
+    ["WordPress MD5", password && username ? `UPDATE wp_users SET user_pass = MD5('${escapedPassword}') WHERE user_login = '${escapedUsername}';` : "--"],
+    ["Generic MD5", md5 && username ? `UPDATE ${table} SET ${column} = '${md5}' WHERE ${whereColumn} = '${escapedUsername}';` : "--"],
+    ["bcrypt", bcryptHash && username ? `UPDATE ${table} SET ${column} = '${bcryptHash}' WHERE ${whereColumn} = '${escapedUsername}';` : "--"],
+    ["Django PBKDF2", pbkdf2Hash && username ? `UPDATE ${table} SET ${column} = '${pbkdf2Hash}' WHERE ${whereColumn} = '${escapedUsername}';` : "--"]
+  ], [bcryptHash, column, escapedPassword, escapedUsername, md5, password, pbkdf2Hash, table, username, whereColumn]);
+  const identifyResult = React.useMemo(() => identifyHash(identifyText), [identifyText]);
+  const hasInput = Boolean(password || targetHash || candidatePasswords || generatedHashes.length || verifyRows.length || username || identifyText);
+
+  const useIdentifiedAsPassword = () => {
+    const value = identifyText.trim();
+    if (!value) return;
+    setPassword(value);
+    clearGenerated();
+    setMode("generate");
+  };
+
+  const clearGenerated = () => {
+    operationRef.current += 1;
+    setLoading("");
+    setQuickGenerated(false);
+    setBcryptHash("");
+    setPbkdf2Hash("");
+    setGeneratedView("");
+  };
+
+  const generateQuickHashes = () => {
+    if (!password || !active) return;
+    operationRef.current += 1;
+    setLoading("");
+    setError("");
+    setQuickGenerated(true);
+    setGeneratedView("common");
+  };
+
+  const generateBcrypt = async () => {
+    if (!password || !active) return;
+    const operationId = ++operationRef.current;
+    setLoading("bcrypt");
+    setError("");
+    try {
+      const bcryptModule = await import("bcryptjs");
+      const bcrypt = bcryptModule.default ?? bcryptModule;
+      const value = await new Promise<string>((resolve, reject) => {
+        bcrypt.hash(password, rounds, (caught, encrypted) => caught || !encrypted ? reject(caught ?? new Error("bcrypt failed")) : resolve(encrypted));
+      });
+      if (operationId !== operationRef.current) return;
+      setBcryptHash(value);
+      setGeneratedView("bcrypt");
+    } catch (caught) {
+      if (operationId === operationRef.current) setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      if (operationId === operationRef.current) setLoading("");
+    }
+  };
+
+  const generatePbkdf2 = async () => {
+    if (!password || !salt || !active) return;
+    const operationId = ++operationRef.current;
+    setLoading("pbkdf2");
+    setError("");
+    try {
+      const value = await djangoPbkdf2(password, salt, pbkdf2Iterations);
+      if (operationId !== operationRef.current) return;
+      setPbkdf2Hash(value);
+      setGeneratedView("pbkdf2");
+    } catch (caught) {
+      if (operationId === operationRef.current) setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      if (operationId === operationRef.current) setLoading("");
+    }
+  };
+
+  const verify = async () => {
+    if (!targetHash.trim() || !candidates.length || !active) return;
+    const operationId = ++operationRef.current;
+    setLoading("verify");
+    setError("");
+    try {
+      const rows = await verifyPasswordCandidates(targetHash.trim(), candidates);
+      if (operationId === operationRef.current) setVerifyRows(rows);
+    } catch (caught) {
+      if (operationId === operationRef.current) setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      if (operationId === operationRef.current) setLoading("");
+    }
+  };
+
+  const clear = () => {
+    operationRef.current += 1;
+    setLoading("");
+    setPassword("");
+    setSalt(randomSalt());
+    setQuickGenerated(false);
+    setBcryptHash("");
+    setPbkdf2Hash("");
+    setGeneratedView("");
+    setTargetHash("");
+    setCandidatePasswords("");
+    setVerifyRows([]);
+    setUsername("");
+    setIdentifyText("");
+    setError("");
+  };
+
+  return (
+    <div className={`tool-grid password-simple-workbench password-grid ${hasInput ? "has-password" : "empty-password"}`}>
+      <div className="tool-panel wide-panel password-simple-main-panel">
+        <ToolPanelHeader
+          title={t.password_hash}
+          actions={<>
+            <ASegmentedGroup className="password-simple-mode" value={mode} selects="single">
+              <ASegmentedButton value="generate" onClick={() => setMode("generate")}>{t.generate}</ASegmentedButton>
+              <ASegmentedButton value="identify" onClick={() => setMode("identify")}>{t.identifyMode}</ASegmentedButton>
+              <ASegmentedButton value="verify" onClick={() => setMode("verify")}>{t.hashMatch}</ASegmentedButton>
+              <ASegmentedButton value="sql" onClick={() => setMode("sql")}>SQL</ASegmentedButton>
+            </ASegmentedGroup>
+            <AButton variant="text" disabled={!hasInput} onClick={clear}>{t.clear}</AButton>
+          </>}
+        />
+
+        {mode === "generate" && (
+          <div className="password-simple-section">
+            <div className="password-simple-generate-grid">
+              <label className="stack-label">{t.passwordValue}<APasswordField className="text-input full-input" value={password} onChange={(event) => { setPassword(event.currentTarget.value); clearGenerated(); }} placeholder={t.passwordValue} /></label>
+              <label className="stack-label">{t.salt}<input className="text-input full-input" value={salt} onChange={(event) => { setSalt(event.currentTarget.value); clearGenerated(); }} /></label>
+              <label className="stack-label">{t.bcrypt_rounds}<AInputNumber min={4} max={14} value={rounds} onChange={(value) => { operationRef.current += 1; setLoading(""); setRounds(Math.min(14, Math.max(4, value ?? 10))); setBcryptHash(""); if (generatedView === "bcrypt") setGeneratedView(""); }} /></label>
+              <label className="stack-label">{t.pbkdf2_iterations}<AInputNumber min={10000} max={2000000} step={10000} value={pbkdf2Iterations} onChange={(value) => { operationRef.current += 1; setLoading(""); setPbkdf2Iterations(Math.min(2000000, Math.max(10000, value ?? 390000))); setPbkdf2Hash(""); if (generatedView === "pbkdf2") setGeneratedView(""); }} /></label>
+            </div>
+            <div className="button-row">
+              <AButton variant="filled" disabled={!password || Boolean(loading)} onClick={generateQuickHashes}>{t.generate_common_hashes}</AButton>
+              <AButton variant="outlined" disabled={!password || Boolean(loading)} onClick={() => void generateBcrypt()}>{loading === "bcrypt" ? "bcrypt..." : t.generateBcrypt}</AButton>
+              <AButton variant="outlined" disabled={!password || !salt || Boolean(loading)} onClick={() => void generatePbkdf2()}>{loading === "pbkdf2" ? "PBKDF2..." : t.generatePbkdf2}</AButton>
+              <AButton variant="text" onClick={() => { setSalt(randomSalt()); clearGenerated(); }}>{t.new_salt}</AButton>
+            </div>
+            {!password && <div className="empty-state">{t.passwordGenerateEmpty}</div>}
+            {visibleGeneratedHashes.length > 0 && (
+              <div className="password-simple-output">
+                <ToolPanelHeader title={t.generated_hash} actions={<AButton variant="text" onClick={() => void copyText(visibleGeneratedHashes.map(([label, value]) => `${label}: ${value}`).join("\n"))}>{visibleGeneratedHashes.length > 1 ? (t.copy_all) : (t.copy)}</AButton>} />
+                <div className="table-scroll"><table className="data-table password-simple-hash-table"><tbody>{visibleGeneratedHashes.map(([label, value]) => <tr key={label}><th>{label}</th><td><button type="button" className="password-simple-value" onClick={() => void copyText(value)}>{value}</button></td></tr>)}</tbody></table></div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {mode === "identify" && (
+          <div className="password-simple-section password-identify">
+            <label className="stack-label">{t.identifyInput}
+              <textarea className="compact-textarea password-identify-input" value={identifyText} onChange={(event) => setIdentifyText(event.currentTarget.value)} placeholder={t.identifyPlaceholder} spellCheck={false} />
+            </label>
+            {!identifyText.trim() ? (
+              <div className="empty-state">{t.identifyEmpty}</div>
+            ) : (
+              <div className="password-identify-result">
+                <div className={`password-identify-kind kind-${identifyResult.kind}`}>
+                  <span className="password-identify-kind-badge">
+                    {identifyResult.kind === "hash" ? t.identifyHashKind : identifyResult.kind === "plaintext" ? t.identifyPlainKind : t.identifyUnknownKind}
+                  </span>
+                  <span className="password-identify-meta">{t.identifyLength}: {identifyResult.length} · {t.identifyCharset}: {english ? identifyResult.charsetEn : identifyResult.charsetZh}</span>
+                </div>
+
+                {identifyResult.kind === "hash" && identifyResult.candidates.length > 0 && (
+                  <div className="password-identify-block">
+                    <div className="password-identify-block-title">{t.identifyCandidates}</div>
+                    <div className="password-identify-list">
+                      {identifyResult.candidates.map((item) => (
+                        <div className={`password-identify-card conf-${item.confidence}`} key={item.id}>
+                          <div className="password-identify-card-head">
+                            <strong>{english ? item.name : item.zh}</strong>
+                            <span className={`password-identify-conf conf-${item.confidence}`}>{t.identifyConfidence}: {confidenceLabel(item.confidence, english)}</span>
+                          </div>
+                          <p className="password-identify-desc">{english ? item.descEn : item.descZh}</p>
+                          <div className="password-identify-tags">
+                            {item.generateHint && <span className="password-identify-tag tag-hint">{t.identifyGenerateHint}: {generateHintLabel(item.generateHint, english)}</span>}
+                            {item.hashcat && <span className="password-identify-tag">{t.identifyReference}: hashcat -m {item.hashcat}</span>}
+                            {item.john && <span className="password-identify-tag">john --format={item.john}</span>}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {identifyResult.kind === "plaintext" && identifyResult.strength && (
+                  <div className="password-identify-block">
+                    <div className="password-identify-block-title">{t.identifyStrength}</div>
+                    <div className="password-identify-strength">
+                      <div className={`password-identify-strength-bar score-${identifyResult.strength.score}`}>
+                        {[0, 1, 2, 3].map((slot) => <span key={slot} className={slot < identifyResult.strength!.score ? "on" : ""} />)}
+                      </div>
+                      <span className="password-identify-strength-label">{english ? identifyResult.strength.labelEn : identifyResult.strength.labelZh}</span>
+                    </div>
+                    <div className="password-identify-classes">
+                      <span className={identifyResult.strength.hasLower ? "on" : ""}>a-z</span>
+                      <span className={identifyResult.strength.hasUpper ? "on" : ""}>A-Z</span>
+                      <span className={identifyResult.strength.hasDigit ? "on" : ""}>0-9</span>
+                      <span className={identifyResult.strength.hasSymbol ? "on" : ""}>#$!</span>
+                    </div>
+                    {(english ? identifyResult.strength.notesEn : identifyResult.strength.notesZh).length > 0 && (
+                      <ul className="password-identify-notes">
+                        {(english ? identifyResult.strength.notesEn : identifyResult.strength.notesZh).map((note, index) => <li key={index}>{note}</li>)}
+                      </ul>
+                    )}
+                    <div className="button-row">
+                      <AButton variant="filled" onClick={useIdentifiedAsPassword}>{t.identifyUseAsPassword}</AButton>
+                    </div>
+                  </div>
+                )}
+
+                {identifyResult.kind === "unknown" && (
+                  <div className="button-row">
+                    <AButton variant="outlined" onClick={useIdentifiedAsPassword}>{t.identifyUseAsPassword}</AButton>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {mode === "verify" && (
+          <div className="password-simple-section">
+            <label className="stack-label">{t.hashTypeInput}<textarea className="compact-textarea password-simple-target" value={targetHash} onChange={(event) => { operationRef.current += 1; setLoading(""); setTargetHash(event.currentTarget.value); setVerifyRows([]); }} placeholder={t.paste_the_target_password_hash} /></label>
+            <label className="stack-label">{t.candidatePasswords}<textarea className="single-textarea password-simple-candidates" value={candidatePasswords} onChange={(event) => { operationRef.current += 1; setLoading(""); setCandidatePasswords(event.currentTarget.value); setVerifyRows([]); }} placeholder={t.one_candidate_password_per_line} /></label>
+            <div className="button-row"><AButton variant="filled" disabled={!targetHash.trim() || !candidates.length || Boolean(loading)} onClick={() => void verify()}>{loading === "verify" ? (t.verifying) : t.verifyCandidates}</AButton></div>
+            {(!targetHash.trim() || !candidates.length) && <div className="empty-state">{t.passwordVerifyEmpty}</div>}
+            {verifyRows.length > 0 && (
+              <div className="password-simple-output">
+                <ToolPanelHeader title={t.verification_results} subtitle={`${matchedCount}/${verifyRows.length} MATCH`} actions={<AButton variant="outlined" onClick={() => downloadTextFile(`password-verify-${Date.now()}.csv`, passwordRowsToCsv(verifyRows), "text/csv;charset=utf-8")}>{t.exportCsv}</AButton>} />
+                <InfoTable rows={[[t.detected_type, targetType], [t.candidates, String(verifyRows.length)], [t.matches, String(matchedCount)]]} />
+                <div className="table-scroll password-simple-verify-scroll"><table className="data-table password-simple-verify-table"><thead><tr><th>{t.candidate}</th><th>{t.componentType}</th><th>{t.result}</th><th>{t.detail}</th></tr></thead><tbody>{verifyRows.map((row, index) => <tr className={row.matched ? "selected-row" : ""} key={`${index}-${row.candidate}`}><td>{row.candidate}</td><td>{row.hashType}</td><td>{row.matched ? "MATCH" : "NO MATCH"}</td><td>{row.detail}</td></tr>)}</tbody></table></div>
+                {candidates.length > 200 && <span className="inline-note">{t.only_the_first_200_candidates_were_checked}</span>}
+              </div>
+            )}
+          </div>
+        )}
+
+        {mode === "sql" && (
+          <div className="password-simple-section">
+            <div className="password-simple-sql-grid">
+              <label className="stack-label">{t.username}<input className="text-input" value={username} onChange={(event) => setUsername(event.currentTarget.value)} /></label>
+              <label className="stack-label">{t.table}<input className="text-input" value={table} onChange={(event) => setTable(event.currentTarget.value)} /></label>
+              <label className="stack-label">{t.password_column}<input className="text-input" value={column} onChange={(event) => setColumn(event.currentTarget.value)} /></label>
+              <label className="stack-label">{t.where_column}<input className="text-input" value={whereColumn} onChange={(event) => setWhereColumn(event.currentTarget.value)} /></label>
+            </div>
+            {!password ? <div className="empty-state">{t.generate_a_password_hash_first}</div> : <div className="password-simple-sql-list">{sqlTemplates.map(([label, value]) => <div className="password-simple-sql-row" key={label}><strong>{label}</strong><code>{value}</code><AButton variant="text" disabled={value === "--"} onClick={() => void copyText(value)}>{t.copy}</AButton></div>)}</div>}
+          </div>
+        )}
+
+        {error && <div className="empty-state error-state">{error}</div>}
+      </div>
+    </div>
+  );
+}

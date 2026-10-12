@@ -1,0 +1,43 @@
+using HR.LeaveManagement.Application.DTOs.LeaveType;
+using HR.LeaveManagement.Application.Features.LeaveTypes.Handlers.Queries;
+using HR.LeaveManagement.Application.Features.LeaveTypes.Requests.Queries;
+using HR.LeaveManagement.Domain;
+using Moq;
+using NUnit.Framework;
+using RCommon.Persistence;
+using RCommon.Persistence.Crud;
+using Shouldly;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Linq.Expressions;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace HR.LeaveManagement.Application.UnitTests.LeaveTypes.Queries
+{
+    [TestFixture()]
+    public class GetLeaveTypeListRequestHandlerTests
+    {
+        [Test]
+        public async Task GetLeaveTypeListTest()
+        {
+            var testData = new List<LeaveType>();
+            for (int i = 0; i < 5; i++)
+            {
+                testData.Add(TestDataActions.CreateLeaveTypeStub());
+            }
+            var mock = new Mock<IGraphRepository<LeaveType>>();
+            mock.Setup(x => x.FindAsync(x=>true, CancellationToken.None))
+                .Returns(() => Task.FromResult(testData as ICollection<LeaveType>));
+
+            var handler = new GetLeaveTypeListRequestHandler(mock.Object);
+            var result = await handler.HandleAsync(new GetLeaveTypeListRequest(), CancellationToken.None);
+
+            result.ShouldBeOfType<List<LeaveTypeDto>>();
+            result.Count.ShouldBe(5);
+
+        }
+    }
+}

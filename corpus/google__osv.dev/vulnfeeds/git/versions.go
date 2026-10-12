@@ -1,0 +1,265 @@
+// Copyright 2023 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package git
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"regexp"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/google/osv.dev/vulnfeeds/models"
+	"github.com/google/osv.dev/vulnfeeds/utility/logger"
+	"github.com/sethvargo/go-retry"
+)
+
+var (
+	versionRangeRegex = regexp.MustCompile(`^(>=|<=|~|\^|>|<|=)\s*([0-9a-zA-Z\.\-]+)(?:,\s*(>=|<=|~|\^|>|<|=)\s*([0-9a-zA-Z\.\-]+))?$`) // Used to parse version strings from the GitHub CNA.
+	// Keep in sync with the intent of https://github.com/google/osv.dev/blob/26050deb42785bc5a4dc7d802eac8e7f95135509/osv/bug.py#L31
+	validVersion     = regexp.MustCompile(`(?i)(\d+|(?:rc|alpha|beta|preview)\d*)`)
+	validVersionText = regexp.MustCompile(`(?i)(?:rc|alpha|beta|preview)\d*`)
+	BackoffBaseDelay = 1 * time.Second
+)
+
+// findFuzzyCommit takes an already normalized version and the mapping of repo tags to
+// normalized tags and commits, and performs fuzzy matching to find a commit hash.
+func findFuzzyCommit(normalizedVersion string, normalizedTags map[string]NormalizedTag) (string, bool) {
+	candidateTags := []string{} // the subset of normalizedTags tags that might be appropriate to use as a fuzzy match for normalizedVersion.
+
+	normalizedVersionMatchesText := validVersionText.MatchString(normalizedVersion)
+
+	for k, v := range normalizedTags {
+		// "1-8-0-RC0" (normalized from "1.8.0-RC0") shouldn't be considered a fuzzy match for "1-8-0" (normalized from "1.8.0")
+		if v.MatchesVersionText == normalizedVersionMatchesText && strings.HasPrefix(k, normalizedVersion) {
+			candidateTags = append(candidateTags, k)
+		}
+	}
+
+	// There are zero, one or more tags to further examine for a best choice.
+
+	// Nothing even looked like it started with normalizedVersion, fail.
+	if len(candidateTags) == 0 {
+		return "", false
+	}
+
+	if len(candidateTags) == 1 {
+		return normalizedTags[candidateTags[0]].Commit, true
+	}
+
+	// Find the most suitable tag from multiple.
+	for _, t := range candidateTags {
+		// Handle the case where the
+		// normalizedVersion is "12-0" (i.e. was "12.0") but the normalizedTags
+		// has "12-0-0" (i.e. the repo had "12.0.0")
+		if strings.TrimPrefix(t, normalizedVersion) == "-0" {
+			return normalizedTags[t].Commit, true
+		}
+	}
+
+	// All fuzzy matching attempts have failed.
+	return "", false
+}
+
+func VersionToAffectedCommit(version string, repo string, commitType models.CommitType, normalizedTags map[string]NormalizedTag) (ac models.AffectedCommit, e error) {
+	commitHash, err := VersionToCommit(version, normalizedTags)
+	if err != nil {
+		return ac, err
+	}
+	ac.SetRepo(repo)
+	models.SetCommitByType(&ac, commitType, commitHash)
+
+	return ac, nil
+}
+
+// Take an unnormalized version string, the pre-normalized mapping of tags to commits and return a commit hash.
+func VersionToCommit(version string, normalizedTags map[string]NormalizedTag) (string, error) {
+	if version == "" {
+		return "", nil
+	}
+	// TODO: try unnormalized version first.
+	normalizedVersion, err := NormalizeVersion(version)
+	if err != nil {
+		logger.Debug("VersionToCommit failed to normalize version", slog.String("version", version), slog.Any("error", err))
+		return "", err
+	}
+	logger.Debug("VersionToCommit normalized version", slog.String("version", version), slog.String("normalizedVersion", normalizedVersion))
+
+	// Try a straight out (case-insensitive) match first.
+	if normalizedTag, ok := normalizedTags[strings.ToLower(normalizedVersion)]; ok {
+		logger.Debug("VersionToCommit found exact match", slog.String("version", version), slog.String("normalizedVersion", normalizedVersion), slog.String("commit", normalizedTag.Commit))
+		return normalizedTag.Commit, nil
+	}
+
+	// Then try to fuzzy-match.
+	if commitHash, ok := findFuzzyCommit(normalizedVersion, normalizedTags); ok {
+		logger.Debug("VersionToCommit found fuzzy match", slog.String("version", version), slog.String("normalizedVersion", normalizedVersion), slog.String("commit", commitHash))
+		return commitHash, nil
+	}
+
+	logger.Debug("VersionToCommit failed to find match", slog.String("version", version), slog.String("normalizedVersion", normalizedVersion))
+
+	return "", fmt.Errorf("failed to find a commit for version %q normalized as %q", version, normalizedVersion)
+}
+
+// Normalize version strings found in CVE CPE Match data or Git tags.
+// Use the same logic and behaviour as normalize_tag() osv/bug.py for consistency.
+func NormalizeVersion(version string) (normalizedVersion string, e error) {
+	if strings.HasPrefix(version, ".") {
+		version = "0" + version
+	}
+	components := validVersion.FindAllString(version, -1)
+	if components == nil {
+		return "", fmt.Errorf("%q is not a supported version", version)
+	}
+	// If the very first component happens to accidentally match the strings we support, remove it.
+	// This is necessary because of the lack of negative lookbehind assertion support in RE2.
+	if validVersionText.MatchString(components[0]) {
+		components = slices.Delete(components, 0, 1)
+	}
+	normalizedVersion = strings.Join(components, "-")
+
+	return normalizedVersion, e
+}
+
+// Parse a version range string into an models.AffectedVersion struct,
+// which aligns with the structure used by GitHub CNA feeds.
+func ParseVersionRange(versionRange string) (models.AffectedVersion, error) {
+	matches := versionRangeRegex.FindStringSubmatch(strings.ReplaceAll(versionRange, " ", ""))
+
+	if len(matches) == 0 {
+		return models.AffectedVersion{}, fmt.Errorf("invalid version range format: %s", versionRange)
+	}
+
+	av := models.AffectedVersion{}
+
+	op1 := matches[1]
+	ver1 := matches[2]
+	op2 := matches[3]
+	ver2 := matches[4]
+
+	if op2 == "" {
+		// Only one constraint
+		switch op1 {
+		case ">=":
+			av.Introduced = ver1
+		case ">":
+			av.Introduced = ver1
+		case "<=":
+			av.Introduced = "0"
+			av.LastAffected = ver1
+		case "<":
+			av.Introduced = "0"
+			av.Fixed = ver1
+		default:
+			return models.AffectedVersion{}, fmt.Errorf("unhandled single operator: %s", op1)
+		}
+	} else {
+		// Two constraints
+		switch op1 {
+		case ">=":
+			av.Introduced = ver1
+		case ">":
+			// this is technically incorrect but better than introduced being 0
+			av.Introduced = ver1
+		default:
+			return models.AffectedVersion{}, fmt.Errorf("unexpected operator at start of range: %s", op1)
+		}
+
+		switch op2 {
+		case "<":
+			av.Fixed = ver2
+		case "<=":
+			av.LastAffected = ver2
+		default:
+			return models.AffectedVersion{}, fmt.Errorf("unexpected operator at end of range: %s", op2)
+		}
+	}
+
+	return av, nil
+}
+
+// Detect linkrot and handle link decay in HTTP(S) links via HEAD request with exponential backoff.
+func ValidateAndCanonicalizeLink(link string, httpClient *http.Client) (canonicalLink string, err error) {
+	u, err := url.Parse(link)
+	if err != nil {
+		return link, err
+	}
+	if !slices.Contains([]string{"http", "https"}, u.Scheme) {
+		// Handle what's presumably a git:// URL.
+		return link, err
+	}
+	if httpClient == nil {
+		panic("ValidateAndCanonicalizeLink called with nil httpClient")
+	}
+	backoff := retry.NewExponential(BackoffBaseDelay)
+	loggingBackoff := newLoggingBackoff(retry.WithMaxRetries(3, backoff), "ValidateAndCanonicalizeLink")
+	if err := retry.Do(context.Background(), loggingBackoff, func(ctx context.Context) error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodHead, link, nil)
+		if err != nil {
+			return err
+		}
+
+		// security.alpinelinux.org responds with text/html content.
+		// default HEAD request in Go does not provide any Accept headers, causing a 406 response.
+		req.Header.Set("Accept", "text/html")
+
+		// Send the request
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+
+		switch resp.StatusCode / 100 {
+		// 4xx response codes are an instant fail.
+		// This will be retried next time the conversion is run so 429 errors may be resolved.
+		case 4:
+			return fmt.Errorf("bad response: %v", resp.StatusCode)
+		// 5xx response codes are retriable.
+		case 5:
+			return retry.RetryableError(fmt.Errorf("bad response: %v", resp.StatusCode))
+		// Anything else is acceptable.
+		default:
+			canonicalLink = resp.Request.URL.String()
+			return nil
+		}
+	}); err != nil {
+		return link, fmt.Errorf("unable to determine validity of %q: %w", link, err)
+	}
+
+	return canonicalLink, nil
+}
+
+func FindCanonicalLink(link string, httpClient *http.Client, cache RepoTagsCache) (canonicalLink string, err error) {
+	if cache != nil {
+		if canonicalLink, ok := cache.GetCanonicalLink(link); ok {
+			return canonicalLink, nil
+		}
+	}
+	canonicalLink, err = ValidateAndCanonicalizeLink(link, httpClient)
+	if err != nil {
+		return link, err
+	}
+	if cache != nil {
+		cache.SetCanonicalLink(link, canonicalLink)
+	}
+
+	return canonicalLink, nil
+}

@@ -1,0 +1,443 @@
+"""Unit tests for apps/nmap — severity mapping, vulners XML parser, web/non-web exclusion."""
+
+import xml.etree.ElementTree as ET
+from unittest.mock import patch
+
+import pytest
+
+from apps.nmap.analyzer import _extract_vulns, _severity_from_cvss, analyze
+from apps.nmap.scanner import run_nmap
+
+
+# ---------------------------------------------------------------------------
+# Severity mapping
+# ---------------------------------------------------------------------------
+
+class TestSeverityFromCvss:
+    def test_critical(self):
+        assert _severity_from_cvss(9.0) == "critical"
+        assert _severity_from_cvss(9.8) == "critical"
+        assert _severity_from_cvss(10.0) == "critical"
+
+    def test_high(self):
+        assert _severity_from_cvss(7.0) == "high"
+        assert _severity_from_cvss(8.1) == "high"
+        assert _severity_from_cvss(8.99) == "high"
+
+    def test_medium(self):
+        assert _severity_from_cvss(4.0) == "medium"
+        assert _severity_from_cvss(5.5) == "medium"
+        assert _severity_from_cvss(6.99) == "medium"
+
+    def test_low(self):
+        assert _severity_from_cvss(0.1) == "low"
+        assert _severity_from_cvss(2.5) == "low"
+        assert _severity_from_cvss(3.99) == "low"
+
+    def test_info(self):
+        assert _severity_from_cvss(0.0) == "info"
+
+
+# ---------------------------------------------------------------------------
+# Vulners XML extractor
+# ---------------------------------------------------------------------------
+
+class TestExtractVulns:
+    def _script_from_xml(self, xml_str):
+        return ET.fromstring(xml_str)
+
+    def test_extracts_single_cve(self):
+        script = self._script_from_xml("""
+            <script id="vulners">
+              <table key="cpe:/a:openbsd:openssh:7.2p2">
+                <table>
+                  <elem key="id">CVE-2018-15473</elem>
+                  <elem key="cvss">5.0</elem>
+                  <elem key="type">cve</elem>
+                  <elem key="is_exploit">false</elem>
+                </table>
+              </table>
+            </script>
+        """)
+        vulns = _extract_vulns(script)
+        assert len(vulns) == 1
+        assert vulns[0]["id"] == "CVE-2018-15473"
+        assert vulns[0]["cvss"] == 5.0
+        assert vulns[0]["type"] == "cve"
+        assert vulns[0]["is_exploit"] is False
+
+    def test_extracts_multiple_cves(self):
+        script = self._script_from_xml("""
+            <script id="vulners">
+              <table key="cpe:/a:openbsd:openssh:7.2p2">
+                <table>
+                  <elem key="id">CVE-2018-15473</elem>
+                  <elem key="cvss">5.0</elem>
+                  <elem key="type">cve</elem>
+                </table>
+                <table>
+                  <elem key="id">CVE-2016-10009</elem>
+                  <elem key="cvss">9.0</elem>
+                  <elem key="type">cve</elem>
+                  <elem key="is_exploit">true</elem>
+                </table>
+              </table>
+            </script>
+        """)
+        vulns = _extract_vulns(script)
+        assert len(vulns) == 2
+        ids = {v["id"] for v in vulns}
+        assert ids == {"CVE-2018-15473", "CVE-2016-10009"}
+
+    def test_handles_exploitdb_entries(self):
+        script = self._script_from_xml("""
+            <script id="vulners">
+              <table>
+                <table>
+                  <elem key="id">EDB-ID:40136</elem>
+                  <elem key="cvss">0.0</elem>
+                  <elem key="type">exploitdb</elem>
+                  <elem key="is_exploit">true</elem>
+                </table>
+              </table>
+            </script>
+        """)
+        vulns = _extract_vulns(script)
+        assert len(vulns) == 1
+        assert vulns[0]["type"] == "exploitdb"
+
+    def test_handles_missing_cvss(self):
+        script = self._script_from_xml("""
+            <script id="vulners">
+              <table>
+                <table>
+                  <elem key="id">CVE-2024-99999</elem>
+                  <elem key="type">cve</elem>
+                </table>
+              </table>
+            </script>
+        """)
+        vulns = _extract_vulns(script)
+        assert len(vulns) == 1
+        assert vulns[0]["cvss"] == 0.0
+
+    def test_empty_script_returns_empty_list(self):
+        script = self._script_from_xml('<script id="vulners"></script>')
+        assert _extract_vulns(script) == []
+
+
+# ---------------------------------------------------------------------------
+# Analyzer end-to-end with synthetic XML
+# ---------------------------------------------------------------------------
+
+@pytest.mark.django_db
+class TestNmapAnalyzer:
+    SAMPLE_XML = """<?xml version="1.0"?>
+<nmaprun>
+<host>
+<address addr="1.2.3.4" addrtype="ipv4"/>
+<ports><port protocol="tcp" portid="22">
+<state state="open"/>
+<service name="ssh" product="OpenSSH" version="7.2p2"/>
+<script id="vulners">
+<table key="cpe:/a:openbsd:openssh:7.2p2">
+<table>
+<elem key="id">CVE-2018-15473</elem>
+<elem key="cvss">5.0</elem>
+<elem key="type">cve</elem>
+</table>
+<table>
+<elem key="id">CVE-2016-10009</elem>
+<elem key="cvss">9.0</elem>
+<elem key="type">cve</elem>
+</table>
+<table>
+<elem key="id">EDB-ID:40136</elem>
+<elem key="cvss">0.0</elem>
+<elem key="type">exploitdb</elem>
+</table>
+</table>
+</script>
+</port></ports>
+</host>
+</nmaprun>
+"""
+
+    def _make_session(self):
+        from apps.core.engine.scans.models import ScanSession
+        from apps.core.data.assets.models import IPAddress, Port
+        sess = ScanSession.objects.create(domain="example.com", scan_type="full")
+        ip = IPAddress.objects.create(session=sess, address="1.2.3.4", version=4, source="dnsx")
+        Port.objects.create(
+            session=sess, ip_address=ip, address="1.2.3.4", port=22,
+            protocol="tcp", state="open", source="naabu",
+        )
+        return sess
+
+    def test_analyze_filters_to_cves_only(self):
+        sess = self._make_session()
+        findings = analyze(sess, {"1.2.3.4": self.SAMPLE_XML})
+        # 2 CVEs, EDB-ID dropped
+        assert len(findings) == 2
+        cves = {f.cve for f in findings}
+        assert cves == {"CVE-2018-15473", "CVE-2016-10009"}
+
+    def test_analyze_maps_severity_correctly(self):
+        sess = self._make_session()
+        findings = analyze(sess, {"1.2.3.4": self.SAMPLE_XML})
+        by_cve = {f.cve: f for f in findings}
+        assert by_cve["CVE-2018-15473"].severity == "medium"  # cvss=5.0
+        assert by_cve["CVE-2016-10009"].severity == "critical"  # cvss=9.0
+
+    def test_analyze_links_finding_to_port_fk(self):
+        sess = self._make_session()
+        findings = analyze(sess, {"1.2.3.4": self.SAMPLE_XML})
+        assert all(f.port is not None for f in findings)
+        assert all(f.port.address == "1.2.3.4" for f in findings)
+
+    def test_analyze_captures_service_and_version(self):
+        sess = self._make_session()
+        findings = analyze(sess, {"1.2.3.4": self.SAMPLE_XML})
+        f = findings[0]
+        assert f.service == "ssh"
+        assert "OpenSSH" in f.version
+
+    # XML where the SAME CVE appears twice on the same port (vulners can list a
+    # CVE under multiple CPE tables). The (ip, port, cve) `seen` guard must
+    # collapse these into a single Finding.
+    DUP_CVE_XML = """<?xml version="1.0"?>
+<nmaprun>
+<host>
+<address addr="1.2.3.4" addrtype="ipv4"/>
+<ports><port protocol="tcp" portid="22">
+<state state="open"/>
+<service name="ssh" product="OpenSSH" version="7.2p2"/>
+<script id="vulners">
+<table key="cpe:/a:openbsd:openssh:7.2p2">
+<table>
+<elem key="id">CVE-2018-15473</elem>
+<elem key="cvss">5.0</elem>
+<elem key="type">cve</elem>
+</table>
+</table>
+<table key="cpe:/a:openssh:openssh:7.2p2">
+<table>
+<elem key="id">CVE-2018-15473</elem>
+<elem key="cvss">5.0</elem>
+<elem key="type">cve</elem>
+</table>
+</table>
+</script>
+</port></ports>
+</host>
+</nmaprun>
+"""
+
+    def test_analyze_dedupes_same_cve_on_same_port(self):
+        sess = self._make_session()
+        # The same CVE is present twice in the XML; the seen guard must fire so
+        # only ONE Finding survives for CVE-2018-15473.
+        findings = analyze(sess, {"1.2.3.4": self.DUP_CVE_XML})
+        assert len(findings) == 1
+        assert findings[0].cve == "CVE-2018-15473"
+
+    def test_analyze_handles_malformed_xml(self):
+        sess = self._make_session()
+        findings = analyze(sess, {"1.2.3.4": "<not valid xml"})
+        assert findings == []
+
+    def test_analyze_handles_empty_input(self):
+        sess = self._make_session()
+        assert analyze(sess, {}) == []
+
+
+# ---------------------------------------------------------------------------
+# Backport XML Matching
+# ---------------------------------------------------------------------------
+
+@pytest.mark.django_db
+class TestBackportMatching:
+    SAMPLE_XML_UBUNTU = """<?xml version="1.0"?>
+<nmaprun>
+<host>
+<address addr="1.2.3.4" addrtype="ipv4"/>
+<ports><port protocol="tcp" portid="22">
+<state state="open"/>
+<service name="ssh" product="OpenSSH" version="9.6p1" extrainfo="Ubuntu Linux; 3ubuntu13.4"/>
+<script id="vulners">
+<table key="cpe:/a:openbsd:openssh:9.6p1">
+<table>
+<elem key="id">CVE-2024-6387</elem>
+<elem key="cvss">8.1</elem>
+<elem key="type">cve</elem>
+</table>
+<table>
+<elem key="id">CVE-2024-39894</elem>
+<elem key="cvss">5.3</elem>
+<elem key="type">cve</elem>
+</table>
+</table>
+</script>
+</port></ports>
+</host>
+</nmaprun>
+"""
+
+    def _make_session(self):
+        from apps.core.engine.scans.models import ScanSession
+        from apps.core.data.assets.models import IPAddress, Port
+        sess = ScanSession.objects.create(domain="example.com", scan_type="full")
+        ip = IPAddress.objects.create(session=sess, address="1.2.3.4", version=4, source="dnsx")
+        Port.objects.create(
+            session=sess, ip_address=ip, address="1.2.3.4", port=22,
+            protocol="tcp", state="open", source="naabu",
+        )
+        return sess
+
+    @patch("apps.nmap.backports.BACKPORTS", {
+        "ubuntu": {
+            "CVE-2024-6387": {"openssh": "3ubuntu13.3"}
+        }
+    })
+    def test_backport_applied_demotes_to_info(self):
+        sess = self._make_session()
+        findings = analyze(sess, {"1.2.3.4": self.SAMPLE_XML_UBUNTU})
+
+        by_cve = {f.cve: f for f in findings}
+
+        # CVE-2024-6387 is patched in 3ubuntu13.3, and we are running 3ubuntu13.4 -> info
+        f1 = by_cve["CVE-2024-6387"]
+        assert f1.severity == "info"
+        assert f1.extra.get("backport_applied") is True
+
+        # CVE-2024-39894 is not in our mock BACKPORTS -> original severity
+        f2 = by_cve["CVE-2024-39894"]
+        assert f2.severity == "medium"
+        assert f2.extra.get("backport_applied") is None
+
+# ---------------------------------------------------------------------------
+# Web/non-web classification via Port.is_web
+# ---------------------------------------------------------------------------
+
+@pytest.mark.django_db
+class TestWebClassification:
+    """Tests that nmap only scans ports with is_web=False."""
+
+    def test_nmap_skips_web_ports(self):
+        from apps.core.engine.scans.models import ScanSession
+        from apps.core.data.assets.models import IPAddress, Port
+
+        sess = ScanSession.objects.create(domain="example.com", scan_type="full")
+        ip = IPAddress.objects.create(session=sess, address="1.2.3.4", version=4, source="dnsx")
+        Port.objects.create(session=sess, ip_address=ip, address="1.2.3.4",
+                            port=80, protocol="tcp", state="open", is_web=True, source="naabu")
+        Port.objects.create(session=sess, ip_address=ip, address="1.2.3.4",
+                            port=22, protocol="tcp", state="open", is_web=False, source="naabu")
+
+        with patch("apps.nmap.scanner.collect", return_value={}) as mock_collect:
+            run_nmap(sess)
+
+        # Only port 22 should be scanned (non-web)
+        if mock_collect.called:
+            ip_to_ports = mock_collect.call_args[0][1]
+            ports = ip_to_ports.get("1.2.3.4", [])
+            assert 80 not in ports
+            assert 22 in ports
+
+    def test_nmap_skips_when_all_web(self):
+        from apps.core.engine.scans.models import ScanSession
+        from apps.core.data.assets.models import IPAddress, Port
+
+        sess = ScanSession.objects.create(domain="example.com", scan_type="full")
+        ip = IPAddress.objects.create(session=sess, address="1.2.3.4", version=4, source="dnsx")
+        Port.objects.create(session=sess, ip_address=ip, address="1.2.3.4",
+                            port=80, protocol="tcp", state="open", is_web=True, source="naabu")
+        Port.objects.create(session=sess, ip_address=ip, address="1.2.3.4",
+                            port=443, protocol="tcp", state="open", is_web=True, source="naabu")
+
+        findings = run_nmap(sess)
+        assert findings == []
+
+    def test_empty_session(self):
+        from apps.core.engine.scans.models import ScanSession
+        sess = ScanSession.objects.create(domain="empty.com", scan_type="full")
+        assert run_nmap(sess) == []
+
+
+# ---------------------------------------------------------------------------
+# Scanner orchestrator (mocked collector)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.django_db
+class TestNmapScanner:
+    def test_run_nmap_skips_when_no_non_web_ports(self):
+        from apps.core.engine.scans.models import ScanSession
+        sess = ScanSession.objects.create(domain="empty.com", scan_type="full")
+        findings = run_nmap(sess)
+        assert findings == []
+
+    def test_run_nmap_excludes_web_ports_via_is_web(self):
+        """nmap should skip ports with is_web=True."""
+        from apps.core.engine.scans.models import ScanSession
+        from apps.core.data.assets.models import IPAddress, Port
+
+        sess = ScanSession.objects.create(domain="example.com", scan_type="full")
+        ip = IPAddress.objects.create(session=sess, address="1.2.3.4", version=4, source="dnsx")
+        Port.objects.create(session=sess, ip_address=ip, address="1.2.3.4",
+                            port=80, protocol="tcp", state="open", is_web=True, source="naabu")
+        Port.objects.create(session=sess, ip_address=ip, address="1.2.3.4",
+                            port=22, protocol="tcp", state="open", is_web=False, source="naabu")
+
+        with patch("apps.nmap.scanner.collect", return_value={}) as mock_collect:
+            run_nmap(sess)
+
+        called_with = mock_collect.call_args[0][1]
+        assert "1.2.3.4" in called_with
+        assert called_with["1.2.3.4"] == [22]
+
+
+# ---------------------------------------------------------------------------
+# Collector failure modes (timeout / binary-missing) — added by test audit
+# ---------------------------------------------------------------------------
+
+import types as _types
+from unittest.mock import patch as _patch, MagicMock as _MagicMock
+import subprocess as _subprocess
+
+
+class TestNmapCollectorFailureModes:
+    def _sess(self):
+        return _types.SimpleNamespace(id=1)
+
+    def _ok(self, stdout="<nmaprun/>"):
+        m = _MagicMock()
+        m.returncode = 0
+        m.stdout = stdout
+        m.stderr = ""
+        return m
+
+    def test_all_ips_timeout_raises(self):
+        # Every target IP timing out means the CVE scan produced nothing due to
+        # timeouts — must raise so the scan reports 'partial', not falsely 'clean'.
+        from apps.nmap.collector import collect
+        from apps.core.engine.workflows.exceptions import ToolTimeout
+        with _patch("apps.nmap.collector.subprocess.run",
+                    side_effect=_subprocess.TimeoutExpired("nmap", 360)):
+            with __import__("pytest").raises(ToolTimeout):
+                collect(self._sess(), {"1.2.3.4": [80], "5.6.7.8": [443]})
+
+    def test_partial_timeout_returns_survivors(self):
+        # One IP timing out is degraded, not failure — the reachable IP's result
+        # is still returned and no exception is raised.
+        from apps.nmap.collector import collect
+        with _patch("apps.nmap.collector.subprocess.run",
+                    side_effect=[_subprocess.TimeoutExpired("nmap", 360), self._ok("<nmaprun>ok</nmaprun>")]):
+            out = collect(self._sess(), {"1.1.1.1": [80], "2.2.2.2": [443]})
+        assert list(out.keys()) == ["2.2.2.2"]
+
+    def test_binary_missing_raises(self):
+        from apps.nmap.collector import collect
+        from apps.core.engine.workflows.exceptions import ToolBinaryMissing
+        with _patch("apps.nmap.collector.subprocess.run", side_effect=FileNotFoundError()):
+            with __import__("pytest").raises(ToolBinaryMissing):
+                collect(self._sess(), {"1.2.3.4": [80]})

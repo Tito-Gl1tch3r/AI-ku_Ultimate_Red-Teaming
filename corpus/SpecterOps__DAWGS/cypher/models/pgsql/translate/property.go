@@ -1,0 +1,113 @@
+package translate
+
+import (
+	"fmt"
+	"sort"
+
+	"github.com/specterops/dawgs/cypher/models/pgsql"
+)
+
+type PropertyLookup struct {
+	Reference pgsql.CompoundIdentifier
+	Field     string
+}
+
+func expressionToPropertyLookupBinaryExpression(expression pgsql.Expression) (*pgsql.BinaryExpression, bool) {
+	if nextExpression := expression; nextExpression != nil {
+		for {
+			switch typedExpression := nextExpression.(type) {
+			case pgsql.AnyExpression:
+				// This is here to unwrap Any expressions that have been passed in as a property lookup. This is
+				// common when dealing with array operators. In the future this check should be handled by the
+				// caller to simplify the logic here.
+				nextExpression = typedExpression.Expression
+				continue
+
+			case *pgsql.BinaryExpression:
+				return typedExpression, pgsql.OperatorIsPropertyLookup(typedExpression.Operator)
+			}
+
+			// Break this loop on all other matches so that flow hits the outer return
+			break
+		}
+	}
+
+	return nil, false
+}
+
+func binaryExpressionToPropertyLookup(expression *pgsql.BinaryExpression) (PropertyLookup, error) {
+	if reference, typeOK := expression.LOperand.(pgsql.CompoundIdentifier); !typeOK {
+		return PropertyLookup{}, fmt.Errorf("expected left operand for property lookup to be a compound identifier but found type: %T", expression.LOperand)
+	} else if field, typeOK := propertyLookupLiteral(expression.ROperand); !typeOK {
+		return PropertyLookup{}, fmt.Errorf("expected right operand for property lookup to be a property key but found type: %T", expression.ROperand)
+	} else if field.CastType != pgsql.Text {
+		return PropertyLookup{}, fmt.Errorf("expected property lookup field a string literal but found data type: %s", field.CastType)
+	} else if stringField, typeOK := field.Value.(string); !typeOK {
+		return PropertyLookup{}, fmt.Errorf("expected property lookup field a string literal but found data type: %T", field)
+	} else {
+		return PropertyLookup{
+			Reference: reference,
+			Field:     stringField,
+		}, nil
+	}
+}
+
+func propertyLookupLiteral(expression pgsql.Expression) (pgsql.Literal, bool) {
+	switch typedExpression := expression.(type) {
+	case pgsql.Literal:
+		return typedExpression, true
+	case pgsql.PropertyKey:
+		return typedExpression.Literal, true
+	default:
+		return pgsql.Literal{}, false
+	}
+}
+
+func decomposePropertyLookup(expression pgsql.Expression) (PropertyLookup, error) {
+	if propertyLookupBinExp, isPropertyLookup := expressionToPropertyLookupBinaryExpression(expression); !isPropertyLookup {
+		return PropertyLookup{}, fmt.Errorf("expected binary expression for property lookup decomposition but found type: %T", expression)
+	} else {
+		return binaryExpressionToPropertyLookup(propertyLookupBinExp)
+	}
+}
+
+func (s *Translator) buildPatternPropertyConstraints(binding *BoundIdentifier, properties TranslatedProperties) (pgsql.Expression, error) {
+	var (
+		propertyConstraints pgsql.Expression
+		keys                = make([]string, 0, len(properties.Map))
+	)
+
+	for key := range properties.Map {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		value := properties.Map[key]
+
+		s.treeTranslator.PushOperand(pgsql.NewPropertyLookup(pgsql.CompoundIdentifier{binding.Identifier, pgsql.ColumnProperties}, pgsql.NewLiteral(key, pgsql.Text)))
+		s.treeTranslator.PushOperand(value)
+
+		if newConstraint, err := s.treeTranslator.PopBinaryExpression(pgsql.OperatorEquals); err != nil {
+			return nil, err
+		} else if rewrittenConstraint, rewritten := buildStringPropertyEqualityPredicate(newConstraint); rewritten {
+			propertyConstraints = pgsql.OptionalAnd(propertyConstraints, rewrittenConstraint)
+		} else {
+			propertyConstraints = pgsql.OptionalAnd(propertyConstraints, newConstraint)
+		}
+	}
+
+	if properties.Parameter != nil {
+		if err := RewriteFrameBindings(s.scope, properties.Parameter); err != nil {
+			return nil, err
+		}
+
+		propertyConstraints = pgsql.OptionalAnd(propertyConstraints, pgsql.NewBinaryExpression(
+			pgsql.CompoundIdentifier{binding.Identifier, pgsql.ColumnProperties},
+			pgsql.OperatorPGArrayLHSContainsRHS,
+			properties.Parameter,
+		))
+	}
+
+	return propertyConstraints, nil
+}

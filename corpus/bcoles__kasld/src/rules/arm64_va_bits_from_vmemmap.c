@@ -1,0 +1,171 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Rule: arm64 VA_BITS discrimination from a VMEMMAP leak address.
+//
+// Sibling of arm64_va_bits_from_directmap.c, using the *upper* fixed
+// boundary of arm64's VAS instead of the lower one. VMEMMAP_END is fixed at
+// -SZ_1G = 0xffffffffc0000000 regardless of VA_BITS; VMEMMAP_START varies:
+//
+//   VA_BITS=48: PAGE_OFFSET = 0xffff000000000000, _PAGE_END(48) =
+//               0xffff800000000000 → VMEMMAP_RANGE = 128 TiB,
+//               VMEMMAP_SIZE ≈ 2 TiB (assumes the common sizeof(struct
+//               page)=64), VMEMMAP_START ≈ 0xfffffdffc0000000.
+//
+//   VA_BITS=52: VMEMMAP_RANGE is 15.5×128 TiB and VMEMMAP_SIZE is PiB-scale,
+//               so VMEMMAP_START is far below the VA_BITS=48 floor.
+//
+// Inference: a VIRT/VMEMMAP observation V_mm inside VA52's vmemmap region but
+// strictly below VMEMMAP_START(VA48) cannot lie in VA_BITS=48's region, so the
+// kernel must be VA_BITS=52. Pin Q_VA_BITS=52 + the matching Q_PAGE_OFFSET
+// ceiling at the VA52 floor.
+//
+// The opposite branch (V_mm ≥ VMEMMAP_START(VA48)) is *consistent with both*
+// paging modes and so does not discriminate — the rule emits nothing for that
+// case. The threshold is VMEMMAP_END - (128 TiB / 4 KiB) * sizeof(struct page);
+// it is sensitive to sizeof(struct page), which SF_STRUCT_PAGE_BYTES supplies
+// exactly (from BTF) when present, else the common 64-byte default
+// (0xfffffdffc0000000).
+//
+// CONFIDENCE — CONF_HEURISTIC, NOT the observation's confidence. This inference
+// holds only under the modern (v5.4+) VA layout. On the pre-v5.4 "unflipped"
+// layout the vmemmap sits LOW (just below the linear map at _PAGE_END(48),
+// e.g. v4.14 vmemmap = [0xffff7e0000000000, 0xffff800000000000]) REGARDLESS of
+// VA_BITS, and that low range OVERLAPS the modern VA52 vmemmap — so a vmemmap
+// address below the VA48 floor is ambiguous (modern VA52, or pre-v5.4 VA48),
+// not a guaranteed VA52 witness. Emitting it in the guaranteed band (at the
+// parsed obs confidence) let the VA52 PAGE_OFFSET ceiling (0xfff0000000000000)
+// override the DIRECTLY OBSERVED old-layout directmap base
+// (0xffff800000000000), pinning PAGE_OFFSET to a value the truth lies above — a
+// guaranteed-window unsoundness. So this is a likely-window heuristic: it
+// shapes the best guess, and a real directmap observation (the sound linear-map
+// base) governs the guaranteed window. Do NOT raise it back to parsed/inferred.
+//
+// arm64 only; inert elsewhere. Inert when no VIRT VMEMMAP observation is
+// present.
+// ---
+// <bcoles@gmail.com>
+
+#include "include/kasld/engine_rules.h"
+
+#include <string.h>
+
+#define ARM64_VMEMMAP_END 0xffffffffc0000000ul /* -SZ_1G; VA_BITS-invariant */
+#define ARM64_VA52_PAGE_OFFSET 0xfff0000000000000ul
+
+int rule_arm64_va_bits_from_vmemmap(const struct evidence_set *ev,
+                                    const struct estimate *est,
+                                    struct constraint *out, int out_max) {
+  (void)est;
+#if defined(__aarch64__)
+  if (out_max < 1)
+    return 0;
+
+  /* Lowest VMEMMAP observation — any address below the VA48 floor is the
+   * VA52-only witness required. */
+  unsigned long lowest = 0;
+  enum kasld_confidence conf = CONF_UNKNOWN;
+  uint32_t src = 0;
+  for (int i = 0; i < ev->n_obs; i++) {
+    const struct observation *o = &ev->obs[i];
+    if (!o->valid || o->value_kind != OBS_ADDRESS ||
+        o->eff_type != KASLD_TYPE_VIRT || o->eff_region != REGION_VMEMMAP)
+      continue;
+    unsigned long a = obs_anchor(o);
+    if (a == 0)
+      continue;
+    if (src == 0 || a < lowest) {
+      lowest = a;
+      conf = o->conf;
+      src = o->id;
+    }
+  }
+  /* sizeof(struct page): exact from BTF (SF_STRUCT_PAGE_BYTES) when present,
+   * else 64. A larger struct page lowers VMEMMAP_START(VA48) — i.e. lowers the
+   * discrimination threshold — so an observation just below the 64-based line
+   * is no longer mis-pinned to VA52. */
+  unsigned long struct_page_bytes = 64ul;
+  uint32_t sp_src = 0;
+  enum kasld_confidence sp_conf = CONF_UNKNOWN;
+  for (int i = 0; i < ev->n_obs; i++) {
+    const struct observation *o = &ev->obs[i];
+    if (o->valid && o->value_kind == OBS_SCALAR &&
+        o->scalar_fact == SF_STRUCT_PAGE_BYTES && o->scalar_value >= 1 &&
+        o->scalar_value <= (1ul << 20)) {
+      struct_page_bytes = o->scalar_value;
+      sp_src = o->id;
+      sp_conf = o->conf;
+      break;
+    }
+  }
+  /* VMEMMAP_START(VA48) = VMEMMAP_END - (128 TiB / 4 KiB) * struct_page_bytes;
+   * with the 64-byte default this is 0xfffffdffc0000000. */
+  unsigned long va48_vmemmap_start =
+      ARM64_VMEMMAP_END - (1ul << 35) * struct_page_bytes;
+
+  /* VMEMMAP_START(VA52) = VMEMMAP_END - ((1<<52) - (1<<47) >> PAGE_SHIFT) *
+   * struct_page_bytes: the floor of the region a VA52 kernel actually maps.
+   *
+   * Needed because the test above is one-sided, and "below the VA48 floor"
+   * is not the same statement as "inside VA52's region". On a pre-flip kernel
+   * -- before the linear map and the kernel half exchanged places -- the
+   * vmemmap does not hang from -1 GiB at all: it sits just under PAGE_OFFSET,
+   * which is -(1 << (VA_BITS - 1)) there. Every such address is far below the
+   * VA48 floor, so the one-sided test called every pre-flip kernel VA52, and
+   * on a 4.14 boot with a 48-bit kernel that is exactly what it did.
+   *
+   * ARM64_VMEMMAP_END is marked VA_BITS-invariant above, and it is -- across
+   * the widths of ONE layout. It is not invariant across the layouts.
+   *
+   * An address below this floor is evidence of neither mode and the rule says
+   * nothing, which is what it already does for an address above the VA48 one.
+   * The struct-page default errs the safe way here: a larger one would put the
+   * true floor lower, so assuming 64 can only withhold an answer, never invent
+   * one. */
+  unsigned long va52_vmemmap_start =
+      ARM64_VMEMMAP_END - ((1ul << 40) - (1ul << 35)) * struct_page_bytes;
+
+  if (src == 0 || lowest >= va48_vmemmap_start || lowest < va52_vmemmap_start)
+    return 0; /* no leak, consistent with both modes, or not this layout */
+
+  int n = 0;
+  if (n < out_max) {
+    struct constraint *c = &out[n++];
+    memset(c, 0, sizeof(*c));
+    c->q = Q_VA_BITS;
+    c->op = C_EQUALS;
+    c->value = 52;
+    c->conf = kasld_conf_min(CONF_HEURISTIC, conf);
+    c->derived_from[0] = src;
+    c->lineage_count = 1;
+    if (sp_src != 0) {
+      c->derived_from[c->lineage_count++] = sp_src;
+      if (sp_conf < c->conf)
+        c->conf = sp_conf;
+    }
+    snprintf(c->origin, ORIGIN_LEN, "arm64_va_bits_from_vmemmap");
+  }
+  /* Q_PAGE_OFFSET upper bound at the VA52 floor (PAGE_OFFSET = -(1 << 52)). */
+  if (n < out_max) {
+    struct constraint *c = &out[n++];
+    memset(c, 0, sizeof(*c));
+    c->q = Q_PAGE_OFFSET;
+    c->op = C_UPPER_BOUND;
+    c->value = ARM64_VA52_PAGE_OFFSET;
+    c->conf = kasld_conf_min(CONF_HEURISTIC, conf);
+    c->derived_from[0] = src;
+    c->lineage_count = 1;
+    if (sp_src != 0) {
+      c->derived_from[c->lineage_count++] = sp_src;
+      if (sp_conf < c->conf)
+        c->conf = sp_conf;
+    }
+    snprintf(c->origin, ORIGIN_LEN, "arm64_va_bits_from_vmemmap");
+  }
+  return n;
+#else
+  (void)ev;
+  (void)out;
+  (void)out_max;
+  return 0;
+#endif
+}

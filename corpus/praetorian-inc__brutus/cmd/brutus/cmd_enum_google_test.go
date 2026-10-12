@@ -1,0 +1,479 @@
+// Copyright 2026 Praetorian Security, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/praetorian-inc/brutus/pkg/enum/google"
+)
+
+// TestEnumGoogleCmd_Flags
+// Verifies that all documented flags exist on enumGoogleCmd and that
+// no shorthand collides with the global --threads/-t flag.
+
+func TestEnumGoogleCmd_Flags(t *testing.T) {
+	// --emails / -e
+	f := enumGoogleCmd.Flags().Lookup("emails")
+	require.NotNil(t, f, "--emails flag must exist on enumGoogleCmd")
+	sh := enumGoogleCmd.Flags().ShorthandLookup("e")
+	require.NotNil(t, sh, "-e shorthand must exist on enumGoogleCmd")
+	assert.Equal(t, "emails", sh.Name, "-e must map to --emails")
+
+	// --email-file / -E
+	f = enumGoogleCmd.Flags().Lookup("email-file")
+	require.NotNil(t, f, "--email-file flag must exist on enumGoogleCmd")
+	sh = enumGoogleCmd.Flags().ShorthandLookup("E")
+	require.NotNil(t, sh, "-E shorthand must exist on enumGoogleCmd")
+	assert.Equal(t, "email-file", sh.Name, "-E must map to --email-file")
+
+	// --domain / -d
+	f = enumGoogleCmd.Flags().Lookup("domain")
+	require.NotNil(t, f, "--domain flag must exist on enumGoogleCmd")
+	sh = enumGoogleCmd.Flags().ShorthandLookup("d")
+	require.NotNil(t, sh, "-d shorthand must exist on enumGoogleCmd")
+	assert.Equal(t, "domain", sh.Name, "-d must map to --domain")
+
+	// --format (no shorthand required; default is first.last)
+	f = enumGoogleCmd.Flags().Lookup("format")
+	require.NotNil(t, f, "--format flag must exist on enumGoogleCmd")
+	assert.Equal(t, "first.last", f.DefValue, "--format default must be \"first.last\"")
+
+	// --limit (no shorthand required)
+	f = enumGoogleCmd.Flags().Lookup("limit")
+	require.NotNil(t, f, "--limit flag must exist on enumGoogleCmd")
+
+	// No -t shorthand: collides with global persistent --threads/-t.
+	noT := enumGoogleCmd.Flags().ShorthandLookup("t")
+	require.Nil(t, noT,
+		"enumGoogleCmd must not define a local -t shorthand (collides with global --threads/-t)")
+
+	// No -s shorthand (consistent with the pattern used by other enum subcommands).
+	noS := enumGoogleCmd.Flags().ShorthandLookup("s")
+	require.Nil(t, noS,
+		"enumGoogleCmd must not define a local -s shorthand (reserved)")
+}
+
+// TestEnumGoogleCmd_RegisteredUnderActiveCmd verifies that enumGoogleCmd has
+// Use=="google" and is a child of enumActiveCmd (hard move — it is no longer
+// a direct child of enumCmd).
+func TestEnumGoogleCmd_RegisteredUnderActiveCmd(t *testing.T) {
+	assert.Equal(t, "google", enumGoogleCmd.Use,
+		"enumGoogleCmd.Use must be \"google\"")
+
+	var found bool
+	for _, cmd := range enumActiveCmd.Commands() {
+		if cmd.Use == "google" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "enumGoogleCmd must be registered as a subcommand of enumActiveCmd (hard move)")
+}
+
+// TestOutputGoogleEnumJSONL
+// Feeds google.Result values and asserts the type/method/idp fields.
+
+func TestOutputGoogleEnumJSONL(t *testing.T) {
+	tests := []struct {
+		name       string
+		result     google.Result
+		wantType   string
+		wantExists bool
+		wantMethod string // empty means key must be absent (omitempty)
+		wantIdP    string // empty means key must be absent (omitempty)
+	}{
+		{
+			name: "workspace-sso with IdP",
+			result: google.Result{
+				Email:  "sso@example.com",
+				Exists: true,
+				Method: google.MethodWorkspaceSSO,
+				IdP:    "login.okta.com",
+			},
+			wantType:   "google_account",
+			wantExists: true,
+			wantMethod: "workspace-sso",
+			wantIdP:    "login.okta.com",
+		},
+		{
+			name: "gmail method",
+			result: google.Result{
+				Email:  "gm@gmail.com",
+				Exists: true,
+				Method: google.MethodGmail,
+			},
+			wantType:   "google_account",
+			wantExists: true,
+			wantMethod: "gmail",
+			wantIdP:    "", // absent (omitempty)
+		},
+		{
+			name: "not found — method and idp omitted",
+			result: google.Result{
+				Email:  "nobody@example.com",
+				Exists: false,
+				Method: google.MethodNone,
+			},
+			wantType:   "google_account",
+			wantExists: false,
+			wantMethod: "", // absent (omitempty — MethodNone is "")
+			wantIdP:    "", // absent
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			outputGoogleEnumJSONL(&buf, []google.Result{tc.result})
+
+			line := strings.TrimSpace(buf.String())
+			require.NotEmpty(t, line, "outputGoogleEnumJSONL must produce a JSONL line")
+
+			var obj map[string]interface{}
+			require.NoError(t, json.Unmarshal([]byte(line), &obj),
+				"JSONL output must be valid JSON: %q", line)
+
+			assert.Equal(t, tc.wantType, obj["type"],
+				"type field must be %q", tc.wantType)
+
+			assert.Equal(t, tc.result.Email, obj["email"],
+				"email field must match result.Email")
+
+			wantExists, _ := obj["exists"].(bool)
+			assert.Equal(t, tc.wantExists, wantExists,
+				"exists field must match result.Exists")
+
+			// method is omitempty — when MethodNone (""), the key must be absent.
+			if tc.wantMethod != "" {
+				assert.Equal(t, tc.wantMethod, obj["method"],
+					"method field must be %q", tc.wantMethod)
+			} else {
+				assert.NotContains(t, obj, "method",
+					"method key must be absent when MethodNone (omitempty)")
+			}
+
+			// idp is omitempty — absent when empty string.
+			if tc.wantIdP != "" {
+				assert.Equal(t, tc.wantIdP, obj["idp"],
+					"idp field must be %q", tc.wantIdP)
+			} else {
+				assert.NotContains(t, obj, "idp",
+					"idp key must be absent when empty (omitempty)")
+			}
+
+			// error must be absent when result.Error is nil.
+			assert.NotContains(t, obj, "error",
+				"error key must be absent when result.Error is nil")
+		})
+	}
+}
+
+// TestOutputGoogleEnumJSONL_NameFields pins the never-invent-a-name rule: a
+// Result carrying First/Last (from --domain generation) must emit
+// "first"/"last" in the JSONL row, while a Result with empty First/Last
+// (supplied via --emails or --email-file) must OMIT both keys entirely
+// rather than emit them as "". Pre-existing fields (type/email/exists/
+// method/idp) must be unaffected by the addition.
+func TestOutputGoogleEnumJSONL_NameFields(t *testing.T) {
+	named := google.Result{
+		Email:  "john.smith@example.com",
+		Exists: true,
+		Method: google.MethodWorkspaceSSO,
+		IdP:    "login.okta.com",
+		First:  "john",
+		Last:   "smith",
+	}
+	unnamed := google.Result{
+		Email:  "supplied@example.com",
+		Exists: true,
+		Method: google.MethodGmail,
+	}
+
+	t.Run("named result emits first and last", func(t *testing.T) {
+		var buf bytes.Buffer
+		outputGoogleEnumJSONL(&buf, []google.Result{named})
+
+		line := strings.TrimSpace(buf.String())
+		require.NotEmpty(t, line, "outputGoogleEnumJSONL must produce a JSONL line")
+
+		var obj map[string]interface{}
+		require.NoError(t, json.Unmarshal([]byte(line), &obj),
+			"JSONL output must be valid JSON: %q", line)
+
+		assert.Equal(t, "john", obj["first"], `first field must be "john"`)
+		assert.Equal(t, "smith", obj["last"], `last field must be "smith"`)
+
+		// Pre-existing fields must remain unaffected by the new ones.
+		assert.Equal(t, "google_account", obj["type"])
+		assert.Equal(t, named.Email, obj["email"])
+		assert.Equal(t, true, obj["exists"])
+		assert.Equal(t, "workspace-sso", obj["method"])
+		assert.Equal(t, "login.okta.com", obj["idp"])
+	})
+
+	t.Run("unnamed result omits first and last keys", func(t *testing.T) {
+		var buf bytes.Buffer
+		outputGoogleEnumJSONL(&buf, []google.Result{unnamed})
+
+		line := strings.TrimSpace(buf.String())
+		require.NotEmpty(t, line, "outputGoogleEnumJSONL must produce a JSONL line")
+
+		var obj map[string]interface{}
+		require.NoError(t, json.Unmarshal([]byte(line), &obj),
+			"JSONL output must be valid JSON: %q", line)
+
+		assert.NotContains(t, obj, "first",
+			`first key must be absent (omitempty), not emitted as ""`)
+		assert.NotContains(t, obj, "last",
+			`last key must be absent (omitempty), not emitted as ""`)
+
+		// Pre-existing fields must remain unaffected.
+		assert.Equal(t, "google_account", obj["type"])
+		assert.Equal(t, unnamed.Email, obj["email"])
+		assert.Equal(t, true, obj["exists"])
+		assert.Equal(t, "gmail", obj["method"])
+	})
+
+	t.Run("mixed batch: one named, one unnamed", func(t *testing.T) {
+		var buf bytes.Buffer
+		outputGoogleEnumJSONL(&buf, []google.Result{named, unnamed})
+
+		lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+		require.Len(t, lines, 2, "must emit exactly one JSONL line per result")
+
+		var first map[string]interface{}
+		require.NoError(t, json.Unmarshal([]byte(lines[0]), &first))
+		assert.Equal(t, "john", first["first"])
+		assert.Equal(t, "smith", first["last"])
+
+		var second map[string]interface{}
+		require.NoError(t, json.Unmarshal([]byte(lines[1]), &second))
+		assert.NotContains(t, second, "first",
+			`second (unnamed) line must not carry a "first" key`)
+		assert.NotContains(t, second, "last",
+			`second (unnamed) line must not carry a "last" key`)
+	})
+}
+
+// TestOutputGoogleEnumResultLine
+// Verifies human-readable line output for EXISTS, gmail, and ANSI safety.
+
+func TestOutputGoogleEnumResultLine(t *testing.T) {
+	t.Run("workspace-sso with IdP shows EXISTS and IdP", func(t *testing.T) {
+		r := google.Result{
+			Email:  "user@example.com",
+			Exists: true,
+			Method: google.MethodWorkspaceSSO,
+			IdP:    "login.okta.com",
+		}
+		var buf bytes.Buffer
+		outputGoogleEnumResultLine(&buf, &r, false /* useColor */)
+		out := buf.String()
+
+		assert.Contains(t, out, "EXISTS",
+			"workspace-sso EXISTS result must contain \"EXISTS\"")
+		assert.Contains(t, out, "workspace-sso",
+			"workspace-sso result must mention the method")
+		assert.Contains(t, out, "login.okta.com",
+			"workspace-sso result must contain the IdP host")
+	})
+
+	t.Run("gmail method shows gmail", func(t *testing.T) {
+		r := google.Result{
+			Email:  "user@gmail.com",
+			Exists: true,
+			Method: google.MethodGmail,
+		}
+		var buf bytes.Buffer
+		outputGoogleEnumResultLine(&buf, &r, false)
+		out := buf.String()
+
+		assert.Contains(t, out, "EXISTS",
+			"gmail EXISTS result must contain \"EXISTS\"")
+		assert.Contains(t, out, "gmail",
+			"gmail result must mention the method")
+		assert.NotContains(t, out, "workspace-sso",
+			"gmail result must not mention workspace-sso")
+	})
+
+	t.Run("not found shows not found label", func(t *testing.T) {
+		r := google.Result{
+			Email:  "nobody@example.com",
+			Exists: false,
+		}
+		var buf bytes.Buffer
+		outputGoogleEnumResultLine(&buf, &r, false)
+		out := buf.String()
+
+		assert.Contains(t, out, "not found",
+			"not-found result must contain \"not found\"")
+		assert.NotContains(t, out, "EXISTS",
+			"not-found result must not contain \"EXISTS\"")
+	})
+
+	t.Run("malicious IdP with ANSI escape is sanitized", func(t *testing.T) {
+		// A server-controlled IdP that injects a raw ESC (0x1B) byte. The output
+		// layer must strip it before rendering (P0-4 requirement).
+		maliciousIdP := "login.okta.com\x1b[31mINJECTED\x1b[0m"
+		r := google.Result{
+			Email:  "user@example.com",
+			Exists: true,
+			Method: google.MethodWorkspaceSSO,
+			IdP:    maliciousIdP,
+		}
+		var buf bytes.Buffer
+		outputGoogleEnumResultLine(&buf, &r, false)
+		out := buf.String()
+
+		// Raw ESC byte must not appear in the output.
+		assert.NotContains(t, out, "\x1b",
+			"raw ESC byte (0x1B) must be absent from the rendered line (sanitizeTerminal must strip it)")
+	})
+}
+
+// googleEnumTargetList
+//
+// 10T-535 (4/8): googleEnumTargets() ([]string, error) is retargeted onto
+// googleEnumTargetList() ([]enum.Target, error) — the Target-returning
+// function that carries each generated address's name. Every prior
+// assertion (dedup, "provide" error) is preserved; the tests are
+// strengthened to also assert the never-invent-a-name rule for
+// CLI-supplied addresses.
+
+func resetGoogleEnumTargetFlags() (restore func()) {
+	origEmails := flagGoogleEnumEmails
+	origEmailFile := flagGoogleEnumEmailFile
+	origDomain := flagGoogleEnumDomain
+	origFormat := flagGoogleEnumFormat
+	origLimit := flagGoogleEnumLimit
+	return func() {
+		flagGoogleEnumEmails = origEmails
+		flagGoogleEnumEmailFile = origEmailFile
+		flagGoogleEnumDomain = origDomain
+		flagGoogleEnumFormat = origFormat
+		flagGoogleEnumLimit = origLimit
+	}
+}
+
+// TestGoogleEnumTargetList_InlineEmails verifies that --emails CSV is parsed,
+// trimmed, and deduplicated, and that every CLI-supplied target carries no
+// name (a supplied address says nothing about whose it is).
+func TestGoogleEnumTargetList_InlineEmails(t *testing.T) {
+	defer resetGoogleEnumTargetFlags()()
+
+	flagGoogleEnumEmails = "alice@example.com,bob@example.com,alice@example.com"
+	flagGoogleEnumEmailFile = ""
+	flagGoogleEnumDomain = ""
+
+	got, err := googleEnumTargetList()
+	require.NoError(t, err)
+
+	emails := enumTargetEmails(got)
+	// Deduplication: alice@example.com appears twice but must appear once.
+	assert.Len(t, emails, 2, "deduplication must collapse duplicate emails")
+	assert.Contains(t, emails, "alice@example.com")
+	assert.Contains(t, emails, "bob@example.com")
+
+	for i, target := range got {
+		assert.Empty(t, target.First, "target %d (%q): CLI-supplied address must have empty First", i, target.Email)
+		assert.Empty(t, target.Last, "target %d (%q): CLI-supplied address must have empty Last", i, target.Email)
+	}
+}
+
+// TestGoogleEnumTargetList_NoSource verifies that an error is returned (and
+// mentions "provide") when no --emails, --email-file, or --domain is given.
+func TestGoogleEnumTargetList_NoSource(t *testing.T) {
+	defer resetGoogleEnumTargetFlags()()
+
+	flagGoogleEnumEmails = ""
+	flagGoogleEnumEmailFile = ""
+	flagGoogleEnumDomain = ""
+
+	_, err := googleEnumTargetList()
+	require.Error(t, err, "googleEnumTargetList must fail when no source is supplied")
+	assert.Contains(t, err.Error(), "provide",
+		"error message must guide the user to supply a target source")
+}
+
+// TestGoogleEnumTargetList_DomainGeneratedCarriesName verifies that
+// --domain-generated targets carry the non-empty First/Last the username was
+// built from, unlike CLI-supplied addresses.
+func TestGoogleEnumTargetList_DomainGeneratedCarriesName(t *testing.T) {
+	defer resetGoogleEnumTargetFlags()()
+
+	flagGoogleEnumEmails = ""
+	flagGoogleEnumEmailFile = ""
+	flagGoogleEnumDomain = "target.com"
+	flagGoogleEnumFormat = "first.last"
+	flagGoogleEnumLimit = 5
+
+	got, err := googleEnumTargetList()
+	require.NoError(t, err)
+	require.Len(t, got, 5, "--limit must cap the number of generated targets")
+
+	for i, target := range got {
+		assert.Contains(t, target.Email, "@target.com", "target %d must be for the requested domain", i)
+		assert.NotEmpty(t, target.First, "target %d (%q): a --domain-generated target must carry a non-empty First", i, target.Email)
+		assert.NotEmpty(t, target.Last, "target %d (%q): a --domain-generated target must carry a non-empty Last", i, target.Email)
+	}
+}
+
+// TestGoogleEnumTargetList_DedupPrecedence verifies that when a CLI-supplied
+// address duplicates a --domain-generated one, the first-seen (CLI-supplied)
+// entry wins and stays nameless — dedup keeps first-seen order/precedence
+// rather than letting a later generated duplicate overwrite it with a name.
+func TestGoogleEnumTargetList_DedupPrecedence(t *testing.T) {
+	defer resetGoogleEnumTargetFlags()()
+
+	flagGoogleEnumFormat = "first.last"
+	flagGoogleEnumLimit = 5
+	flagGoogleEnumDomain = "target.com"
+
+	// First, discover what the first generated candidate's address would be,
+	// so we can supply that exact address via --emails ahead of generation.
+	generated, err := googleEnumGenerate()
+	require.NoError(t, err)
+	require.NotEmpty(t, generated, "domain generation must produce at least one candidate for this test to be meaningful")
+	dupe := generated[0].Email
+
+	flagGoogleEnumEmails = dupe
+
+	got, err := googleEnumTargetList()
+	require.NoError(t, err)
+
+	emails := enumTargetEmails(got)
+	assert.Equal(t, dupe, emails[0], "the CLI-supplied address must retain its first-seen position")
+
+	// Count occurrences of dupe: dedup must collapse it to exactly one entry.
+	var count int
+	for _, target := range got {
+		if target.Email == dupe {
+			count++
+		}
+	}
+	assert.Equal(t, 1, count, "a supplied address duplicating a generated one must be deduplicated to a single entry")
+
+	// The surviving entry must be the CLI-supplied (nameless) one, not the
+	// generated (named) duplicate.
+	assert.Empty(t, got[0].First, "the surviving deduplicated entry must be the CLI-supplied one and carry no name")
+	assert.Empty(t, got[0].Last, "the surviving deduplicated entry must be the CLI-supplied one and carry no name")
+}

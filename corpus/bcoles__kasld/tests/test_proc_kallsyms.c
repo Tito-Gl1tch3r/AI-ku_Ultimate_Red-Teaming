@@ -1,0 +1,219 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Unit tests for proc_kallsyms, driven end-to-end over a staged
+// KASLD_SYSROOT /proc/kallsyms with the component's main renamed.
+//
+// Two behaviours are pinned, because both were broken by a mechanical
+// conversion and neither had coverage to catch it:
+//
+//   1. The kptr_restrict probe. Every address reading as zero is the masked
+//      case and must be reported as restricted; a symbol legitimately AT zero
+//      must not be mistaken for a real address (several are).
+//   2. Address width. A symbol address wider than this build's word must be
+//      refused, not truncated — an fscanf("%lx") over a 64-bit kallsyms on a
+//      32-bit build silently yields the low half, which looks exactly like a
+//      valid image base and enters the evidence set at CONF_PARSED.
+//
+// Runs under tests/test-cross, which is where (2) is a genuine refusal rather
+// than an ordinary parse, so the assertions are written against the build's
+// own word size.
+// ---
+// <bcoles@gmail.com>
+#define _GNU_SOURCE
+
+int proc_kallsyms_main(void);
+#define main proc_kallsyms_main
+#include "../src/components/proc_kallsyms.c"
+#undef main
+
+#include "test_harness.h"
+#include "test_sysroot.h"
+
+#include <assert.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static char cap[8192];
+static int last_rc;
+
+static void stage_kallsyms(const char *text) {
+  char path[320];
+  th_sysroot_stage_path("/proc/kallsyms", path, sizeof(path));
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  TH_CHECK(fd >= 0);
+  size_t n = strlen(text);
+  TH_CHECK(write(fd, text, n) == (ssize_t)n);
+  close(fd);
+}
+
+static void run_capture(void) {
+  fflush(stdout);
+  char tmpl[] = "/tmp/kasld_ks_capXXXXXX";
+  int fd = mkstemp(tmpl);
+  TH_CHECK(fd >= 0);
+  int saved = dup(1);
+  dup2(fd, 1);
+  fflush(stderr);
+  int saved_err = dup(2);
+  int devnull = open("/dev/null", O_WRONLY);
+  if (devnull >= 0)
+    dup2(devnull, 2);
+
+  last_rc = proc_kallsyms_main();
+
+  fflush(stdout);
+  fflush(stderr);
+  dup2(saved, 1);
+  close(saved);
+  dup2(saved_err, 2);
+  close(saved_err);
+  if (devnull >= 0)
+    close(devnull);
+  lseek(fd, 0, SEEK_SET);
+  ssize_t r = read(fd, cap, sizeof(cap) - 1);
+  cap[r > 0 ? r : 0] = '\0';
+  close(fd);
+  unlink(tmpl);
+}
+
+/* kptr_restrict masks every address to zero. That is an access restriction,
+ * not a missing source, and nothing may be emitted from it. */
+static void test_masked_kallsyms_is_denied(void) {
+  stage_kallsyms("0000000000000000 A irq_stack_union\n"
+                 "0000000000000000 T _stext\n"
+                 "0000000000000000 T _text\n"
+                 "0000000000000000 T _etext\n");
+  run_capture();
+  TH_CHECK(last_rc == KASLD_EXIT_NOPERM);
+  TH_CHECK(strstr(cap, "V kernel_image") == NULL);
+  TH_CHECK(strstr(cap, "V kernel_text") == NULL);
+}
+
+/* A readable table yields the image base at its full width. */
+static void test_readable_kallsyms_emits_base(void) {
+  char text[512];
+  unsigned long base = (unsigned long)KERNEL_VIRT_TEXT_DEFAULT;
+  snprintf(text, sizeof(text), "%lx T _stext\n%lx T _text\n%lx T _etext\n",
+           base, base, base + 0x100000);
+  stage_kallsyms(text);
+  run_capture();
+  TH_CHECK(last_rc != KASLD_EXIT_NOPERM);
+  char want[64];
+  snprintf(want, sizeof(want), "lo=%#lx", base);
+  TH_CHECK(strstr(cap, want) != NULL);
+}
+
+/* _text and _end are the image's outer edges, so their distance is the
+ * footprint itself and bounds it from both sides. */
+static void test_text_to_end_is_the_exact_footprint(void) {
+  char text[512];
+  unsigned long b = (unsigned long)KERNEL_VIRT_TEXT_DEFAULT;
+  snprintf(text, sizeof(text),
+           "%lx T _text\n%lx T _stext\n%lx T _etext\n%lx B _end\n", b,
+           b + 0x1000, b + 0x400000, b + 0x800000);
+  stage_kallsyms(text);
+  run_capture();
+  TH_CHECK(strstr(cap, "image_size_min conf=parsed value=0x800000") != NULL);
+  TH_CHECK(strstr(cap, "image_size_max conf=parsed value=0x800000") != NULL);
+}
+
+/* _stext and _etext lie inside the image, so their distance understates the
+ * footprint. It still bounds it from below, but claiming it as an upper bound
+ * would put the image-base floor above the true base and exclude it. */
+static void test_inner_symbols_bound_from_below_only(void) {
+  char text[512];
+  unsigned long b = (unsigned long)KERNEL_VIRT_TEXT_DEFAULT;
+  snprintf(text, sizeof(text), "%lx T _stext\n%lx T _etext\n", b, b + 0x600000);
+  stage_kallsyms(text);
+  run_capture();
+  TH_CHECK(strstr(cap, "image_size_min conf=parsed value=0x600000") != NULL);
+  TH_CHECK(strstr(cap, "image_size_max") == NULL);
+}
+
+/* _text present but _end absent: the high edge falls back to _etext, which is
+ * inside the image, so the span understates the footprint. An upper bound may
+ * never understate -- the floor rule subtracts it from a leaked in-image
+ * address, and too small a value puts the floor above the true base and
+ * excludes it. One true edge is not enough. */
+static void test_text_without_end_bounds_from_below_only(void) {
+  char text[512];
+  unsigned long b = (unsigned long)KERNEL_VIRT_TEXT_DEFAULT;
+  snprintf(text, sizeof(text), "%lx T _text\n%lx T _etext\n", b, b + 0x600000);
+  stage_kallsyms(text);
+  run_capture();
+  TH_CHECK(strstr(cap, "image_size_min conf=parsed value=0x600000") != NULL);
+  TH_CHECK(strstr(cap, "image_size_max") == NULL);
+}
+
+/* The symmetric case: _end present but _text absent, so the low edge falls back
+ * to _stext, again inside the image. */
+static void test_end_without_text_bounds_from_below_only(void) {
+  char text[512];
+  unsigned long b = (unsigned long)KERNEL_VIRT_TEXT_DEFAULT;
+  snprintf(text, sizeof(text), "%lx T _stext\n%lx B _end\n", b, b + 0x600000);
+  stage_kallsyms(text);
+  run_capture();
+  TH_CHECK(strstr(cap, "image_size_min conf=parsed value=0x600000") != NULL);
+  TH_CHECK(strstr(cap, "image_size_max") == NULL);
+}
+
+/* Outer edges a page apart are not a kernel; the shared plausibility floor
+ * rejects the pair rather than publishing a footprint nothing could hold. */
+static void test_footprint_below_floor_not_emitted(void) {
+  char text[512];
+  unsigned long b = (unsigned long)KERNEL_VIRT_TEXT_DEFAULT;
+  snprintf(text, sizeof(text), "%lx T _text\n%lx B _end\n", b, b + 0x1000);
+  stage_kallsyms(text);
+  run_capture();
+  TH_CHECK(strstr(cap, "image_size_min") == NULL);
+  TH_CHECK(strstr(cap, "image_size_max") == NULL);
+}
+
+/* A 64-bit table read by a narrower build. The addresses cannot be
+ * represented, so nothing may be emitted — least of all their low halves,
+ * which are plausible kernel-text values in their own right. */
+static void test_too_wide_addresses_are_not_truncated(void) {
+  stage_kallsyms("ffffffff81a00000 T _stext\n"
+                 "ffffffff81a00000 T _text\n"
+                 "ffffffff83204c4b T _etext\n");
+  run_capture();
+  if (sizeof(kasld_addr_t) >= 8) {
+    TH_CHECK(strstr(cap, "lo=0xffffffff81a00000") != NULL);
+  } else {
+    /* The truncation this pins: the low half of _text. */
+    TH_CHECK(strstr(cap, "81a00000") == NULL);
+    TH_CHECK(strstr(cap, "V kernel_image") == NULL);
+  }
+}
+
+/* The masked probe must not read a refusal as a mask: a too-wide address had
+ * digits, so the table is readable and simply out of range for this build. */
+static void test_too_wide_is_not_reported_as_restricted(void) {
+  stage_kallsyms("ffffffff81a00000 T _stext\n"
+                 "ffffffff81a00000 T _text\n");
+  run_capture();
+  if (sizeof(kasld_addr_t) < 8)
+    TH_CHECK(last_rc != KASLD_EXIT_NOPERM);
+}
+
+int main(void) {
+  TEST_SUITE("proc_kallsyms (masked probe + footprint + address width)");
+  th_sysroot_init("proc_kallsyms");
+
+  BEGIN_CATEGORY("kptr_restrict probe");
+  RUN(test_masked_kallsyms_is_denied);
+  RUN(test_readable_kallsyms_emits_base);
+  BEGIN_CATEGORY("image footprint");
+  RUN(test_text_to_end_is_the_exact_footprint);
+  RUN(test_inner_symbols_bound_from_below_only);
+  RUN(test_text_without_end_bounds_from_below_only);
+  RUN(test_end_without_text_bounds_from_below_only);
+  RUN(test_footprint_below_floor_not_emitted);
+  BEGIN_CATEGORY("address width");
+  RUN(test_too_wide_addresses_are_not_truncated);
+  RUN(test_too_wide_is_not_reported_as_restricted);
+
+  return TEST_DONE();
+}

@@ -1,0 +1,181 @@
+package controller
+
+import (
+	"github.com/go-openapi/runtime/middleware"
+	"github.com/jmoiron/sqlx"
+	"github.com/michaelquigley/df/dl"
+	"github.com/openziti/edge-api/rest_model"
+	"github.com/openziti/zrok/v2/controller/automation"
+	"github.com/openziti/zrok/v2/controller/store"
+	"github.com/openziti/zrok/v2/rest_model_zrok"
+	"github.com/openziti/zrok/v2/rest_server_zrok/operations/share"
+	"github.com/pkg/errors"
+)
+
+type accessHandler struct {
+	// commit is replaceable so a test can fail the commit after the dial policy exists.
+	commit func(*sqlx.Tx) error
+}
+
+func newAccessHandler() *accessHandler {
+	return &accessHandler{commit: (*sqlx.Tx).Commit}
+}
+
+func (h *accessHandler) Handle(params share.AccessParams, principal *rest_model_zrok.Principal) middleware.Responder {
+	trx, err := str.Begin()
+	if err != nil {
+		dl.Errorf("error starting transaction for user '%v': %v", principal.Email, err)
+		return share.NewAccessInternalServerError()
+	}
+	defer func() { _ = trx.Rollback() }()
+
+	envZId := params.Body.EnvZID
+	envId := 0
+	if envs, err := str.FindEnvironmentsForAccount(int(principal.ID), trx); err == nil {
+		found := false
+		for _, env := range envs {
+			if env.ZId == envZId {
+				dl.Debugf("found identity '%v' for user '%v'", envZId, principal.Email)
+				envId = env.Id
+				found = true
+				break
+			}
+		}
+		if !found {
+			dl.Errorf("environment '%v' not found for user '%v'", envZId, principal.Email)
+			return share.NewAccessUnauthorized()
+		}
+	} else {
+		dl.Errorf("error finding environments for account '%v'", principal.Email)
+		return share.NewAccessNotFound()
+	}
+
+	shrToken := params.Body.ShareToken
+	shr, err := str.FindShareWithToken(shrToken, trx)
+	if err != nil {
+		dl.Errorf("error finding share with token '%v': %v", shrToken, err)
+		return share.NewAccessNotFound()
+	}
+	if shr == nil {
+		dl.Errorf("unable to find share '%v' for user '%v'", shrToken, principal.Email)
+		return share.NewAccessNotFound()
+	}
+
+	if shr.PermissionMode == store.ClosedPermissionMode {
+		shrEnv, err := str.GetEnvironment(shr.EnvironmentId, trx)
+		if err != nil {
+			dl.Errorf("error getting environment for share '%v': %v", shrToken, err)
+			return share.NewAccessInternalServerError()
+		}
+
+		if err := h.checkAccessGrants(shr, *shrEnv.AccountId, principal, trx); err != nil {
+			dl.Errorf("closed permission mode for '%v' fails for '%v': %v", shr.Token, principal.Email, err)
+			return share.NewAccessUnauthorized()
+		}
+	}
+
+	if err := h.checkLimits(shr, trx); err != nil {
+		dl.Errorf("cannot access limited share for '%v': %v", principal.Email, err)
+		return share.NewAccessNotFound()
+	}
+
+	feToken, err := CreateToken()
+	if err != nil {
+		dl.Error(err)
+		return share.NewAccessInternalServerError()
+	}
+
+	fe := &store.Frontend{PrivateShareId: &shr.Id, Token: feToken, ZId: envZId, PermissionMode: store.ClosedPermissionMode}
+	if params.Body.BindAddress != "" {
+		fe.BindAddress = &params.Body.BindAddress
+	}
+	if _, err := str.CreateFrontend(envId, fe, trx); err != nil {
+		dl.Errorf("error creating frontend record for user '%v': %v", principal.Email, err)
+		return share.NewAccessInternalServerError()
+	}
+
+	ziti, err := automation.NewZitiAutomation(cfg.Ziti)
+	if err != nil {
+		dl.Error(err)
+		if automation.IsRateLimited(err) {
+			return share.NewAccessServiceUnavailable().WithRetryAfter(rateLimitedRetryAfter)
+		}
+		return share.NewAccessInternalServerError()
+	}
+
+	policyName := feToken + "-" + envZId + "-" + shr.ZId + "-dial"
+	tags := automation.ZrokShareTags(shrToken).
+		WithTag("zrokEnvironmentZId", envZId).
+		WithTag("zrokFrontendToken", feToken)
+
+	opts := &automation.ServicePolicyOptions{
+		BaseOptions: automation.BaseOptions{
+			Name: policyName,
+			Tags: tags,
+		},
+		IdentityRoles: []string{"@" + envZId},
+		ServiceRoles:  []string{"@" + shr.ZId},
+		PolicyType:    rest_model.DialBindDial,
+		Semantic:      rest_model.SemanticAllOf,
+	}
+
+	dialPolicyZId, err := ziti.ServicePolicies.CreateDial(opts)
+	if err != nil {
+		dl.Errorf("unable to create dial policy for user '%v': %v", principal.Email, err)
+		if automation.IsRateLimited(err) {
+			return share.NewAccessServiceUnavailable().WithRetryAfter(rateLimitedRetryAfter)
+		}
+		return share.NewAccessInternalServerError()
+	}
+
+	// the dial policy is deleted by id unless the frontend record commits
+	compensation := newZitiCompensation(compensatingAccess, feToken)
+	compensation.add(zitiServicePolicy, dialPolicyZId)
+	committed := false
+	defer func() {
+		if !committed {
+			compensation.run(ziti)
+		}
+	}()
+
+	if err := h.commit(trx); err != nil {
+		dl.Errorf("error committing frontend record: %v", err)
+		return share.NewAccessInternalServerError()
+	}
+	committed = true
+
+	return share.NewAccessCreated().WithPayload(&share.AccessCreatedBody{
+		FrontendToken: feToken,
+		BackendMode:   shr.BackendMode,
+	})
+}
+
+func (h *accessHandler) checkLimits(shr *store.Share, trx *sqlx.Tx) error {
+	if limitsAgent != nil {
+		ok, err := limitsAgent.CanAccessShare(shr.Id, trx)
+		if err != nil {
+			return errors.Wrapf(err, "error checking share limits for '%v'", shr.Token)
+		}
+		if !ok {
+			return errors.Errorf("share limit check failed for '%v'", shr.Token)
+		}
+	}
+	return nil
+}
+
+func (h *accessHandler) checkAccessGrants(shr *store.Share, ownerAccountId int, principal *rest_model_zrok.Principal, trx *sqlx.Tx) error {
+	if int(principal.ID) == ownerAccountId {
+		dl.Infof("accessing own share '%v' for '%v'", shr.Token, principal.Email)
+		return nil
+	}
+	count, err := str.IsAccessGrantedToAccountForShare(shr.Id, int(principal.ID), trx)
+	if err != nil {
+		dl.Infof("error checking access grants for '%v': %v", shr.Token, err)
+		return err
+	}
+	if count > 0 {
+		dl.Infof("found '%d' grants for '%v'", count, principal.Email)
+		return nil
+	}
+	return errors.Errorf("access denied for '%v' accessing '%v'", principal.Email, shr.Token)
+}

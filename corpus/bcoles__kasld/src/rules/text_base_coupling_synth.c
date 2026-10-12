@@ -1,0 +1,195 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Rule: symmetric phys↔virt text-base coupling synthesizer.
+//
+// On TEXT_TRACKS_DIRECTMAP arches the kernel image is mapped at a fixed
+// offset (PAGE_OFFSET) above its physical load, so:
+//
+//   virt_image_base ≈ virt_page_offset + (phys_image_base - PHYS_OFFSET)
+//
+// Reads the post-narrowing estimates and propagates each side's interval
+// onto the other:
+//
+//   est[Q_VIRT_IMAGE_BASE]  → bounds on Q_PHYS_IMAGE_BASE
+//   est[Q_PHYS_IMAGE_BASE]  → bounds on Q_VIRT_IMAGE_BASE
+//
+// This complements:
+//   * text_pin_from_observation, which only fires when a direct text-base
+//     witness exists on the target side.
+//   * kernel_image_phys_bound, which projects raw phys observations onto
+//     Q_VIRT_IMAGE_BASE but never the other direction, and reads raw
+//     observations (not the post-narrowing estimate).
+//
+// Net effect: any narrowing of either text base — by an iomem/kallsyms
+// pin, by image-size ceilings, by module-relative bounds, by DRAM bounds,
+// or by upstream coupling — is now propagated symmetrically. The
+// dominant win is on a coupled arch with only a virt leak (kallsyms but
+// no iomem): Q_PHYS_IMAGE_BASE collapses from its honest top to a small
+// window around the implied phys base.
+//
+// Soundness:
+//   * Requires Q_PAGE_OFFSET narrowed to a single value. On
+//     DIRECTMAP_STATIC arches this is provided by phys_virt_synth (from
+//     paired directmap+DRAM leaks) or page_offset_invariant_pin (on the
+//     architecturally-fixed subset). Without that pin nothing can project
+//     symbols across the boundary.
+//   * The IMAGE_BASE_OFFSET safety margin (added as text_off) accounts for the
+//     slack between the linker-defined _text base and what components actually
+//     observe. It is IMAGE_BASE_OFFSET, which is 2 MiB on LoongArch — not the
+//     128 KiB STEXT_OFFSET head gap (_text->_stext), which is normalized
+//     separately. Same convention as kernel_image_phys_bound.
+//   * Emitted at the confidence of the EDGE it projects, capped at
+//     CONF_DERIVED (below CONF_PARSED); any contradicting witness from a
+//     direct observation wins the engine's conflict resolution rather than
+//     being overridden by this synthesizer.
+//
+//     The guaranteed window does not depend on that: resolving at the sound
+//     floor ignores the sub-floor constraints that could have moved the edge,
+//     so the projection there is taken from an edge that stands on its own.
+//     The tier matters for the all-signals store, which is read by confidence
+//     elsewhere -- a bound stamped CONF_DERIVED while resting on a guess says
+//     something about its own admissibility that is not true. ppc32 makes the
+//     case concrete: ppc32_phys_ceiling models the BookE placement window at
+//     CONF_HEURISTIC, correctly, because BookE and BookS cannot be told apart
+//     at compile time, and on a BookS kernel placed past that window the
+//     narrowing it produces is wrong about this target. Carrying the edge's
+//     confidence keeps the projection no more believable than what it came
+//     from. Same convention as image_base_grid_align, which carries the
+//     confidence of the bound it sharpens.
+//   * Bounds-only emission (no C_EQUALS) — the meet of the four bounds
+//     pins the target when one side is itself pinned.
+//
+// Inert on decoupled arches (TEXT_TRACKS_DIRECTMAP=0): arm64, riscv64,
+// s390, x86_64 carry independent phys/virt KASLR slides; the coupling
+// here would be unsound for them.
+// ---
+// <bcoles@gmail.com>
+
+#include "include/kasld/engine_rules.h"
+
+#include <limits.h>
+#include <string.h>
+
+int rule_text_base_coupling_synth(const struct evidence_set *ev,
+                                  const struct estimate *est,
+                                  struct constraint *out, int out_max) {
+#if TEXT_TRACKS_DIRECTMAP
+  const struct estimate *po = &est[Q_PAGE_OFFSET];
+  unsigned long virt_page_offset;
+  if (!quantity_pinned(Q_PAGE_OFFSET, po, &virt_page_offset))
+    return 0; /* virt_page_offset must be pinned for the projection to be sound
+               */
+
+  /* The linear map anchors virt_page_offset to the true DRAM base, NOT the
+   * compile-time PHYS_OFFSET -- which every coupled arch models as 0. The two
+   * coincide only where DRAM starts at phys 0 (mips, ppc64, loongarch64,
+   * x86_32, ppc32 e500); on arm32 the board places DRAM at 0x40000000, and a
+   * projection through PHYS_OFFSET=0 shifts the image by virt_page_offset
+   * instead of (virt_page_offset - 0x40000000), landing the whole window ABOVE
+   * the true base. Read the corroborated base from evidence -- the lowest phys
+   * REGION_RAM POS_BASE, the same floor dram_floor_bound trusts -- and decline
+   * if it is absent: the phys<->virt delta is then unknowable and any
+   * projection would be a guess.
+   *
+   * The lowest observed RAM base IS the address the linear map anchors at on
+   * every architecture this rule is gated to: TEXT_TRACKS_DIRECTMAP implies
+   * LINEAR_MAP_ANCHOR is LM_ANCHOR_DRAM_BASE or LM_ANCHOR_PHYS_OFFSET, and on
+   * the latter the constant is 0 and DRAM starts there, so the two agree. That
+   * is a property of the headers rather than an assumption of this rule -- see
+   * LINEAR_MAP_ANCHOR in api.h, and phys_virt_synth, which reads the axis
+   * directly because it is not gated on coupling and so meets arm64, whose
+   * anchor is recoverable from nothing.
+   *
+   * The exposure is an emitter reporting a bank the kernel did not take, which
+   * would put the anchor LOW. Two of the four bounds below are unsound in that
+   * direction -- a low anchor inflates v_minus_p, dropping the virt->phys
+   * ceiling and raising the phys->virt floor, either able to carve out the
+   * truth. Only REGION_RAM POS_BASE counts, which is the kernel's own account
+   * of its memory rather than firmware's account of the board. */
+  unsigned long dram_base = 0;
+  if (!evidence_lowest_dram_base(ev, &dram_base, NULL, NULL) ||
+      dram_base > virt_page_offset)
+    return 0;
+
+  const struct estimate *vt = &est[Q_VIRT_IMAGE_BASE];
+  const struct estimate *pt = &est[Q_PHYS_IMAGE_BASE];
+  /* A projection is worth what its source edge is worth, and never more than a
+   * derivation. An untouched edge sits at the quantity's honest top and carries
+   * no confidence of its own; projecting it says nothing, but the bound is
+   * still trivially true, so the tier is simply capped rather than special
+   * cased. */
+#define COUPLING_CONF(edge_conf)                                               \
+  ((edge_conf) < CONF_DERIVED ? (edge_conf) : CONF_DERIVED)
+  const unsigned long phys_off = dram_base;
+  const unsigned long text_off = (unsigned long)IMAGE_BASE_OFFSET;
+  /* virt_to_phys delta: PAGE_OFFSET - PHYS_OFFSET. Positive on every
+   * TEXT_TRACKS_DIRECTMAP arch (kernel virt > kernel phys). */
+  const unsigned long v_minus_p = virt_page_offset - phys_off;
+
+  int n = 0;
+
+  /* Two-stage overflow guards on the (v_minus_p + text_off) sub-expression.
+   * Realistic kernel constants are far below ULONG_MAX so this is purely
+   * defensive — protects against a port-day arch with unusual offsets where
+   * the inner addition could otherwise wrap and let the outer subtraction /
+   * addition silently produce nonsense bounds. */
+  int vplus_off_safe = (v_minus_p <= ULONG_MAX - text_off);
+
+  /* virt → phys: phys ∈ [vt.lo - v_minus_p - IMAGE_BASE_OFFSET,  vt.hi -
+   * v_minus_p]
+   */
+  if (vplus_off_safe && vt->lo > v_minus_p + text_off && n < out_max) {
+    struct constraint *c = &out[n++];
+    memset(c, 0, sizeof(*c));
+    c->q = Q_PHYS_IMAGE_BASE;
+    c->op = C_LOWER_BOUND;
+    c->value = vt->lo - v_minus_p - text_off;
+    c->conf = COUPLING_CONF(vt->lo_conf);
+    c->lineage_count = 0;
+    snprintf(c->origin, ORIGIN_LEN, "text_base_coupling_synth");
+  }
+  if (vt->hi > v_minus_p && n < out_max) {
+    struct constraint *c = &out[n++];
+    memset(c, 0, sizeof(*c));
+    c->q = Q_PHYS_IMAGE_BASE;
+    c->op = C_UPPER_BOUND;
+    c->value = vt->hi - v_minus_p;
+    c->conf = COUPLING_CONF(vt->hi_conf);
+    c->lineage_count = 0;
+    snprintf(c->origin, ORIGIN_LEN, "text_base_coupling_synth");
+  }
+
+  /* phys → virt: virt ∈ [pt.lo + v_minus_p,  pt.hi + v_minus_p +
+   * IMAGE_BASE_OFFSET]
+   */
+  if (pt->lo <= ULONG_MAX - v_minus_p && n < out_max) {
+    struct constraint *c = &out[n++];
+    memset(c, 0, sizeof(*c));
+    c->q = Q_VIRT_IMAGE_BASE;
+    c->op = C_LOWER_BOUND;
+    c->value = pt->lo + v_minus_p;
+    c->conf = COUPLING_CONF(pt->lo_conf);
+    c->lineage_count = 0;
+    snprintf(c->origin, ORIGIN_LEN, "text_base_coupling_synth");
+  }
+  if (vplus_off_safe && pt->hi <= ULONG_MAX - v_minus_p - text_off &&
+      n < out_max) {
+    struct constraint *c = &out[n++];
+    memset(c, 0, sizeof(*c));
+    c->q = Q_VIRT_IMAGE_BASE;
+    c->op = C_UPPER_BOUND;
+    c->value = pt->hi + v_minus_p + text_off;
+    c->conf = COUPLING_CONF(pt->hi_conf);
+    c->lineage_count = 0;
+    snprintf(c->origin, ORIGIN_LEN, "text_base_coupling_synth");
+  }
+#undef COUPLING_CONF
+  return n;
+#else
+  (void)ev;
+  (void)est;
+  (void)out;
+  (void)out_max;
+  return 0;
+#endif
+}

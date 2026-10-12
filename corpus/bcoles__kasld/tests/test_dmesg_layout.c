@@ -1,0 +1,179 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Parser unit tests for dmesg_mem_init_kernel_layout.
+//
+// The riscv print_vm_layout() dump's "kernel : 0x<virt_addr> - 0x<end>" line
+// reports kernel_map.virt_addr (where _start/_stext land) directly, so its low
+// edge is a pos=base kernel-text pin. These tests exercise the static parser
+// (on_match() + the entries table) by #including the component with its main
+// renamed, capturing the emitted P/V/S wire lines. Addresses derive from the
+// arch's VIRT_TEXT_PLAUSIBLE_MIN, so the suite is valid on every
+// width/endianness under tests/test-cross.
+// ---
+// <bcoles@gmail.com>
+
+/* Rename the component's main so its parser/table link into this test TU. The
+ * forward declaration keeps -Wmissing-prototypes quiet for the renamed symbol.
+ */
+int dmesg_layout_component_main(void);
+#define main dmesg_layout_component_main
+#include "../src/components/dmesg_mem_init_kernel_layout.c"
+#undef main
+
+#include "test_harness.h"
+
+#include <assert.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+/* Run one log line through the parser, capturing the component's stdout (the
+ * P/V/S wire lines) into buf so the emitted result can be asserted. */
+static void parse_capture(const char *line, char *buf, size_t bufsz) {
+  fflush(stdout);
+  int saved = dup(STDOUT_FILENO);
+  FILE *tmp = tmpfile();
+  TH_CHECK(saved >= 0 && tmp);
+  dup2(fileno(tmp), STDOUT_FILENO);
+  /* Silence the component's stderr diagnostics (the kasld_info/_found
+   * data-echo) for the duration of the call so they don't leak into the test
+   * runner; we assert only on the stdout wire line. */
+  fflush(stderr);
+  int saved_err = dup(STDERR_FILENO);
+  int devnull = open("/dev/null", O_WRONLY);
+  TH_CHECK(saved_err >= 0 && devnull >= 0);
+  dup2(devnull, STDERR_FILENO);
+  struct search_ctx ctx = {0};
+  on_match(line, &ctx);
+  fflush(stdout);
+  dup2(saved, STDOUT_FILENO);
+  close(saved);
+  fflush(stderr);
+  dup2(saved_err, STDERR_FILENO);
+  close(saved_err);
+  close(devnull);
+  rewind(tmp);
+  size_t n = fread(buf, 1, bufsz - 1, tmp);
+  buf[n] = '\0';
+  fclose(tmp);
+}
+
+static char cap[8192];
+
+/* The "kernel" line reports _start (kernel_map.virt_addr, the image LOAD
+ * address). The engine's image base is _text, IMAGE_BASE_OFFSET above _start on
+ * a head-gap arch, so the emitted pos=base KERNEL_IMAGE value is projected up
+ * by IMAGE_BASE_OFFSET (a no-op on arches where it is 0, e.g. the x86_64 host).
+ */
+static void test_kernel_line_pins_text_base(void) {
+  unsigned long start = (unsigned long)VIRT_TEXT_PLAUSIBLE_MIN;
+  unsigned long image_base = start + (unsigned long)IMAGE_BASE_OFFSET;
+  char line[256], want[64];
+  snprintf(line, sizeof(line),
+           "      kernel : 0x%lx - 0xffffffffffffffff   (   2 GB)", start);
+  parse_capture(line, cap, sizeof(cap));
+  /* REGION_KERNEL_IMAGE, not KERNEL_TEXT (which the engine treats as _stext and
+   * shifts down by the head gap). */
+  TH_CHECK(strstr(cap, "V kernel_image pos=base") != NULL);
+  snprintf(want, sizeof(want), "lo=0x%lx",
+           image_base); /* _start + head = _text */
+  TH_CHECK(strstr(cap, want) != NULL);
+}
+
+/* An address below the kernel-text window is rejected by the section gate, so
+ * the broad "kernel : 0x" needle cannot false-match an unrelated log line. The
+ * accept path for this needle emits REGION_KERNEL_IMAGE (kernel_image), so the
+ * rejection is confirmed by the absence of that token. */
+static void test_kernel_line_below_text_rejected(void) {
+  parse_capture("      kernel : 0x1000 - 0xffffffffffffffff", cap, sizeof(cap));
+  TH_CHECK(strstr(cap, "kernel_image") == NULL);
+}
+
+/* The ARM/arm64/x86_32 layout ".text : 0x<lo> - 0x<hi>" low edge IS _text (the
+ * image base) directly, not _stext and not _start. It must pin
+ * REGION_KERNEL_IMAGE at the value UNCHANGED — never KERNEL_TEXT (which the
+ * engine reads as _stext and shifts DOWN by STEXT_OFFSET, below _text on
+ * arm64/loongarch64), and never with the _start->_text projection (which on
+ * arm32 would add IMAGE_BASE_OFFSET = 0x8000 and land ABOVE _text). The emitted
+ * lo must equal the raw value on every arch, including those with
+ * IMAGE_BASE_OFFSET != 0. */
+static void test_text_line_pins_image_base(void) {
+  unsigned long image_base = (unsigned long)VIRT_TEXT_PLAUSIBLE_MIN;
+  char line[256], want[64];
+  snprintf(line, sizeof(line), "      .text : 0x%lx - 0x%lx   (  6208 KB)",
+           image_base, image_base + 0x600000);
+  parse_capture(line, cap, sizeof(cap));
+  TH_CHECK(strstr(cap, "V kernel_image pos=base") != NULL);
+  TH_CHECK(strstr(cap, "kernel_text") == NULL); /* not shifted down as _stext */
+  snprintf(want, sizeof(want), "lo=0x%lx",
+           image_base); /* unchanged: no project */
+  TH_CHECK(strstr(cap, want) != NULL);
+}
+
+/* The layout dump's region lines print the address ONE PAST the region -- each
+ * arch derives the size it shows as (hi - lo), and the constants behind them
+ * are half-open bounds. An extent is stored inclusive, so the emitted hi must
+ * be one below the printed figure. The staged span is a round 1 GiB, which the
+ * printed pair can only express the half-open way. */
+static void test_vmalloc_range_high_edge_is_exclusive(void) {
+  unsigned long lo = (unsigned long)VIRT_TEXT_PLAUSIBLE_MIN;
+  unsigned long printed_hi = lo + 0x40000000ul;
+  char line[256], want[80];
+  snprintf(line, sizeof(line), "      vmalloc : 0x%lx - 0x%lx   (1024 MB)", lo,
+           printed_hi);
+  parse_capture(line, cap, sizeof(cap));
+  snprintf(want, sizeof(want),
+           "V vmalloc pos=base conf=parsed lo=0x%lx hi=0x%lx", lo,
+           printed_hi - 1);
+  TH_CHECK(strstr(cap, want) != NULL);
+}
+
+/* The vmemmap needle carries the same convention, and the s390 spelling has no
+ * spaces around the dash -- both reach the same conversion. */
+static void test_vmemmap_and_s390_spelling(void) {
+  unsigned long lo = (unsigned long)VIRT_TEXT_PLAUSIBLE_MIN;
+  unsigned long printed_hi = lo + 0x40000000ul;
+  char line[256], want[80];
+
+  snprintf(line, sizeof(line), "      vmemmap : 0x%lx - 0x%lx   (1024 MB)", lo,
+           printed_hi);
+  parse_capture(line, cap, sizeof(cap));
+  snprintf(want, sizeof(want),
+           "V vmemmap pos=base conf=parsed lo=0x%lx hi=0x%lx", lo,
+           printed_hi - 1);
+  TH_CHECK(strstr(cap, want) != NULL);
+
+  snprintf(line, sizeof(line), "vmalloc area:        0x%lx-0x%lx", lo,
+           printed_hi);
+  parse_capture(line, cap, sizeof(cap));
+  snprintf(want, sizeof(want),
+           "V vmalloc pos=base conf=parsed lo=0x%lx hi=0x%lx", lo,
+           printed_hi - 1);
+  TH_CHECK(strstr(cap, want) != NULL);
+}
+
+/* A line whose two figures are equal describes no region; stepping the high
+ * edge back would put it under the low one, so nothing is emitted. */
+static void test_degenerate_range_emits_nothing(void) {
+  unsigned long lo = (unsigned long)VIRT_TEXT_PLAUSIBLE_MIN;
+  char line[256];
+  snprintf(line, sizeof(line), "      vmalloc : 0x%lx - 0x%lx   (   0 MB)", lo,
+           lo);
+  parse_capture(line, cap, sizeof(cap));
+  TH_CHECK(strstr(cap, "vmalloc") == NULL);
+}
+
+int main(void) {
+  TEST_SUITE("test_dmesg_layout");
+  BEGIN_CATEGORY("riscv layout-dump kernel line");
+  RUN(test_kernel_line_pins_text_base);
+  RUN(test_kernel_line_below_text_rejected);
+  BEGIN_CATEGORY("arm/x86_32 layout .text line");
+  RUN(test_text_line_pins_image_base);
+  BEGIN_CATEGORY("half-open region lines");
+  RUN(test_vmalloc_range_high_edge_is_exclusive);
+  RUN(test_vmemmap_and_s390_spelling);
+  RUN(test_degenerate_range_emits_nothing);
+  return TEST_DONE();
+}

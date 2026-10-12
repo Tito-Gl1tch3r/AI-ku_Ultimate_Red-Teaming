@@ -1,0 +1,552 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Render-layer cross-file glue. Used to share helpers between the
+// per-output-mode files (src/render/*.c) and the dispatcher (src/render.c).
+// Public consumers of the render layer use only `render_summary()` from
+// kasld/internal.h — this header is internal to the renderer.
+// ---
+// <bcoles@gmail.com>
+
+#ifndef KASLD_RENDER_INTERNAL_H
+#define KASLD_RENDER_INTERNAL_H
+
+#include "internal.h"
+
+#include <stddef.h>
+
+/* -------------------------------------------------------------------------
+ * Shared formatting helpers — defined in src/render.c.
+ * -------------------------------------------------------------------------
+ */
+const char *human_size(unsigned long bytes, char *buf, size_t bufsz);
+
+/* Phys/virt text-base coupling, in one phrase shared by every renderer so the
+ * classification never drifts between formats. On coupled arches a physical
+ * leak reveals the virtual text base; on decoupled arches they randomize
+ * independently. */
+static inline const char *kasld_coupling_descr(void) {
+  return TEXT_TRACKS_DIRECTMAP
+             ? "physical and virtual text move together (coupled)"
+             : "physical and virtual text randomize independently";
+}
+
+/* Result-model helpers (mirror anchor_addr(). result_method returns the
+ * strongest method in the record's method_set; contributors are walked with
+ * origin_set_next() over r->origins at the consuming renderer). */
+const char *kasld_oracle_status_name(enum oracle_access a);
+const char *kasld_oracle_answer(enum oracle_access a);
+const char *result_method(const struct result *r);
+const char *result_section(const struct result *r);
+int in_bounds(const struct result *r);
+
+/* Display heading for a (type, section) bucket. NULL for metadata-only
+ * sections (e.g. "pageoffset") that have no leak-group view. */
+const char *section_display_name(enum kasld_addr_type type,
+                                 const char *section);
+
+/* Number of CONF_DERIVED records currently in results[]. */
+int count_derived(void);
+
+/* The disclosure phrases, named so a caller that needs to TEST one compares
+ * against the same definition the producer returns. A bare literal at the
+ * comparison drifts silently the day the wording changes. */
+#define DISCLOSE_VIRT "virtual addresses"
+#define DISCLOSE_PHYS "physical addresses"
+#define DISCLOSE_BOTH "virtual and physical addresses"
+#define DISCLOSE_FACTS "system facts"
+
+/* What a component disclosed, as one phrase shared by every output format so
+ * the three cannot word the same fact differently.
+ *
+ * component_disclosed() reads it off the records attributed to the component
+ * and is exact for anything that succeeded; disclosure_descr() renders a
+ * DECLARED value, for the sections that list components which produced nothing.
+ * Both return NULL when there is nothing to say -- callers must print nothing
+ * rather than substitute a kind the component never claimed. */
+const char *component_disclosed(int slot);
+const char *disclosure_descr(const char *declared);
+
+/* Consensus over (type, section, optional region_filter). See the comment
+ * on section_consensus_pick in render.c for the selection rule. */
+unsigned long section_consensus(enum kasld_addr_type type, const char *section,
+                                enum kasld_region region_filter);
+void section_consensus_info(enum kasld_addr_type type, const char *section,
+                            enum kasld_region region_filter,
+                            const char **best_method, int *n_sources,
+                            int *n_conflicts, int *interior_only);
+
+/* Distinct contributing components, and "no edge record, only interior samples"
+ * predicate, for a (type, section, optional region_filter). */
+int section_edge_addr(enum kasld_addr_type type, const char *section,
+                      enum kasld_region region_filter, unsigned long *out);
+int section_source_count(enum kasld_addr_type type, const char *section,
+                         enum kasld_region region_filter);
+int section_is_interior_only(enum kasld_addr_type type, const char *section,
+                             enum kasld_region region_filter);
+
+/* Extent of the in-bounds results in a (type, section, optional
+ * region_filter). lo/hi = 0 when none match. */
+void section_range(enum kasld_addr_type type, const char *section,
+                   enum kasld_region region_filter, unsigned long *out_lo,
+                   unsigned long *out_hi);
+
+/* JSON string escaper — used by json.c and hardening.c. */
+void json_print_escaped(const char *s);
+
+/* Canonical section iteration order (NULL-terminated), shared by all modes. */
+extern const char *const kasld_render_sections[];
+
+/* -------------------------------------------------------------------------
+ * Per-mode entry points — each is defined in one src/render/<mode>.c file.
+ * render_summary() in render.c dispatches to these based on the output flags.
+ * -------------------------------------------------------------------------
+ */
+void render_text(const struct summary *s);
+void render_json(const struct summary *s);
+void render_oneline(const struct summary *s);
+void render_markdown(const struct summary *s);
+
+/* -------------------------------------------------------------------------
+ * Hardening assessment model.
+ *
+ * build_hardening_report() walks the component logs / scalar facts / sysctl
+ * gates ONCE and fills this structure; the text, json, and markdown hardening
+ * renderers then consume it, so the section-derivation logic lives in exactly
+ * one place. Each renderer still chooses how to present (and which fields to
+ * show): json omits the side-channel section; only text annotates ✓/⚠/✗ and
+ * residual counts. Raw origin
+ * strings are stored verbatim (empty allowed) so each format applies its own
+ * "(unknown)" / "unknown" fallback.
+ * -------------------------------------------------------------------------
+ */
+#define HR_NAME_MAX 64
+#define HR_GATES_MAX                                                           \
+  6 /* 5 sysctl gates + the synthetic seccomp filter gate                      \
+     */
+#define HR_VULNS_MAX 16
+#define HR_SURFACE_MAX 64
+#define HR_HW_MAX 64
+#define HR_NOMIT_MAX 128
+#define HR_SUGG_MAX 8
+
+enum hr_posture {
+  HR_POSTURE_ACTIVE = 0,
+  HR_POSTURE_RANDOMIZATION_FAILED,
+  HR_POSTURE_DISABLED,
+  HR_POSTURE_UNSUPPORTED,
+};
+
+/* What a gate's exemption was owed to: a privilege the account holds that the
+ * gate's own check accepts, rather than the gate having been got around. */
+enum hr_exempt_kind {
+  HR_EXEMPT_NONE = 0,
+  HR_EXEMPT_CAPABILITY, /* a capability the gate's own check accepts */
+  HR_EXEMPT_GROUP,      /* a group granting read to a copy of the source */
+  HR_EXEMPT_ACCOUNT,    /* the account's own access to that copy */
+};
+
+struct hr_gate {
+  const char *display;
+  const char *surface; /* enforcement lever: "sysctl" / "boot_param" /
+                        * "seccomp" — routes a report to the owning team */
+  int value, threshold, active;
+  int gated, blocked, bypassed, fallback; /* full counts (names may be fewer) */
+  const char *gated_names[HR_NAME_MAX];
+  int n_gated_names;
+  const char *blocked_names[HR_NAME_MAX];
+  int n_blocked_names;
+  const char *bypassed_names[HR_NAME_MAX];
+  int n_bypassed_names;
+  /* Succeeded through a privilege this account holds that the gate does not
+   * restrict -- a capability the gate's check accepts, or, for dmesg_restrict,
+   * a group the log copies grant read to -- so neither blocked nor a way around
+   * it.
+   *
+   * The reason is a property of the gate and the vantage rather than of any one
+   * component, so it is settled once per gate and held here: `exempt_source`
+   * names what was read where the gate has a source worth naming, `exempt_cap`
+   * the capability, `exempt_gid` the groups. Each gate carries its own because
+   * a vantage can be exempt from several through different privileges. */
+  int exempt;
+  const char *exempt_names[HR_NAME_MAX];
+  int n_exempt_names;
+  enum hr_exempt_kind exempt_kind;
+  const char *exempt_cap;
+  const char *exempt_source;
+  unsigned long exempt_gid[KASLD_N_GROUPS + 1];
+  int n_exempt_gid;
+  /* Components enabling this gate would actually SILENCE: succeeded and gated
+   * with no fallback source (a fallback-bypassing leak survives the sysctl).
+   * The exclude set for the counterfactual posture projection. */
+  const char *silenced_names[HR_NAME_MAX];
+  int n_silenced;
+};
+
+struct hr_suggestion {
+  const char *display;
+  const char *surface; /* enforcement lever (see hr_gate.surface) */
+  int threshold;
+  int impact; /* components this gate governs (gated count) */
+  /* Projected posture, leave-one-out framing: skip_* is the guaranteed
+   * residual entropy with EVERY suggestion applied EXCEPT this one, so the bits
+   * forfeited by omitting it are (report.all_vbits - skip_vbits). silences is
+   * how many succeeded base-leaks this suggestion actually removes (0 => the
+   * gate governs components but none leak the base). has_projection is 0 when
+   * the engine is compiled out. */
+  int has_projection;
+  int silences;
+  int skip_vbits, skip_pbits;
+};
+struct hr_vuln {
+  const char *name, *cve, *patch;
+};
+/* `discloses` on these two is observed where the component produced something
+ * and falls back to its declaration otherwise: both sections list a component
+ * whether or not it ran to a result, so there is not always anything to
+ * observe. NULL means neither answered -- render nothing, never a default. */
+struct hr_surface {
+  const char *name, *config, *discloses;
+};
+struct hr_hw {
+  const char *name, *hardware, *discloses;
+  int succeeded;
+};
+struct hr_nomit {
+  const char *name;
+  /* Observed, not declared: what the component's own records disclosed this
+   * run. NULL only if it somehow disclosed nothing, which OUTCOME_SUCCESS
+   * rules out for every row in this list. */
+  const char *discloses;
+};
+
+/* How this run read the kernel log while dmesg_restrict was active.
+ *
+ * The sysctl governs the ring buffer and nothing else. An account holding
+ * CAP_SYSLOG is not subject to it, and the copies of the log on disk answer to
+ * their own modes and ACLs, which grant root and the log-reader groups read by
+ * design. So only a copy every account can read is a way around the sysctl;
+ * reading through the account's own privilege is an exemption it was meant to
+ * leave. */
+enum hr_log_route {
+  HR_LOG_UNSETTLED = 0, /* not established, so not credited either way */
+  HR_LOG_CAPABILITY,    /* the ring buffer, through a capability held */
+  HR_LOG_GROUP,         /* /var/log/dmesg, through this account's groups */
+  HR_LOG_SELF,          /* /var/log/dmesg, through this account's own access */
+  HR_LOG_WORLD,         /* /var/log/dmesg, which every account can read */
+};
+
+struct hardening_report {
+  int succeeded, total; /* exposure: non-detection components */
+  /* Of `succeeded`, those that went through a privilege this account holds
+   * rather than past a defense (hr_gate.exempt, summed over the gates). */
+  int exempt;
+
+  /* KASLR posture. rand_detectors[] is the raw set of randomization-failure
+   * witnesses (independent of the prioritised posture state, which json uses);
+   * the text banner fires whenever n_rand_detectors > 0. */
+  enum hr_posture posture;
+  int slot_entropy_zero, kernel_at_default;
+  const char *rand_detectors[HR_NAME_MAX];
+  int n_rand_detectors;
+
+  struct hr_gate gates[HR_GATES_MAX];
+  int n_gates;  /* gates with a readable value and >= 1 gated component */
+  int lockdown; /* enum lockdown_state */
+
+  struct hr_suggestion gate_suggestions[HR_SUGG_MAX];
+  int n_gate_suggestions;
+  int suggest_lockdown, lockdown_impact;
+  int lockdown_suggest_mode; /* enum lockdown_mode the suggestion recommends */
+
+  /* How the dmesg components read the log past an active dmesg_restrict, and
+   * what it went through: the capability, or the groups granting
+   * /var/log/dmesg. */
+  enum hr_log_route log_route;
+  const char *log_route_cap;
+  unsigned long log_route_gid[KASLD_N_GROUPS + 1];
+  int n_log_route_gid;
+
+  /* Copies of the kernel log every account can read, as indices into
+   * kasld_oracles[]. dmesg_restrict governs only the ring buffer, so such a
+   * copy opens the records to every account whatever the sysctl says. It is
+   * flagged from any vantage; it silences only the leaks this run took
+   * through it. */
+  int suggest_world_log;
+  int world_log_copy[KASLD_N_ORACLES];
+  int n_world_log_copies;
+
+  /* Projected posture: current guaranteed residual entropy, and the
+   * ceiling if ALL suggestions are applied together. has_projection is 0 when
+   * the engine is compiled out (projected rows are then suppressed). The
+   * lockdown and world-readable-log suggestions carry their own projected pair
+   * because they are not gate_suggestions[] entries. */
+  int has_projection;
+  int cur_vbits, cur_pbits;
+  int all_vbits, all_pbits;
+  int all_impact; /* distinct components silenced by applying every suggestion
+                   */
+  /* Leave-one-out for the lockdown and world-readable-log suggestions (they
+   * are not gate_suggestions[] entries). skip_* / silences mirror
+   * hr_suggestion. */
+  int lockdown_has_projection, lockdown_silences;
+  int lockdown_skip_vbits, lockdown_skip_pbits;
+  int world_log_has_projection, world_log_silences;
+  int world_log_skip_vbits, world_log_skip_pbits;
+
+  int vuln_total;
+  struct hr_vuln vulns[HR_VULNS_MAX]; /* succeeded (possibly unpatched) */
+  int n_vulns;
+
+  struct hr_surface surface[HR_SURFACE_MAX];
+  int n_surface;
+
+  struct hr_hw hw[HR_HW_MAX]; /* side-channels (text-only section) */
+  int n_hw, hw_succeeded;
+
+  struct hr_nomit nomit[HR_NOMIT_MAX];
+  int n_nomit;
+
+  /* Controls a component positively observed to defeat it at runtime (a
+   * `mitigation` disposition). Distinct from `gates`, which are sysctl levers
+   * read from their values: these are confirmed by a leak being foiled, and
+   * name controls no sysctl reports (KPTI, an MDS hardware fix, a hardening
+   * CONFIG). Pointers alias the owning comp_logs entry, which outlives the
+   * report. */
+  struct hr_confirmed {
+    const char *component;
+    const char *gate;
+    const char *message;
+  } confirmed[HR_NAME_MAX];
+  int n_confirmed;
+
+  /* Kernel-text function ordering (SF_TEXT_ORDER, resolved by max confidence:
+   * config CONF_PARSED supersedes the kallsyms heuristic CONF_HEURISTIC).
+   * text_order == 0 means undetermined. Gates whether a generic System.map can
+   * resolve symbols from the slide (see render of the two rows). */
+  enum kasld_text_order text_order;
+  enum kasld_confidence text_order_conf;
+};
+
+/* Resolve SF_TEXT_ORDER from the scalar facts by max confidence (config
+ * CONF_PARSED supersedes the kallsyms heuristic CONF_HEURISTIC). Returns the
+ * class (0 = undetermined); writes the winning confidence to *conf_out if set.
+ * Shared by the hardening report and the main text readout. */
+static inline enum kasld_text_order
+resolve_text_order(enum kasld_confidence *conf_out) {
+  enum kasld_text_order best = 0;
+  enum kasld_confidence bc = 0;
+  for (int i = 0; i < num_scalar_facts; i++) {
+    if (scalar_facts[i].fact != SF_TEXT_ORDER || scalar_facts[i].value == 0)
+      continue;
+    if (!best || scalar_facts[i].conf > bc) {
+      best = (enum kasld_text_order)scalar_facts[i].value;
+      bc = scalar_facts[i].conf;
+    }
+  }
+  if (conf_out)
+    *conf_out = bc;
+  return best;
+}
+
+/* The target's page size, in bytes, or 0 where this run cannot state one.
+ *
+ * Two sources, in order. Where the architecture admits exactly one page size
+ * the constant IS the answer and no probe is needed -- which is what makes this
+ * answerable under a capture, where the live probe is deliberately absent.
+ * Where it admits several, only an observation can say, and without one the
+ * answer is nothing rather than a default: the sizes differ by a factor of
+ * sixteen, so a guess is not an approximation.
+ *
+ * The architecture's own constant describes the binary reading the capture, as
+ * `arch=` and every window in the output already do; replaying one
+ * architecture's capture with another's binary is a rendering convenience, not
+ * a soundness-bearing mode.
+ */
+static inline unsigned long resolve_page_size(enum kasld_confidence *conf_out) {
+#if PAGE_SIZE_KNOWN_AT_BUILD
+  if (conf_out)
+    *conf_out = CONF_PARSED;
+  return (unsigned long)PAGE_SIZE_MIN;
+#else
+  unsigned long best = 0;
+  enum kasld_confidence bc = CONF_UNKNOWN;
+  for (int i = 0; i < num_scalar_facts; i++) {
+    if (scalar_facts[i].fact != SF_PAGE_SIZE || scalar_facts[i].value == 0)
+      continue;
+    if (!best || scalar_facts[i].conf > bc) {
+      best = scalar_facts[i].value;
+      bc = scalar_facts[i].conf;
+    }
+  }
+  if (conf_out)
+    *conf_out = bc;
+  return best;
+#endif
+}
+
+/* sizeof(struct page) for the target, or 0 where this run cannot state one.
+ *
+ * Unlike the page size this has no architectural answer: nothing outside the
+ * kernel's own BTF derives it, so it is the observation or nothing. A build
+ * without CONFIG_DEBUG_INFO_BTF therefore reports nothing here, which is the
+ * honest result and not a gap to be filled with the common value. */
+static inline unsigned long
+resolve_struct_page_bytes(enum kasld_confidence *conf_out) {
+  unsigned long best = 0;
+  enum kasld_confidence bc = CONF_UNKNOWN;
+  for (int i = 0; i < num_scalar_facts; i++) {
+    if (scalar_facts[i].fact != SF_STRUCT_PAGE_BYTES ||
+        scalar_facts[i].value == 0)
+      continue;
+    if (!best || scalar_facts[i].conf > bc) {
+      best = scalar_facts[i].value;
+      bc = scalar_facts[i].conf;
+    }
+  }
+  if (conf_out)
+    *conf_out = bc;
+  return best;
+}
+
+/* The compile-time default as a remark on the resolved image base, or NULL when
+ * there is nothing to say. Shared by every format that reports a base with no
+ * slide, so the same bounds always produce the same sentence. Defined in
+ * src/render.c. */
+const char *default_base_remark(unsigned long def, unsigned long lo,
+                                unsigned long hi, const char *addr_text,
+                                char *buf, size_t bufsz);
+
+/* Size with the trailing ".0" trimmed: a slot pitch is exact by construction,
+ * so the decimal is noise. Shared by every format that prints a grid. */
+const char *kasld_grain(unsigned long align, char *buf, size_t sz);
+
+/* The address vocabulary the readout and the map share instead of keeping one
+ * each: un-padded right-aligned hex, sized to the widest address a column
+ * actually draws. Two blocks rendering the same address two ways is a
+ * difference a reader reads as meaning. */
+int readout_hex_digits(unsigned long v);
+
+/* A decimal with thousands separators, for human-facing formats only. One
+ * rendering of a number, so the same figure does not appear grouped in one
+ * block and undivided in another a few lines below it.
+ *
+ * Callers size their buffer with KASLD_DECIMAL_MAX rather than a literal: the
+ * renderer falls back to ungrouped digits where it is handed less, and
+ * truncates where even those do not fit, so an under-sized buffer states a
+ * WRONG count in a column whose whole worth is exactness. Naming the size here
+ * is what keeps the right one the easiest to write. */
+#define KASLD_DECIMAL_MAX 28 /* 20 digits + 6 separators + NUL */
+const char *kasld_decimal(unsigned long v, char *buf, size_t sz);
+
+/* Report-model types used by the prototypes below; the full definitions live in
+ * kasld/report.h, which the renderers include directly. */
+struct kasld_report;
+struct kasld_report_quantity;
+struct kasld_report_window;
+
+/* The denominator a residual is stated against, as a raw count. One definition,
+ * because three formats stating "N of M" against different M is a difference a
+ * reader reads as disagreement about the target. */
+unsigned long kasld_entropy_top(const struct kasld_report_quantity *it);
+/* The same baseline, withheld where it is below the count it would be stated
+ * against. Every format publishing a count beside a baseline uses this. */
+unsigned long kasld_entropy_baseline(const struct kasld_report_quantity *it,
+                                     const struct kasld_report_window *w);
+/* The same, in bits, which is the form the readout's entropy line states. */
+int kasld_entropy_baseline_bits(const struct kasld_report_quantity *it,
+                                const struct kasld_report_window *w);
+
+/* Residual entropy in bits, against the baseline where one is modelled. One
+ * definition, because the shape of the phrase is a claim: a bare "N bits"
+ * states that no baseline exists, and a missing "~" states that ceil(log2)
+ * rounded nothing. A format that composes its own is a format that can assert
+ * either of those by accident. */
+const char *kasld_entropy_phrase(int bits, int bits_top,
+                                 unsigned long candidates, unsigned long top,
+                                 char *buf, size_t bufsz);
+const char *readout_addr(unsigned long v, int digits, char *buf, size_t sz);
+
+/* The two grades, and the displacement note a concrete base carries. Shared
+ * vocabulary: every format states the same word for the same claim. */
+#define GRADE_LIKELY "likely"
+#define GRADE_GUARANTEED "guaranteed"
+const char *readout_slide(long slide, char *buf, size_t sz);
+
+/* The Layout table's rows, built once in render.c and rendered per format. */
+#define LAYOUT_COLS 5
+#define LAYOUT_CELL 72
+#define LAYOUT_MAX_ROWS 12
+struct layout_row {
+  char cell[LAYOUT_COLS][LAYOUT_CELL];
+  /* The range's parts, kept alongside the composed cell so a format that
+   * aligns columns can re-compose with its own padding. Addresses are never
+   * zero-padded -- a 16 MiB physical address must not wear the costume of a
+   * 64-bit kernel pointer -- so alignment is done with spaces or not at all. */
+  unsigned long lo, hi;
+  /* Which of the two the row actually states. Carried rather than read off the
+   * value, because zero is a real edge on some quantities and the absence of an
+   * edge on others, and a format that tells them apart by truthiness renders a
+   * base pinned at zero as though nothing were known about it. */
+  int has_lo, has_hi;
+  /* The counts behind cell[3], kept so a format that presents rows in a shape
+   * other than the table (the static-posture block) need not re-derive them
+   * from the summary -- which is how a renderer ends up deciding for itself
+   * which quantities exist. The model carries values; each format does its own
+   * formatting. */
+  unsigned long slots, top;
+  unsigned long align;
+  /* Whether `align` is the grain or a floor under it. A floor makes the row's
+   * candidate count a ceiling: a coarser true alignment admits fewer. */
+  int align_exact;
+  char note[32];
+  int dim; /* nothing bounded: the row recedes */
+  /* The row's window names ONE address rather than a span.
+   *
+   * Grade-free on purpose. The readout's emphasis encodes two independent
+   * things -- weight says a row names a single address, hue says it is
+   * unproven -- and a flag carrying both would entangle them where it is set
+   * while they still read as orthogonal where they are drawn. The name states
+   * the test it performs, so it cannot be reached for as a general "solved": a
+   * quantity can be resolved without being an address, and the emphasis this
+   * drives belongs to addresses. */
+  int one_address;
+  /* The row states a SET of admissible values, not a window. Its Window cell
+   * holds the values themselves and `lo`/`hi` are unset, so a format that
+   * judges a compile-time default against a row's bounds must skip it: a set
+   * has no bounds to judge against, and reading its zeroed edges as a window
+   * would rule the default out on every run. */
+  int is_set;
+};
+extern struct layout_row layout_rows[LAYOUT_MAX_ROWS];
+extern int n_layout_rows;
+extern const char *const layout_hdr[LAYOUT_COLS];
+void layout_build(void);
+/* The report model for the run being rendered, or NULL where none was built
+ * (the engine-less test build). Formats read the model through this. */
+const struct kasld_report *render_report(void);
+/* True when any row carries a bound -- the model's own answer to "is there a
+ * table to draw", which every format asks instead of inferring it from the
+ * summary's slot counts. */
+int layout_has_resolved(void);
+
+/* Build the model from the global component logs / scalar facts / gates. */
+void build_hardening_report(struct hardening_report *r);
+
+/* Hardening assessment renderers — each consumes a built report. text is
+ * appended to text mode under -H; json is embedded under -H -j; markdown is
+ * appended to markdown mode under -H -m. Defined in src/render/hardening.c. */
+/* Virtual + physical ASCII memory-layout maps (verbose). Defined in
+ * src/render/text.c; also embedded, color-free, in a markdown code block. */
+void print_memory_map(void);
+
+/* The -v flow's opening blocks, rendered from the environment snapshot: the
+ * tool banner, then the hardening settings, confinement and source
+ * readability of the vantage the analysis ran from. */
+void render_banner(void);
+void render_system_config(int replay);
+
+void render_hardening_text(void);
+void render_hardening_json(void);
+void render_hardening_markdown(void);
+
+#endif /* KASLD_RENDER_INTERNAL_H */

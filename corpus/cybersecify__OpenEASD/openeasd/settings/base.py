@@ -1,0 +1,694 @@
+"""
+Django settings for OpenEASD project.
+
+OpenEASD - Automated External Attack Surface Detection
+Company: Cybersecify | Authors: Rathnakara GN, Ashok Kamat
+"""
+
+import os
+import sys
+from datetime import timedelta
+from pathlib import Path
+
+from django.core.exceptions import ImproperlyConfigured
+from decouple import config
+
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+
+SECRET_KEY = config("SECRET_KEY", default="django-insecure-change-me-in-production")
+
+# Encrypts secrets stored at rest (BYOK API keys, webhook URLs) via
+# apps.core.fields.EncryptedField. Optional: when unset, a key is derived from
+# SECRET_KEY. Set it (a urlsafe-base64 32-byte Fernet key, e.g.
+# `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`)
+# to decouple secret encryption from SECRET_KEY rotation. Changing whichever key
+# is in effect makes already-stored secrets unreadable (re-enter them).
+FIELD_ENCRYPTION_KEY = config("FIELD_ENCRYPTION_KEY", default="")
+
+DEBUG = config("DEBUG", default=False, cast=bool)
+
+
+def _validate_secret_key(secret_key: str, debug: bool) -> None:
+    """Fail fast in production on an unset/placeholder SECRET_KEY.
+
+    The key also signs JWTs (NINJA_JWT["SIGNING_KEY"] below), so the well-known
+    default would let anyone forge access/refresh tokens for any user. DEBUG
+    builds keep the default for local dev.
+    """
+    if not debug and secret_key.startswith("django-insecure"):
+        raise ImproperlyConfigured(
+            "SECRET_KEY is unset or still the insecure default while DEBUG=False. "
+            "Generate one with `openssl rand -hex 32` and set it via the SECRET_KEY "
+            "environment variable. This key also signs JWT access/refresh tokens, so "
+            "the default value allows anyone to forge authentication tokens."
+        )
+
+
+def _under_pytest() -> bool:
+    """True only when the pytest runner is the actual process entrypoint.
+
+    The production fail-fast guards below skip under the test runner: pytest-django
+    imports settings before any conftest/env hook can provide real secrets, and
+    key/password strength is irrelevant to tests. We detect the *runner* via
+    ``sys.argv[0]`` rather than ``"pytest" in sys.modules`` (F-sec2) — a transitive
+    import of pytest in a production process (a dependency, a debug shell) must
+    never disable a security guard. The subprocess wiring tests run ``python -c``
+    (argv[0] != pytest), so the guards still fire there and prove it.
+    """
+    return os.path.basename(sys.argv[0] or "").startswith(("pytest", "py.test"))
+
+
+if not _under_pytest():
+    _validate_secret_key(SECRET_KEY, DEBUG)
+
+ALLOWED_HOSTS = config("ALLOWED_HOSTS", default="localhost,127.0.0.1").split(",")
+
+# --- Production HTTPS / security hardening (DEBUG=False only) ---
+def _security_settings(debug: bool) -> dict:
+    """Production security flags. Pure + testable (see test_settings_security).
+
+    - SECURE_PROXY_SSL_HEADER is always set: behind a TLS-terminating proxy
+      (Caddy/nginx/Cloudflare) it lets Django see the original HTTPS scheme; with
+      no proxy it is simply never matched, so it is harmless.
+    - The rest apply only outside DEBUG. Cookies are secure-by-default (an
+      HTTP-only deploy should fix TLS, not weaken this). SSL redirect + HSTS
+      default OFF because enabling them before TLS is terminated breaks the site
+      (redirect loop / HSTS pin) — turn them on via env once TLS is in front.
+    """
+    flags = {"SECURE_PROXY_SSL_HEADER": ("HTTP_X_FORWARDED_PROTO", "https")}
+    if not debug:
+        flags.update(
+            SESSION_COOKIE_SECURE=config("SESSION_COOKIE_SECURE", default=True, cast=bool),
+            CSRF_COOKIE_SECURE=config("CSRF_COOKIE_SECURE", default=True, cast=bool),
+            SECURE_CONTENT_TYPE_NOSNIFF=True,
+            SECURE_SSL_REDIRECT=config("SECURE_SSL_REDIRECT", default=False, cast=bool),
+            SECURE_HSTS_SECONDS=config("SECURE_HSTS_SECONDS", default=0, cast=int),
+            SECURE_HSTS_INCLUDE_SUBDOMAINS=config("SECURE_HSTS_INCLUDE_SUBDOMAINS", default=True, cast=bool),
+            SECURE_HSTS_PRELOAD=config("SECURE_HSTS_PRELOAD", default=False, cast=bool),
+        )
+    return flags
+
+
+globals().update(_security_settings(DEBUG))
+
+# Allow Vite dev server to make CSRF-protected POST requests in development
+CSRF_TRUSTED_ORIGINS = config(
+    "CSRF_TRUSTED_ORIGINS",
+    default="http://localhost:5173,http://127.0.0.1:5173",
+).split(",")
+
+INSTALLED_APPS = [
+    "django.contrib.admin",
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
+    # Local apps
+    "apps.core.console.dashboard",
+    "apps.core.data.assets",
+    "apps.core.data.web_assets",
+    "apps.core.engine.service_detection",
+    "apps.core.data.findings",
+    "apps.core.data.issues",
+    "apps.core.data.asset_inventory",
+    "apps.core.engine.scans",
+    "apps.core.data.domains",
+    "apps.core.engine.workflows",
+    "apps.core.engine.scheduler",
+    "apps.core.console.notifications",
+    "apps.core.console.credentials",
+    "apps.core.console.insights",
+    "apps.core.console.reports",
+    "apps.core.console.ai",
+    "apps.core.engine.durable",
+    "ninja_jwt",
+    "ninja_jwt.token_blacklist",
+    "apps.domain_security",
+    "apps.domain_probe",
+    "apps.asn_cluster",
+    "apps.hudson_rock",
+    "apps.breach_check",
+    "apps.dns_history",
+    "apps.subfinder",
+    "apps.amass",
+    "apps.asn_discovery",
+    "apps.alterx",
+    "apps.dnsx",
+    "apps.takeover_check",
+    "apps.cloud_assets",
+    "apps.naabu",
+    # Web tools — disabled for non-web focus (re-enable for full scan)
+    "apps.httpx",
+    "apps.historical_urls",
+    "apps.katana",
+    "apps.nmap",
+    "apps.tls_checker",
+    "apps.ssh_checker",
+    "apps.nuclei",
+    "apps.nuclei_network",
+    "apps.web_checker",
+    "apps.js_secrets",
+    "apps.shodan",
+    "apps.tldsquatting",
+    "apps.github_secrets",
+    "apps.github_recon",
+    "apps.cve_intel",
+]
+
+MIDDLEWARE = [
+    "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    "apps.core.console.api.ratelimit.LoginRateLimitMiddleware",
+]
+
+# Brute-force rate limiting for POST /api/token/pair (see apps/core/api/ratelimit.py).
+LOGIN_RATELIMIT_ENABLED = config("LOGIN_RATELIMIT_ENABLED", default=True, cast=bool)
+# Whether to key the limiter on the leftmost X-Forwarded-For entry (the client,
+# behind the mandated TLS reverse proxy) vs the raw REMOTE_ADDR. Keep True for the
+# standard proxied deployment. Set False ONLY if OpenEASD is somehow exposed
+# without a trusted proxy — then XFF is attacker-controllable and would let a
+# brute-forcer rotate the header to evade the per-IP limit; REMOTE_ADDR (the TCP
+# peer) is unspoofable but, behind a proxy, is the proxy itself (one shared IP).
+LOGIN_RATELIMIT_TRUST_FORWARDED_FOR = config(
+    "LOGIN_RATELIMIT_TRUST_FORWARDED_FOR", default=True, cast=bool
+)
+LOGIN_RATELIMIT_MAX_FAILURES = config("LOGIN_RATELIMIT_MAX_FAILURES", default=5, cast=int)
+LOGIN_RATELIMIT_WINDOW_SECONDS = config("LOGIN_RATELIMIT_WINDOW_SECONDS", default=900, cast=int)
+LOGIN_RATELIMIT_LOCKOUT_SECONDS = config("LOGIN_RATELIMIT_LOCKOUT_SECONDS", default=900, cast=int)
+
+ROOT_URLCONF = "openeasd.urls"
+
+TEMPLATES = [
+    {
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "DIRS": [BASE_DIR / "templates", BASE_DIR / "frontend" / "dist"],
+        "APP_DIRS": True,
+        "OPTIONS": {
+            "context_processors": [
+                "django.template.context_processors.debug",
+                "django.template.context_processors.request",
+                "django.contrib.auth.context_processors.auth",
+                "django.contrib.messages.context_processors.messages",
+            ],
+        },
+    },
+]
+
+WSGI_APPLICATION = "openeasd.wsgi.application"
+ASGI_APPLICATION = "openeasd.asgi.application"
+
+# Database
+# PostgreSQL — the `local` branch re-platforms off SQLite so DBOS can back
+# durable scan execution and so scans can run with real concurrency (no more
+# single-writer lock). Configure via DB_* env vars; DATABASE_URL wins if set.
+_DATABASE_URL = config("DATABASE_URL", default="")
+_DB_PASSWORD = config("DB_PASSWORD", default="openeasd")  # only used on the DB_* path
+
+
+def _validate_db_password(using_database_url: bool, db_password: str, debug: bool) -> None:
+    """Fail fast in production on the well-known default DB password.
+
+    Mirrors _validate_secret_key. Only the DB_* path carries a default
+    ('openeasd'); DATABASE_URL supplies its own credentials, so it's exempt.
+    A shipped default password is a trivial foothold on the database that holds
+    every scan result AND the encrypted BYOK credentials. DEBUG builds keep the
+    default for local dev.
+    """
+    if not debug and not using_database_url and db_password == "openeasd":
+        raise ImproperlyConfigured(
+            "DB_PASSWORD is still the insecure default 'openeasd' while DEBUG=False. "
+            "Set a strong DB_PASSWORD (or a full DATABASE_URL) via the environment. "
+            "This database holds all scan results and encrypted BYOK credentials, "
+            "so the well-known default leaves them open to anyone who can reach it."
+        )
+
+
+if _DATABASE_URL:
+    import dj_database_url  # type: ignore
+
+    DATABASES = {"default": dj_database_url.parse(_DATABASE_URL, conn_max_age=600, conn_health_checks=True)}
+else:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": config("DB_NAME", default="openeasd"),
+            "USER": config("DB_USER", default="openeasd"),
+            "PASSWORD": _DB_PASSWORD,
+            "HOST": config("DB_HOST", default="127.0.0.1"),
+            "PORT": config("DB_PORT", default="5432"),
+            "CONN_MAX_AGE": config("DB_CONN_MAX_AGE", default=600, cast=int),
+            # With persistent connections (CONN_MAX_AGE>0), verify a reused
+            # connection is still alive before handing it out and transparently
+            # reconnect if the server dropped it (e.g. a Postgres restart/OOM).
+            # Without this, a reused dead connection raises "the connection is
+            # closed" until it ages out — the error that wedged the worker for
+            # hours after a Postgres OOM.
+            "CONN_HEALTH_CHECKS": config("DB_CONN_HEALTH_CHECKS", default=True, cast=bool),
+        }
+    }
+
+# Skip under the test runner for the same reason as the SECRET_KEY guard (see
+# _under_pytest — runner-entrypoint detection, not mere importability).
+if not _under_pytest():
+    _validate_db_password(bool(_DATABASE_URL), _DB_PASSWORD, DEBUG)
+
+# DBOS durable-execution system database. Checkpoints scan workflows/steps so a
+# crashed or restarted worker RESUMES a scan instead of losing it (retiring the
+# reap_stuck_scans watchdog). By default it shares the app's Postgres via a
+# dedicated `dbos` schema; the SQLAlchemy URL is derived from DATABASES in
+# apps/core/durable/dbos_app.py. Override with DBOS_DATABASE_URL to isolate it.
+DBOS_DATABASE_URL = config("DBOS_DATABASE_URL", default="")
+
+# Password validation
+AUTH_PASSWORD_VALIDATORS = [
+    {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
+    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
+    {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
+    {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
+]
+
+LANGUAGE_CODE = "en-us"
+TIME_ZONE = "Asia/Kolkata"
+USE_I18N = True
+USE_TZ = True
+
+STATIC_URL = "static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
+STATICFILES_DIRS = [
+    BASE_DIR / "frontend" / "dist",
+]
+STORAGES = {
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+    },
+}
+
+MEDIA_URL = "media/"
+MEDIA_ROOT = BASE_DIR / "data" / "media"
+
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+# Scan schedule (24h clock, uses TIME_ZONE above)
+SCAN_DAILY_HOUR = config("SCAN_DAILY_HOUR", default=2, cast=int)
+SCAN_DAILY_MINUTE = config("SCAN_DAILY_MINUTE", default=0, cast=int)
+
+# Set to False on extra gunicorn workers so only one process runs the scheduler
+SCHEDULER_ENABLED = config("SCHEDULER_ENABLED", default=True, cast=bool)
+
+# Master switch for unattended scanning (daily scan + per-domain monitoring).
+# Default True preserves self-hosted behaviour. Set False for a manual-only
+# deployment (e.g. a managed instance that must never scan without an explicit,
+# per-request approval) — no auto-scan schedules are registered, and any that
+# already exist are removed on the next scheduler startup. Manual/API scans are
+# unaffected. Independent of the authorization gate below, which blocks
+# unauthorized domains even when this is True.
+SCHEDULED_SCANS_ENABLED = config("SCHEDULED_SCANS_ENABLED", default=True, cast=bool)
+
+# OpenEASD Configuration
+OPENEASD_CONFIG_DIR = BASE_DIR / "config"
+OPENEASD_DATA_DIR = BASE_DIR / "data"
+OPENEASD_LOGS_DIR = BASE_DIR / "logs"
+
+# Ensure required directories exist at startup
+for _dir in [OPENEASD_DATA_DIR, OPENEASD_LOGS_DIR]:
+    _dir.mkdir(parents=True, exist_ok=True)
+
+# Per-scan wall-clock cap (seconds). Under DBOS this bounds a scan step; a full
+# scan can legitimately run for hours (nuclei up to NUCLEI_TIMEOUT), so keep it
+# generous. The stuck-scan watchdog (SCAN_TIMEOUT_MINUTES) must stay >= this so
+# it only reaps genuinely orphaned scans, never a healthy long-running one.
+SCAN_TASK_TIMEOUT = config("SCAN_TASK_TIMEOUT", default=86400, cast=int)  # 24h
+
+# DBOS is the entire task/execution + scheduling layer on this branch (durable,
+# resumable, Postgres-backed) — Django-Q has been removed. Scan-execution tuning
+# consumed in apps/core/durable.
+DBOS_APP_NAME = config("DBOS_APP_NAME", default="openeasd")
+# Max scans executing concurrently across all workers. Postgres (unlike SQLite)
+# handles concurrent writers, so this can be >1 — bounded here to protect target
+# politeness and host RAM (nuclei/amass are memory-hungry).
+DBOS_SCAN_CONCURRENCY = config("DBOS_SCAN_CONCURRENCY", default=2, cast=int)
+SCAN_STEP_TIMEOUT = config("SCAN_STEP_TIMEOUT", default=SCAN_TASK_TIMEOUT, cast=int)
+
+# Scan retention / pruning (H3 — bounded result store). OFF by default: pruning
+# deletes scan history (cascading to its assets/findings), so it is opt-in. When
+# enabled, prune_old_scans keeps, per domain, the newest KEEP_PER_DOMAIN scans AND
+# any scan newer than MAX_AGE_DAYS; older ones are deleted. The single latest scan
+# per domain is ALWAYS kept regardless. The persistent asset_inventory + Issue
+# registers preserve the long-term "surface over time" story, so pruning raw scan
+# rows does not lose it. Set MAX_AGE_DAYS=0 to disable the age rule (count only).
+SCAN_RETENTION_ENABLED = config("SCAN_RETENTION_ENABLED", default=False, cast=bool)
+SCAN_RETENTION_KEEP_PER_DOMAIN = config("SCAN_RETENTION_KEEP_PER_DOMAIN", default=30, cast=int)
+SCAN_RETENTION_MAX_AGE_DAYS = config("SCAN_RETENTION_MAX_AGE_DAYS", default=180, cast=int)
+
+# Prometheus metrics endpoint (H2). GET /metrics is UNAUTHENTICATED (counts only,
+# no finding detail), so it is OPT-IN: OFF by default (404). Enable it deliberately
+# (METRICS_ENABLED=true) once the endpoint is network-restricted to your scraper —
+# leaving it public exposes aggregate posture (open-finding counts by severity, scan
+# activity) to any caller. (M3, API security review.)
+METRICS_ENABLED = config("METRICS_ENABLED", default=False, cast=bool)
+
+# Finding verification — deterministic re-probe of medium+ findings at finalize.
+FINDING_VERIFICATION_ENABLED = config("FINDING_VERIFICATION_ENABLED", default=True, cast=bool)
+FINDING_VERIFICATION_MIN_SEVERITY = config("FINDING_VERIFICATION_MIN_SEVERITY", default="medium")
+
+# tldsquatting FP reduction — collapse benign lookalike classes (owned/parked/
+# unrelated/pre_existing, from apps/tldsquatting/classify.py) into a single
+# info-severity rollup Finding per class instead of one Finding per domain.
+# Threat-classified lookalikes always stay individual regardless of this flag.
+TLDSQUATTING_COLLAPSE_BENIGN = config("TLDSQUATTING_COLLAPSE_BENIGN", default=True, cast=bool)
+
+# Scanner timeouts (seconds) — override in .env if needed
+SCANNER_DNS_TIMEOUT = config("SCANNER_DNS_TIMEOUT", default=5, cast=int)
+SCANNER_HTTP_TIMEOUT = config("SCANNER_HTTP_TIMEOUT", default=10, cast=int)
+
+# Alert channels — set either or both in .env to enable
+SLACK_WEBHOOK_URL = config("SLACK_WEBHOOK_URL", default="")
+MS_TEAMS_WEBHOOK_URL = config("MS_TEAMS_WEBHOOK_URL", default="")
+
+# Minimum severity to trigger an alert: critical / high / medium / low
+ALERT_SEVERITY_THRESHOLD = config("ALERT_SEVERITY_THRESHOLD", default="high")
+
+# Report CTA — optional call-to-action rendered at the end of PDF and CSV
+# exports. Both default to empty (self-hosters get a clean report with no
+# upsell). Operators of hosted-snapshot deployments can set these to point
+# report readers at a follow-up resource. The CTA block is rendered only
+# when BOTH url and text are non-empty.
+REPORT_CTA_URL = config("REPORT_CTA_URL", default="")
+REPORT_CTA_TEXT = config("REPORT_CTA_TEXT", default="")
+
+# Tool paths — defaults resolve via PATH so the same setting works for:
+#   - Container deploys (tools in /usr/local/bin, per Dockerfile)
+#   - Local dev with pdtm (~/.pdtm/go/bin is added to PATH by pdtm install)
+#   - Local dev with system-installed tools (apt/brew/go install — anywhere on PATH)
+# Override individually via env (TOOL_SUBFINDER=/full/path) when PATH won't do.
+TOOL_SUBFINDER = config("TOOL_SUBFINDER", default="subfinder")
+TOOL_DNSX = config("TOOL_DNSX", default="dnsx")
+TOOL_NAABU = config("TOOL_NAABU", default="naabu")
+TOOL_HTTPX = config("TOOL_HTTPX", default="httpx")
+TOOL_GAU = config("TOOL_GAU", default="gau")
+TOOL_KATANA = config("TOOL_KATANA", default="katana")
+TOOL_NMAP = config("TOOL_NMAP", default="nmap")
+TOOL_NUCLEI = config("TOOL_NUCLEI", default="nuclei")
+TOOL_AMASS = config("TOOL_AMASS", default="amass")
+TOOL_ALTERX = config("TOOL_ALTERX", default="alterx")
+TOOL_CLOUD_ENUM = config("TOOL_CLOUD_ENUM", default="cloud_enum")
+TOOL_GITLEAKS = config("TOOL_GITLEAKS", default="gitleaks")
+
+# Shodan passive-exposure tool (apps/shodan). BYOK: with no key it uses Shodan's
+# FREE InternetDB endpoint (ports + CVEs, no credits) — so the tool always adds
+# value out of the box. Set SHODAN_API_KEY (per-deployment secret, NEVER baked
+# into the public image — that would leak the key and breach Shodan's ToS) to
+# upgrade to the full host API (service banners + versions). SHODAN_MAX_IPS caps
+# the paid path's per-scan queries to protect the plan's credit quota (the free
+# InternetDB path is uncapped — it costs no credits).
+# NOTE ON COMMERCIAL USE: Shodan's free InternetDB is licensed for NON-COMMERCIAL
+# use ("you can use it at a company but you can't use it to build commercial
+# products that you charge money for"). If you build a PAID product/service on
+# OpenEASD, supply your own paid Shodan plan via SHODAN_API_KEY (which switches to
+# the licensed host API) or disable the shodan tool. See THIRD_PARTY_NOTICES.md.
+SHODAN_API_KEY = config("SHODAN_API_KEY", default="")
+SHODAN_MAX_IPS = config("SHODAN_MAX_IPS", default=50, cast=int)
+
+# GitHub tools — both passive, BYO-token, sharing GITHUB_TOKEN/GITHUB_ORG.
+#   * apps/github_secrets — searches public GitHub code-search for the org's leaked
+#     secrets. BYOK MANDATORY (code-search needs auth; no token -> logged no-op).
+#   * apps/github_recon — enumerates the org's public repos + surfaces infra
+#     references. Works KEYLESS at 60 req/hr (capped by GITHUB_MAX_REPOS/REQUESTS);
+#     richer with a token at 5000 req/hr.
+# GITHUB_TOKEN is a PER-DEPLOYMENT secret — NEVER bake it into the public image
+# (that would leak the token + spend the operator's quota). A read-only/public-scope
+# PAT is sufficient. GITHUB_ORG pins the org (recommended; auto-derivation from the
+# domain apex label is best-effort). GitHub API ToS applies: official API only,
+# honour rate limits. GITHUB_SECRETS_GLOBAL_SEARCH adds a noisy un-scoped search
+# (github_secrets only, off by default).
+GITHUB_TOKEN = config("GITHUB_TOKEN", default="")
+GITHUB_ORG = config("GITHUB_ORG", default="")
+GITHUB_API_BASE = config("GITHUB_API_BASE", default="https://api.github.com")
+GITHUB_SECRETS_GLOBAL_SEARCH = config("GITHUB_SECRETS_GLOBAL_SEARCH", default=False, cast=bool)
+GITHUB_MAX_REPOS = config("GITHUB_MAX_REPOS", default=50, cast=int)
+GITHUB_MAX_REQUESTS = config("GITHUB_MAX_REQUESTS", default=100, cast=int)
+
+# Agentic AI subsystem (apps/core/ai). BYOK: Cloudflare Workers AI, called
+# directly from Django (D-014 as amended). Entirely OFF unless credentials
+# are available AND the operator enables the feature AND records consent in
+# the UI — with any of those missing, every scan runs exactly as if this
+# subsystem did not exist. Credentials are PER-DEPLOYMENT secrets (never
+# baked into the public image): the operator saves them on the /ai page
+# (stored in AISettings, write-only through the API — never serialized back
+# out), or supplies these env vars as fallback (DB wins, NotificationConfig
+# webhook precedent). Finding data is sent to Cloudflare only on consented
+# deployments; prompt and response bodies are NEVER persisted (AIInvocation
+# audit rows carry metadata only — D-013 4c). CLOUDFLARE_AI_MAX_CALLS_PER_SCAN
+# is a hard per-scan budget the client enforces so no agent loop can run up
+# the operator's bill.
+CLOUDFLARE_ACCOUNT_ID = config("CLOUDFLARE_ACCOUNT_ID", default="")
+CLOUDFLARE_API_TOKEN = config("CLOUDFLARE_API_TOKEN", default="")
+CLOUDFLARE_AI_MODEL = config(
+    "CLOUDFLARE_AI_MODEL", default="@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+)
+CLOUDFLARE_AI_TIMEOUT = config("CLOUDFLARE_AI_TIMEOUT", default=120, cast=int)
+CLOUDFLARE_AI_MAX_CALLS_PER_SCAN = config(
+    "CLOUDFLARE_AI_MAX_CALLS_PER_SCAN", default=10, cast=int
+)
+
+# Honest scanner identity. Sent as the User-Agent on the tools that probe the
+# target's web surface (httpx, katana, nuclei) so a customer can deliberately
+# allowlist us. Some nuclei templates hard-set their own UA; those are not
+# overridden. See docs/specs/2026-08-16-waf-coverage-honest-scope.md (C3).
+OPENEASD_USER_AGENT = config(
+    "OPENEASD_USER_AGENT",
+    default="OpenEASD/1.0 (+https://cybersecify.com/openeasd)",
+)
+
+# dns_history (passive): BYO passive-DNS JSON endpoint returning historical
+# A/AAAA/MX records for `?domain=<domain>`. Unset → the tool no-ops.
+DNS_HISTORY_API_URL = config("DNS_HISTORY_API_URL", default="")
+
+# Resource profile — adapts scan behaviour to the host's specs.
+#   low      : same-phase tools run sequentially, nuclei throttled, amass skips
+#              brute — survives ~1 GB without OOM (slower).
+#   balanced : phase-parallel, nuclei -c 25 (the previous default).
+#   high     : phase-parallel + higher LOCAL concurrency and deeper enumeration
+#              for big boxes. Per-target request rate stays polite on purpose —
+#              a bigger box is no licence to hammer the target (and higher rates
+#              just trip WAFs, which the coverage report then flags).
+# OPENEASD_PROFILE = auto (default) | low | balanced | high. "auto" picks from
+# host RAM. OPENEASD_LOW_MEMORY=true is kept as a back-compat alias for low.
+def _detect_ram_gb():
+    """Best-effort total RAM in GB (Linux/macOS via sysconf); None if unknown."""
+    try:
+        return (os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")) / (1024 ** 3)
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+def _resolve_profile() -> str:
+    if config("OPENEASD_LOW_MEMORY", default=False, cast=bool):
+        return "low"  # explicit legacy flag wins
+    p = config("OPENEASD_PROFILE", default="auto").lower()
+    if p in ("low", "balanced", "high"):
+        return p
+    ram = _detect_ram_gb()  # auto
+    if ram is None:
+        return "balanced"
+    if ram < 2:
+        return "low"
+    if ram >= 8:
+        return "high"
+    return "balanced"
+
+
+PROFILE = _resolve_profile()
+LOW_MEMORY = PROFILE == "low"  # runner serialises + amass skips brute when true
+
+# Per-profile tuning. nuclei_rate (per-target request rate) is deliberately
+# capped — it scales politely, NOT with your CPU, to stay under WAF/abuse
+# thresholds. nuclei_c raises local template parallelism.
+#
+# nuclei_sev scopes which template severities run. This is the single biggest
+# lever for nuclei's two real problems: (1) FREEZE — nuclei compiles its whole
+# template set (~13.5k) into RAM at startup regardless of target count; ~38% of
+# templates are `info` and ~4% `low`, and dropping them cuts the load memory that
+# swaps a 1 GB box. (2) TIMEOUT — fewer templates means fewer requests per target,
+# so the run finishes inside the wall-clock cap. `info` findings are also mostly
+# recon noise for a prioritised attack-surface report and are already covered by
+# httpx tech-detect + web_checker, so dropping them raises signal, not lowers it.
+# low profile is tightest (critical/high/medium); bigger boxes also run `low`.
+#
+# nuclei_bs (-bulk-size) is the REAL peak-memory lever. nuclei parses all ~13.5k
+# templates up front regardless (~500 MB fixed — so -severity does NOT shrink the
+# startup parse; it only cuts the executed set → fewer requests → no TIMEOUT).
+# Runtime peak ≈ c × bulk_size × per-host response buffer, so on a 1 GB box the
+# bound that actually prevents the FREEZE is GOMEMLIMIT + a small bulk_size.
+# Default bulk_size is 25; we scale it down hard on the low profile.
+_PROFILE_TUNING = {
+    "low":      {"nuclei_c": 10, "nuclei_rate": 40,  "nuclei_sev": "critical,high,medium,low", "nuclei_bs": 5},
+    "balanced": {"nuclei_c": 25, "nuclei_rate": 100, "nuclei_sev": "critical,high,medium,low", "nuclei_bs": 15},
+    "high":     {"nuclei_c": 40, "nuclei_rate": 150, "nuclei_sev": "critical,high,medium,low", "nuclei_bs": 25},
+}
+NUCLEI_CONCURRENCY = _PROFILE_TUNING[PROFILE]["nuclei_c"]
+NUCLEI_RATE_LIMIT = _PROFILE_TUNING[PROFILE]["nuclei_rate"]
+NUCLEI_BULK_SIZE = _PROFILE_TUNING[PROFILE]["nuclei_bs"]
+# Optional cap on how many URLs nuclei probes. Default 0 = NO CAP — scan the whole
+# discovered surface and deliver complete results (the product's whole value). We
+# give nuclei the TIME to finish (NUCLEI_TIMEOUT below + the 24h scan watchdog)
+# rather than truncating its output. A deployment that WANTS to bound it can set
+# NUCLEI_MAX_TARGETS>0; when it does, live-probed (httpx) URLs are prioritised and
+# the truncation is logged (never silent).
+NUCLEI_MAX_TARGETS = config("NUCLEI_MAX_TARGETS", default=0, cast=int)
+# Wall-clock cap for the whole nuclei run. Generous by default (6h) so nuclei
+# actually FINISHES a large surface instead of being cut off mid-scan — completing
+# with full output matters more than finishing fast, and the scan window is 48h.
+NUCLEI_TIMEOUT = config("NUCLEI_TIMEOUT", default=21600, cast=int)
+# Overridable: drop to critical,high,medium to trade coverage for speed, or add
+# info to include tech-detect templates (noisy, redundant with httpx tech-detect).
+NUCLEI_SEVERITY = config("NUCLEI_SEVERITY", default=_PROFILE_TUNING[PROFILE]["nuclei_sev"])
+
+# Soft memory ceiling for the nuclei/nuclei_network Go processes. nuclei loads
+# its whole template set into RAM (the real footprint — independent of the polite
+# rate cap), which on a 1 GB box swaps hard and can freeze the whole host,
+# including the web UI, for minutes. GOMEMLIMIT makes the Go runtime GC
+# aggressively as it nears the ceiling, holding RSS down (costs some CPU, keeps
+# full template coverage). Only applied in the low profile; empty = leave Go's
+# default (unbounded) alone. GOGC lowered alongside to trade CPU for memory.
+NUCLEI_GOMEMLIMIT = config("NUCLEI_GOMEMLIMIT", default=("600MiB" if LOW_MEMORY else ""))
+
+# Hudson Rock (Cavalier) OSINT API base — free, keyless infostealer-exposure
+# intelligence. OSS use permitted by Hudson Rock co-founder Alon Gal. Overridable
+# for testing / self-hosting.
+HUDSON_ROCK_BASE_URL = config(
+    "HUDSON_ROCK_BASE_URL",
+    default="https://cavalier.hudsonrock.com/api/json/v2/osint-tools",
+)
+
+# Breach-exposure tool (apps/breach_check). Two-tier BYOK: with no key it uses
+# XposedOrNot's FREE keyless public breach catalog (which known breaches are tied
+# to the domain) — so the tool always adds value out of the box. Set HIBP_API_KEY
+# (a per-deployment secret, NEVER baked into the public image — that would leak
+# the operator's paid key) to switch to the authoritative Have I Been Pwned
+# breacheddomain endpoint, which also needs the operator to have verified domain
+# ownership with HIBP. Only aggregate counts + public breach metadata are ever
+# stored — never email aliases or credentials. Base URLs overridable for testing.
+HIBP_API_KEY = config("HIBP_API_KEY", default="")
+HIBP_BASE_URL = config("HIBP_BASE_URL", default="https://haveibeenpwned.com/api/v3")
+BREACH_CHECK_XON_BASE_URL = config(
+    "BREACH_CHECK_XON_BASE_URL", default="https://api.xposedornot.com/v1"
+)
+
+# Build provenance — baked into the image at build time (see Dockerfile ARG/ENV
+# + the CI publish job's build-args). Lets a deployer verify exactly what
+# version/commit/date the running image was built from, via GET /health/ and
+# GET /api/version/. Defaults render cleanly for local (non-image) runs.
+OPENEASD_VERSION = config("OPENEASD_VERSION", default="dev")
+OPENEASD_GIT_SHA = config("OPENEASD_GIT_SHA", default="unknown")
+OPENEASD_BUILD_DATE = config("OPENEASD_BUILD_DATE", default="unknown")
+
+# Support/contact address for the in-app "Report an issue" / "Request a feature"
+# links. When set, those buttons become mailto: links to this address (a branded
+# deployment can route them to its own support inbox). When empty (the OSS
+# default), the buttons fall back to filing a GitHub issue with the build
+# auto-attached. Surfaced via GET /api/version/ so the SPA can render either.
+SUPPORT_EMAIL = config("SUPPORT_EMAIL", default="")
+
+# Logging
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "verbose": {
+            "format": "{asctime} {levelname} {name} {message}",
+            "style": "{",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "verbose",
+            "level": "WARNING",
+        },
+        "console_access": {
+            "class": "logging.StreamHandler",
+            "formatter": "verbose",
+            "level": "INFO",
+        },
+        "file": {
+            "class": "logging.FileHandler",
+            "filename": BASE_DIR / "logs" / "openeasd.log",
+            "formatter": "verbose",
+            "level": "DEBUG",
+        },
+    },
+    "root": {
+        "handlers": ["console", "file"],
+        "level": "INFO",
+    },
+    "loggers": {
+        "apps": {
+            "handlers": ["console", "file"],
+            "level": "DEBUG" if DEBUG else "INFO",
+            "propagate": False,
+        },
+        "src": {
+            "handlers": ["file"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        "dbos": {
+            "handlers": ["file"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        "django.server": {
+            "handlers": ["console_access", "file"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        "django.request": {
+            "handlers": ["console", "file"],
+            "level": "WARNING",
+            "propagate": False,
+        },
+        "weasyprint": {
+            "handlers": ["file"],
+            "level": "WARNING",
+            "propagate": False,
+        },
+        "fontTools": {
+            "handlers": ["file"],
+            "level": "WARNING",
+            "propagate": False,
+        },
+    },
+}
+
+# Caches
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+    }
+}
+
+
+# Auth
+LOGIN_URL = "/login/"
+LOGIN_REDIRECT_URL = "/"
+LOGOUT_REDIRECT_URL = "/login/"
+
+# ninja-jwt token configuration
+NINJA_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=60),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
+    "ALGORITHM": "HS256",
+    "SIGNING_KEY": SECRET_KEY,
+    "AUTH_HEADER_TYPES": ("Bearer",),
+    "ROTATE_REFRESH_TOKENS": False,
+    "BLACKLIST_AFTER_ROTATION": False,
+    "UPDATE_LAST_LOGIN": False,
+}

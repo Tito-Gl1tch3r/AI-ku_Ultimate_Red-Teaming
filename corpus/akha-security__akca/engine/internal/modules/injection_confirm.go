@@ -1,0 +1,182 @@
+package modules
+
+import (
+	"html"
+	"net/url"
+	"regexp"
+	"strings"
+
+	"github.com/akha-security/akca/engine/internal/payloadgen"
+)
+
+var (
+	sqliErrorRe = regexp.MustCompile(`(?i)(you have an error in your sql syntax|mysql.*syntax|mysql\s+error|mariadb.*syntax|mariadb\s+error|sqlite3?\.OperationalError|postgresql.*ERROR.*syntax|postgresql\s+error|pg_query\(\)|ora-\d{4,5}|sqlstate\[|unclosed quotation mark|quoted string not properly terminated|warning:\s*mysql|syntax error at or near|incorrect syntax near\s+'|microsoft ole db provider|odbc sql server driver|pg::syntaxerror|PDOException.*SQLSTATE|java\.sql\.SQLException|com\.mysql\.jdbc|org\.postgresql\.util\.PSQLException|sql\s+syntax\s+error|db2.*cli driver|db2.*sql error|sybase.*error|adaptive server|informix.*error|h2 database.*error|cockroachdb.*error|crdb.*internal|clickhouse.*exception|code:\s*\d+.*DB::Exception|snowflake.*error|sql compilation error|duckdb.*error|syntax\s*error:\s*unexpected|syntaxerror:\s*unexpected|syntaxerror:\s*unterminated|unclosed\s+(?:quote|quotation)|unterminated\s+(?:quoted\s+)?string|query\s+failed:\s*error|database\s+query\s+error)`)
+	cmdOutRe    = regexp.MustCompile(`(?i)\buid=\d+(?:\([a-z0-9._-]+\))?\s+gid=\d+(?:\([a-z0-9._-]+\))?(?:\s+groups=\d+(?:\([a-z0-9._-]+\))?(?:,\d+(?:\([a-z0-9._-]+\))?)*)?`)
+	cmdWinDirRe = regexp.MustCompile(`(?is)\bvolume serial number is\b.{0,500}\bdirectory of\b`)
+	xssExecRe   = regexp.MustCompile(`(?i)(<script[^>]*>[\s\S]{0,200}alert\s*\(|<svg[^>]+onload\s*=|<img[^>]+onerror\s*=)`)
+)
+
+func injectionPayloadReflected(payload, body, baseline string) bool {
+	if payload == "" {
+		return false
+	}
+	needle := strings.ToLower(payload)
+	bodyVariants := reflectionDecodeVariants(body)
+	baselineVariants := reflectionDecodeVariants(baseline)
+	for _, candidate := range bodyVariants {
+		if !strings.Contains(candidate, needle) {
+			continue
+		}
+		reflectedInBaseline := false
+		for _, control := range baselineVariants {
+			if strings.Contains(control, needle) {
+				reflectedInBaseline = true
+				break
+			}
+		}
+		if !reflectedInBaseline {
+			return true
+		}
+	}
+	return false
+}
+
+// reflectionDecodeVariants exposes the common representations used when an
+// application copies a request value into HTML, JavaScript or an analytics
+// URL. Comparing decoded probe and baseline variants prevents an encoded echo
+// from being mistaken for server-side execution.
+func reflectionDecodeVariants(value string) []string {
+	seen := map[string]struct{}{}
+	queue := []string{value}
+	variants := make([]string, 0, 8)
+	for depth := 0; depth < 4 && len(queue) > 0; depth++ {
+		current := queue
+		queue = nil
+		for _, raw := range current {
+			normalized := strings.ToLower(raw)
+			normalized = strings.ReplaceAll(normalized, `\/`, "/")
+			for escaped, decoded := range map[string]string{
+				`\u002f`: "/", `\u003a`: ":", `\u0025`: "%", `\u0026`: "&",
+				`\u003f`: "?", `\u003d`: "=", `\u002b`: "+",
+			} {
+				normalized = strings.ReplaceAll(normalized, escaped, decoded)
+			}
+			if _, ok := seen[normalized]; ok {
+				continue
+			}
+			seen[normalized] = struct{}{}
+			variants = append(variants, normalized)
+
+			if decoded := html.UnescapeString(normalized); decoded != normalized {
+				queue = append(queue, decoded)
+			}
+			if decoded, err := url.QueryUnescape(normalized); err == nil && decoded != normalized {
+				queue = append(queue, decoded)
+			}
+			if decoded, err := url.PathUnescape(normalized); err == nil && decoded != normalized {
+				queue = append(queue, decoded)
+			}
+		}
+	}
+	return variants
+}
+
+func sqliSignalConfirmed(p payloadgen.Payload, body, baseline, signal string) bool {
+	if signal == "" || body == "" {
+		return false
+	}
+	if injectionPayloadReflected(p.Value, body, baseline) && signal != "union_signal" && signal != "error_based" &&
+		signal != "timing_differential" && signal != "stacked_timing" && signal != "delayed_timing_confirmed" {
+		return false
+	}
+	// Normalize volatile fields (timestamps, UUIDs, CSRF tokens) before
+	// comparing bodies so that dynamic page elements don't inflate the diff.
+	normBody := normalizeVolatileFields(body)
+	normBase := normalizeVolatileFields(baseline)
+	switch signal {
+	case "error_based":
+		return sqliErrorInBody(body, baseline)
+	case "boolean_pair_confirmed":
+		// This signal is emitted only after the bespoke alternating true/false
+		// verifier has reproduced both branches on the same injection surface.
+		return strings.TrimSpace(body) != ""
+	case "union_signal":
+		return unionSignalConfirmed(p.Value, body, baseline)
+	case "timing_differential", "stacked_timing":
+		return true
+	default:
+		return normBody != normBase && bodyDiffRatio(normBase, normBody) >= 0.03
+	}
+}
+
+func xssSignalConfirmed(p payloadgen.Payload, body, baseline, signal string) bool {
+	if signal == "" || body == "" {
+		return false
+	}
+
+	switch signal {
+	case "reflected_encoded":
+		return false
+	case "reflected", "reflected_browser_execution":
+		if injectionPayloadReflected(p.Value, body, baseline) {
+			if sqliErrorRe.MatchString(body) {
+				return false
+			}
+			return xssExecutableReflection(body, p.Value) && !xssExecutableReflection(baseline, p.Value)
+		}
+		return false
+	case "reflected_partial":
+		return false
+	case "dom_execution", "stored_tracking":
+		if sqliErrorRe.MatchString(body) {
+			return false
+		}
+		return xssExecRe.MatchString(body) && !xssExecRe.MatchString(baseline)
+	default:
+		if sqliErrorRe.MatchString(body) {
+			return false
+		}
+		return xssExecRe.MatchString(body) && !xssExecRe.MatchString(baseline)
+	}
+}
+
+func cmdInjSignalConfirmed(p payloadgen.Payload, body, baseline, signal string) bool {
+	if signal == "" {
+		return false
+	}
+	switch signal {
+	case "canary_output":
+		expected := commandExpectedMarker(p)
+		return expected != "" && !strings.Contains(p.Value, expected) &&
+			strings.Contains(body, expected) && !strings.Contains(baseline, expected)
+	case "separator_output", "command_output":
+		return commandOutputForPayload(p, body) && !commandOutputForPayload(p, baseline)
+	case "timing_signal":
+		return true
+	default:
+		return false
+	}
+}
+
+func commandOutputForPayload(p payloadgen.Payload, body string) bool {
+	signal := strings.ToLower(p.ExpectedSignal)
+	value := strings.ToLower(p.Value)
+	switch {
+	case strings.Contains(signal, "win") && strings.Contains(value, "dir"):
+		return cmdWinDirRe.MatchString(body)
+	case strings.Contains(signal, "win") && strings.Contains(value, "whoami"):
+		// A bare DOMAIN\user line is accepted only for an explicit whoami
+		// payload; arbitrary backslashes elsewhere in HTML are not evidence.
+		for _, line := range strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n") {
+			line = strings.TrimSpace(line)
+			if regexp.MustCompile(`(?i)^[a-z0-9._-]+\\[a-z0-9.$_-]+$`).MatchString(line) {
+				return true
+			}
+		}
+		return false
+	case strings.Contains(value, "id") || strings.Contains(signal, "command_output"):
+		return cmdOutRe.MatchString(body)
+	default:
+		return false
+	}
+}

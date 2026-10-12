@@ -1,0 +1,373 @@
+package neo4j
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
+	"github.com/specterops/dawgs/graph"
+	"github.com/specterops/dawgs/util/size"
+)
+
+type createRelationshipByIDs struct {
+	startID    graph.ID
+	endID      graph.ID
+	kind       graph.Kind
+	properties *graph.Properties
+}
+
+type batchTransaction struct {
+	innerTx                    *neo4jTransaction
+	nodeDeletionBuffer         []graph.ID
+	relationshipDeletionBuffer []graph.ID
+	nodeUpdateBuffer           []*graph.Node
+	nodeUpdateByBuffer         []graph.NodeUpdate
+	relationshipCreateBuffer   []createRelationshipByIDs
+	relationshipUpdateByBuffer []graph.RelationshipUpdate
+	batchWriteSize             int
+}
+
+func (s *batchTransaction) CreateNode(node *graph.Node) error {
+	_, err := s.innerTx.CreateNode(node.Properties, node.Kinds...)
+	return err
+}
+
+func (s *batchTransaction) CreateNodes(nodes []*graph.Node) ([]graph.ID, error) {
+	if len(nodes) == 0 {
+		return nil, nil
+	}
+
+	type nodeCreateGroup struct {
+		labels []string
+		rows   []map[string]any
+	}
+	groups := map[string]*nodeCreateGroup{}
+	for ordinal, node := range nodes {
+		if node == nil {
+			return nil, fmt.Errorf("bulk create node %d is nil", ordinal)
+		}
+
+		labels := node.Kinds.Strings()
+		sort.Strings(labels)
+		labels = compactStrings(labels)
+		key := strings.Join(labels, "\x00")
+		group, found := groups[key]
+		if !found {
+			group = &nodeCreateGroup{labels: labels}
+			groups[key] = group
+		}
+		properties := map[string]any{}
+		if node.Properties != nil {
+			properties = node.Properties.MapOrEmpty()
+		}
+		group.rows = append(group.rows, map[string]any{
+			"ordinal":    ordinal,
+			"properties": properties,
+		})
+	}
+
+	createdIDs := make([]graph.ID, len(nodes))
+	seen := make([]bool, len(nodes))
+	for _, group := range groups {
+		var statement strings.Builder
+		statement.WriteString("unwind $nodes as row create (n")
+		for _, label := range group.labels {
+			statement.WriteString(":")
+			statement.WriteString(label)
+		}
+		statement.WriteString(") set n = row.properties return row.ordinal, id(n)")
+
+		result := s.innerTx.runAndLog(statement.String(), map[string]any{"nodes": group.rows}, len(group.rows))
+		for result.Next() {
+			var ordinal int
+			var id graph.ID
+			if err := result.Scan(&ordinal, &id); err != nil {
+				result.Close()
+				return nil, err
+			}
+			if ordinal < 0 || ordinal >= len(nodes) || seen[ordinal] {
+				result.Close()
+				return nil, fmt.Errorf("bulk create returned invalid node ordinal %d", ordinal)
+			}
+			createdIDs[ordinal] = id
+			seen[ordinal] = true
+		}
+		if err := result.Error(); err != nil {
+			result.Close()
+			return nil, err
+		}
+		result.Close()
+	}
+
+	for ordinal, found := range seen {
+		if !found {
+			return nil, fmt.Errorf("bulk create did not return node ordinal %d", ordinal)
+		}
+	}
+
+	return createdIDs, nil
+}
+
+func compactStrings(values []string) []string {
+	if len(values) < 2 {
+		return values
+	}
+
+	compacted := values[:1]
+	for _, value := range values[1:] {
+		if value != compacted[len(compacted)-1] {
+			compacted = append(compacted, value)
+		}
+	}
+
+	return compacted
+}
+
+func (s *batchTransaction) CreateRelationship(relationship *graph.Relationship) error {
+	return s.CreateRelationshipByIDs(relationship.StartID, relationship.EndID, relationship.Kind, relationship.Properties)
+}
+
+func (s *batchTransaction) WithGraph(graphSchema graph.Graph) graph.Batch {
+	return s
+}
+
+func (s *batchTransaction) Nodes() graph.NodeQuery {
+	return NewNodeQuery(s.innerTx.ctx, s)
+}
+
+func (s *batchTransaction) Relationships() graph.RelationshipQuery {
+	return NewRelationshipQuery(s.innerTx.ctx, s)
+}
+
+func (s *batchTransaction) UpdateNodeBy(update graph.NodeUpdate) error {
+	s.nodeUpdateByBuffer = append(s.nodeUpdateByBuffer, update)
+
+	if len(s.nodeUpdateByBuffer) >= s.batchWriteSize {
+		return s.flushNodeUpdateByBuffer()
+	}
+
+	return nil
+}
+
+func (s *batchTransaction) UpdateNodes(nodes []*graph.Node) error {
+	s.nodeUpdateBuffer = append(s.nodeUpdateBuffer, nodes...)
+
+	if len(s.nodeUpdateBuffer) > s.batchWriteSize {
+		return s.flushNodeUpdateBuffer()
+	}
+
+	return nil
+}
+
+func (s *batchTransaction) UpdateRelationshipBy(update graph.RelationshipUpdate) error {
+	if s.relationshipUpdateByBuffer = append(s.relationshipUpdateByBuffer, update); len(s.relationshipUpdateByBuffer) >= s.batchWriteSize {
+		return s.flushRelationshipUpdates()
+	}
+
+	return nil
+}
+
+func (s *batchTransaction) DeleteNodes(ids []graph.ID) error {
+	return s.innerTx.DeleteNodesBySlice(ids)
+}
+
+func (s *batchTransaction) DeleteRelationships(ids []graph.ID) error {
+	return s.innerTx.DeleteRelationshipsBySlice(ids)
+}
+
+func (s *batchTransaction) Commit() error {
+	if len(s.nodeUpdateByBuffer) > 0 {
+		if err := s.flushNodeUpdateByBuffer(); err != nil {
+			return err
+		}
+	}
+
+	if len(s.nodeUpdateBuffer) > 0 {
+		if err := s.flushNodeUpdateBuffer(); err != nil {
+			return err
+		}
+	}
+
+	if len(s.relationshipCreateBuffer) > 0 {
+		if err := s.flushRelationshipCreation(); err != nil {
+			return err
+		}
+	}
+
+	if len(s.relationshipUpdateByBuffer) > 0 {
+		if err := s.flushRelationshipUpdates(); err != nil {
+			return err
+		}
+	}
+
+	if len(s.nodeDeletionBuffer) > 0 {
+		if err := s.flushNodeDeletions(); err != nil {
+			return err
+		}
+	}
+
+	if len(s.relationshipDeletionBuffer) > 0 {
+		if err := s.flushRelationshipDeletions(); err != nil {
+			return err
+		}
+	}
+
+	return s.innerTx.Commit()
+}
+
+func (s *batchTransaction) Close() error {
+	return s.innerTx.Close()
+}
+
+func (s *batchTransaction) UpdateNode(target *graph.Node) error {
+	return s.UpdateNodes([]*graph.Node{target})
+}
+
+func (s *batchTransaction) CreateRelationshipByIDs(startNodeID, endNodeID graph.ID, kind graph.Kind, properties *graph.Properties) error {
+	nextUpdate := createRelationshipByIDs{
+		startID:    startNodeID,
+		endID:      endNodeID,
+		kind:       kind,
+		properties: properties,
+	}
+
+	if s.relationshipCreateBuffer = append(s.relationshipCreateBuffer, nextUpdate); len(s.relationshipCreateBuffer) >= s.batchWriteSize {
+		return s.flushRelationshipCreation()
+	}
+
+	return nil
+}
+
+func (s *batchTransaction) DeleteNode(id graph.ID) error {
+	if s.nodeDeletionBuffer = append(s.nodeDeletionBuffer, id); len(s.nodeDeletionBuffer) >= s.batchWriteSize {
+		return s.flushNodeDeletions()
+	}
+
+	return nil
+}
+
+func (s *batchTransaction) DeleteRelationship(id graph.ID) error {
+	if s.relationshipDeletionBuffer = append(s.relationshipDeletionBuffer, id); len(s.relationshipDeletionBuffer) >= s.batchWriteSize {
+		return s.flushRelationshipDeletions()
+	}
+
+	return nil
+}
+
+func (s *batchTransaction) UpdateRelationship(relationship *graph.Relationship) error {
+	return s.innerTx.UpdateRelationship(relationship)
+}
+
+func (s *batchTransaction) Raw(cypher string, params map[string]any) graph.Result {
+	return s.innerTx.Raw(cypher, params)
+}
+
+type relationshipCreateByIDBatch struct {
+	numRelationships int
+	queryParameters  map[string]any
+}
+
+func cypherBuildRelationshipCreateByIDBatch(updates []createRelationshipByIDs) ([]string, []relationshipCreateByIDBatch) {
+	var (
+		queries         []string
+		queryParameters []relationshipCreateByIDBatch
+
+		output           = strings.Builder{}
+		updatesByRelKind = map[graph.Kind][]createRelationshipByIDs{}
+	)
+
+	for _, update := range updates {
+		updatesByRelKind[update.kind] = append(updatesByRelKind[update.kind], update)
+	}
+
+	for kind, batchJobs := range updatesByRelKind {
+		output.WriteString("unwind $p as p match (s) where id(s) = p.s match(e) where id(e) = p.e merge (s)-[r:")
+		output.WriteString(kind.String())
+		output.WriteString("]->(e) set r += p.p")
+
+		nextQueryParameters := make([]map[string]any, len(batchJobs))
+
+		for idx, batchJob := range batchJobs {
+			nextQueryParameters[idx] = map[string]any{
+				"s": batchJob.startID,
+				"e": batchJob.endID,
+				"p": batchJob.properties.Map,
+			}
+		}
+
+		queries = append(queries, output.String())
+		queryParameters = append(queryParameters, relationshipCreateByIDBatch{
+			numRelationships: len(nextQueryParameters),
+			queryParameters: map[string]any{
+				"p": nextQueryParameters,
+			},
+		})
+
+		output.Reset()
+	}
+
+	return queries, queryParameters
+}
+
+func (s *batchTransaction) flushRelationshipCreation() error {
+	statements, batches := cypherBuildRelationshipCreateByIDBatch(s.relationshipCreateBuffer)
+
+	for parameterIdx, statement := range statements {
+		nextBatch := batches[parameterIdx]
+
+		if result := s.innerTx.runAndLog(statement, nextBatch.queryParameters, nextBatch.numRelationships); result.Error() != nil {
+			return result.Error()
+		}
+	}
+
+	s.relationshipCreateBuffer = s.relationshipCreateBuffer[:0]
+	return nil
+}
+
+func (s *batchTransaction) flushRelationshipDeletions() error {
+	buffer := s.relationshipDeletionBuffer
+	s.relationshipDeletionBuffer = s.relationshipDeletionBuffer[:0]
+
+	return s.DeleteRelationships(buffer)
+}
+
+func (s *batchTransaction) flushNodeUpdateByBuffer() error {
+	buffer := s.nodeUpdateByBuffer
+	s.nodeUpdateByBuffer = s.nodeUpdateByBuffer[:0]
+
+	return s.innerTx.updateNodesBy(buffer...)
+}
+
+func (s *batchTransaction) flushNodeUpdateBuffer() error {
+	buffer := s.nodeUpdateBuffer
+	s.nodeUpdateBuffer = s.nodeUpdateBuffer[:0]
+
+	return s.innerTx.updateNodeBatch(buffer)
+}
+
+func (s *batchTransaction) flushRelationshipUpdates() error {
+	buffer := s.relationshipUpdateByBuffer
+	s.relationshipUpdateByBuffer = s.relationshipUpdateByBuffer[:0]
+
+	return s.innerTx.updateRelationshipsBy(buffer...)
+}
+
+func (s *batchTransaction) flushNodeDeletions() error {
+	buffer := s.nodeDeletionBuffer
+	s.nodeDeletionBuffer = s.nodeDeletionBuffer[:0]
+
+	return s.innerTx.DeleteNodesBySlice(buffer)
+}
+
+func newBatchOperation(ctx context.Context, session neo4j.Session, cfg graph.TransactionConfig, writeFlushSize int, batchWriteSize int, graphQueryMemoryLimit size.Size) *batchTransaction {
+	return &batchTransaction{
+		innerTx:                    newTransaction(ctx, session, cfg, writeFlushSize, batchWriteSize, graphQueryMemoryLimit),
+		batchWriteSize:             batchWriteSize,
+		nodeDeletionBuffer:         make([]graph.ID, 0, batchWriteSize),
+		relationshipDeletionBuffer: make([]graph.ID, 0, batchWriteSize),
+		nodeUpdateByBuffer:         make([]graph.NodeUpdate, 0, batchWriteSize),
+		relationshipUpdateByBuffer: make([]graph.RelationshipUpdate, 0, batchWriteSize),
+	}
+}

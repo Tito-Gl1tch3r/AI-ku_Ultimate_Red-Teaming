@@ -1,0 +1,247 @@
+package graph_test
+
+import (
+	"strconv"
+	"testing"
+
+	"github.com/cespare/xxhash/v2"
+	"github.com/specterops/dawgs/graph"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestNewProperties(t *testing.T) {
+	properties := graph.NewProperties()
+
+	require.Equal(t, 24, int(properties.SizeOf()))
+	require.Equal(t, 0, properties.Len())
+	require.Equal(t, nil, properties.Get("test").Any())
+	require.Equal(t, map[string]any{}, properties.ModifiedProperties())
+	require.Equal(t, []string(nil), properties.DeletedProperties())
+
+	properties.Delete("test")
+	require.False(t, properties.Exists("not found"))
+	require.Equal(t, "default", properties.GetOrDefault("not found", "default").Any())
+
+	// Set values to trigger allocation of the storage map
+	properties.Set("test", "test")
+	properties.Set("value", "test")
+
+	require.Equal(t, 146, int(properties.SizeOf()))
+
+	properties.Delete("value")
+
+	require.Equal(t, 105, int(properties.SizeOf()))
+
+	require.False(t, properties.Exists("not found"))
+	require.Equal(t, 1, properties.Len())
+	require.Equal(t, "default", properties.GetOrDefault("not found", "default").Any())
+	require.Equal(t, "test", properties.GetOrDefault("test", "default").Any())
+	require.Equal(t, "test", properties.Get("test").Any())
+
+	properties.Delete("test")
+	properties.Set("test", "other")
+
+	require.Equal(t, map[string]any{"test": "other"}, properties.ModifiedProperties())
+
+	_, markedForDeletion := properties.Deleted["test"]
+	require.False(t, markedForDeletion)
+	require.Equal(t, []string{"value"}, properties.DeletedProperties())
+}
+
+func TestSizeOfProperties(t *testing.T) {
+	properties := graph.NewProperties()
+
+	require.Equal(t, 24, int(properties.SizeOf()))
+
+	// Set an initial value to force allocation
+	properties.Set("initial", 0)
+	require.Equal(t, 78, int(properties.SizeOf()))
+
+	// Further allocation past 8 forces a new bucket to be allocated for the backing maps in the properties struct
+	for iter := 0; iter < 8; iter++ {
+		properties.Set("test"+strconv.Itoa(iter), iter)
+	}
+
+	require.Equal(t, 478, int(properties.SizeOf()))
+
+}
+
+func TestAsPropertiesLeavesMutationTrackingLazy(t *testing.T) {
+	properties := graph.AsProperties(map[string]any{"name": "alice"})
+	if properties.Modified != nil || properties.Deleted != nil {
+		t.Fatalf("read-only properties eagerly allocated tracking maps: %+v", properties)
+	}
+
+	clone := properties.Clone()
+	if clone.Modified != nil || clone.Deleted != nil {
+		t.Fatalf("read-only clone eagerly allocated tracking maps: %+v", clone)
+	}
+	if clone.Get("name").Any() != "alice" {
+		t.Fatalf("read-only clone lost property map: %+v", clone)
+	}
+}
+
+func TestPropertiesMutationsInitializeLazyTracking(t *testing.T) {
+	properties := graph.AsProperties(map[string]any{"delete": "value"})
+	properties.Set("set", "value")
+	properties.Delete("delete")
+
+	if _, ok := properties.Modified["set"]; !ok {
+		t.Fatalf("set property was not tracked: %+v", properties)
+	}
+	if _, ok := properties.Deleted["delete"]; !ok {
+		t.Fatalf("deleted property was not tracked: %+v", properties)
+	}
+
+	merged := graph.NewProperties()
+	merged.Merge(properties)
+	if merged.Get("set").Any() != "value" {
+		t.Fatalf("merge lost set property: %+v", merged)
+	}
+	if _, ok := merged.Modified["set"]; !ok {
+		t.Fatalf("merge lost modified tracking: %+v", merged)
+	}
+	if _, ok := merged.Deleted["delete"]; !ok {
+		t.Fatalf("merge lost deleted tracking: %+v", merged)
+	}
+
+	readOnly := graph.NewProperties()
+	readOnly.Merge(graph.AsProperties(map[string]any{"read": "only"}))
+	if readOnly.Modified != nil || readOnly.Deleted != nil {
+		t.Fatalf("read-only merge allocated tracking maps: %+v", readOnly)
+	}
+}
+
+func TestGetWithFallbackProperties(t *testing.T) {
+	properties := graph.NewProperties()
+
+	// Set an initial value to force allocation
+	properties.SetAll(map[string]any{"sugar": "Sugar", "spice": "Spice", "everythingNice": "Everything Nice"})
+
+	t.Run("returns property when exists", func(t *testing.T) {
+		value, err := properties.GetWithFallback("sugar", "").String()
+		require.Nil(t, err)
+		require.Equal(t, "Sugar", value)
+	})
+
+	t.Run("returns fallback property when original property doesn't exists", func(t *testing.T) {
+		value, err := properties.GetWithFallback("missing", "", "spice").String()
+		require.Nil(t, err)
+		require.Equal(t, "Spice", value)
+	})
+
+	t.Run("returns default property when neither fallback nor property exists", func(t *testing.T) {
+		value, err := properties.GetWithFallback("", "ChemicalX", "").String()
+		require.Nil(t, err)
+		require.Equal(t, "ChemicalX", value)
+	})
+}
+
+func TestPropertiesKey(t *testing.T) {
+	// sorted and ignores "z"
+	props := graph.NewProperties()
+	props.SetAll(map[string]any{
+		"z": 1,
+		"a": 2,
+		"m": 3,
+	})
+	ignored := map[string]struct{}{
+		"z": {},
+	}
+
+	got := props.Keys(ignored)
+	want := []string{"a", "m"} // sorted, excludes "z"
+
+	assert.Equal(t, want, got)
+
+	// sorted and ignores all
+	props = graph.NewProperties()
+	props.SetAll(map[string]any{
+		"a": 2,
+	})
+	ignored = map[string]struct{}{
+		"a": {},
+	}
+
+	assert.Empty(t, props.Keys(ignored))
+
+	// sorted and empty
+	props = graph.NewProperties()
+	assert.Empty(t, props.Keys(nil))
+}
+
+func TestPropertiesHash(t *testing.T) {
+	t.Run("Hash is deterministic", func(t *testing.T) {
+		props := graph.NewProperties().SetAll(map[string]any{
+			"foo": "bar",
+			"baz": 42,
+		})
+
+		h := xxhash.New()
+
+		h.Reset()
+		require.NoError(t, props.HashInto(h, nil))
+		sum1 := h.Sum64()
+
+		h.Reset()
+		require.NoError(t, props.HashInto(h, nil))
+		sum2 := h.Sum64()
+
+		assert.Equal(t, sum1, sum2)
+	})
+
+	t.Run("order of keys does not affect hash", func(t *testing.T) {
+		a := graph.NewProperties().SetAll(map[string]any{"x": 1, "y": 2})
+		b := graph.NewProperties().SetAll(map[string]any{"y": 2, "x": 1})
+
+		h := xxhash.New()
+
+		h.Reset()
+		require.NoError(t, a.HashInto(h, nil))
+		sum1 := h.Sum64()
+
+		h.Reset()
+		require.NoError(t, b.HashInto(h, nil))
+		sum2 := h.Sum64()
+
+		assert.Equal(t, sum1, sum2)
+	})
+
+	t.Run("ambiguity is resolved", func(t *testing.T) {
+		a := graph.NewProperties().Set("a", "bc")
+		b := graph.NewProperties().Set("ab", "c")
+
+		h := xxhash.New()
+
+		h.Reset()
+		require.NoError(t, a.HashInto(h, nil))
+		sum1 := h.Sum64()
+
+		h.Reset()
+		require.NoError(t, b.HashInto(h, nil))
+		sum2 := h.Sum64()
+
+		assert.NotEqual(t, sum1, sum2)
+	})
+
+	t.Run("ignored keys", func(t *testing.T) {
+		props := graph.NewProperties().SetAll(map[string]any{
+			"keep": "yes",
+			"drop": "no",
+		})
+		ignored := map[string]struct{}{"drop": {}}
+
+		h := xxhash.New()
+
+		h.Reset()
+		require.NoError(t, props.HashInto(h, nil))
+		sum1 := h.Sum64()
+
+		h.Reset()
+		require.NoError(t, props.HashInto(h, ignored))
+		sum2 := h.Sum64()
+
+		assert.NotEqual(t, sum1, sum2)
+	})
+}

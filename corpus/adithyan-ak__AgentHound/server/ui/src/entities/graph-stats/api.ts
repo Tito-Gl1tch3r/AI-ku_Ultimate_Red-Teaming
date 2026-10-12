@@ -1,0 +1,106 @@
+import { ProjectionConflictError } from "@shared/api/conflicts";
+import { useQuery } from "@tanstack/react-query";
+import { api } from "@shared/api/client";
+import { qk } from "@shared/api/query-keys";
+
+export interface GraphStats {
+  node_counts: Record<string, number>;
+  edge_counts: Record<string, number>;
+  total_nodes: number;
+  total_edges: number;
+  projection: {
+    scanId: string;
+    revision: number;
+    coverageLimited: boolean;
+    coverageLimitationCount: number;
+  };
+}
+
+function record(value: unknown, path: string): Record<string, unknown> {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${path} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function nonNegativeInteger(value: unknown, path: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new TypeError(`${path} must be a non-negative integer`);
+  }
+  return value as number;
+}
+
+function positiveInteger(value: unknown, path: string): number {
+  const result = nonNegativeInteger(value, path);
+  if (result < 1) throw new TypeError(`${path} must be positive`);
+  return result;
+}
+
+function requiredBoolean(value: unknown, path: string): boolean {
+  if (typeof value !== "boolean") {
+    throw new TypeError(`${path} must be a boolean`);
+  }
+  return value;
+}
+
+function counts(value: unknown, path: string): Record<string, number> {
+  const raw = record(value, path);
+  const result: Record<string, number> = {};
+  for (const [key, count] of Object.entries(raw)) {
+    result[key] = nonNegativeInteger(count, `${path}.${key}`);
+  }
+  return result;
+}
+
+export async function fetchGraphStats(): Promise<GraphStats> {
+  const response = await api.get("graph/stats", { throwHttpErrors: false });
+  if (response.status === 409) {
+    const envelope = record(await response.json<unknown>(), "graph conflict");
+    const error = record(envelope.error, "graph conflict.error");
+    if (error.code === "PROJECTION_CONFLICT") {
+      throw new ProjectionConflictError(
+        typeof error.message === "string" ? error.message : undefined,
+        (error.details as { reason?: string } | undefined)?.reason,
+      );
+    }
+  }
+  if (!response.ok) {
+    throw new Error(`graph statistics request failed with status ${response.status}`);
+  }
+  const body = record(await response.json<unknown>(), "graph stats");
+  const projection = record(body.projection, "graph stats.projection");
+  if (
+    typeof projection.scan_id !== "string" ||
+    projection.scan_id.length === 0
+  ) {
+    throw new TypeError("graph stats.projection.scan_id must be a non-empty string");
+  }
+  return {
+    node_counts: counts(body.node_counts, "graph stats.node_counts"),
+    edge_counts: counts(body.edge_counts, "graph stats.edge_counts"),
+    total_nodes: nonNegativeInteger(body.total_nodes, "graph stats.total_nodes"),
+    total_edges: nonNegativeInteger(body.total_edges, "graph stats.total_edges"),
+    projection: {
+      scanId: projection.scan_id,
+      revision: positiveInteger(
+        projection.revision,
+        "graph stats.projection.revision",
+      ),
+      coverageLimited: requiredBoolean(
+        projection.coverage_limited,
+        "graph stats.projection.coverage_limited",
+      ),
+      coverageLimitationCount: nonNegativeInteger(
+        projection.coverage_limitation_count,
+        "graph stats.projection.coverage_limitation_count",
+      ),
+    },
+  };
+}
+
+export function useGraphStats() {
+  return useQuery({
+    queryKey: qk.graphStats(),
+    queryFn: fetchGraphStats,
+  });
+}

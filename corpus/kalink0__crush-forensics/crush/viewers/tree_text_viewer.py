@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 - now Marco Neumann (kalink0)
+"""Combined decoded-tree + raw-text viewer, used for JSON, XML, and plist."""
+from __future__ import annotations
+
+from typing import Any
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import QLabel, QTabWidget, QVBoxLayout, QWidget
+
+from crush.core.issues import ParseIssue, render_value
+
+from crush.viewers.text_viewer import TextView
+from crush.viewers.tree_viewer import TreeViewer
+from crush.ui.i18n import translate
+
+
+class TreeTextViewer(QWidget):
+    """Tabbed viewer: decoded tree structure alongside the raw/reconstructed text."""
+
+    # Bytes from a widget inside this viewer (a nested table, the BLOB
+    # Inspector, ...) to open as a new tab -- see crush/viewers/open_bytes.py.
+    open_bytes_with_format_requested = Signal(bytes, str, object, dict)
+
+    def __init__(
+        self,
+        data: Any,
+        parent: QWidget | None = None,
+        raw_text: str | bytes = "",
+        archive: Any = None,
+        status: ParseIssue | list[ParseIssue] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._raw_text = raw_text
+        self._text_view: TextView | None = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Why Decoded isn't the resolved structure (e.g. an NSKeyedArchiver
+        # archive that couldn't be resolved and is shown as stored): said
+        # above the tabs, not only in the Properties panel.
+        if status is not None:
+            label = QLabel(render_value(status, localized=True))
+            label.setObjectName("tree_text_status")
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setStyleSheet("padding: 4px 8px; color: #cc8800;")
+            layout.addWidget(label)
+
+        self._tabs = QTabWidget()
+        # Only a tree resolved from an NSKeyedArchiver archive folds its class
+        # metadata into the Type column. Decoded is the archive itself when it
+        # wasn't resolved (XML form, missing references, resolving failed),
+        # and any other plist, JSON or XML is plain data: every key shown.
+        resolved_archive = archive is not None and data is not archive
+        self._tabs.addTab(
+            TreeViewer(data, self._tabs, fold_class_meta=resolved_archive),
+            translate("TreeTextViewer", "Decoded"),
+        )
+        if archive is not None:
+            # An NSKeyedArchiver archive as stored, before resolving: $top,
+            # every $objects entry by index, references as UIDs.
+            self._tabs.addTab(
+                TreeViewer(archive, self._tabs), translate("TreeTextViewer", "Stored archive")
+            )
+        # The Text tab is built when first shown: laying out and highlighting
+        # a large file takes seconds that shouldn't delay the tree.
+        self._text_tab = QWidget()
+        text_layout = QVBoxLayout(self._text_tab)
+        text_layout.setContentsMargins(0, 0, 0, 0)
+        self._tabs.addTab(self._text_tab, translate("TreeTextViewer", "Text"))
+        self._tabs.currentChanged.connect(self._on_tab_changed)
+        layout.addWidget(self._tabs)
+
+    def _on_tab_changed(self, index: int) -> None:
+        if self._text_view is not None or self._tabs.widget(index) is not self._text_tab:
+            return
+        self._text_view = TextView(self._raw_text, self._text_tab)
+        self._text_tab.layout().addWidget(self._text_view)

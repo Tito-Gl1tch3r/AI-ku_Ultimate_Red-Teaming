@@ -1,0 +1,88 @@
+import {User} from "./model/user.ts";
+import {useEffect, useState} from "react";
+import {buildMetrics} from "./model/util.ts";
+import {getMetadataApi} from "./model/api.ts";
+import {Node} from "@xyflow/react";
+import {Box, CircularProgress, Grid2, Modal, Typography} from "@mui/material";
+import {modalStyle} from "./styling/theme.ts";
+import MetricsGraph from "./MetricsGraph.tsx";
+import {extractErrorMessage, isAbortError} from "./model/errors.ts";
+
+interface EnvironmentMetricsModalProps {
+    close: () => void;
+    isOpen: boolean;
+    user: User;
+    environment: Node;
+}
+
+const EnvironmentMetricsModal = ({ close, isOpen, user, environment }: EnvironmentMetricsModalProps) => {
+    const environmentId = environment.data?.envZId as string | undefined;
+    const [metrics30, setMetrics30] = useState(buildMetrics({}));
+    const [metrics7, setMetrics7] = useState(buildMetrics({}));
+    const [metrics1, setMetrics1] = useState(buildMetrics({}));
+    const [errorMessage, setErrorMessage] = useState<string>("");
+    const [loading, setLoading] = useState<boolean>(false);
+
+    useEffect(() => {
+        if (!isOpen || !user || !environmentId) return;
+        const controller = new AbortController();
+        setErrorMessage("");
+        setLoading(true);
+        const metadataApi = getMetadataApi(user);
+        const p1 = metadataApi.getEnvironmentMetrics({envId: environmentId }, { signal: controller.signal })
+            .then(d => {
+                setMetrics30(buildMetrics(d));
+            })
+            .catch(async (e) => {
+                if (isAbortError(e)) return;
+                const msg = await extractErrorMessage(e, "unable to load metrics");
+                setErrorMessage(msg);
+            });
+        const p2 = metadataApi.getEnvironmentMetrics({envId: environmentId, duration: "168h"}, { signal: controller.signal })
+            .then(d => {
+                setMetrics7(buildMetrics(d));
+            })
+            .catch(async (e) => {
+                if (isAbortError(e)) return;
+                const msg = await extractErrorMessage(e, "unable to load metrics");
+                setErrorMessage(msg);
+            });
+        const p3 = metadataApi.getEnvironmentMetrics({envId: environmentId, duration: "24h"}, { signal: controller.signal })
+            .then(d => {
+                setMetrics1(buildMetrics(d));
+            })
+            .catch(async (e) => {
+                if (isAbortError(e)) return;
+                const msg = await extractErrorMessage(e, "unable to load metrics");
+                setErrorMessage(msg);
+            });
+        Promise.allSettled([p1, p2, p3]).then(() => {
+            if (!controller.signal.aborted) {
+                setLoading(false);
+            }
+        });
+        return () => controller.abort();
+    }, [environmentId, isOpen, user]);
+
+    return (
+        <Modal open={isOpen} onClose={close} aria-labelledby="modal-title-environment-metrics">
+            <Box sx={{ ...modalStyle }}>
+                <Grid2 container sx={{ flexGrow: 1, p: 1 }} alignItems="center">
+                    <Typography variant="h5" id="modal-title-environment-metrics"><strong>Environment Metrics</strong></Typography>
+                </Grid2>
+                { errorMessage && <Grid2 container sx={{ flexGrow: 1, p: 1 }}><Typography color="error">{errorMessage}</Typography></Grid2> }
+                {loading ? (
+                    <Grid2 container justifyContent="center" sx={{ mt: 4 }}><CircularProgress /></Grid2>
+                ) : (
+                    <>
+                        <MetricsGraph title="Last 30 Days" data={metrics30.data} />
+                        <MetricsGraph title="Last 7 Days" data={metrics7.data} showTime />
+                        <MetricsGraph title="Last 24 Hours" data={metrics1.data} showTime />
+                    </>
+                )}
+            </Box>
+        </Modal>
+    );
+}
+
+export default EnvironmentMetricsModal;

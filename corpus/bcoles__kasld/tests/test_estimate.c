@@ -1,0 +1,1066 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Unit tests for the evidential inference core: per-lattice meet,
+// bottom test, the greedy conflict-aware resolver, trust-stratified
+// estimate_at, and the honest-top soundness validation for the compiled
+// arch. Standalone — links only estimate.c + quantities.c, no orchestrator.
+// ---
+// <bcoles@gmail.com>
+
+#include "include/kasld/estimate.h"
+#include "include/kasld/quantity.h"
+#include "test_harness.h"
+
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+
+/* Build a constraint. lineage_count doubles as the corroboration count for
+ * the within-tier tie-break. */
+static struct constraint mk(enum kasld_quantity q, enum constraint_op op,
+                            unsigned long v, enum kasld_confidence conf,
+                            uint32_t id) {
+  struct constraint c;
+  memset(&c, 0, sizeof(c));
+  c.q = q;
+  c.op = op;
+  c.value = v;
+  c.conf = conf;
+  c.id = id;
+  c.lineage_count = 1;
+  return c;
+}
+
+/* ========================================================================
+ * Interval meet
+ * ======================================================================== */
+static void test_interval_meet_bounds(void) {
+  struct estimate e;
+  quantities[Q_VIRT_IMAGE_BASE].init_top(&e);
+  unsigned long top_lo = e.lo, top_hi = e.hi;
+
+  struct constraint up = mk(Q_VIRT_IMAGE_BASE, C_UPPER_BOUND,
+                            top_lo + 0x10000000ul, CONF_PARSED, 1);
+  estimate_meet(&e, &quantities[Q_VIRT_IMAGE_BASE], &up);
+  TH_CHECK(e.hi == top_lo + 0x10000000ul);
+  TH_CHECK(e.hi_binding == 1);
+  TH_CHECK(e.lo == top_lo); /* unchanged */
+  TH_CHECK(!estimate_is_bottom(&e, &quantities[Q_VIRT_IMAGE_BASE]));
+
+  struct constraint lo = mk(Q_VIRT_IMAGE_BASE, C_LOWER_BOUND,
+                            top_lo + 0x1000000ul, CONF_PARSED, 2);
+  estimate_meet(&e, &quantities[Q_VIRT_IMAGE_BASE], &lo);
+  TH_CHECK(e.lo == top_lo + 0x1000000ul);
+  TH_CHECK(e.lo_binding == 2);
+
+  /* A looser upper bound does not widen. */
+  struct constraint loose =
+      mk(Q_VIRT_IMAGE_BASE, C_UPPER_BOUND, top_hi, CONF_PARSED, 3);
+  estimate_meet(&e, &quantities[Q_VIRT_IMAGE_BASE], &loose);
+  TH_CHECK(e.hi == top_lo + 0x10000000ul); /* still the tighter one */
+  TH_CHECK(e.hi_binding == 1);
+}
+
+static void test_interval_meet_equals_and_bottom(void) {
+  struct estimate e;
+  quantities[Q_VIRT_IMAGE_BASE].init_top(&e);
+  unsigned long base = e.lo;
+
+  struct constraint eq =
+      mk(Q_VIRT_IMAGE_BASE, C_EQUALS, base + 0x2000000ul, CONF_DERIVED, 1);
+  estimate_meet(&e, &quantities[Q_VIRT_IMAGE_BASE], &eq);
+  TH_CHECK(e.lo == base + 0x2000000ul && e.hi == base + 0x2000000ul);
+
+  /* Contradicting equals → bottom. */
+  struct estimate e2;
+  quantities[Q_VIRT_IMAGE_BASE].init_top(&e2);
+  struct constraint a =
+      mk(Q_VIRT_IMAGE_BASE, C_UPPER_BOUND, base + 0x1000000ul, CONF_PARSED, 1);
+  struct constraint b =
+      mk(Q_VIRT_IMAGE_BASE, C_LOWER_BOUND, base + 0x2000000ul, CONF_PARSED, 2);
+  estimate_meet(&e2, &quantities[Q_VIRT_IMAGE_BASE], &a);
+  estimate_meet(&e2, &quantities[Q_VIRT_IMAGE_BASE], &b);
+  TH_CHECK(estimate_is_bottom(&e2, &quantities[Q_VIRT_IMAGE_BASE]));
+}
+
+/* ========================================================================
+ * Max-align meet (never bottom)
+ * ======================================================================== */
+static void test_maxalign_meet(void) {
+  struct estimate e;
+  quantities[Q_VIRT_KASLR_ALIGN].init_top(&e);
+  TH_CHECK(e.lo == 1ul);
+
+  struct constraint a1 =
+      mk(Q_VIRT_KASLR_ALIGN, C_AT_LEAST_ALIGN, 0x1000ul, CONF_INFERRED, 1);
+  estimate_meet(&e, &quantities[Q_VIRT_KASLR_ALIGN], &a1);
+  TH_CHECK(e.lo == 0x1000ul);
+
+  struct constraint a2 =
+      mk(Q_VIRT_KASLR_ALIGN, C_AT_LEAST_ALIGN, 0x200000ul, CONF_INFERRED, 2);
+  estimate_meet(&e, &quantities[Q_VIRT_KASLR_ALIGN], &a2);
+  TH_CHECK(e.lo == 0x200000ul); /* max */
+
+  struct constraint a3 =
+      mk(Q_VIRT_KASLR_ALIGN, C_AT_LEAST_ALIGN, 0x1000ul, CONF_INFERRED, 3);
+  estimate_meet(&e, &quantities[Q_VIRT_KASLR_ALIGN], &a3);
+  TH_CHECK(e.lo == 0x200000ul); /* unchanged; max stays */
+  TH_CHECK(!estimate_is_bottom(&e, &quantities[Q_VIRT_KASLR_ALIGN]));
+  /* Floors alone leave the ceiling open, which is what keeps a floor a floor.
+   */
+  TH_CHECK(e.hi == 0);
+}
+
+/* A stated granularity closes the ceiling, and does so whether or not it moves
+ * the floor -- the value a source reads is usually the one already standing,
+ * which is exactly the case that has to register. */
+static void test_maxalign_stated_granularity_closes_the_ceiling(void) {
+  struct estimate e;
+  const struct quantity_def *qd = &quantities[Q_VIRT_KASLR_ALIGN];
+  unsigned long v = 0;
+
+  quantities[Q_VIRT_KASLR_ALIGN].init_top(&e);
+  struct constraint floor =
+      mk(Q_VIRT_KASLR_ALIGN, C_AT_LEAST_ALIGN, 0x200000ul, CONF_INFERRED, 1);
+  estimate_meet(&e, qd, &floor);
+  TH_CHECK(!quantity_pinned(Q_VIRT_KASLR_ALIGN, &e, NULL));
+
+  struct constraint exact =
+      mk(Q_VIRT_KASLR_ALIGN, C_EQUALS, 0x200000ul, CONF_PARSED, 2);
+  estimate_meet(&e, qd, &exact);
+  TH_CHECK(e.lo == 0x200000ul && e.hi == 0x200000ul);
+  TH_CHECK(!estimate_is_bottom(&e, qd));
+  TH_CHECK(quantity_pinned(Q_VIRT_KASLR_ALIGN, &e, &v) && v == 0x200000ul);
+  /* Provenance travels with the edge it set, as on an interval. */
+  TH_CHECK(e.hi_binding == 2 && e.hi_conf == CONF_PARSED);
+}
+
+/* A granularity coarser than any floor raises both edges together. */
+static void test_maxalign_stated_granularity_raises_the_floor(void) {
+  struct estimate e;
+  const struct quantity_def *qd = &quantities[Q_VIRT_KASLR_ALIGN];
+  unsigned long v = 0;
+  quantities[Q_VIRT_KASLR_ALIGN].init_top(&e);
+  struct constraint floor =
+      mk(Q_VIRT_KASLR_ALIGN, C_AT_LEAST_ALIGN, 0x200000ul, CONF_INFERRED, 1);
+  struct constraint exact =
+      mk(Q_VIRT_KASLR_ALIGN, C_EQUALS, 0x1000000ul, CONF_PARSED, 2);
+  estimate_meet(&e, qd, &floor);
+  estimate_meet(&e, qd, &exact);
+  TH_CHECK(quantity_pinned(Q_VIRT_KASLR_ALIGN, &e, &v) && v == 0x1000000ul);
+  TH_CHECK(e.lo == 0x1000000ul && e.hi == 0x1000000ul);
+}
+
+/* The ceiling is met, never assigned. A second statement may only tighten it,
+ * and where two disagree the floor passes the ceiling and the estimate reads
+ * bottom -- which is the resolver's cue to drop one, rather than the later
+ * statement silently winning. Asserted in both orders, since an assignment
+ * would look correct in one of them. */
+static void test_maxalign_stated_granularity_only_tightens(void) {
+  const struct quantity_def *qd = &quantities[Q_VIRT_KASLR_ALIGN];
+  struct estimate e;
+  struct constraint fine =
+      mk(Q_VIRT_KASLR_ALIGN, C_EQUALS, 0x200000ul, CONF_PARSED, 1);
+  struct constraint coarse =
+      mk(Q_VIRT_KASLR_ALIGN, C_EQUALS, 0x400000ul, CONF_PARSED, 2);
+
+  /* Coarser first: the finer one tightens the ceiling, and the floor it also
+   * raised has already passed it -- a contradiction, reported as bottom. */
+  quantities[Q_VIRT_KASLR_ALIGN].init_top(&e);
+  estimate_meet(&e, qd, &coarse);
+  TH_CHECK(e.hi == 0x400000ul);
+  estimate_meet(&e, qd, &fine);
+  TH_CHECK(e.hi == 0x200000ul); /* tightened, never raised */
+  TH_CHECK(estimate_is_bottom(&e, qd));
+
+  /* Finer first: the coarser one must not raise the ceiling back. */
+  quantities[Q_VIRT_KASLR_ALIGN].init_top(&e);
+  estimate_meet(&e, qd, &fine);
+  estimate_meet(&e, qd, &coarse);
+  TH_CHECK(e.hi == 0x200000ul);
+  TH_CHECK(estimate_is_bottom(&e, qd));
+}
+
+/* Two sources disagreeing about the grid IS a contradiction, where a pair of
+ * floors never could be. The resolver detects it the same way it detects any
+ * other -- by trialling the meet and asking whether the result is bottom -- so
+ * the weaker claim is dropped rather than silently absorbed by the max. */
+static void test_maxalign_floor_past_a_stated_granularity_is_bottom(void) {
+  struct estimate e;
+  const struct quantity_def *qd = &quantities[Q_VIRT_KASLR_ALIGN];
+  quantities[Q_VIRT_KASLR_ALIGN].init_top(&e);
+  struct constraint exact =
+      mk(Q_VIRT_KASLR_ALIGN, C_EQUALS, 0x200000ul, CONF_PARSED, 1);
+  struct constraint floor =
+      mk(Q_VIRT_KASLR_ALIGN, C_AT_LEAST_ALIGN, 0x1000000ul, CONF_INFERRED, 2);
+  estimate_meet(&e, qd, &exact);
+  TH_CHECK(!estimate_is_bottom(&e, qd));
+  estimate_meet(&e, qd, &floor);
+  TH_CHECK(estimate_is_bottom(&e, qd));
+}
+
+/* ========================================================================
+ * Finite-set meet
+ * ======================================================================== */
+static int finset_has(enum kasld_quantity q, const struct estimate *e,
+                      unsigned long value) {
+  const struct quantity_def *qd = &quantities[q];
+  for (int i = 0; i < qd->n_candidates; i++)
+    if (qd->candidates[i] == value)
+      return (e->lo & (1ul << i)) != 0;
+  return 0;
+}
+
+static void test_finset_meet(void) {
+  const struct quantity_def *qd = &quantities[Q_VA_BITS];
+  TH_CHECK(qd->n_candidates >= 1);
+
+  struct estimate e;
+  qd->init_top(&e);
+  /* Top admits every candidate. */
+  for (int i = 0; i < qd->n_candidates; i++)
+    TH_CHECK(finset_has(Q_VA_BITS, &e, qd->candidates[i]));
+
+  /* C_EQUALS to a real candidate narrows to just that one. */
+  struct estimate e2 = e;
+  struct constraint eq =
+      mk(Q_VA_BITS, C_EQUALS, qd->candidates[0], CONF_PARSED, 1);
+  estimate_meet(&e2, qd, &eq);
+  TH_CHECK(finset_has(Q_VA_BITS, &e2, qd->candidates[0]));
+  TH_CHECK(!estimate_is_bottom(&e2, qd));
+  if (qd->n_candidates > 1)
+    TH_CHECK(!finset_has(Q_VA_BITS, &e2, qd->candidates[1]));
+
+  /* C_EQUALS to a non-candidate empties the set → bottom. */
+  struct estimate e3 = e;
+  struct constraint bad = mk(Q_VA_BITS, C_EQUALS, 999ul, CONF_PARSED, 2);
+  estimate_meet(&e3, qd, &bad);
+  TH_CHECK(estimate_is_bottom(&e3, qd));
+}
+
+/* Every other op on a finite set. A synthetic candidate table rather than
+ * Q_VA_BITS, so the assertions are exact and identical on every architecture:
+ * the real VA-bits list is a single entry on most arches, which would leave
+ * everything below vacuous exactly where a regression would hide. The values
+ * are the x86_32 vmsplit set, the case this lattice work exists for. */
+static const unsigned long fs_cands[] = {0x40000000ul, 0x80000000ul,
+                                         0xb0000000ul, 0xc0000000ul};
+static const struct quantity_def fs_qd = {"test_finset", LK_FINSET, NULL,
+                                          fs_cands, 4};
+#define FS_ALL 0xful
+
+static void fs_top(struct estimate *e) {
+  memset(e, 0, sizeof(*e));
+  e->kind = LK_FINSET;
+  e->lo = FS_ALL;
+}
+static int fs_live(const struct estimate *e, unsigned long v) {
+  for (int i = 0; i < fs_qd.n_candidates; i++)
+    if (fs_cands[i] == v)
+      return (e->lo & (1ul << i)) != 0;
+  return 0;
+}
+
+static void test_finset_bounds_and_excludes(void) {
+  struct estimate e;
+
+  /* A lower bound trims the low end. */
+  fs_top(&e);
+  struct constraint lb =
+      mk(Q_VA_BITS, C_LOWER_BOUND, 0x80000000ul, CONF_PARSED, 1);
+  estimate_meet(&e, &fs_qd, &lb);
+  TH_CHECK(!fs_live(&e, 0x40000000ul));
+  TH_CHECK(fs_live(&e, 0x80000000ul) && fs_live(&e, 0xc0000000ul));
+  TH_CHECK(e.lo_binding == 1);
+
+  /* An upper bound trims the high end and composes with the bound above. */
+  struct constraint ub =
+      mk(Q_VA_BITS, C_UPPER_BOUND, 0xb0000000ul, CONF_PARSED, 2);
+  estimate_meet(&e, &fs_qd, &ub);
+  TH_CHECK(fs_live(&e, 0x80000000ul) && fs_live(&e, 0xb0000000ul));
+  TH_CHECK(!fs_live(&e, 0x40000000ul) && !fs_live(&e, 0xc0000000ul));
+  TH_CHECK(!estimate_is_bottom(&e, &fs_qd));
+
+  /* An exclude removes an INTERIOR candidate exactly — the case a single
+   * interval can only approximate by trimming an end. */
+  fs_top(&e);
+  struct constraint ex = mk(Q_VA_BITS, C_EXCLUDE, 0x80000000ul, CONF_PARSED, 3);
+  ex.value2 = 0x80000000ul;
+  estimate_meet(&e, &fs_qd, &ex);
+  TH_CHECK(!fs_live(&e, 0x80000000ul));
+  TH_CHECK(fs_live(&e, 0x40000000ul) && fs_live(&e, 0xb0000000ul) &&
+           fs_live(&e, 0xc0000000ul));
+
+  /* A span exclude removes every candidate it covers, interior or not. */
+  struct constraint ex2 =
+      mk(Q_VA_BITS, C_EXCLUDE, 0xb0000000ul, CONF_PARSED, 4);
+  ex2.value2 = 0xfffffffful;
+  estimate_meet(&e, &fs_qd, &ex2);
+  TH_CHECK(fs_live(&e, 0x40000000ul));
+  TH_CHECK(!fs_live(&e, 0xb0000000ul) && !fs_live(&e, 0xc0000000ul));
+
+  /* An exclude covering everything still live is bottom, matching the
+   * interval lattice rather than silently accepting a no-op. */
+  struct constraint ex3 = mk(Q_VA_BITS, C_EXCLUDE, 0ul, CONF_PARSED, 5);
+  ex3.value2 = ~0ul;
+  estimate_meet(&e, &fs_qd, &ex3);
+  TH_CHECK(estimate_is_bottom(&e, &fs_qd));
+
+  /* Alignment filters candidates; 0xb0000000 is not 1 GiB-aligned. */
+  fs_top(&e);
+  struct constraint al =
+      mk(Q_VA_BITS, C_AT_LEAST_ALIGN, 0x40000000ul, CONF_PARSED, 6);
+  estimate_meet(&e, &fs_qd, &al);
+  TH_CHECK(!fs_live(&e, 0xb0000000ul));
+  TH_CHECK(fs_live(&e, 0x40000000ul) && fs_live(&e, 0x80000000ul) &&
+           fs_live(&e, 0xc0000000ul));
+
+  /* A stride narrows the live set directly and leaves no residue annotation
+   * to carry, unlike the interval lattice. */
+  fs_top(&e);
+  struct constraint st = mk(Q_VA_BITS, C_STRIDE, 0x30000000ul, CONF_PARSED, 7);
+  st.value2 = 0x40000000ul; /* == 0x30000000 (mod 1 GiB): only 0xb0000000 */
+  estimate_meet(&e, &fs_qd, &st);
+  TH_CHECK(fs_live(&e, 0xb0000000ul));
+  TH_CHECK(!fs_live(&e, 0x40000000ul) && !fs_live(&e, 0x80000000ul) &&
+           !fs_live(&e, 0xc0000000ul));
+  TH_CHECK(e.stride == 0 && e.stride_offset == 0);
+
+  /* A constraint that changes nothing must not claim the binding. */
+  fs_top(&e);
+  struct constraint noop = mk(Q_VA_BITS, C_LOWER_BOUND, 0ul, CONF_PARSED, 8);
+  estimate_meet(&e, &fs_qd, &noop);
+  TH_CHECK(e.lo == FS_ALL && e.lo_binding == 0);
+}
+
+/* ========================================================================
+ * Arch declaration: the linear-map base axis
+ * ======================================================================== */
+/* PAGE_OFFSET_MIN / _MAX must be stated as literals — they are used in #if
+ * arithmetic and static initialisers, where a candidate array cannot be
+ * indexed — so nothing at compile time can check them against the list they
+ * are supposed to bracket. This does, on whichever architecture it is built
+ * for, which `make test-cross` turns into coverage of all of them. */
+static void test_page_offset_axis_is_self_consistent(void) {
+  TH_CHECK((unsigned long)PAGE_OFFSET_MIN <= (unsigned long)PAGE_OFFSET_MAX);
+  /* This binary's own build must be admissible under its own declaration. */
+  TH_CHECK((unsigned long)PAGE_OFFSET >= (unsigned long)PAGE_OFFSET_MIN);
+  TH_CHECK((unsigned long)PAGE_OFFSET <= (unsigned long)PAGE_OFFSET_MAX);
+
+#if PAGE_OFFSET_IS_FINITE
+  static const unsigned long cands[] = PAGE_OFFSET_CANDIDATES;
+  const int n = (int)(sizeof(cands) / sizeof(cands[0]));
+  TH_CHECK(n >= 1);
+  TH_CHECK(n <= KASLD_FINSET_MAX_CANDIDATES);
+
+  unsigned long lo = ~0ul, hi = 0;
+  int has_default = 0, sorted_desc = 1;
+  for (int i = 0; i < n; i++) {
+    if (cands[i] < lo)
+      lo = cands[i];
+    if (cands[i] > hi)
+      hi = cands[i];
+    if (cands[i] == (unsigned long)PAGE_OFFSET)
+      has_default = 1;
+    if (i && cands[i] >= cands[i - 1])
+      sorted_desc = 0;
+  }
+  /* The window is exactly the set's extremes — not merely a superset, or the
+   * band derived from PAGE_OFFSET_MIN would be wider than the truth. */
+  TH_CHECK(lo == (unsigned long)PAGE_OFFSET_MIN);
+  TH_CHECK(hi == (unsigned long)PAGE_OFFSET_MAX);
+  /* The compile-time default is one of the admissible values. */
+  TH_CHECK(has_default);
+  /* Highest first, and no duplicates. Documented order that consumers rely on
+   * for snap-down, and the strict comparison catches a repeated entry, which
+   * would waste a bitmask bit and make the set look larger than it is. */
+  TH_CHECK(sorted_desc);
+  /* Exactly one admissible value is what "this binary knows the base" means. */
+  TH_CHECK(PAGE_OFFSET_KNOWN_AT_BUILD == (n == 1));
+#else
+  /* No enumerable set: derived from another quantity, or continuous. Either
+   * way the base is not knowable from this binary alone. */
+  TH_CHECK(!PAGE_OFFSET_KNOWN_AT_BUILD);
+#endif
+}
+
+/* ========================================================================
+ * Lattice-agnostic accessors
+ * ======================================================================== */
+static void test_accessors_interval(void) {
+  struct estimate e;
+  quantities[Q_VIRT_IMAGE_BASE].init_top(&e);
+  unsigned long lo = 0, hi = 0;
+
+  TH_CHECK(!quantity_narrowed(Q_VIRT_IMAGE_BASE, &e));
+  TH_CHECK(quantity_window(Q_VIRT_IMAGE_BASE, &e, &lo, &hi));
+  TH_CHECK(lo == e.lo && hi == e.hi);
+  TH_CHECK(!quantity_pinned(Q_VIRT_IMAGE_BASE, &e, NULL));
+  TH_CHECK(quantity_admits(Q_VIRT_IMAGE_BASE, &e, lo));
+  TH_CHECK(quantity_admits(Q_VIRT_IMAGE_BASE, &e, hi));
+
+  /* Pin it and re-ask. */
+  struct constraint eq =
+      mk(Q_VIRT_IMAGE_BASE, C_EQUALS, lo + 0x200000ul, CONF_PARSED, 1);
+  estimate_meet(&e, &quantities[Q_VIRT_IMAGE_BASE], &eq);
+  unsigned long v = 0;
+  TH_CHECK(quantity_pinned(Q_VIRT_IMAGE_BASE, &e, &v));
+  TH_CHECK(v == lo + 0x200000ul);
+  TH_CHECK(quantity_narrowed(Q_VIRT_IMAGE_BASE, &e));
+  TH_CHECK(quantity_admits(Q_VIRT_IMAGE_BASE, &e, v));
+  TH_CHECK(!quantity_admits(Q_VIRT_IMAGE_BASE, &e, v + 1));
+
+  /* NULL outputs are accepted. */
+  TH_CHECK(quantity_window(Q_VIRT_IMAGE_BASE, &e, NULL, NULL));
+
+  /* Bottom reports no window and no pin. */
+  struct estimate b;
+  quantities[Q_VIRT_IMAGE_BASE].init_top(&b);
+  b.lo = 1;
+  b.hi = 0;
+  TH_CHECK(!quantity_window(Q_VIRT_IMAGE_BASE, &b, &lo, &hi));
+  TH_CHECK(!quantity_pinned(Q_VIRT_IMAGE_BASE, &b, NULL));
+  TH_CHECK(!quantity_admits(Q_VIRT_IMAGE_BASE, &b, 0));
+}
+
+static void test_accessors_finset(void) {
+  const struct quantity_def *qd = &quantities[Q_VA_BITS];
+  struct estimate e;
+  qd->init_top(&e);
+
+  /* The window spans the candidate extremes, whatever order the table is in. */
+  unsigned long lo = 0, hi = 0, cmin = ~0ul, cmax = 0;
+  for (int i = 0; i < qd->n_candidates; i++) {
+    if (qd->candidates[i] < cmin)
+      cmin = qd->candidates[i];
+    if (qd->candidates[i] > cmax)
+      cmax = qd->candidates[i];
+  }
+  TH_CHECK(quantity_window(Q_VA_BITS, &e, &lo, &hi));
+  TH_CHECK(lo == cmin && hi == cmax);
+  TH_CHECK(!quantity_narrowed(Q_VA_BITS, &e));
+
+  /* admits() is exact — every candidate yes, a non-candidate no. */
+  for (int i = 0; i < qd->n_candidates; i++)
+    TH_CHECK(quantity_admits(Q_VA_BITS, &e, qd->candidates[i]));
+  TH_CHECK(!quantity_admits(Q_VA_BITS, &e, 999ul));
+
+  /* A one-entry table is pinned at its top; a longer one is not. */
+  TH_CHECK(quantity_pinned(Q_VA_BITS, &e, NULL) == (qd->n_candidates == 1));
+
+  /* Narrow to one candidate: pinned, and admits only that one. */
+  struct constraint eq =
+      mk(Q_VA_BITS, C_EQUALS, qd->candidates[0], CONF_PARSED, 1);
+  estimate_meet(&e, qd, &eq);
+  unsigned long v = 0;
+  TH_CHECK(quantity_pinned(Q_VA_BITS, &e, &v) && v == qd->candidates[0]);
+  TH_CHECK(quantity_admits(Q_VA_BITS, &e, qd->candidates[0]));
+  if (qd->n_candidates > 1) {
+    TH_CHECK(quantity_narrowed(Q_VA_BITS, &e));
+    TH_CHECK(!quantity_admits(Q_VA_BITS, &e, qd->candidates[1]));
+  }
+
+  /* An empty set is bottom: no window, no pin, admits nothing. */
+  struct estimate b;
+  qd->init_top(&b);
+  b.lo = 0;
+  TH_CHECK(!quantity_window(Q_VA_BITS, &b, &lo, &hi));
+  TH_CHECK(!quantity_pinned(Q_VA_BITS, &b, NULL));
+  TH_CHECK(!quantity_admits(Q_VA_BITS, &b, qd->candidates[0]));
+}
+
+static void test_accessors_maxalign_is_not_a_value(void) {
+  struct estimate e;
+  struct constraint exact =
+      mk(Q_VIRT_KASLR_ALIGN, C_EQUALS, 0x200000ul, CONF_PARSED, 1);
+  quantities[Q_VIRT_KASLR_ALIGN].init_top(&e);
+  /* An alignment is not an address set: it spans no window and admits nothing —
+   * the same answer quantity_ranges already gives. Nor is a bare floor a value.
+   */
+  TH_CHECK(!quantity_pinned(Q_VIRT_KASLR_ALIGN, &e, NULL));
+  TH_CHECK(!quantity_window(Q_VIRT_KASLR_ALIGN, &e, NULL, NULL));
+  TH_CHECK(!quantity_admits(Q_VIRT_KASLR_ALIGN, &e, e.lo));
+  /* A closed granularity IS a value, and still not an address set: the two
+   * answers are independent, and conflating them would put an alignment into
+   * the window and range accessors an address consumer reads. */
+  estimate_meet(&e, &quantities[Q_VIRT_KASLR_ALIGN], &exact);
+  TH_CHECK(quantity_pinned(Q_VIRT_KASLR_ALIGN, &e, NULL));
+  TH_CHECK(!quantity_window(Q_VIRT_KASLR_ALIGN, &e, NULL, NULL));
+  TH_CHECK(!quantity_admits(Q_VIRT_KASLR_ALIGN, &e, e.lo));
+}
+
+/* ========================================================================
+ * Greedy resolver: contradictions resolved by trust priority
+ * ======================================================================== */
+static void test_resolve_stronger_wins(void) {
+  struct estimate top;
+  quantities[Q_VIRT_IMAGE_BASE].init_top(&top);
+  unsigned long base = top.lo;
+
+  /* PARSED upper bound vs TIMING lower bound that contradicts it. */
+  struct constraint cs[2];
+  cs[0] =
+      mk(Q_VIRT_IMAGE_BASE, C_UPPER_BOUND, base + 0x1000000ul, CONF_PARSED, 10);
+  cs[1] =
+      mk(Q_VIRT_IMAGE_BASE, C_LOWER_BOUND, base + 0x2000000ul, CONF_TIMING, 11);
+
+  struct resolve_result r;
+  estimate_resolve(Q_VIRT_IMAGE_BASE, CONF_BRUTE, cs, 2, &r);
+
+  /* PARSED upper accepted; contradicting TIMING lower rejected. */
+  TH_CHECK(r.est.hi == base + 0x1000000ul);
+  TH_CHECK(r.est.lo == base); /* lower bound was the rejected one */
+  TH_CHECK(r.n_conflicts == 1 && r.conflicts[0] == 11);
+}
+
+static void test_resolve_priority_flips_with_confidence(void) {
+  struct estimate top;
+  quantities[Q_VIRT_IMAGE_BASE].init_top(&top);
+  unsigned long base = top.lo;
+
+  /* Same shapes, confidences swapped: now the lower bound is PARSED. */
+  struct constraint cs[2];
+  cs[0] =
+      mk(Q_VIRT_IMAGE_BASE, C_UPPER_BOUND, base + 0x1000000ul, CONF_TIMING, 10);
+  cs[1] =
+      mk(Q_VIRT_IMAGE_BASE, C_LOWER_BOUND, base + 0x2000000ul, CONF_PARSED, 11);
+
+  struct resolve_result r;
+  estimate_resolve(Q_VIRT_IMAGE_BASE, CONF_BRUTE, cs, 2, &r);
+
+  TH_CHECK(r.est.lo == base + 0x2000000ul);
+  TH_CHECK(r.n_conflicts == 1 && r.conflicts[0] == 10); /* upper rejected */
+}
+
+static void test_resolve_deterministic_and_no_conflict(void) {
+  struct estimate top;
+  quantities[Q_VIRT_IMAGE_BASE].init_top(&top);
+  unsigned long base = top.lo;
+
+  /* Two compatible upper bounds; tightest wins, no conflict. */
+  struct constraint cs[2];
+  cs[0] =
+      mk(Q_VIRT_IMAGE_BASE, C_UPPER_BOUND, base + 0x4000000ul, CONF_PARSED, 1);
+  cs[1] =
+      mk(Q_VIRT_IMAGE_BASE, C_UPPER_BOUND, base + 0x2000000ul, CONF_DERIVED, 2);
+
+  struct resolve_result r;
+  estimate_resolve(Q_VIRT_IMAGE_BASE, CONF_BRUTE, cs, 2, &r);
+  TH_CHECK(r.est.hi == base + 0x2000000ul); /* tighter */
+  TH_CHECK(r.est.hi_binding == 2);
+  TH_CHECK(r.n_conflicts == 0);
+}
+
+/* ========================================================================
+ * Trust-stratified estimate_at (higher floor → fewer constraints → looser)
+ * ======================================================================== */
+static void test_estimate_at_trust_floor(void) {
+  struct estimate top;
+  quantities[Q_VIRT_IMAGE_BASE].init_top(&top);
+  unsigned long base = top.lo;
+
+  struct constraint cs[2];
+  cs[0] = mk(Q_VIRT_IMAGE_BASE, C_UPPER_BOUND, base + 0x4000000ul, CONF_PARSED,
+             1); /* trusted, looser */
+  cs[1] = mk(Q_VIRT_IMAGE_BASE, C_UPPER_BOUND, base + 0x1000000ul, CONF_TIMING,
+             2); /* shaky, tighter */
+
+  struct resolve_result all, trusted;
+  estimate_resolve(Q_VIRT_IMAGE_BASE, CONF_BRUTE, cs, 2, &all);
+  estimate_resolve(Q_VIRT_IMAGE_BASE, CONF_PARSED, cs, 2, &trusted);
+
+  /* Accepting everything gives the tighter (timing) bound. */
+  TH_CHECK(all.est.hi == base + 0x1000000ul && all.est.hi_binding == 2);
+  /* Restricting to PARSED-or-better gives the looser, rock-solid bound. */
+  TH_CHECK(trusted.est.hi == base + 0x4000000ul && trusted.est.hi_binding == 1);
+}
+
+/* ========================================================================
+ * quantity_ranges — interval-set value-access for consumers
+ * ======================================================================== */
+static void test_quantity_ranges_interval_plain(void) {
+  struct estimate e;
+  quantities[Q_VIRT_IMAGE_BASE].init_top(&e);
+  struct range out[8];
+  int n = quantity_ranges(Q_VIRT_IMAGE_BASE, &e, CONF_BRUTE, NULL, 0, out, 8);
+  TH_CHECK(n == 1);
+  TH_CHECK(out[0].lo == e.lo && out[0].hi == e.hi);
+}
+
+static void test_quantity_ranges_interval_with_interior_hole(void) {
+  struct estimate e;
+  quantities[Q_VIRT_IMAGE_BASE].init_top(&e);
+  unsigned long base = e.lo;
+  /* An interior C_EXCLUDE hole splits the interval into two ranges. */
+  struct constraint cs[1];
+  cs[0] = mk(Q_VIRT_IMAGE_BASE, C_EXCLUDE, base + 0x1000000ul, CONF_DERIVED, 1);
+  cs[0].value2 = base + 0x1fffffful; /* hole [base+16M, base+32M-1] */
+
+  struct range out[8];
+  int n = quantity_ranges(Q_VIRT_IMAGE_BASE, &e, CONF_BRUTE, cs, 1, out, 8);
+  TH_CHECK(n == 2);
+  TH_CHECK(out[0].lo == base && out[0].hi == base + 0x1000000ul - 1);
+  TH_CHECK(out[1].lo == base + 0x2000000ul && out[1].hi == e.hi);
+}
+
+/* A C_EXCLUDE spanning the whole interval empties it. estimate_meet drives the
+ * estimate to bottom (so a full-cover exclude is a resolver conflict, not a
+ * silent no-op), and quantity_ranges reports zero ranges for the same input —
+ * the two notions of "empty" agree. */
+static void test_exclude_full_cover_is_bottom(void) {
+  const struct quantity_def *qd = &quantities[Q_VIRT_IMAGE_BASE];
+  struct estimate e;
+  qd->init_top(&e);
+  e.lo = 0x1000000ul;
+  e.hi = 0x2000000ul;
+
+  /* Exclude [lo, hi] exactly. */
+  struct constraint c = mk(Q_VIRT_IMAGE_BASE, C_EXCLUDE, e.lo, CONF_DERIVED, 1);
+  c.value2 = e.hi;
+  struct estimate m = e;
+  estimate_meet(&m, qd, &c);
+  TH_CHECK(estimate_is_bottom(&m, qd));
+
+  struct range out[8];
+  TH_CHECK(quantity_ranges(Q_VIRT_IMAGE_BASE, &e, CONF_BRUTE, &c, 1, out, 8) ==
+           0);
+
+  /* A cover that overhangs both edges (value < lo, value2 > hi) is also bottom.
+   */
+  struct estimate m2 = e;
+  struct constraint c2 =
+      mk(Q_VIRT_IMAGE_BASE, C_EXCLUDE, e.lo - 0x1000ul, CONF_DERIVED, 2);
+  c2.value2 = e.hi + 0x1000ul;
+  estimate_meet(&m2, qd, &c2);
+  TH_CHECK(estimate_is_bottom(&m2, qd));
+}
+
+static void test_quantity_slots_hole_aware(void) {
+  struct estimate e;
+  quantities[Q_VIRT_IMAGE_BASE].init_top(&e);
+  unsigned long base = e.lo;
+  e.hi = base + 0x4000000ul;         /* 64 MiB span */
+  unsigned long align = 0x1000000ul; /* 16 MiB slots */
+
+  /* No holes. The range is closed at both edges, so a 64 MiB span at a 16 MiB
+   * pitch admits five placements (base, +16M, +32M, +48M, +64M) — not four.
+   * Asserted as a literal rather than as the formula, so the count and the
+   * window a reader is shown cannot drift apart. */
+  unsigned long full =
+      quantity_slots(Q_VIRT_IMAGE_BASE, &e, CONF_BRUTE, NULL, 0, align);
+  TH_CHECK(full == 5);
+  TH_CHECK(full == (e.hi - e.lo) / align + 1);
+
+  /* An interior hole strictly reduces the count, and each surviving sub-range
+   * is itself counted closed: [base, base+16M-1] holds one placement and
+   * [base+32M, base+64M] holds three. */
+  struct constraint cs[1];
+  cs[0] = mk(Q_VIRT_IMAGE_BASE, C_EXCLUDE, base + 0x1000000ul, CONF_DERIVED, 1);
+  cs[0].value2 = base + 0x1fffffful; /* hole [base+16M, base+32M-1] */
+  unsigned long holed =
+      quantity_slots(Q_VIRT_IMAGE_BASE, &e, CONF_BRUTE, cs, 1, align);
+  TH_CHECK(holed == 4);
+  TH_CHECK(holed < full);
+
+  /* align 0 is defined as 0 slots (no division). */
+  TH_CHECK(quantity_slots(Q_VIRT_IMAGE_BASE, &e, CONF_BRUTE, NULL, 0, 0) == 0);
+}
+
+/* A pinned quantity is one candidate, and a window narrower than one slot is
+ * also one — both fall out of counting a closed range rather than needing a
+ * special case. Zero candidates would be indistinguishable from an empty
+ * result, and would report a pin as if nothing had been resolved. */
+static void test_quantity_slots_pin_is_one_candidate(void) {
+  struct estimate e;
+  quantities[Q_VIRT_IMAGE_BASE].init_top(&e);
+  unsigned long base = e.lo;
+  unsigned long align = 0x1000000ul; /* 16 MiB slots */
+
+  e.hi = e.lo; /* pinned */
+  TH_CHECK(quantity_slots(Q_VIRT_IMAGE_BASE, &e, CONF_BRUTE, NULL, 0, align) ==
+           1);
+
+  e.hi = base + 0x1000ul; /* 4 KiB window, far narrower than one slot */
+  TH_CHECK(quantity_slots(Q_VIRT_IMAGE_BASE, &e, CONF_BRUTE, NULL, 0, align) ==
+           1);
+}
+
+/* The floor gates which C_EXCLUDE holes carve, exactly as estimate_resolve
+ * gates the edge-setting constraints: a hole from a below-floor constraint must
+ * not shrink a floored (guaranteed) window, or the carved candidate set could
+ * drop the true value the >= floor evidence still admits. A hole at/above the
+ * floor still carves. This is the read-time half of the two-window soundness
+ * guarantee — the estimate's edges and its interior holes come from the same
+ * trust level. */
+static void test_quantity_slots_floor_gates_holes(void) {
+  struct estimate e;
+  quantities[Q_VIRT_IMAGE_BASE].init_top(&e);
+  unsigned long base = e.lo;
+  e.hi = base + 0x4000000ul;         /* 64 MiB span */
+  unsigned long align = 0x1000000ul; /* 16 MiB slots */
+  unsigned long full =
+      quantity_slots(Q_VIRT_IMAGE_BASE, &e, CONF_INFERRED, NULL, 0, align);
+
+  /* A sub-floor (CONF_HEURISTIC) interior exclude. */
+  struct constraint cs[1];
+  cs[0] =
+      mk(Q_VIRT_IMAGE_BASE, C_EXCLUDE, base + 0x1000000ul, CONF_HEURISTIC, 1);
+  cs[0].value2 = base + 0x1fffffful; /* hole [base+16M, base+32M-1] */
+
+  /* Guaranteed floor (CONF_INFERRED): the sub-floor hole is ignored — every
+   * candidate the >= floor evidence admits survives, and the interval is not
+   * split. */
+  TH_CHECK(quantity_slots(Q_VIRT_IMAGE_BASE, &e, CONF_INFERRED, cs, 1, align) ==
+           full);
+  {
+    struct range out[8];
+    int n =
+        quantity_ranges(Q_VIRT_IMAGE_BASE, &e, CONF_INFERRED, cs, 1, out, 8);
+    TH_CHECK(n == 1);
+    TH_CHECK(out[0].lo == e.lo && out[0].hi == e.hi);
+  }
+
+  /* All-signals floor (CONF_BRUTE): the same hole DOES carve. */
+  TH_CHECK(quantity_slots(Q_VIRT_IMAGE_BASE, &e, CONF_BRUTE, cs, 1, align) <
+           full);
+
+  /* A hole at/above the floor carves even at the guaranteed floor. */
+  cs[0].conf = CONF_PARSED;
+  TH_CHECK(quantity_slots(Q_VIRT_IMAGE_BASE, &e, CONF_INFERRED, cs, 1, align) <
+           full);
+}
+
+static void test_quantity_ranges_finset(void) {
+  const struct quantity_def *qd = &quantities[Q_VA_BITS];
+  struct estimate e;
+  qd->init_top(&e); /* all candidates live */
+  struct range out[16];
+  int n = quantity_ranges(Q_VA_BITS, &e, CONF_BRUTE, NULL, 0, out, 16);
+  TH_CHECK(n == qd->n_candidates);
+  for (int i = 0; i < n; i++)
+    TH_CHECK(out[i].lo == out[i].hi); /* degenerate point per candidate */
+}
+
+static void test_quantity_ranges_maxalign_empty(void) {
+  struct estimate e;
+  quantities[Q_VIRT_KASLR_ALIGN].init_top(&e);
+  struct range out[4];
+  int n = quantity_ranges(Q_VIRT_KASLR_ALIGN, &e, CONF_BRUTE, NULL, 0, out, 4);
+  TH_CHECK(n == 0); /* an alignment is not an address set */
+}
+
+/* ========================================================================
+ * Honest-top soundness validation (compiled arch)
+ * ======================================================================== */
+static int interval_admits(enum kasld_quantity q, unsigned long v) {
+  struct estimate e;
+  quantities[q].init_top(&e);
+  return v >= e.lo && v <= e.hi;
+}
+
+static void test_honest_tops_admit_known_values(void) {
+  /* Every arch: the KASLR-off default text base must be inside the top. The
+   * virtual top is [VIRT_TEXT_MIN_ANY_CONFIG, VIRT_TEXT_MAX_DEFAULT_CONFIG];
+   * the _WIDE floor is VIRT_TEXT_MIN_DEFAULT_CONFIG on arches without a
+   * configurable PHYSICAL_START, and is wider on arches like x86_64 where
+   * VIRT_TEXT_MIN_DEFAULT_CONFIG bakes in CONFIG_PHYSICAL_START at its
+   * compile-time default (a smaller config would otherwise leave text outside
+   * the window — soundness violation we now avoid). */
+  TH_CHECK(interval_admits(Q_VIRT_IMAGE_BASE,
+                           (unsigned long)KERNEL_VIRT_TEXT_DEFAULT));
+  TH_CHECK(interval_admits(Q_VIRT_IMAGE_BASE,
+                           (unsigned long)VIRT_TEXT_MIN_ANY_CONFIG));
+  TH_CHECK(interval_admits(Q_VIRT_IMAGE_BASE,
+                           (unsigned long)VIRT_TEXT_MAX_DEFAULT_CONFIG - 1ul));
+  /* And the COMPILE-TIME VIRT_TEXT_MIN_DEFAULT_CONFIG (the heuristic floor) is
+   * admitted, sitting at-or-above the widened floor. */
+  TH_CHECK(interval_admits(Q_VIRT_IMAGE_BASE,
+                           (unsigned long)VIRT_TEXT_MIN_DEFAULT_CONFIG));
+
+#if defined(__aarch64__)
+  /* Pre-v5.4 arm64 layout: the kernel image sits LOW, below _PAGE_END, at
+   * VA_START(48) + 128 MiB module region; _text a TEXT_OFFSET above it (v4.14
+   * real value 0xffff000008080000). The honest top must admit it, or an
+   * unprivileged report on a pre-v5.4 kernel excludes the true text base. */
+  TH_CHECK(interval_admits(Q_VIRT_IMAGE_BASE, 0xffff000008080000ul));
+  /* Physical image base: memstart_addr can place DRAM (and the image) anywhere,
+   * and IMAGE_BASE_OFFSET is 0, so the honest top spans [DRAM base,
+   * PHYS_ADDR_TOP] with no sub-offset floor gap. Admit the low DRAM-base floor
+   * and a realistic ~1 GiB load (a real aarch64 boot loads at 0x40200000). A
+   * high load above the PHYS_PLAUSIBLE_MAX RAM heuristic is now admitted — the
+   * honest top is the architectural PHYS_ADDR_TOP; reject only above that. */
+  TH_CHECK(
+      interval_admits(Q_PHYS_IMAGE_BASE, (unsigned long)PHYS_MIN_ANY_CONFIG));
+  TH_CHECK(interval_admits(Q_PHYS_IMAGE_BASE, 0x40200000ul));
+  TH_CHECK(interval_admits(Q_PHYS_IMAGE_BASE,
+                           (unsigned long)PHYS_PLAUSIBLE_MAX + 1ul));
+  TH_CHECK(!interval_admits(Q_PHYS_IMAGE_BASE, PHYS_ADDR_TOP + 1ul));
+#endif
+#if (defined(__riscv) || defined(__riscv__)) && __riscv_xlen == 64
+  /* Physical image base: OpenSBI loads the kernel at DRAM base +
+   * RISCV_PHYS_LOAD_OFFSET (2 MiB), so the honest top floors at that convention
+   * (PHYS_MIN_ANY_CONFIG == KERNEL_PHYS_DEFAULT) and spans to PHYS_ADDR_TOP.
+   * Admit the firmware base and a mid-range load; reject below the floor (the
+   * OpenSBI-reserved head of DRAM). A high load above the PHYS_PLAUSIBLE_MAX
+   * RAM heuristic is now admitted (architectural top); reject only above that.
+   */
+  TH_CHECK(
+      interval_admits(Q_PHYS_IMAGE_BASE, (unsigned long)PHYS_MIN_ANY_CONFIG));
+  TH_CHECK(interval_admits(Q_PHYS_IMAGE_BASE,
+                           (unsigned long)PHYS_PLAUSIBLE_MIN + 0x40000000ul));
+  TH_CHECK(!interval_admits(Q_PHYS_IMAGE_BASE,
+                            (unsigned long)PHYS_MIN_ANY_CONFIG - 1ul));
+  TH_CHECK(interval_admits(Q_PHYS_IMAGE_BASE,
+                           (unsigned long)PHYS_PLAUSIBLE_MAX + 1ul));
+  TH_CHECK(!interval_admits(Q_PHYS_IMAGE_BASE, PHYS_ADDR_TOP + 1ul));
+#endif
+#if defined(__s390__) || defined(__s390x__)
+  /* Pre-v6.8 s390 runs identity-mapped: kernel text near address 0 (image base
+   * at the bottom of RAM, _stext at IMAGE_BASE_OFFSET). The honest top must
+   * admit the low identity-mapped text base. */
+  TH_CHECK(
+      interval_admits(Q_VIRT_IMAGE_BASE, (unsigned long)IMAGE_BASE_OFFSET));
+  TH_CHECK(interval_admits(Q_VIRT_IMAGE_BASE, 0x200ul));
+  /* The PHYSICAL image base (_text = __kaslr_offset_phys) is identity-mapped
+   * low too — as low as PHYS_PLAUSIBLE_MIN, IMAGE_BASE_OFFSET below _stext. A
+   * real 4.14 boot shows iomem "Kernel code" starting at phys 0x200. The honest
+   * top must admit it; the derived KERNEL_PHYS_DEFAULT (= _stext floor,
+   * 0x100000) would exclude it and reject the parsed low-base pin — an unsound
+   * phys window. */
+  TH_CHECK(
+      interval_admits(Q_PHYS_IMAGE_BASE, (unsigned long)PHYS_PLAUSIBLE_MIN));
+  TH_CHECK(interval_admits(Q_PHYS_IMAGE_BASE, 0x200ul));
+#endif
+
+#if defined(__x86_64__) || defined(__amd64__)
+  /* Physical text base: the honest top must admit a HIGH load address —
+   * the whole point of demoting the 16 GiB PHYS_PLAUSIBLE_MAX heuristic.
+   * 256 GiB would fail against the old hard cap. The FLOOR is now
+   * PHYS_MIN_ANY_CONFIG (== PHYSICAL_START_MIN_PRACTICAL = 2 MiB on x86_64)
+   * so kernels built with a non-default CONFIG_PHYSICAL_START as low as
+   * 2 MiB are admitted; addresses below that minimum are excluded. */
+  TH_CHECK(interval_admits(Q_PHYS_IMAGE_BASE, (unsigned long)PHYSICAL_START));
+  TH_CHECK(
+      interval_admits(Q_PHYS_IMAGE_BASE, (unsigned long)KERNEL_PHYS_DEFAULT));
+  TH_CHECK(
+      interval_admits(Q_PHYS_IMAGE_BASE, (unsigned long)PHYS_MIN_ANY_CONFIG));
+  TH_CHECK(!interval_admits(Q_PHYS_IMAGE_BASE,
+                            (unsigned long)PHYS_MIN_ANY_CONFIG - 1ul));
+  TH_CHECK(interval_admits(Q_PHYS_IMAGE_BASE, 0x4000000000ul)); /* 256 GiB */
+  TH_CHECK(!interval_admits(Q_PHYS_IMAGE_BASE, PHYS_ADDR_TOP + 1ul));
+
+  /* PAGE_OFFSET top spans both 5-level (the compile default) and 4-level. */
+  TH_CHECK(interval_admits(Q_PAGE_OFFSET, (unsigned long)PAGE_OFFSET));
+  TH_CHECK(interval_admits(Q_PAGE_OFFSET, 0xffff888000000000ul)); /* 4-level */
+
+  /* The Q_VA_BITS top admits every architectural VA-bits candidate. */
+  {
+    struct estimate e;
+    quantities[Q_VA_BITS].init_top(&e);
+    static const unsigned long cands[] = VA_BITS_CANDIDATES;
+    for (size_t i = 0; i < sizeof(cands) / sizeof(cands[0]); i++)
+      TH_CHECK(finset_has(Q_VA_BITS, &e, cands[i]));
+  }
+#endif
+}
+
+/* ========================================================================
+ * C_STRIDE: q ≡ value (mod modulus) annotation on LK_INTERVAL.
+ * ======================================================================== */
+static struct constraint mk_stride(enum kasld_quantity q, unsigned long residue,
+                                   unsigned long modulus, uint32_t id) {
+  struct constraint c;
+  memset(&c, 0, sizeof(c));
+  c.q = q;
+  c.op = C_STRIDE;
+  c.value = residue;
+  c.value2 = modulus;
+  c.conf = CONF_PARSED;
+  c.id = id;
+  c.lineage_count = 1;
+  return c;
+}
+
+/* First stride constraint sets the estimate's stride pair to the residue and
+ * modulus. */
+static void test_stride_first_constraint_sets_pair(void) {
+  struct estimate e;
+  quantities[Q_VIRT_IMAGE_BASE].init_top(&e);
+  struct constraint c =
+      mk_stride(Q_VIRT_IMAGE_BASE, 0x1234ul, 0x100000ul /* 1 MiB */, 1);
+  estimate_meet(&e, &quantities[Q_VIRT_IMAGE_BASE], &c);
+  TH_CHECK(e.stride == 0x100000ul);
+  TH_CHECK(e.stride_offset == 0x1234ul);
+  TH_CHECK(!estimate_is_bottom(&e, &quantities[Q_VIRT_IMAGE_BASE]));
+}
+
+/* Two stride constraints with the same modulus agree → estimate stays
+ * non-bottom and annotation is preserved. */
+static void test_stride_same_modulus_agreeing_residues(void) {
+  struct estimate e;
+  quantities[Q_VIRT_IMAGE_BASE].init_top(&e);
+  struct constraint c1 = mk_stride(Q_VIRT_IMAGE_BASE, 0x1000ul, 0x10000ul, 1);
+  struct constraint c2 = mk_stride(Q_VIRT_IMAGE_BASE, 0x11000ul, 0x10000ul, 2);
+  estimate_meet(&e, &quantities[Q_VIRT_IMAGE_BASE], &c1);
+  estimate_meet(&e, &quantities[Q_VIRT_IMAGE_BASE], &c2);
+  TH_CHECK(e.stride == 0x10000ul);
+  TH_CHECK(e.stride_offset == 0x1000ul);
+  TH_CHECK(!estimate_is_bottom(&e, &quantities[Q_VIRT_IMAGE_BASE]));
+}
+
+/* Two stride constraints with the same modulus, disagreeing residues →
+ * estimate goes bottom (the system is unsatisfiable). */
+static void test_stride_same_modulus_disagreeing_residues_bottom(void) {
+  struct estimate e;
+  quantities[Q_VIRT_IMAGE_BASE].init_top(&e);
+  struct constraint c1 = mk_stride(Q_VIRT_IMAGE_BASE, 0x1000ul, 0x10000ul, 1);
+  struct constraint c2 = mk_stride(Q_VIRT_IMAGE_BASE, 0x2000ul, 0x10000ul, 2);
+  estimate_meet(&e, &quantities[Q_VIRT_IMAGE_BASE], &c1);
+  estimate_meet(&e, &quantities[Q_VIRT_IMAGE_BASE], &c2);
+  TH_CHECK(estimate_is_bottom(&e, &quantities[Q_VIRT_IMAGE_BASE]));
+}
+
+/* Two stride constraints with different (non-coprime) moduli combine via
+ * CRT to lcm(m1, m2) with a consistent residue. */
+static void test_stride_crt_combines_to_lcm(void) {
+  struct estimate e;
+  quantities[Q_VIRT_IMAGE_BASE].init_top(&e);
+  /* x ≡ 1 (mod 6), x ≡ 4 (mod 9) — gcd(6,9)=3; (4-1) mod 3 == 0 so solvable.
+   * lcm(6, 9) = 18; solution class: x ≡ 13 (mod 18). */
+  struct constraint c1 = mk_stride(Q_VIRT_IMAGE_BASE, 1ul, 6ul, 1);
+  struct constraint c2 = mk_stride(Q_VIRT_IMAGE_BASE, 4ul, 9ul, 2);
+  estimate_meet(&e, &quantities[Q_VIRT_IMAGE_BASE], &c1);
+  estimate_meet(&e, &quantities[Q_VIRT_IMAGE_BASE], &c2);
+  TH_CHECK(e.stride == 18ul);
+  TH_CHECK(e.stride_offset == 13ul);
+  TH_CHECK(!estimate_is_bottom(&e, &quantities[Q_VIRT_IMAGE_BASE]));
+}
+
+/* CRT spotting inconsistency: x ≡ 1 (mod 6), x ≡ 5 (mod 9) — (5-1) mod
+ * gcd(6,9)=3 is 1, so no joint solution exists. */
+static void test_stride_crt_inconsistent_bottom(void) {
+  struct estimate e;
+  quantities[Q_VIRT_IMAGE_BASE].init_top(&e);
+  struct constraint c1 = mk_stride(Q_VIRT_IMAGE_BASE, 1ul, 6ul, 1);
+  struct constraint c2 = mk_stride(Q_VIRT_IMAGE_BASE, 5ul, 9ul, 2);
+  estimate_meet(&e, &quantities[Q_VIRT_IMAGE_BASE], &c1);
+  estimate_meet(&e, &quantities[Q_VIRT_IMAGE_BASE], &c2);
+  TH_CHECK(estimate_is_bottom(&e, &quantities[Q_VIRT_IMAGE_BASE]));
+}
+
+/* CRT of two large coprime moduli whose lcm just fits in unsigned long. The
+ * naive combiner (r1 + m1 * (diff/g) * x) multiplies three ~2^32 cofactors and
+ * overflows 64-bit signed here; verify the reduced combiner is correct via the
+ * defining congruences. 64-bit only: on a 32-bit unsigned long the lcm exceeds
+ * ULONG_MAX and the pair does not combine (that path is covered above). */
+static void test_stride_crt_large_moduli_no_overflow(void) {
+#if __SIZEOF_LONG__ >= 8
+  struct estimate e;
+  quantities[Q_VIRT_IMAGE_BASE].init_top(&e);
+  /* Widen the interval to the whole address space: the combined class has
+   * stride lcm ~= 2^64, so its one in-range member (the residue R itself) only
+   * lands inside a maximally wide window — this test targets the CRT
+   * arithmetic, not interval intersection. */
+  e.lo = 0;
+  e.hi = ~0ul;
+  const unsigned long m1 = 0xFFFFFFFBul; /* 2^32 - 5 */
+  const unsigned long m2 =
+      0xFFFFFFFDul; /* 2^32 - 3; coprime with m1 (diff 2) */
+  const unsigned long r1 = 0x12345ul, r2 = 0x67890ul;
+  struct constraint c1 = mk_stride(Q_VIRT_IMAGE_BASE, r1, m1, 1);
+  struct constraint c2 = mk_stride(Q_VIRT_IMAGE_BASE, r2, m2, 2);
+  estimate_meet(&e, &quantities[Q_VIRT_IMAGE_BASE], &c1);
+  estimate_meet(&e, &quantities[Q_VIRT_IMAGE_BASE], &c2);
+  TH_CHECK(!estimate_is_bottom(&e, &quantities[Q_VIRT_IMAGE_BASE]));
+  TH_CHECK(e.stride == m1 * m2);        /* coprime -> lcm = m1*m2 */
+  TH_CHECK(e.stride_offset % m1 == r1); /* combined class satisfies both */
+  TH_CHECK(e.stride_offset % m2 == r2); /* defining congruences */
+#endif
+}
+
+/* Stride with no residue-class member in the interval → bottom. */
+static void test_stride_no_intersection_with_interval_bottom(void) {
+  struct estimate e;
+  quantities[Q_VIRT_IMAGE_BASE].init_top(&e);
+  /* Pin the interval to a single point not matching the stride class. */
+  e.lo = e.hi = 0x100ul; /* the only admitted value */
+  struct constraint c = mk_stride(Q_VIRT_IMAGE_BASE, 7ul, 16ul, 1);
+  /* 0x100 mod 16 == 0; residue 7 — disjoint. */
+  estimate_meet(&e, &quantities[Q_VIRT_IMAGE_BASE], &c);
+  TH_CHECK(estimate_is_bottom(&e, &quantities[Q_VIRT_IMAGE_BASE]));
+}
+
+/* quantity_slots with a stride > align counts residue-class members, not
+ * raw align-step members. Demonstrates entropy collapse — the s390
+ * segment-mod use case. */
+static void test_quantity_slots_with_stride(void) {
+  struct constraint cs[1];
+  cs[0] = mk_stride(Q_VIRT_IMAGE_BASE, 0x200000ul, 0x100000ul, 1);
+  struct estimate e;
+  quantities[Q_VIRT_IMAGE_BASE].init_top(&e);
+  e.stride = 0x100000ul;        /* 1 MiB */
+  e.stride_offset = 0x200000ul; /* anchor inside the class */
+  /* Pin a small window so the count is meaningfully bounded. */
+  e.lo = 0x10000000ul;
+  e.hi = 0x10000000ul + 0x800000ul; /* 8 MiB window */
+  /* Both edges count, as everywhere else. With align = 16 KiB the window would
+   * hold 8 MiB / 16 KiB + 1 = 513 align-slots; the stride class admits only
+   * 8 MiB / 1 MiB + 1 = 9. */
+  unsigned long slots = quantity_slots(Q_VIRT_IMAGE_BASE, &e, CONF_BRUTE, cs, 1,
+                                       0x4000ul /* 16 KiB */);
+  TH_CHECK(slots == 9);
+}
+
+int main(void) {
+  TEST_SUITE("test_estimate");
+
+  BEGIN_CATEGORY("Lattice meet");
+  RUN(test_interval_meet_bounds);
+  RUN(test_interval_meet_equals_and_bottom);
+  RUN(test_maxalign_meet);
+  RUN(test_maxalign_stated_granularity_closes_the_ceiling);
+  RUN(test_maxalign_stated_granularity_raises_the_floor);
+  RUN(test_maxalign_stated_granularity_only_tightens);
+  RUN(test_maxalign_floor_past_a_stated_granularity_is_bottom);
+  RUN(test_finset_meet);
+  RUN(test_finset_bounds_and_excludes);
+
+  BEGIN_CATEGORY("Arch declaration: linear-map base axis");
+  RUN(test_page_offset_axis_is_self_consistent);
+
+  BEGIN_CATEGORY("Lattice-agnostic accessors");
+  RUN(test_accessors_interval);
+  RUN(test_accessors_finset);
+  RUN(test_accessors_maxalign_is_not_a_value);
+
+  BEGIN_CATEGORY("Stride (C_STRIDE) algebra");
+  RUN(test_stride_first_constraint_sets_pair);
+  RUN(test_stride_same_modulus_agreeing_residues);
+  RUN(test_stride_same_modulus_disagreeing_residues_bottom);
+  RUN(test_stride_crt_combines_to_lcm);
+  RUN(test_stride_crt_inconsistent_bottom);
+  RUN(test_stride_crt_large_moduli_no_overflow);
+  RUN(test_stride_no_intersection_with_interval_bottom);
+  RUN(test_quantity_slots_with_stride);
+
+  BEGIN_CATEGORY("Greedy resolver");
+  RUN(test_resolve_stronger_wins);
+  RUN(test_resolve_priority_flips_with_confidence);
+  RUN(test_resolve_deterministic_and_no_conflict);
+  RUN(test_estimate_at_trust_floor);
+
+  BEGIN_CATEGORY("Consumer value-access (quantity_ranges/slots)");
+  RUN(test_quantity_ranges_interval_plain);
+  RUN(test_quantity_ranges_interval_with_interior_hole);
+  RUN(test_exclude_full_cover_is_bottom);
+  RUN(test_quantity_slots_hole_aware);
+  RUN(test_quantity_slots_pin_is_one_candidate);
+  RUN(test_quantity_slots_floor_gates_holes);
+  RUN(test_quantity_ranges_finset);
+  RUN(test_quantity_ranges_maxalign_empty);
+
+  BEGIN_CATEGORY("Honest-top soundness");
+  RUN(test_honest_tops_admit_known_values);
+
+  return TEST_DONE();
+}

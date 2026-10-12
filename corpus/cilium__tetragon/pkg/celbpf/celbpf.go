@@ -1,0 +1,109 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Tetragon
+
+// CEL -> BPF code generation
+// Heavily based on an earlier implementation by Yutaro Hayakawa <yutaro.hayakawa@isovalent.com>
+package celbpf
+
+import (
+	"fmt"
+
+	cgChecker "cel.dev/cel-go/checker"
+	cgCommon "cel.dev/cel-go/common"
+	cgParser "cel.dev/cel-go/parser"
+	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/btf"
+
+	"github.com/cilium/tetragon/pkg/bpf"
+	"github.com/cilium/tetragon/pkg/config"
+	"github.com/cilium/tetragon/pkg/k8s/apis/cilium.io/v1alpha1"
+)
+
+type Env struct{}
+
+type ExprArg struct {
+	GenTy     int
+	ArgOffset int
+}
+
+// EnabledInBPF returns true if celbpf is supported in the BPF programs
+func EnabledInBPF() bool {
+	return config.EnableLargeProgs()
+}
+
+// Supported returns true if celbpf is supported at runtime
+// NB: The cel_expr code uses bpf-to-bpf calls, so we need to detect whether mixing bpf-to-bpf calls
+// and tail-calls is allowed.
+// See: https://lore.kernel.org/bpf/20200829231925.GB31692@ranger.igk.intel.com/T/
+func Supported() bool {
+	return bpf.DetectMixBpfAndTailCalls()
+}
+
+func Compile(celExpr string, sig, data []v1alpha1.KProbeArg, labelPrefix string) (asm.Instructions, []uint16, error) {
+	source := cgCommon.NewTextSource(celExpr)
+	parser, err := cgParser.NewParser()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed initialize CEL parser: %w", err)
+	}
+
+	ast, errs := parser.Parse(source)
+	if len(errs.GetErrors()) > 0 {
+		return nil, nil, fmt.Errorf("failed to parse CEL expresion %q: %s", celExpr, errs.ToDisplayString())
+	}
+
+	checkerEnv, err := newCheckerEnv(sig, data)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	ast, errs = cgChecker.Check(ast, source, checkerEnv)
+	if len(errs.GetErrors()) > 0 {
+		return nil, nil, fmt.Errorf("check failed on CEL expresion %q: %s", celExpr, errs.ToDisplayString())
+	}
+
+	compiler := newCompiler(ast, source, sig, data, labelPrefix)
+	return compiler.compile()
+}
+
+type s struct {
+	s string
+}
+
+func (s s) String() string {
+	return s.s
+}
+
+func btfCelExprTy(fnName string) *btf.Func {
+	return &btf.Func{
+		Name: fnName,
+		Type: &btf.FuncProto{
+			Return: &btf.Int{
+				Name:     "s32",
+				Size:     4,
+				Encoding: btf.Signed,
+			},
+			Params: []btf.FuncParam{},
+		},
+		Linkage: btf.StaticFunc,
+	}
+}
+
+func CompileEmptyFunction(fnName string) asm.Instructions {
+	insns := asm.Instructions{
+		asm.Mov.Imm(asm.R0, 0),
+		asm.Return(),
+	}
+	fnTy := btfCelExprTy(fnName)
+	insns[0] = btf.WithFuncMetadata(insns[0].WithSymbol(fnTy.Name), fnTy).WithSource(s{"default"})
+	return insns
+}
+
+func CompileFn(fnName, celExpr string, sig, data []v1alpha1.KProbeArg) (asm.Instructions, []uint16, error) {
+	insns, arg_indexes, err := Compile(celExpr, sig, data, fnName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to compile CEL expression %q: %w", celExpr, err)
+	}
+	fnTy := btfCelExprTy(fnName)
+	insns[0] = btf.WithFuncMetadata(insns[0].WithSymbol(fnTy.Name), fnTy).WithSource(s{celExpr})
+	return insns, arg_indexes, nil
+}

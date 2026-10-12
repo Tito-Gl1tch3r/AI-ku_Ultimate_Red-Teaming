@@ -1,0 +1,58 @@
+package org.pac4j.saml.metadata;
+
+import lombok.val;
+import org.junit.jupiter.api.Test;
+import org.pac4j.saml.config.SAML2Configuration;
+import org.pac4j.saml.util.ConfigurationManager;
+import org.pac4j.saml.util.DefaultConfigurationManager;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.FileSystemResource;
+
+import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+
+/**
+ * This is {@link DefaultSAML2MetadataSignerTests}.
+ *
+ * @author Misagh Moayyed
+ * @since 5.4.4
+ */
+public class DefaultSAML2MetadataSignerTests {
+    @Test
+    public void verifySigningWithConfigurationDefaults() throws Exception {
+        val configuration = new SAML2Configuration();
+        verifyMetadataSigning(configuration);
+    }
+
+    @Test
+    public void verifySigningWithConfigurationOverride() throws Exception {
+        val configuration = new SAML2Configuration();
+        configuration.setSignatureAlgorithms(List.of("http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"));
+        configuration.setSignatureReferenceDigestMethods(List.of("http://www.w3.org/2001/04/xmlenc#sha256"));
+        verifyMetadataSigning(configuration);
+    }
+
+    private static void verifyMetadataSigning(SAML2Configuration configuration) throws Exception {
+        configuration.setForceKeystoreGeneration(true);
+        configuration.setKeystorePath("target/keystore.jks");
+        configuration.setKeystorePassword("pac4j");
+        configuration.setPrivateKeyPassword("pac4j");
+        configuration.setSignMetadata(true);
+        configuration.getServiceProviderMetadata().setResource(new FileSystemResource("target/out.xml"));
+        configuration.getIdentityProviderMetadata().setResource(new ClassPathResource("idp-metadata.xml"));
+        configuration.setMetadataSigner(new DefaultSAML2MetadataSigner(configuration));
+        configuration.init();
+
+        ConfigurationManager mgr = new DefaultConfigurationManager();
+        mgr.configure();
+        val metadataGenerator = configuration.toMetadataGenerator();
+        val entity = metadataGenerator.buildEntityDescriptor();
+        assertNotNull(entity);
+        val metadata = metadataGenerator.getMetadata(entity);
+        assertNotNull(metadata);
+
+        metadataGenerator.storeMetadata(metadata, true);
+        assertNotNull(metadataGenerator.buildMetadataResolver());
+    }
+}

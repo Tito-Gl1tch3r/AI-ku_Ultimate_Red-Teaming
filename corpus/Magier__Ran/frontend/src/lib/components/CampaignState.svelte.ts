@@ -1,0 +1,664 @@
+import { getContext, setContext } from 'svelte';
+import type { ArmoryType } from '#lib/model.js';
+import type {
+	AttackFlow,
+	BinaryPresence,
+	CampaignState as State,
+	Graph,
+	TTP
+} from '#lib/api/index.js';
+import type { KubetierCatalog, LocalPermissionAssessment, UiConfig } from '#lib/api/index.js';
+import { showToast, type ToastType } from '#lib/components/toaster.js';
+import { getRanAPI, RanAPI, type SseEventMap } from '#lib/ran_api.js';
+import { timeline } from '#lib/stores/timelineStore.svelte.js';
+import { DEFAULT_NAMESPACE_UI_CONFIG } from '#lib/namespace_filter.js';
+
+// Great video how to build stores in Svelte 5: https://www.youtube.com/watch?v=kMBDsyozllk
+
+export type Entity = {
+	id: string;
+	name: string;
+	kind?: string;
+	namespace?: string;
+	accessLevel?: { User: number; Level: number } | string;
+	binaries?: Record<string, BinaryPresence>;
+	envVars?: Record<string, string>;
+	files?: string[];
+	directories?: string[];
+	listedDirectories?: string[];
+	volume_mounts?: Array<{
+		name: string;
+		mount_root: string;
+		mount_point: string;
+		mount_type?: string;
+		is_host_path: boolean;
+		read_only: boolean;
+	}>;
+	mounts?: Array<{
+		name: string;
+		mount_root: string;
+		mount_point: string;
+		mount_type?: string;
+		is_host_path: boolean;
+		read_only: boolean;
+	}>;
+	containers?: Array<{
+		name: string;
+		volume_mounts?: Array<{
+			name: string;
+			mount_root: string;
+			mount_point: string;
+			mount_type?: string;
+			is_host_path: boolean;
+			read_only: boolean;
+		}>;
+		[key: string]: any;
+	}>;
+	phase?: string;
+	ready?: boolean;
+	stateReason?: string;
+	ips?: string[];
+	provenance?: string[];
+	compromised?: boolean;
+	token?: { Raw?: string };
+	meta?: { name_confidence?: string };
+};
+
+export type Relation = {
+	id: string;
+	source: string;
+	destination: string;
+	kind: string;
+	[key: string]: any; // Allow additional fields from specific relation types
+};
+
+type ErrorMsg = {
+	CmdId: string;
+	Level: string;
+	Msg: string;
+};
+
+type ParseAuditUI = SseEventMap['parse-audited']['audits'][number];
+
+const EXECUTION_FAILURE_EFFECT_ID = 'execution.failure';
+
+export function executionFailureMessage(detail: string): string {
+	return detail.replace(/^unclassified failure:\s*/i, '').trim() || 'Action execution failed';
+}
+
+export type LiveExecutionOutput = {
+	sequence: number;
+	stdout: string;
+	stderr: string;
+	stdoutBytes: number;
+	stderrBytes: number;
+	truncated: boolean;
+	completed: boolean;
+	success?: boolean;
+	failReason?: string;
+};
+
+const LIVE_OUTPUT_LIMIT = 1024 * 1024;
+
+export class CampaignState {
+	campaignId: number = $state(0);
+	entities = $state<Entity[]>([]);
+	relations = $state<Map<string, Relation>>(new Map());
+	namespaces = $state<Entity[]>([]);
+	pods = $state<Entity[]>([]);
+	serviceAccounts = $state<Entity[]>([]);
+	armory = $state<ArmoryType>(new Map());
+	graph = $state<Graph>({ nodes: [], edges: [], rootNodeId: '' });
+	kubetier = $state<KubetierCatalog | null>(null);
+	permissionAssessments = $state<LocalPermissionAssessment[]>([]);
+	uiConfig = $state<UiConfig>({ namespaces: DEFAULT_NAMESPACE_UI_CONFIG });
+	executionOutputs = $state<Map<string, LiveExecutionOutput>>(new Map());
+	/// Bumped whenever the scoring profile changes, so recommendation views refetch.
+	scoringVersion = $state(0);
+	pendingMessages: string[] = [];
+	api: RanAPI = $state(getRanAPI());
+	private factsChangedCounter = 0;
+	private getCampaignStateCounter = 0;
+	private liveRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+	private liveRefreshInFlight = false;
+	private liveRefreshQueued = false;
+	private initPromise: Promise<void> | null = null;
+	private hasConnectedToBackend = false;
+	private snapshotReady = $state(false);
+
+	init(): Promise<void> {
+		if (this.initPromise) return this.initPromise;
+		this.initPromise = this.initialize();
+		return this.initPromise;
+	}
+
+	private async initialize(): Promise<void> {
+		// The API URL is constructed from window.location.
+
+		this.api.on('armory-loaded', (data) => {
+			this.armory = parseArmory(data);
+		});
+		this.api.on('facts-changed', () => this.#queueLiveRefresh());
+		this.api.on('parse-audited', (data) => {
+			const audits = data.audits;
+			if (audits.length === 0) {
+				// A TTP that declares no effects has nothing to parse, so an empty
+				// audit list is the normal outcome, not a failed action. Keep it in
+				// the console for parser-coverage work instead of toasting an error
+				// at the operator, who would read it as the action having failed.
+				console.debug('[parse-audited] no parse audits for this action (no declared effects)');
+				return;
+			}
+
+			const executionFailures = audits.filter(
+				(a: ParseAuditUI) => a.effectId === EXECUTION_FAILURE_EFFECT_ID
+			);
+			if (executionFailures.length > 0) {
+				const details = executionFailures
+					.map((a: ParseAuditUI) => executionFailureMessage(a.detail))
+					.join('\n');
+				showToast('Action failed', details, 'error');
+			}
+
+			const parserAudits = audits.filter(
+				(a: ParseAuditUI) => a.effectId !== EXECUTION_FAILURE_EFFECT_ID
+			);
+
+			const logOnly = new Set(['NoParser', 'KnownFailure']);
+			const problematic = parserAudits.filter(
+				(a: ParseAuditUI) => a.parseResult !== 'Parsed' && !logOnly.has(a.parseResult)
+			);
+			const gaps = parserAudits.filter((a: ParseAuditUI) => logOnly.has(a.parseResult));
+			if (gaps.length > 0) {
+				console.log(
+					'[parse-audited] parser gaps (log only):',
+					gaps.map((a: ParseAuditUI) => `${a.effectId}: ${a.parseResult} (${a.detail})`)
+				);
+			}
+			if (problematic.length > 0) {
+				const details = problematic
+					.map((a: ParseAuditUI) => `${a.effectId}: ${a.parseResult} (${a.detail})`)
+					.join('\n');
+				showToast('Parsing gap detected', details, 'error');
+				return;
+			}
+		});
+		this.api.on('ttp-output', (data) => this.recordExecutionOutput(data));
+		this.api.on('ttp-executed', (data) => this.completeExecutionOutput(data));
+		this.api.onConnectionStateChange((state) => {
+			if (state !== 'connected') return;
+			void this.restoreLiveExecutionOutput();
+			if (this.hasConnectedToBackend) this.#queueLiveRefresh();
+			this.hasConnectedToBackend = true;
+		});
+		this.api.on('reset-campaign', () => this.onReset());
+		this.api.on('error-msg', (rawMsg: string) => {
+			const msg: ErrorMsg = JSON.parse(rawMsg);
+
+			// Map msg.Level to ToastType
+			let toastType: ToastType;
+			switch (msg.Level) {
+				case 'ERROR':
+				case 'WARN':
+				case 'FATAL':
+					toastType = 'error';
+					break;
+				case 'INFO':
+				case 'DEBUG':
+				default:
+					toastType = 'info';
+			}
+
+			showToast('Error', msg.Msg, toastType);
+		});
+		console.log('CampaignState connecting to backend...');
+		await this.api.connect();
+
+		void this.api
+			.GetUiConfig()
+			.then((config) => {
+				this.uiConfig = config;
+			})
+			.catch((err) => console.warn('Failed to load UI configuration', err));
+		void this.api
+			.GetKubetierCatalog()
+			.then((catalog) => {
+				this.kubetier = catalog;
+			})
+			.catch((err) => console.warn('Failed to load offline KubeTier catalog', err));
+		void this.api
+			.GetArmory()
+			.then((armory: TTP[]) => {
+				this.armory = parseArmory(armory);
+			})
+			.catch((err) => console.warn('Failed to load armory', err));
+
+		const [graph, state] = await this.#fetchSnapshot();
+		this.#installSnapshot(graph, state);
+	}
+
+	async #fetchSnapshot(): Promise<[Graph, State]> {
+		return Promise.all([this.api.GetGraph(), this.api.GetCampaignState()]);
+	}
+
+	#installSnapshot(graph: Graph, state: State): void {
+		this.graph = graph;
+		this.#setState(state);
+		this.snapshotReady = true;
+	}
+
+	private async restoreLiveExecutionOutput(): Promise<void> {
+		try {
+			const flow = await this.api.GetFlow();
+			for (const step of flow.steps.filter((candidate) => candidate.status === 'Ongoing')) {
+				const stdout = step.stdout ?? step.results?.[0] ?? '';
+				const stderr = step.stderr ?? step.results?.[1] ?? '';
+				this.setExecutionOutput(step.id, {
+					sequence: Number(step.outputSequence ?? 0),
+					stdout,
+					stderr,
+					stdoutBytes: Number(step.stdoutBytes ?? new TextEncoder().encode(stdout).length),
+					stderrBytes: Number(step.stderrBytes ?? new TextEncoder().encode(stderr).length),
+					truncated: step.outputTruncated ?? false,
+					completed: false
+				});
+			}
+		} catch (err) {
+			console.warn('Failed to restore live execution output', err);
+		}
+	}
+
+	private recordExecutionOutput(data: SseEventMap['ttp-output']): void {
+		const cmdId = data.cmdId;
+		const sequence = data.sequence;
+		if (!cmdId) return;
+		const current = this.executionOutputs.get(cmdId) ?? {
+			sequence: 0,
+			stdout: '',
+			stderr: '',
+			stdoutBytes: 0,
+			stderrBytes: 0,
+			truncated: false,
+			completed: false
+		};
+		if (sequence <= current.sequence) return;
+		if (sequence > current.sequence + 1) {
+			void this.restoreLiveExecutionOutput();
+			return;
+		}
+		const stdout = current.stdout + data.stdout;
+		const stderr = current.stderr + data.stderr;
+		this.setExecutionOutput(cmdId, {
+			sequence,
+			stdout: stdout.slice(-LIVE_OUTPUT_LIMIT),
+			stderr: stderr.slice(-LIVE_OUTPUT_LIMIT),
+			stdoutBytes: data.stdoutBytes,
+			stderrBytes: data.stderrBytes,
+			truncated:
+				current.truncated || stdout.length > LIVE_OUTPUT_LIMIT || stderr.length > LIVE_OUTPUT_LIMIT,
+			completed: false
+		});
+	}
+
+	private completeExecutionOutput(data: SseEventMap['ttp-executed']): void {
+		const cmdId = data.cmdId;
+		if (!cmdId) return;
+		const current = this.executionOutputs.get(cmdId) ?? {
+			sequence: 0,
+			stdout: '',
+			stderr: '',
+			stdoutBytes: 0,
+			stderrBytes: 0,
+			truncated: false,
+			completed: false
+		};
+		const results = data.results;
+		this.setExecutionOutput(cmdId, {
+			...current,
+			stdout: results[0] ?? current.stdout,
+			stderr: results[1] ?? current.stderr,
+			completed: true,
+			success: data.success,
+			failReason: data.failReason || undefined
+		});
+	}
+
+	private setExecutionOutput(id: string, output: LiveExecutionOutput): void {
+		const next = new Map(this.executionOutputs);
+		next.set(id, output);
+		this.executionOutputs = next;
+	}
+
+	getExecutionOutput(id: string): LiveExecutionOutput | undefined {
+		return this.executionOutputs.get(id);
+	}
+
+	isReady(): boolean {
+		return this.snapshotReady;
+	}
+
+	showError(msg: string | object) {
+		if (typeof msg === 'object') {
+			if (Object.hasOwn(msg, 'message')) {
+				msg = String((msg as { message: unknown }).message);
+			} else {
+				// fallback handling to show full object (may allow later refinement)
+				msg = JSON.stringify(msg);
+			}
+		} else if (typeof msg !== 'string') {
+			msg = String(msg);
+		}
+
+		console.error(msg);
+		showToast('Error', JSON.stringify(msg), 'error');
+	}
+
+	reset() {
+		this.snapshotReady = false;
+		this.entities = [];
+		this.namespaces = [];
+		this.pods = [];
+		this.serviceAccounts = [];
+		this.campaignId += 1; // Increment campaign ID, to trigger changes based on new campaign
+		this.api.ResetCampaign().then(() => {
+			this.#fetchSnapshot().then(([graph, state]) => this.#installSnapshot(graph, state));
+		});
+	}
+
+	async onReset(): Promise<void> {
+		console.log('Received reset-campaign event from backend');
+		this.snapshotReady = false;
+		// Clear the in-memory operation timeline so a reset/restart from any path
+		// (backend restart, autonomous loop, CLI) doesn't carry previous
+		// iterations' logs into the new campaign. The app-menu Reset clears it
+		// directly; this covers every reset signalled via the SSE event. Sharing
+		// this reset-campaign handler keeps the state and timeline refresh together.
+		timeline.clear();
+		this.executionOutputs = new Map();
+		const [graph, state] = await this.#fetchSnapshot();
+		this.#installSnapshot(graph, state);
+	}
+
+	/**
+	 * Coalesce bursts of SSE notifications into one graph/state refresh. A bulk
+	 * Kubernetes discovery is persisted atomically but used to start independent
+	 * full-graph requests for every notification, allowing stale responses and
+	 * repeated ELK layouts to monopolise the browser.
+	 */
+	#queueLiveRefresh(): void {
+		this.liveRefreshQueued = true;
+		if (this.liveRefreshTimer !== undefined || this.liveRefreshInFlight) return;
+
+		this.liveRefreshTimer = setTimeout(() => {
+			this.liveRefreshTimer = undefined;
+			void this.#refreshLiveState();
+		}, 50);
+	}
+
+	async #refreshLiveState(): Promise<void> {
+		if (this.liveRefreshInFlight) return;
+		this.liveRefreshInFlight = true;
+
+		try {
+			while (this.liveRefreshQueued) {
+				this.liveRefreshQueued = false;
+				const eventId = ++this.factsChangedCounter;
+				const stateCallId = ++this.getCampaignStateCounter;
+				try {
+					const [graph, state] = await this.#fetchSnapshot();
+					this.#installSnapshot(graph, state);
+				} catch (err) {
+					console.error(
+						`Live campaign refresh failed [Event ${eventId}->Call ${stateCallId}]:`,
+						err
+					);
+					showToast(
+						'Live update failed',
+						'The latest campaign changes could not be loaded. Retrying on the next update.',
+						'error'
+					);
+				}
+			}
+		} finally {
+			this.liveRefreshInFlight = false;
+			if (this.liveRefreshQueued) this.#queueLiveRefresh();
+		}
+	}
+
+	#setState(state: State): void {
+		const entities = [];
+		const namespaces = [];
+		const pods = [];
+		const serviceAccounts = [];
+
+		for (const [id, entity] of Object.entries(state.entities || {})) {
+			const typedEntity = entity as unknown as Entity;
+			if (typedEntity === null) {
+				console.warn(`⚠️ Skipping entity with id ${id} because it is null`);
+				console.log(state.entities);
+				continue;
+			}
+
+			if (typedEntity.kind === 'Namespace') {
+				namespaces.push(typedEntity);
+			} else if (typedEntity.kind === 'Pod') {
+				pods.push(typedEntity);
+			} else if (typedEntity.kind === 'ServiceAccount') {
+				serviceAccounts.push(typedEntity);
+			}
+
+			if (!typedEntity.id) {
+				typedEntity.id = id;
+			}
+			entities.push(typedEntity);
+		}
+
+		this.entities = entities;
+		this.namespaces = namespaces;
+		this.pods = pods;
+		this.serviceAccounts = serviceAccounts;
+		this.permissionAssessments = state.permissionAssessments ?? [];
+
+		// Process relations
+		console.info('Setting campaign state with relations:', state.relations);
+		const relationsMap = new Map<string, Relation>();
+		for (const relation of state.relations || []) {
+			// Extract source and target from the relation
+			// The backend sends relations with all their fields
+			const id = relation.id as string;
+			if (id) {
+				relationsMap.set(id, relation as Relation);
+			}
+		}
+		this.relations = relationsMap;
+		timeline.backfillBootstrap(state.bootstrapOperations ?? []);
+	}
+
+	// #updateState is currently unused but kept for potential future use
+	// #updateState(state: State): void {
+	// 	for (const [id, entity] of Object.entries(state.entities || {})) {
+	// 		const typedEntity = entity as any as Entity;
+	// 		if (!this.entities.some((e) => e.id === typedEntity.id)) {
+	// 			this.entities = [...this.entities, typedEntity];
+	// 		} else {
+	// 			// TODO: properly update the entity
+	// 		}
+	// 		if (typedEntity.kind === 'Namespace') {
+	// 			this.namespaces = [...this.namespaces, typedEntity];
+	// 		}
+	// 	}
+	// }
+
+	// updateEntities(data: FactsChanged): Entity[] {
+	//     // Update the entities based on the facts changed
+	//     for (const entity of data.RemovedEntities || []) {
+	//         this.entities = this.entities.filter(e => e.id !== entity.id);
+	//     }
+
+	//     for (const entity of data.NewEntities || []) {
+	//         if (!this.entities.some(e => e.id === entity.id)) {
+	//             console.log("Adding entity: ", entity);
+	//             this.entities = [...this.entities, entity];
+	//         } else {
+	//             // TODO: properly update the entity
+	//         }
+	//         if (entity.kind === 'Namespace') {
+	//             this.namespaces = [...this.namespaces, entity];
+	//         }
+	//     }
+	//     return this.entities
+	// }
+
+	getTtpById(id: string): TTP | undefined {
+		for (const [, ttps] of this.armory) {
+			const ttp = ttps.find((t) => t.id === id);
+			if (ttp) {
+				return ttp;
+			}
+		}
+	}
+
+	getNamespaces(): Entity[] {
+		const ns = this.entities.filter((entity) => entity.kind === 'Namespace');
+		return ns || [];
+	}
+
+	getPods(ns?: string): Entity[] {
+		const pods = this.entities.filter(
+			(entity) => entity.kind === 'Pod' && (!ns || entity.namespace === ns)
+		);
+		return pods || [];
+	}
+
+	getObjectById(id: string): Entity | Relation | undefined {
+		if (isRelation(id)) {
+			return this.getRelationById(id);
+		} else {
+			return this.getEntityById(id);
+		}
+	}
+
+	getEntityById(id: string): Entity | undefined {
+		if (id === '') {
+			return undefined;
+		}
+		return this.entities.find((entity) => entity.id === id);
+	}
+
+	getRelationById(id: string): Relation | undefined {
+		if (id === '') {
+			return undefined;
+		}
+
+		// First check if we have the full relation data stored
+		const storedRelation = this.relations.get(id);
+		if (storedRelation) {
+			return storedRelation;
+		}
+
+		// Fallback: parse the ID to create a basic relation object
+		const parts = id.match(/^(.+?)-\[(.+?)\]->(.+)$/);
+		if (parts) {
+			const [, source, label, destination] = parts;
+			return {
+				id: id,
+				source: source,
+				destination: destination,
+				kind: label
+			};
+		}
+		return undefined;
+	}
+
+	getCompromisedSystems(): Entity[] {
+		const systemKinds = ['Pod', 'K8sNode', 'UnknownSystem'];
+		return this.entities.filter(
+			(entity) =>
+				systemKinds.includes(entity.kind ?? '') &&
+				typeof entity.accessLevel === 'string' &&
+				entity.accessLevel.endsWith('exec')
+		);
+	}
+
+	getServiceAccounts(ns?: string): Entity[] {
+		let serviceAccounts = this.entities.filter((entity) => entity.kind === 'ServiceAccount');
+		if (ns) {
+			serviceAccounts = serviceAccounts.filter((entity) => entity.namespace === ns);
+		}
+		return serviceAccounts || [];
+	}
+
+	getServiceAccountsWithTokens(ns?: string): Entity[] {
+		// Get all service account tokens
+		const tokens = this.entities.filter(
+			(entity) =>
+				entity.kind === 'ServiceAccountToken' ||
+				(entity.kind === 'ServiceAccount' && Object.hasOwn(entity, 'token'))
+		); // Include ServiceAccounts that have token binaries
+
+		// Extract the ServiceAccount IDs from tokens (tokens have ID format: ns/{namespace}/sa/{saName}/token)
+		const saIdsWithTokens = new Set(
+			tokens.map((token) => {
+				// Extract SA ID from token ID by removing the /token suffix
+				const tokenId = token.id;
+				return tokenId.replace(/\/token$/, '');
+			})
+		);
+
+		// Filter ServiceAccounts to only those that have tokens
+		let serviceAccounts = this.entities.filter(
+			(entity) => entity.kind === 'ServiceAccount' && saIdsWithTokens.has(entity.id)
+		);
+
+		if (ns) {
+			serviceAccounts = serviceAccounts.filter((entity) => entity.namespace === ns);
+		}
+
+		return serviceAccounts || [];
+	}
+
+	// ExecuteAction(
+	// 	actionId: string,
+	// 	targetId: string,
+	// 	procedureId: string,
+	// 	args: Record<string, any>
+	// ): Promise<void> {
+	// 	const cmd: ExecuteActionRequest = {actionId, targetId, procedureId, args};
+	// 	return this.api.ExecuteAction(cmd).then(() => {});
+	// }
+
+	GetFlow(): Promise<AttackFlow> {
+		return this.api.GetFlow();
+	}
+}
+
+const DEFAULT_KEY = '$_campaignState';
+
+export const getCampaignState = (key = DEFAULT_KEY) => {
+	return getContext<CampaignState>(key);
+};
+
+export const setCampaignState = (key = DEFAULT_KEY) => {
+	const campaignState = new CampaignState();
+	return setContext(key, campaignState);
+};
+
+export function parseArmory(data: TTP[]): ArmoryType {
+	// this comes from the backend must be converted
+	const armoryMap = new Map<string, TTP[]>();
+	for (const ttp of data) {
+		let groupName = ttp.tactic;
+		if (groupName === '') {
+			groupName = 'Other';
+		}
+		if (!armoryMap.has(groupName)) {
+			armoryMap.set(groupName, []);
+		}
+		armoryMap.get(groupName)!.push(ttp);
+	}
+	// Armory contains a CmdId field; process accordingly if needed.
+	return armoryMap;
+}
+export function isRelation(id: string): boolean {
+	return id.indexOf('->') !== -1;
+}

@@ -1,0 +1,72 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Rule: ppc64 firmware reserved-region ceiling.
+//
+// OPAL (PowerNV)
+// and RTAS (pseries) occupy physically contiguous firmware regions in the
+// first few GiB; the kernel image must fit below them. On ppc64 PHYS_OFFSET =
+// IMAGE_BASE_OFFSET = 0 and the base is PAGE_OFFSET (no mainline KASLR), so
+// phys_to_directmap_virt(x) = PAGE_OFFSET + x = VIRT_TEXT_MIN_DEFAULT_CONFIG +
+// x, giving:
+//
+//   virt_ceiling = VIRT_TEXT_MIN_DEFAULT_CONFIG + fw_base - min_image
+//
+// The kernel must fit below BOTH firmware regions, so the bridge supplies the
+// lower of the OPAL/RTAS bases (SF_PHYS_FW_RESERVED_BASE); the merged ceiling
+// equals the tighter of the two bounds. C_UPPER_BOUND on Q_VIRT_IMAGE_BASE.
+// ppc64 only; emits nothing when no firmware base is present.
+// ---
+// <bcoles@gmail.com>
+
+#include "include/kasld/engine_rules.h"
+
+#include <string.h>
+
+int rule_ppc64_firmware_ceiling(const struct evidence_set *ev,
+                                const struct estimate *est,
+                                struct constraint *out, int out_max) {
+  (void)est;
+#if !defined(__powerpc64__)
+  (void)ev;
+  (void)out;
+  (void)out_max;
+  return 0;
+#else
+  if (out_max < 1)
+    return 0;
+
+  unsigned long fw_base = 0;
+  enum kasld_confidence conf = CONF_UNKNOWN;
+  uint32_t src = 0;
+  const unsigned long min_image = evidence_image_size_min_or_floor(ev);
+  for (int i = 0; i < ev->n_obs; i++) {
+    const struct observation *o = &ev->obs[i];
+    if (o->valid && o->value_kind == OBS_SCALAR &&
+        o->scalar_fact == SF_PHYS_FW_RESERVED_BASE) {
+      fw_base = o->scalar_value;
+      conf = o->conf;
+      src = o->id;
+      break;
+    }
+  }
+  if (fw_base <= min_image)
+    return 0;
+
+  unsigned long ceiling = VIRT_TEXT_MIN_DEFAULT_CONFIG + fw_base - min_image;
+  ceiling =
+      kasld_floor_virt_text_bound(ceiling, (unsigned long)KASLR_VIRT_ALIGN);
+  if (ceiling <= VIRT_TEXT_MIN_DEFAULT_CONFIG)
+    return 0;
+
+  struct constraint *c = &out[0];
+  memset(c, 0, sizeof(*c));
+  c->q = Q_VIRT_IMAGE_BASE;
+  c->op = C_UPPER_BOUND;
+  c->value = ceiling;
+  c->conf = conf;
+  c->derived_from[0] = src;
+  c->lineage_count = 1;
+  snprintf(c->origin, ORIGIN_LEN, "ppc64_firmware_ceiling");
+  return 1;
+#endif
+}

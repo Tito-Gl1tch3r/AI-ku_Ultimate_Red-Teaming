@@ -1,0 +1,1334 @@
+package format
+
+import (
+	"fmt"
+	"maps"
+	"strconv"
+	"strings"
+
+	"github.com/specterops/dawgs/cypher/models/pgsql"
+)
+
+const extractedParameterNamespace = "__strlit"
+
+type OutputBuilder struct {
+	extractedParams        map[string]string
+	extractedParamsBackref map[string]string
+	materializeParameters  bool
+	materializedParams     map[string]any
+	builder                *strings.Builder
+	extractedLiteralID     int64
+}
+
+func NewOutputBuilder() *OutputBuilder {
+	return &OutputBuilder{
+		builder:                &strings.Builder{},
+		extractedParams:        make(map[string]string),
+		extractedParamsBackref: make(map[string]string),
+	}
+}
+
+func (s *OutputBuilder) WithMaterializedParameters(parameters map[string]any) *OutputBuilder {
+	s.materializeParameters = true
+	s.materializedParams = parameters
+
+	return s
+}
+
+func (s *OutputBuilder) HasOutput() bool {
+	return s.builder.Len() != 0
+}
+
+func (s *OutputBuilder) Write(values ...any) {
+	for _, value := range values {
+		switch typedValue := value.(type) {
+		case string:
+			s.builder.WriteString(typedValue)
+
+		case fmt.Stringer:
+			s.builder.WriteString(typedValue.String())
+
+		default:
+			panic(fmt.Sprintf("invalid write parameter type: %T", value))
+		}
+	}
+}
+
+func (s *OutputBuilder) Build() Formatted {
+	outParams := make(map[string]any)
+	for k, v := range s.extractedParams {
+		outParams[k] = v
+	}
+
+	return Formatted{
+		Statement:         s.builder.String(),
+		Parameters:        outParams,
+		LiteralParameters: maps.Clone(s.extractedParams),
+	}
+}
+
+// extractLiteral takes a literal value, stores it in a parameter map internal to the OutputBuilder,
+// and returns a string representation to be resolved by the database at query-time.
+func (s *OutputBuilder) extractLiteral(literalValue string) pgsql.Identifier {
+	if existingKey, ok := s.extractedParamsBackref[literalValue]; ok {
+		return pgsql.Identifier(existingKey)
+	}
+
+	literalKey := fmt.Sprintf("%s%d", extractedParameterNamespace, s.extractedLiteralID)
+	s.extractedParams[literalKey] = literalValue
+	s.extractedParamsBackref[literalValue] = literalKey
+	s.extractedLiteralID += 1
+
+	return pgsql.Identifier(literalKey)
+}
+
+func formatSlice[T any, TS []T](builder *OutputBuilder, slice TS, dataType pgsql.DataType) error {
+	builder.Write("array [")
+
+	var (
+		tval    T
+		fmtFunc func(builder *OutputBuilder, value any) error
+	)
+	if _, ok := any(tval).(string); ok {
+		if builder.materializeParameters {
+			fmtFunc = formatEscapedString
+		} else {
+			fmtFunc = formatExtractedStringLiteralParameter
+		}
+	} else {
+		fmtFunc = formatValue
+	}
+
+	for idx, value := range slice {
+		if idx > 0 {
+			builder.Write(", ")
+		}
+
+		if err := fmtFunc(builder, value); err != nil {
+			return err
+		}
+	}
+
+	builder.Write("]::", dataType.String())
+	return nil
+}
+
+func formatExtractedStringLiteralParameter(builder *OutputBuilder, value any) error {
+	return formatExtractedStringLiteralParameterWithCast(builder, value, pgsql.Text)
+}
+
+func formatExtractedStringLiteralParameterWithCast(builder *OutputBuilder, value any, castTo pgsql.DataType) error {
+	if stringValue, ok := value.(string); !ok {
+		return fmt.Errorf("input value is not a string")
+	} else {
+		ident := builder.extractLiteral(stringValue)
+		builder.Write(fmt.Sprintf("@%s::%s", ident.String(), castTo.String()))
+
+		return nil
+	}
+}
+
+func formatValue(builder *OutputBuilder, value any) error {
+	switch typedValue := value.(type) {
+	case uint:
+		builder.Write(strconv.FormatUint(uint64(typedValue), 10))
+
+	case uint8:
+		builder.Write(strconv.FormatUint(uint64(typedValue), 10))
+
+	case uint16:
+		builder.Write(strconv.FormatUint(uint64(typedValue), 10))
+
+	case uint32:
+		builder.Write(strconv.FormatUint(uint64(typedValue), 10))
+
+	case uint64:
+		builder.Write(strconv.FormatUint(typedValue, 10))
+
+	case int:
+		builder.Write(strconv.FormatInt(int64(typedValue), 10))
+
+	case []int:
+		return formatSlice(builder, typedValue, pgsql.Int8Array)
+
+	case int8:
+		builder.Write(strconv.FormatInt(int64(typedValue), 10))
+
+	case []int8:
+		return formatSlice(builder, typedValue, pgsql.Int2Array)
+
+	case int16:
+		builder.Write(strconv.FormatInt(int64(typedValue), 10))
+
+	case []int16:
+		return formatSlice(builder, typedValue, pgsql.Int2Array)
+
+	case int32:
+		builder.Write(strconv.FormatInt(int64(typedValue), 10))
+
+	case []int32:
+		return formatSlice(builder, typedValue, pgsql.Int4Array)
+
+	case int64:
+		builder.Write(strconv.FormatInt(typedValue, 10))
+
+	case []int64:
+		return formatSlice(builder, typedValue, pgsql.Int8Array)
+
+	case bool:
+		builder.Write(strconv.FormatBool(typedValue))
+
+	case float32:
+		builder.Write(strconv.FormatFloat(float64(typedValue), 'f', -1, 64))
+
+	case float64:
+		builder.Write(strconv.FormatFloat(typedValue, 'f', -1, 64))
+
+	case []string:
+		return formatSlice(builder, typedValue, pgsql.TextArray)
+
+	default:
+		return fmt.Errorf("unsupported literal type: %T", value)
+	}
+
+	return nil
+}
+
+func formatLiteral(builder *OutputBuilder, literal pgsql.Literal) error {
+	if literal.Null {
+		builder.Write("null")
+		return nil
+	}
+
+	switch literal.Value.(type) {
+	case string:
+		if builder.materializeParameters {
+			if castType := literal.CastType; !castType.IsKnown() || castType == pgsql.Text {
+				return formatEscapedStringLiteral(builder, literal)
+			} else {
+				return formatEscapedStringLiteralWithCast(builder, literal, castType)
+			}
+		}
+
+		if literal.CastType == pgsql.Interval {
+			return formatExtractedStringLiteralParameterWithCast(builder, literal.Value, literal.CastType)
+		}
+
+		return formatExtractedStringLiteralParameter(builder, literal.Value)
+	default:
+		switch literal.CastType {
+		case pgsql.Interval:
+			builder.Write("interval ")
+		}
+		return formatValue(builder, literal.Value)
+	}
+}
+
+func escapeString(raw string) string {
+	// Order matters here, backslashes must be escaped first
+	replacer := strings.NewReplacer(`\`, `\\`, `'`, `\'`)
+	return replacer.Replace(raw)
+}
+
+func formatEscapedString(builder *OutputBuilder, value any) error {
+	if strValue, ok := value.(string); !ok {
+		return fmt.Errorf("input value is not a string")
+	} else {
+		builder.Write("E'", escapeString(strValue), "'")
+		return nil
+	}
+}
+
+// formatEscapedStringLiteral escapes the string literal and writes it into the output builder
+func formatEscapedStringLiteral(builder *OutputBuilder, literal pgsql.Literal) error {
+	return formatEscapedString(builder, literal.Value)
+}
+
+// formatEscapedStringLiteralWithCast does the same as formatEscapedStringLiteral
+// but attaches a cast after the escaped string literal is written
+func formatEscapedStringLiteralWithCast(builder *OutputBuilder, literal pgsql.Literal, castAs pgsql.DataType) error {
+	if err := formatEscapedStringLiteral(builder, literal); err != nil {
+		return err
+	}
+
+	builder.Write(fmt.Sprintf("::%s", castAs.String()))
+	return nil
+}
+
+func formatPropertyKey(builder *OutputBuilder, key pgsql.PropertyKey) error {
+	return formatEscapedStringLiteral(builder, key.Literal)
+}
+
+func formatCase(builder *OutputBuilder, caseExpr pgsql.Case) error {
+	if len(caseExpr.Conditions) != len(caseExpr.Then) {
+		return fmt.Errorf("case expression has %d conditions and %d then expressions", len(caseExpr.Conditions), len(caseExpr.Then))
+	}
+
+	builder.Write("case")
+
+	if caseExpr.Operand != nil {
+		builder.Write(" ")
+
+		if err := formatNode(builder, caseExpr.Operand); err != nil {
+			return err
+		}
+	}
+
+	for idx, condition := range caseExpr.Conditions {
+		builder.Write(" when ")
+
+		if err := formatNode(builder, condition); err != nil {
+			return err
+		}
+
+		builder.Write(" then ")
+
+		if err := formatNode(builder, caseExpr.Then[idx]); err != nil {
+			return err
+		}
+	}
+
+	if caseExpr.Else != nil {
+		builder.Write(" else ")
+
+		if err := formatNode(builder, caseExpr.Else); err != nil {
+			return err
+		}
+	}
+
+	builder.Write(" end")
+
+	return nil
+}
+
+func formatNode(builder *OutputBuilder, rootExpr pgsql.SyntaxNode) error {
+	exprStack := []pgsql.SyntaxNode{
+		rootExpr,
+	}
+
+	for len(exprStack) > 0 {
+		nextExpr := exprStack[len(exprStack)-1]
+		exprStack = exprStack[:len(exprStack)-1]
+
+		switch typedNextExpr := nextExpr.(type) {
+		case pgsql.Query:
+			if err := formatSetExpression(builder, typedNextExpr); err != nil {
+				return err
+			}
+
+		case pgsql.Select:
+			if err := formatSelect(builder, typedNextExpr); err != nil {
+				return err
+			}
+
+		case *pgsql.OrderBy:
+			// Don't emit 'asc' since it's the default
+			if !typedNextExpr.Ascending {
+				exprStack = append(exprStack, pgsql.FormattingLiteral(" desc"))
+			}
+
+			exprStack = append(exprStack, typedNextExpr.Expression)
+
+		case pgsql.Wildcard:
+			builder.Write("*")
+
+		case pgsql.Literal:
+			if err := formatLiteral(builder, typedNextExpr); err != nil {
+				return err
+			}
+
+		case pgsql.PropertyKey:
+			if err := formatPropertyKey(builder, typedNextExpr); err != nil {
+				return err
+			}
+
+		case *pgsql.Case:
+			if err := formatCase(builder, *typedNextExpr); err != nil {
+				return err
+			}
+
+		case pgsql.Case:
+			if err := formatCase(builder, typedNextExpr); err != nil {
+				return err
+			}
+
+		case *pgsql.Materialized:
+			if typedNextExpr.Materialized {
+				exprStack = append(exprStack, pgsql.FormattingLiteral("materialized"))
+			} else {
+				exprStack = append(exprStack, pgsql.FormattingLiteral("not materialized"))
+			}
+
+		case *pgsql.FunctionCall:
+			exprStack = append(exprStack, *typedNextExpr)
+
+		case pgsql.FunctionCall:
+			if typedNextExpr.CastType.IsKnown() {
+				exprStack = append(exprStack, typedNextExpr.CastType, pgsql.FormattingLiteral("::"))
+			}
+
+			if !typedNextExpr.Bare {
+				exprStack = append(exprStack, pgsql.FormattingLiteral(")"))
+			}
+
+			for idx := len(typedNextExpr.Parameters) - 1; idx >= 0; idx-- {
+				exprStack = append(exprStack, typedNextExpr.Parameters[idx])
+
+				if idx > 0 {
+					exprStack = append(exprStack, pgsql.FormattingLiteral(", "))
+				}
+			}
+
+			if typedNextExpr.Distinct {
+				exprStack = append(exprStack, pgsql.FormattingLiteral("distinct "))
+			}
+
+			if !typedNextExpr.Bare {
+				exprStack = append(exprStack, pgsql.FormattingLiteral("("))
+			}
+
+			exprStack = append(exprStack, typedNextExpr.Function)
+
+		case pgsql.Operator:
+			builder.Write(typedNextExpr.String())
+
+		case pgsql.Identifier:
+			builder.Write(typedNextExpr)
+
+		case pgsql.CompoundIdentifier:
+			for idx := len(typedNextExpr) - 1; idx >= 0; idx-- {
+				exprStack = append(exprStack, typedNextExpr[idx])
+
+				if idx > 0 {
+					exprStack = append(exprStack, pgsql.FormattingLiteral("."))
+				}
+			}
+
+		case pgsql.FormattingLiteral:
+			builder.Write(typedNextExpr)
+
+		case *pgsql.UnaryExpression:
+			exprStack = append(exprStack, *typedNextExpr)
+
+		case pgsql.UnaryExpression:
+			exprStack = append(exprStack,
+				typedNextExpr.Operand,
+				pgsql.FormattingLiteral(" "),
+				typedNextExpr.Operator,
+			)
+
+		case *pgsql.BinaryExpression:
+			exprStack = append(exprStack, *typedNextExpr)
+
+		case pgsql.BinaryExpression:
+			switch typedNextExpr.Operator {
+			case pgsql.OperatorJSONField, pgsql.OperatorJSONTextField:
+				exprStack = append(exprStack, pgsql.FormattingLiteral(")"))
+			}
+
+			// Push the operands and operator onto the stack in reverse order
+			exprStack = append(exprStack,
+				typedNextExpr.ROperand,
+				pgsql.FormattingLiteral(" "),
+				typedNextExpr.Operator,
+				pgsql.FormattingLiteral(" "),
+				typedNextExpr.LOperand,
+			)
+
+			switch typedNextExpr.Operator {
+			case pgsql.OperatorJSONField, pgsql.OperatorJSONTextField:
+				exprStack = append(exprStack, pgsql.FormattingLiteral("("))
+			}
+
+		case pgsql.TableReference:
+			if typedNextExpr.Binding.Set {
+				exprStack = append(exprStack, typedNextExpr.Binding.Value, pgsql.FormattingLiteral(" "))
+			}
+
+			exprStack = append(exprStack, typedNextExpr.Name)
+
+		case pgsql.LateralSubquery:
+			if typedNextExpr.Binding.Set {
+				exprStack = append(exprStack, typedNextExpr.Binding.Value, pgsql.FormattingLiteral(" "))
+			}
+
+			exprStack = append(exprStack, pgsql.FormattingLiteral(")"), typedNextExpr.Query, pgsql.FormattingLiteral("lateral ("))
+
+		case pgsql.Assignment:
+			exprStack = append(exprStack,
+				typedNextExpr,
+				pgsql.FormattingLiteral(" "),
+				pgsql.Operator("="),
+				pgsql.FormattingLiteral(" "),
+				typedNextExpr)
+
+		case pgsql.Values:
+			exprStack = append(exprStack, pgsql.FormattingLiteral(")"))
+
+			for idx := len(typedNextExpr.Values) - 1; idx >= 0; idx-- {
+				exprStack = append(exprStack, typedNextExpr.Values[idx])
+
+				if idx > 0 {
+					exprStack = append(exprStack, pgsql.FormattingLiteral(", "))
+				}
+			}
+
+			exprStack = append(exprStack, pgsql.FormattingLiteral("values ("))
+
+		case pgsql.ArrayLiteral:
+			if typedNextExpr.CastType != pgsql.UnsetDataType {
+				if arrayCastType, err := typedNextExpr.CastType.ToArrayType(); err != nil {
+					return err
+				} else {
+					exprStack = append(exprStack, pgsql.FormattingLiteral(arrayCastType.String()), pgsql.FormattingLiteral("::"))
+				}
+			}
+
+			exprStack = append(exprStack, pgsql.FormattingLiteral("]"))
+
+			for idx := len(typedNextExpr.Values) - 1; idx >= 0; idx-- {
+				exprStack = append(exprStack, typedNextExpr.Values[idx])
+
+				if idx > 0 {
+					exprStack = append(exprStack, pgsql.FormattingLiteral(", "))
+				}
+			}
+
+			exprStack = append(exprStack, pgsql.FormattingLiteral("array ["))
+
+		case pgsql.DataType:
+			exprStack = append(exprStack, pgsql.FormattingLiteral(typedNextExpr.String()))
+
+		case pgsql.CompositeValue:
+			exprStack = append(exprStack, typedNextExpr.DataType)
+			exprStack = append(exprStack, pgsql.FormattingLiteral("::"))
+			exprStack = append(exprStack, pgsql.FormattingLiteral(")"))
+
+			for idx := len(typedNextExpr.Values) - 1; idx >= 0; idx-- {
+				exprStack = append(exprStack, typedNextExpr.Values[idx])
+
+				if idx > 0 {
+					exprStack = append(exprStack, pgsql.FormattingLiteral(", "))
+				}
+			}
+
+			exprStack = append(exprStack, pgsql.FormattingLiteral("("))
+
+		case pgsql.DoUpdate:
+			if typedNextExpr.Where != nil {
+				exprStack = append(exprStack, typedNextExpr.Where)
+				exprStack = append(exprStack, pgsql.FormattingLiteral(" where "))
+			}
+
+			if len(typedNextExpr.Assignments) > 0 {
+				for idx := len(typedNextExpr.Assignments) - 1; idx >= 0; idx-- {
+					exprStack = append(exprStack, typedNextExpr.Assignments[idx])
+				}
+
+				exprStack = append(exprStack, pgsql.FormattingLiteral(" set "))
+			}
+
+			exprStack = append(exprStack, pgsql.FormattingLiteral("do update"))
+
+		case pgsql.ConflictTarget:
+			if len(typedNextExpr.Columns) > 0 {
+				if len(typedNextExpr.Constraint) > 0 {
+					return fmt.Errorf("conflict target has both columns and an 'on constraint' expression set")
+				}
+
+				exprStack = append(exprStack, pgsql.FormattingLiteral(")"))
+
+				for idx := len(typedNextExpr.Columns) - 1; idx >= 0; idx-- {
+					exprStack = append(exprStack, typedNextExpr.Columns[idx])
+
+					if idx > 0 {
+						exprStack = append(exprStack, pgsql.FormattingLiteral(", "))
+					}
+				}
+
+				exprStack = append(exprStack, pgsql.FormattingLiteral("("))
+			}
+
+			if len(typedNextExpr.Constraint) > 0 {
+				if len(typedNextExpr.Columns) > 0 {
+					return fmt.Errorf("conflict target has both columns and an 'on constraint' expression set")
+				}
+
+				exprStack = append(exprStack, typedNextExpr.Constraint, pgsql.FormattingLiteral("on constraint "))
+			}
+
+		case *pgsql.AliasedExpression:
+			exprStack = append(exprStack, *typedNextExpr)
+
+		case pgsql.AliasedExpression:
+			if typedNextExpr.Alias.Set {
+				exprStack = append(exprStack, typedNextExpr.Alias.Value)
+				exprStack = append(exprStack, pgsql.FormattingLiteral(" as "))
+				exprStack = append(exprStack, typedNextExpr.Expression)
+			} else {
+				exprStack = append(exprStack, typedNextExpr.Expression)
+			}
+
+		case *pgsql.AnyExpression:
+			exprStack = append(exprStack, pgsql.FormattingLiteral(")"))
+			exprStack = append(exprStack, typedNextExpr.Expression)
+			exprStack = append(exprStack, pgsql.FormattingLiteral("any ("))
+
+		case pgsql.AllExpression:
+			exprStack = append(exprStack, pgsql.FormattingLiteral(")"))
+			exprStack = append(exprStack, typedNextExpr.Expression)
+			exprStack = append(exprStack, pgsql.FormattingLiteral("all ("))
+
+		case pgsql.ArrayExpression:
+			exprStack = append(exprStack, pgsql.FormattingLiteral(")"))
+			exprStack = append(exprStack, typedNextExpr.Expression)
+
+			exprStack = append(exprStack, pgsql.FormattingLiteral("array("))
+
+		case pgsql.ArrayIndex:
+			exprStack = append(exprStack, pgsql.FormattingLiteral("]"))
+
+			for idx := len(typedNextExpr.Indexes) - 1; idx >= 0; idx-- {
+				exprStack = append(exprStack, typedNextExpr.Indexes[idx])
+
+				if idx > 0 {
+					exprStack = append(exprStack, pgsql.FormattingLiteral(", "))
+				}
+			}
+
+			exprStack = append(exprStack, pgsql.FormattingLiteral("["))
+			exprStack = append(exprStack, typedNextExpr.Expression)
+
+		case *pgsql.ArrayIndex:
+			exprStack = append(exprStack, *typedNextExpr)
+
+		case pgsql.ArraySlice:
+			exprStack = append(exprStack, pgsql.FormattingLiteral("]"))
+
+			if typedNextExpr.Upper != nil {
+				exprStack = append(exprStack, typedNextExpr.Upper)
+			}
+
+			exprStack = append(exprStack, pgsql.FormattingLiteral(":"))
+
+			if typedNextExpr.Lower != nil {
+				exprStack = append(exprStack, typedNextExpr.Lower)
+			}
+
+			exprStack = append(exprStack, pgsql.FormattingLiteral("["))
+			exprStack = append(exprStack, typedNextExpr.Expression)
+
+		case *pgsql.ArraySlice:
+			exprStack = append(exprStack, *typedNextExpr)
+
+		case pgsql.TypeCast:
+			switch typedCastedExpr := typedNextExpr.Expression.(type) {
+			case *pgsql.BinaryExpression:
+				if typedCastedExpr.Operator == pgsql.OperatorJSONTextField && typedNextExpr.CastType == pgsql.Text {
+					// Avoid formatting property lookups wrapped in text type casts
+					exprStack = append(exprStack, typedNextExpr.Expression)
+				} else {
+					exprStack = append(exprStack, pgsql.FormattingLiteral(typedNextExpr.CastType), pgsql.FormattingLiteral(")::"))
+					exprStack = append(exprStack, typedNextExpr.Expression)
+					exprStack = append(exprStack, pgsql.FormattingLiteral("("))
+				}
+
+			case *pgsql.Parenthetical:
+				// Avoid formatting type-casted parenthetical statements as (('test'))::text - this should instead look like ('test')::text
+				exprStack = append(exprStack, pgsql.FormattingLiteral(typedNextExpr.CastType), pgsql.FormattingLiteral("::"))
+				exprStack = append(exprStack, typedNextExpr.Expression)
+
+			default:
+				exprStack = append(exprStack, pgsql.FormattingLiteral(typedNextExpr.CastType), pgsql.FormattingLiteral(")::"))
+				exprStack = append(exprStack, typedNextExpr.Expression)
+				exprStack = append(exprStack, pgsql.FormattingLiteral("("))
+			}
+
+		case *pgsql.Parenthetical:
+			exprStack = append(exprStack, pgsql.FormattingLiteral(")"))
+			exprStack = append(exprStack, typedNextExpr.Expression)
+			exprStack = append(exprStack, pgsql.FormattingLiteral("("))
+
+		case *pgsql.EdgeArrayFromPathIDs:
+			if typedNextExpr.PathIDs == nil {
+				return fmt.Errorf("edge array from path IDs has no path expression")
+			}
+
+			exprStack = append(
+				exprStack,
+				pgsql.FormattingLiteral(") with ordinality as _path(id, ordinality) join edge _edge on _edge.id = _path.id)"),
+				typedNextExpr.PathIDs,
+				pgsql.FormattingLiteral("(select coalesce(array_agg((_edge.id, _edge.start_id, _edge.end_id, _edge.kind_id, _edge.properties)::edgecomposite order by _path.ordinality), array []::edgecomposite[]) from unnest("),
+			)
+
+		case pgsql.Parameter:
+			if builder.materializeParameters {
+				if parameterValue, hasParameter := builder.materializedParams[typedNextExpr.Identifier.String()]; !hasParameter {
+					return fmt.Errorf("invalid parameter %s", typedNextExpr.Identifier.String())
+				} else if parameterLiteral, err := pgsql.AsLiteral(parameterValue); err != nil {
+					return fmt.Errorf("invalid parameter value for %s: %v", typedNextExpr.Identifier.String(), err)
+				} else {
+					exprStack = append(exprStack, parameterLiteral)
+				}
+			} else {
+				if typedNextExpr.CastType != pgsql.UnsetDataType {
+					exprStack = append(exprStack, typedNextExpr.CastType, pgsql.FormattingLiteral("::"))
+				}
+
+				exprStack = append(exprStack, typedNextExpr.Identifier, pgsql.FormattingLiteral("@"))
+			}
+
+		case *pgsql.Parameter:
+			exprStack = append(exprStack, *typedNextExpr)
+
+		case pgsql.Variadic:
+			exprStack = append(exprStack, typedNextExpr.Expression, pgsql.FormattingLiteral("variadic "))
+
+		case pgsql.RowColumnReference:
+			exprStack = append(exprStack, typedNextExpr.Column, pgsql.FormattingLiteral(")."), typedNextExpr.Identifier, pgsql.FormattingLiteral("("))
+
+		case pgsql.ExistsExpression:
+			exprStack = append(exprStack, typedNextExpr.Subquery, pgsql.FormattingLiteral("exists "))
+
+			if typedNextExpr.Negated {
+				exprStack = append(exprStack, pgsql.FormattingLiteral("not "))
+			}
+
+		case pgsql.ProjectionFrom:
+			for idx, projection := range typedNextExpr.Projection {
+				if idx > 0 {
+					builder.Write(", ")
+				}
+
+				if err := formatNode(builder, projection); err != nil {
+					return err
+				}
+			}
+
+			if len(typedNextExpr.From) > 0 {
+				builder.Write(" from ")
+
+				if err := formatFromClauses(builder, typedNextExpr.From); err != nil {
+					return err
+				}
+			}
+
+		case pgsql.Subquery:
+			exprStack = append(exprStack, pgsql.FormattingLiteral(")"), typedNextExpr.Query, pgsql.FormattingLiteral("("))
+
+		case pgsql.SyntaxNodeFuture:
+			exprStack = append(exprStack, typedNextExpr.Unwrap())
+
+		default:
+			return fmt.Errorf("unable to format pgsql node type: %T", nextExpr)
+		}
+	}
+
+	return nil
+}
+
+func Expression(expression pgsql.SyntaxNode, builder *OutputBuilder) (Formatted, error) {
+	if err := formatNode(builder, expression); err != nil {
+		return Formatted{}, err
+	}
+
+	return builder.Build(), nil
+}
+
+func formatSelect(builder *OutputBuilder, selectStmt pgsql.Select) error {
+	builder.Write("select ")
+
+	if selectStmt.Distinct {
+		builder.Write("distinct ")
+	}
+
+	for idx, projection := range selectStmt.Projection {
+		if idx > 0 {
+			builder.Write(", ")
+		}
+
+		if err := formatNode(builder, projection); err != nil {
+			return err
+		}
+	}
+
+	if len(selectStmt.From) > 0 {
+		builder.Write(" from ")
+
+		if err := formatFromClauses(builder, selectStmt.From); err != nil {
+			return err
+		}
+	}
+
+	if selectStmt.Where != nil {
+		builder.Write(" where ")
+
+		if err := formatNode(builder, selectStmt.Where); err != nil {
+			return err
+		}
+	}
+
+	if len(selectStmt.GroupBy) > 0 {
+		builder.Write(" group by ")
+
+		if err := formatGroupBy(builder, selectStmt.GroupBy); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func formatGroupBy(builder *OutputBuilder, groupByExpressions []pgsql.Expression) error {
+	for idx, groupByExpression := range groupByExpressions {
+		if idx > 0 {
+			builder.Write(", ")
+		}
+
+		if err := formatNode(builder, groupByExpression); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func formatFromClauses(builder *OutputBuilder, fromClauses []pgsql.FromClause) error {
+	for idx, fromClause := range fromClauses {
+		if idx > 0 {
+			builder.Write(", ")
+		}
+
+		if err := formatNode(builder, fromClause.Source); err != nil {
+			return err
+		}
+
+		for _, join := range fromClause.Joins {
+			builder.Write(" ")
+
+			switch join.JoinOperator.JoinType {
+			case pgsql.JoinTypeInner:
+				// A bare join keyword is also an alias for an inner join
+
+			case pgsql.JoinTypeLeftOuter:
+				builder.Write("left outer ")
+
+			case pgsql.JoinTypeRightOuter:
+				builder.Write("right outer ")
+
+			case pgsql.JoinTypeFullOuter:
+				builder.Write("full outer ")
+
+			default:
+				return fmt.Errorf("unsupported join type: %d", join.JoinOperator.JoinType)
+			}
+
+			builder.Write("join ")
+
+			if err := formatNode(builder, join.Table); err != nil {
+				return err
+			}
+
+			if join.JoinOperator.Constraint != nil {
+				builder.Write(" on ")
+
+				if err := formatNode(builder, join.JoinOperator.Constraint); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func formatTableAlias(builder *OutputBuilder, tableAlias pgsql.TableAlias) error {
+	builder.Write(tableAlias.Name)
+
+	if tableAlias.Shape != nil {
+		builder.Write("(")
+
+		for idx, column := range tableAlias.Shape.Columns {
+			if idx > 0 {
+				builder.Write(", ")
+			}
+
+			if err := formatNode(builder, column); err != nil {
+				return err
+			}
+		}
+
+		builder.Write(")")
+	}
+
+	return nil
+}
+
+func formatCommonTableExpressions(builder *OutputBuilder, commonTableExpressions pgsql.With) error {
+	// Only write "with" if there are actually expressions
+	if len(commonTableExpressions.Expressions) == 0 {
+		return nil
+	}
+
+	builder.Write("with ")
+
+	if commonTableExpressions.Recursive {
+		builder.Write("recursive ")
+	}
+
+	for idx, commonTableExpression := range commonTableExpressions.Expressions {
+		if idx > 0 {
+			builder.Write(", ")
+		}
+
+		if err := formatTableAlias(builder, commonTableExpression.Alias); err != nil {
+			return err
+		}
+
+		builder.Write(" as ")
+
+		if commonTableExpression.Materialized != nil {
+			if err := formatNode(builder, commonTableExpression.Materialized); err != nil {
+				return err
+			}
+
+			builder.Write(" ")
+		}
+
+		builder.Write("(")
+
+		if err := formatSetExpression(builder, commonTableExpression.Query); err != nil {
+			return err
+		}
+
+		builder.Write(")")
+	}
+
+	// Leave a trailing space after formatting CTEs for the subsequent query body
+	builder.Write(" ")
+
+	return nil
+}
+
+func formatSetExpression(builder *OutputBuilder, expression pgsql.SetExpression) error {
+	switch typedSetExpression := expression.(type) {
+	case pgsql.Query:
+		if typedSetExpression.CommonTableExpressions != nil {
+			if err := formatCommonTableExpressions(builder, *typedSetExpression.CommonTableExpressions); err != nil {
+				return err
+			}
+		}
+
+		if err := formatSetExpression(builder, typedSetExpression.Body); err != nil {
+			return err
+		}
+
+		if len(typedSetExpression.OrderBy) > 0 {
+			builder.Write(" order by ")
+
+			for idx, orderBy := range typedSetExpression.OrderBy {
+				if idx > 0 {
+					builder.Write(", ")
+				}
+
+				if err := formatNode(builder, orderBy); err != nil {
+					return err
+				}
+			}
+		}
+
+		if typedSetExpression.Offset != nil {
+			builder.Write(" offset ")
+
+			if err := formatNode(builder, typedSetExpression.Offset); err != nil {
+				return err
+			}
+		}
+
+		if typedSetExpression.Limit != nil {
+			builder.Write(" limit ")
+
+			if err := formatNode(builder, typedSetExpression.Limit); err != nil {
+				return err
+			}
+		}
+
+		builder.Write()
+
+	case pgsql.Select:
+		return formatSelect(builder, typedSetExpression)
+
+	case pgsql.Delete:
+		return formatDeleteStatement(builder, typedSetExpression)
+
+	case pgsql.SetOperation:
+		if typedSetExpression.All && typedSetExpression.Distinct {
+			return fmt.Errorf("set operation for query may not be both ALL and DISTINCT")
+		}
+
+		if err := formatSetExpression(builder, typedSetExpression.LOperand); err != nil {
+			return err
+		}
+
+		builder.Write(" ")
+
+		if err := formatNode(builder, typedSetExpression.Operator); err != nil {
+			return err
+		}
+
+		builder.Write(" ")
+
+		if typedSetExpression.All {
+			builder.Write("all ")
+		}
+
+		if typedSetExpression.Distinct {
+			builder.Write("distinct ")
+		}
+
+		if err := formatSetExpression(builder, typedSetExpression.ROperand); err != nil {
+			return err
+		}
+
+	case pgsql.Values:
+		return formatNode(builder, typedSetExpression)
+
+	case pgsql.Insert:
+		return formatInsertStatement(builder, typedSetExpression)
+
+	case pgsql.Update:
+		return formatUpdateStatement(builder, typedSetExpression)
+
+	default:
+		return fmt.Errorf("unsupported set expression type %T", expression)
+	}
+
+	return nil
+}
+
+func formatMergeStatement(builder *OutputBuilder, merge pgsql.Merge) error {
+	builder.Write("merge ")
+
+	if merge.Into {
+		builder.Write("into ")
+	}
+
+	if err := formatNode(builder, merge.Table); err != nil {
+		return err
+	}
+
+	builder.Write(" using ")
+
+	if err := formatNode(builder, merge.Source); err != nil {
+		return err
+	}
+
+	builder.Write(" on ")
+
+	if err := formatNode(builder, merge.JoinTarget); err != nil {
+		return err
+	}
+
+	builder.Write(" ")
+
+	for idx, mergeAction := range merge.Actions {
+		if idx > 0 {
+			builder.Write(" ")
+		}
+
+		builder.Write("when ")
+
+		switch typedMergeAction := mergeAction.(type) {
+		case pgsql.MatchedUpdate:
+			builder.Write("matched")
+
+			// Predicate is optional
+			if typedMergeAction.Predicate != nil {
+				builder.Write(" and ")
+
+				if err := formatNode(builder, typedMergeAction.Predicate); err != nil {
+					return err
+				}
+			}
+
+			builder.Write(" then update set ")
+
+			for idx, assignment := range typedMergeAction.Assignments {
+				if idx > 0 {
+					builder.Write(", ")
+				}
+
+				if err := formatNode(builder, assignment); err != nil {
+					return err
+				}
+			}
+
+		case pgsql.MatchedDelete:
+			builder.Write("matched")
+
+			// Predicate is optional
+			if typedMergeAction.Predicate != nil {
+				builder.Write(" and ")
+
+				if err := formatNode(builder, typedMergeAction.Predicate); err != nil {
+					return err
+				}
+			}
+
+			builder.Write(" then delete")
+
+		case pgsql.UnmatchedAction:
+			builder.Write("not matched")
+
+			// Predicate is optional
+			if typedMergeAction.Predicate != nil {
+				builder.Write(" and ")
+
+				if err := formatNode(builder, typedMergeAction.Predicate); err != nil {
+					return err
+				}
+			}
+
+			builder.Write(" then insert (")
+
+			for idx, column := range typedMergeAction.Columns {
+				if idx > 0 {
+					builder.Write(", ")
+				}
+
+				if err := formatNode(builder, column); err != nil {
+					return err
+				}
+			}
+
+			builder.Write(") ")
+
+			if err := formatNode(builder, typedMergeAction.Values); err != nil {
+				return err
+			}
+
+		default:
+			return fmt.Errorf("unknown merge action type: %T", mergeAction)
+		}
+	}
+
+	return nil
+}
+
+func formatInsertStatement(builder *OutputBuilder, insert pgsql.Insert) error {
+	builder.Write("insert into ")
+
+	if err := formatNode(builder, insert.Table); err != nil {
+		return err
+	}
+
+	if insert.Shape != nil && len(insert.Shape.Columns) > 0 {
+		builder.Write(" (")
+
+		for idx, column := range insert.Shape.Columns {
+			if idx > 0 {
+				builder.Write(", ")
+			}
+
+			builder.Write(column)
+		}
+
+		builder.Write(")")
+	}
+
+	builder.Write(" ")
+
+	if insert.Source != nil {
+		if err := formatSetExpression(builder, *insert.Source); err != nil {
+			return err
+		}
+	}
+
+	if insert.OnConflict != nil {
+		builder.Write(" on conflict ")
+
+		if insert.OnConflict.Target != nil {
+			if err := formatNode(builder, *insert.OnConflict.Target); err != nil {
+				return err
+			}
+
+			builder.Write(" ")
+		}
+
+		if err := formatNode(builder, insert.OnConflict.Action); err != nil {
+			return err
+		}
+	}
+
+	if len(insert.Returning) > 0 {
+		builder.Write(" returning ")
+
+		for idx, projection := range insert.Returning {
+			if idx > 0 {
+				builder.Write(", ")
+			}
+
+			if err := formatNode(builder, projection); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func formatUpdateStatement(builder *OutputBuilder, update pgsql.Update) error {
+	builder.Write("update ")
+
+	if err := formatNode(builder, update.Table); err != nil {
+		return err
+	}
+
+	builder.Write(" set ")
+
+	for idx, assignment := range update.Assignments {
+		if idx > 0 {
+			builder.Write(", ")
+		}
+
+		if err := formatNode(builder, assignment); err != nil {
+			return err
+		}
+	}
+
+	if len(update.From) > 0 {
+		builder.Write(" from ")
+
+		if err := formatFromClauses(builder, update.From); err != nil {
+			return err
+		}
+	}
+
+	if update.Where != nil {
+		builder.Write(" where ")
+
+		if err := formatNode(builder, update.Where); err != nil {
+			return err
+		}
+	}
+
+	if len(update.Returning) > 0 {
+		builder.Write(" returning ")
+
+		for idx, projection := range update.Returning {
+			if idx > 0 {
+				builder.Write(", ")
+			}
+
+			if err := formatNode(builder, projection); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func formatDeleteStatement(builder *OutputBuilder, sqlDelete pgsql.Delete) error {
+	builder.Write("delete from ")
+
+	for idx, tableRef := range sqlDelete.From {
+		if idx > 0 {
+			builder.Write(", ")
+		}
+
+		if err := formatNode(builder, tableRef); err != nil {
+			return err
+		}
+	}
+
+	if len(sqlDelete.Using) > 0 {
+		builder.Write(" using ")
+
+		if err := formatFromClauses(builder, sqlDelete.Using); err != nil {
+			return err
+		}
+	}
+
+	if sqlDelete.Where != nil {
+		builder.Write(" where ")
+
+		if err := formatNode(builder, sqlDelete.Where); err != nil {
+			return err
+		}
+	}
+
+	if len(sqlDelete.Returning) > 0 {
+		builder.Write(" returning ")
+
+		for idx, projection := range sqlDelete.Returning {
+			if idx > 0 {
+				builder.Write(", ")
+			}
+
+			if err := formatNode(builder, projection); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func Statement(statement pgsql.Statement, builder *OutputBuilder) (Formatted, error) {
+	switch typedStatement := statement.(type) {
+	case pgsql.Merge:
+		if err := formatMergeStatement(builder, typedStatement); err != nil {
+			return Formatted{}, err
+		}
+
+	case pgsql.Query:
+		if err := formatSetExpression(builder, typedStatement); err != nil {
+			return Formatted{}, err
+		}
+
+	case pgsql.Insert:
+		if err := formatInsertStatement(builder, typedStatement); err != nil {
+			return Formatted{}, err
+		}
+
+	case pgsql.Update:
+		if err := formatUpdateStatement(builder, typedStatement); err != nil {
+			return Formatted{}, err
+		}
+
+	case pgsql.Delete:
+		if err := formatDeleteStatement(builder, typedStatement); err != nil {
+			return Formatted{}, err
+		}
+
+	default:
+		return Formatted{}, fmt.Errorf("unsupported PgSQL statement type: %T", statement)
+	}
+
+	builder.Write(";")
+	return builder.Build(), nil
+}
+
+func SyntaxNode(node pgsql.SyntaxNode) (Formatted, error) {
+	return SyntaxNodeWithBuilder(node, NewOutputBuilder())
+}
+
+func SyntaxNodeWithBuilder(node pgsql.SyntaxNode, builder *OutputBuilder) (Formatted, error) {
+	switch typedNode := node.(type) {
+	case pgsql.Statement:
+		return Statement(typedNode, builder)
+
+	case pgsql.Expression:
+		return Expression(typedNode, builder)
+
+	default:
+		return Formatted{}, fmt.Errorf("unknown SQL AST type: %T", node)
+	}
+}
+
+type Formatted struct {
+	Statement         string
+	Parameters        map[string]any
+	LiteralParameters map[string]string
+}

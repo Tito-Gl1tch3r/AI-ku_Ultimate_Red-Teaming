@@ -1,0 +1,435 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 - now Marco Neumann (kalink0)
+"""MMKV key-value store parser (wraps vendored crush/third_party/mmkv_parser, MIT).
+
+Explicit-only: MMKV has no magic bytes to auto-detect from, so this parser is
+never picked up during type indexing — reachable only via the filesystem
+panel's "Open as" -> MMKV / MMKV (Encrypted)... actions, same as Protobuf.
+
+The vendored reader operates on real filesystem paths (it opens the file and
+its ".crc" companion directly), not in-memory bytes, so this wrapper writes
+both to a temp directory before calling it and cleans up afterward — the same
+pattern SQLiteParser already uses for its -wal/-shm companions, for the same
+reason (the underlying library needs a real path).
+"""
+from __future__ import annotations
+
+import os
+import struct
+from typing import Any, cast
+
+from crush.core import tempdir
+from crush.core.issues import ParseIssue
+from crush.core.passwords import WrongPasswordError
+from crush.core.vfs import VFS, VFSNode, find_sibling
+from crush.parsers.base import AbstractParser, ParseResult
+from crush.third_party.mmkv_parser import MMKVError, decode_value, read_entries
+from crush.third_party.mmkv_parser.mmkv_parser import (
+    _HEADER_LENGTH,
+    _decrypt,
+    _key_material,
+    _read_varint,
+    _region_size,
+    _walk,
+)
+
+# MMKVMetaInfo (.crc file) layout, independently verified against Tencent/MMKV's
+# MMKVMetaInfo.hpp: crc u32, version u32, sequence u32, aesVector[16], actualSize u32.
+_META_MIN_LEN = 28   # crc + version + sequence + vector — enough to detect encryption
+_META_FULL_LEN = 32  # + actualSize
+_META_VECTOR = slice(12, 28)
+_META_VERSION_ACTUAL_SIZE = 3  # from this meta version, actualSize is meaningful
+
+# Why a non-zero .crc vector was overridden -- one wording, shown both in the
+# parse metadata and in the viewer's Overview tab.
+_FALSE_POSITIVE_NOTE = ParseIssue("mmkv.false_positive_note")
+
+
+def _read_meta_info(crc_bytes: bytes | None) -> dict[str, Any] | None:
+    """Decode the fixed-offset MMKVMetaInfo fields directly.
+
+    This does not call the vendored reader's own (private) meta parsing — these
+    are all fixed-offset struct fields with no variable-width tricks involved,
+    so re-reading them here is low-risk and keeps this wrapper decoupled from
+    the vendored module's internals.
+    """
+    if crc_bytes is None or len(crc_bytes) < _META_MIN_LEN:
+        return None
+    crc, version, sequence = struct.unpack_from("<III", crc_bytes, 0)
+    vector = crc_bytes[_META_VECTOR]
+    # An all-zero vector means "not encrypted". Normalize it to b"" (as the
+    # vendored reader's own _read_meta does) so "vector" and "encrypted" can
+    # never disagree: 16 zero bytes are truthy in Python, which once made
+    # every plaintext store with a .crc look encrypted to the offset code.
+    if not any(vector):
+        vector = b""
+    actual_size = (
+        struct.unpack_from("<I", crc_bytes, 28)[0] if len(crc_bytes) >= _META_FULL_LEN else None
+    )
+    return {
+        "crc": crc,
+        "version": version,
+        "sequence": sequence,
+        "encrypted": bool(vector),
+        "actual_size": actual_size if version >= _META_VERSION_ACTUAL_SIZE else None,
+        "vector": vector,
+    }
+
+
+def _try_plain_walk(raw: bytes) -> list[tuple[str, bytes]] | None:
+    """Attempt to read *raw* as an unencrypted MMKV store, ignoring the .crc
+    meta file's encryption flag entirely.
+
+    The .crc file's "non-zero vector means AES-encrypted" heuristic is only
+    as good as the MMKVMetaInfo layout it's read against — seen false-
+    positive in the field on a real react-native-mmkv store whose meta
+    "version" field was far higher than anything this layout has been
+    verified against (61, vs. the 1-4 range the known struct evolution
+    covers), producing a non-zero vector for a demonstrably plaintext store.
+    Rather than trust the flag blindly, confirm it: a genuinely encrypted
+    store fed through here as if it weren't will, per read_entries()'s own
+    documented invariant, either yield nothing or leave a tail unread.
+    """
+    if len(raw) < _HEADER_LENGTH:
+        return None
+    region_size = _region_size(raw, None)  # type: ignore[no-untyped-call]
+    if region_size == 0 or _HEADER_LENGTH + region_size > len(raw):
+        return None
+    region = raw[_HEADER_LENGTH:_HEADER_LENGTH + region_size]
+    entries, unread = _walk(region)  # type: ignore[no-untyped-call]
+    if not entries or unread:
+        return None
+    return cast(list[tuple[str, bytes]], entries)
+
+
+def _compute_entry_offsets(
+    raw: bytes,
+    meta_info: dict[str, Any] | None,
+    password: str | bytes | None,
+    aes256: bool,
+) -> list[tuple[int, int, int, int]] | None:
+    """Re-derive each entry's real on-disk byte spans as (entry_start, key_end,
+    value_start, value_end) absolute file offsets, or None if the region can't
+    be reconstructed the same way read_entries() did.
+
+    read_entries()/_walk() compute exactly these positions internally while
+    walking but never return them -- this mirrors that same walk (region
+    derivation + entry loop), reusing the vendored module's own _read_varint/
+    _decrypt/_key_material helpers directly (same reuse-not-duplicate pattern
+    already used elsewhere in this file) so only the ~15-line walk/bookkeeping
+    loop is independently re-derived, not the format's bit-level decode math.
+
+    AES-CFB is a byte-position-preserving stream cipher (ciphertext and
+    plaintext are the same length, position-for-position), so the *file*
+    offset math is identical whether or not the store is encrypted -- only
+    finding each entry's length (which requires the *decrypted* bytes to
+    parse the varints correctly) differs. Highlighting an encrypted store's
+    real on-disk bytes shows genuine ciphertext, not a decoded-looking value --
+    an honest answer, same spirit as Freeblocks showing raw undecoded cell
+    content elsewhere in this codebase.
+    """
+    region_size = _region_size(raw, meta_info)  # type: ignore[no-untyped-call]
+    if region_size == 0 or _HEADER_LENGTH + region_size > len(raw):
+        return None
+    region = raw[_HEADER_LENGTH:_HEADER_LENGTH + region_size]
+
+    if meta_info is not None and meta_info["encrypted"]:
+        if password is None:
+            return None  # encrypted, no key available (e.g. false-positive-flag plaintext path never reaches here)
+        try:
+            region = _decrypt(  # type: ignore[no-untyped-call]
+                region,
+                _key_material(password, aes256),  # type: ignore[no-untyped-call]
+                meta_info["vector"],
+            )
+        except Exception:
+            return None
+
+    spans: list[tuple[int, int, int, int]] = []
+    try:
+        _items_size, offset = _read_varint(region, 0)  # type: ignore[no-untyped-call]
+    except MMKVError:
+        return spans
+    end = len(region)
+    while offset < end:
+        entry_start = offset
+        try:
+            key_length, offset = _read_varint(region, offset)  # type: ignore[no-untyped-call]
+            if key_length == 0 or offset + key_length > end:
+                break
+            region[offset:offset + key_length].decode("utf-8")
+            offset += key_length
+            key_end = offset
+            value_length, offset = _read_varint(region, offset)  # type: ignore[no-untyped-call]
+            if offset + value_length > end:
+                break
+            value_start = offset
+            offset += value_length
+            value_end = offset
+        except (MMKVError, UnicodeDecodeError):
+            break
+        spans.append((
+            entry_start + _HEADER_LENGTH, key_end + _HEADER_LENGTH,
+            value_start + _HEADER_LENGTH, value_end + _HEADER_LENGTH,
+        ))
+    return spans
+
+
+_TYPE_LABELS: dict[type, str] = {str: "string", int: "int", bytes: "bytes"}
+
+
+def _content_bytes(container: bytes) -> bytes:
+    """Return the value's own bytes, with MMKV's internal string length-prefix
+    varint removed when the container has that shape — a length-prefix is not
+    part of the value, it's MMKV's own on-disk way of telling a string value
+    apart from a bare scalar varint (untyped on disk otherwise). Left in, it
+    breaks anything that tries to actually use the bytes (e.g. a value that's
+    JSON text no longer parses as JSON with a stray leading byte).
+
+    This is deliberately kept as a *separate* field from the entry's own
+    "raw" — raw must always stay the complete, untouched value container
+    (nothing is ever removed from it); this stripped form exists only for
+    "Inspect Value", where inspecting the value itself — not MMKV's on-disk
+    framing around it — is the whole point.
+
+    Mirrors decode_value()'s own shape check exactly (read a varint at offset
+    0, string-shaped iff it exactly accounts for the rest of the container),
+    so this always agrees with whatever decode_value() decided — a bare
+    scalar's container is returned unchanged, since it has no such prefix.
+    """
+    if not container:
+        return container
+    try:
+        length, offset = _read_varint(container, 0)  # type: ignore[no-untyped-call]
+    except MMKVError:
+        return container
+    if offset + length == len(container):
+        return container[offset:offset + length]
+    return container
+
+
+def _classify_entries(entries: list[tuple[str, bytes]]) -> list[dict[str, Any]]:
+    """Tag every entry, in file order, as Live / Superseded / Removed.
+
+    MMKV is append-only between rewrites: setting a key appends a new entry
+    rather than editing the old one, and the last occurrence of a key is the
+    one the app reads. A zero-length value container marks a removal, not an
+    empty value — read_entries() already keeps every occurrence in file order,
+    so classifying them is just tracking each key's last index.
+    """
+    last_index: dict[str, int] = {}
+    for i, (key, _container) in enumerate(entries):
+        last_index[key] = i
+
+    records: list[dict[str, Any]] = []
+    for i, (key, container) in enumerate(entries):
+        if i == last_index[key]:
+            state = "Removed" if not container else "Live"
+        else:
+            state = "Superseded"
+        decoded = decode_value(container)  # type: ignore[no-untyped-call]
+        records.append({
+            "index": i,
+            "key": key,
+            "state": state,
+            "type": _TYPE_LABELS.get(type(decoded), "empty"),
+            "decoded": decoded,
+            "raw": container,  # complete, untouched value container — never stripped
+            "value_bytes": _content_bytes(container),  # for Inspect Value only
+        })
+    return records
+
+
+class MMKVParser(AbstractParser):
+    """Tencent MMKV key-value store — same family as the LevelDB viewer.
+
+    Reference: https://github.com/abrignoni/mmkv-parser (MIT), format verified
+    independently against Tencent/MMKV's own source (see CHANGELOG).
+    """
+
+    DISPLAY_NAME = "MMKV Key-Value Store"
+    SUPPORTED_EXTENSIONS: list[str] = []
+    SUPPORTS_PASSWORD = True
+
+    def can_parse(self, path: str, peek_bytes: bytes) -> bool:  # noqa: ARG002
+        return False  # Explicit-only — see module docstring.
+
+    def parse(
+        self,
+        node: VFSNode,
+        vfs: VFS,
+        password: str | bytes | None = None,
+        aes256: bool = False,
+    ) -> ParseResult:
+        raw = vfs.read(node)
+        crc_bytes: bytes | None = None
+        # Why there is no meta info, when there isn't: missing, unreadable
+        # and too short are different findings (short form for the viewer's
+        # Overview, long form with the consequence for the Properties panel).
+        meta_status: ParseIssue | None = None
+        meta_status_long: ParseIssue | None = None
+        sibling = find_sibling(node, vfs, ".crc")
+        if sibling is None:
+            meta_status = ParseIssue("mmkv.meta_not_found_short")
+            meta_status_long = ParseIssue("mmkv.meta_not_found")
+        else:
+            try:
+                crc_bytes = vfs.read(sibling)
+            except Exception as exc:
+                meta_status = ParseIssue("mmkv.meta_unreadable_short", detail=str(exc))
+                meta_status_long = ParseIssue("mmkv.meta_unreadable", detail=str(exc))
+            else:
+                if len(crc_bytes) < _META_MIN_LEN:
+                    too_short = {"size": len(crc_bytes), "needed": _META_MIN_LEN}
+                    meta_status = ParseIssue("mmkv.meta_too_short_short", too_short)
+                    meta_status_long = ParseIssue("mmkv.meta_too_short", too_short)
+
+        meta_info = _read_meta_info(crc_bytes)
+        meta_flagged_encrypted = meta_info is not None and meta_info["encrypted"]
+        false_positive_encrypted_flag = False
+
+        if meta_flagged_encrypted and password is None:
+            plain_entries = _try_plain_walk(raw)
+            if plain_entries is None:
+                return ParseResult(
+                    viewer_type="tree",
+                    data={
+                        "error": ParseIssue("mmkv.encrypted_error"),
+                        "hint": ParseIssue("mmkv.encrypted_hint"),
+                    },
+                    metadata={
+                        "Format": ParseIssue("mmkv.format_encrypted"),
+                        "File size": f"{node.size:,} B",
+                        "Encrypted": ParseIssue("mmkv.encrypted_yes"),
+                    },
+                )
+            # The .crc file's vector-nonzero flag said "encrypted", but the
+            # store just read cleanly as plaintext -- trust the successful
+            # read over the flag, and say so explicitly rather than silently
+            # overriding it.
+            entries = plain_entries
+            false_positive_encrypted_flag = True
+        else:
+            tmp_dir = str(tempdir.mkdtemp(prefix="crush_mmkv_"))
+            tmp_path = os.path.join(tmp_dir, node.name)
+            try:
+                with open(tmp_path, "wb") as f:
+                    f.write(raw)
+                if crc_bytes is not None:
+                    with open(tmp_path + ".crc", "wb") as f:
+                        f.write(crc_bytes)
+                try:
+                    entries = read_entries(  # type: ignore[no-untyped-call]
+                        tmp_path, key=password, aes256=aes256
+                    )
+                except MMKVError as exc:
+                    msg = str(exc)
+                    if password is not None and "did not decrypt" in msg:
+                        raise WrongPasswordError(ParseIssue("mmkv.wrong_key", detail=msg)) from exc
+                    return ParseResult(
+                        viewer_type="tree",
+                        data={
+                            "error": ParseIssue("mmkv.read_failed", detail=msg),
+                            "hint": ParseIssue("mmkv.read_failed_hint"),
+                        },
+                        metadata={
+                            "Format": ParseIssue("mmkv.format_parse_failed"),
+                            "File size": f"{node.size:,} B",
+                            "Parse error": ParseIssue("mmkv.read_failed", detail=msg),
+                        },
+                    )
+            finally:
+                for p in (tmp_path, tmp_path + ".crc"):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+                try:
+                    os.rmdir(tmp_dir)
+                except OSError:
+                    pass
+
+        records = _classify_entries(entries)
+
+        # Byte-provenance for the embedded Hex pane: re-derive each entry's
+        # real on-disk span. The false-positive-flag path already proved this
+        # store is plaintext despite meta_info's vector, so treat it as
+        # unencrypted here too rather than re-triggering the "need a key" guard.
+        offsets_meta_info = None if false_positive_encrypted_flag else meta_info
+        offsets = _compute_entry_offsets(raw, offsets_meta_info, password, aes256)
+        offsets_issue: ParseIssue | None = None
+        if offsets is not None and len(offsets) == len(records):
+            for record, (entry_start, _key_end, value_start, value_end) in zip(records, offsets):
+                record["entry_range"] = (entry_start, value_end)
+                record["value_range"] = (value_start, value_end)
+        elif offsets is None:
+            offsets_issue = ParseIssue("mmkv.offsets_unavailable")
+        else:
+            offsets_issue = ParseIssue("mmkv.offsets_mismatch", {
+                "found": len(offsets), "total": len(records),
+            })
+
+        live = sum(1 for r in records if r["state"] == "Live")
+        superseded = sum(1 for r in records if r["state"] == "Superseded")
+        removed = sum(1 for r in records if r["state"] == "Removed")
+
+        meta: dict[str, Any] = {
+            "Format": "MMKV Key-Value Store",
+            "File size": f"{node.size:,} B",
+            "Entries": f"{len(records):,}",
+            "Live": f"{live:,}",
+            "Superseded": f"{superseded:,}",
+            "Removed": f"{removed:,}",
+        }
+        if meta_info is not None:
+            meta["Meta version"] = str(meta_info["version"])
+            meta["Sequence"] = str(meta_info["sequence"])
+        else:
+            # No usable .crc meta file — encryption status and the recorded
+            # region size (vs. the header's own copy) could not be cross-checked.
+            meta["Meta file"] = meta_status_long
+        if offsets_issue is not None:
+            meta["Hex offsets"] = offsets_issue
+        if password is not None:
+            if meta_info is not None and meta_info["encrypted"]:
+                meta["Encrypted"] = ParseIssue("mmkv.encrypted_decrypted")
+            elif meta_info is None:
+                # The reader can only decrypt with the .crc's AES vector; without
+                # the file the key is ignored and the bytes are walked as-is.
+                meta["Encrypted"] = (
+                    ParseIssue("mmkv.key_ignored_no_meta") if sibling is None
+                    else ParseIssue("mmkv.key_ignored_bad_meta", {"meta": meta_status})
+                )
+            else:
+                meta["Encrypted"] = ParseIssue("mmkv.key_ignored_zero_vector")
+        elif false_positive_encrypted_flag:
+            meta["Encrypted"] = ParseIssue(
+                "mmkv.encrypted_false_positive", {"note": _FALSE_POSITIVE_NOTE},
+            )
+
+        # The Overview tab reads meta_info["encrypted"]; hand it the verdict, not
+        # the raw flag the false-positive check just overrode, plus the reasoning
+        # as a separate field (parser owns fact and reasoning, viewer just shows).
+        viewer_meta_info = meta_info
+        if false_positive_encrypted_flag and meta_info is not None:
+            viewer_meta_info = {**meta_info, "encrypted": False, "encrypted_note": _FALSE_POSITIVE_NOTE}
+
+        text_parts: list[str] = []
+        for r in records:
+            text_parts.append(r["key"])
+            if isinstance(r["decoded"], str):
+                text_parts.append(r["decoded"][:256])
+            if len(text_parts) >= 2000:
+                break
+
+        return ParseResult(
+            viewer_type="mmkv",
+            data={
+                "records": records,
+                "meta_info": viewer_meta_info,
+                "meta_status": meta_status,
+                "__mmkv_file_bytes": raw,
+            },
+            metadata=meta,
+            text_index=" ".join(text_parts[:2000]),
+        )

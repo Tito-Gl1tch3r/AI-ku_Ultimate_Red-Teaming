@@ -1,0 +1,64 @@
+package org.pac4j.oidc.federation.config;
+
+import lombok.Getter;
+import lombok.Setter;
+import lombok.experimental.Accessors;
+import org.pac4j.core.config.properties.JwksProperties;
+import org.pac4j.core.config.properties.KeystoreProperties;
+import org.pac4j.core.keystore.generation.FileSystemKeystoreGenerator;
+import org.pac4j.oidc.federation.entity.EntityConfigurationGenerator;
+
+import java.time.Period;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Properties dedicated to the federation.
+ * https://openid.net/specs/openid-federation-1_0.html
+ *
+ * @author Jerome LELEU
+ * @since 6.4.0
+ */
+@Getter
+@Setter
+@Accessors(chain = true)
+public class OidcFederationProperties {
+
+    private KeystoreProperties keystore = new KeystoreProperties();
+
+    private JwksProperties jwks = new JwksProperties();
+
+    private EntityConfigurationGenerator entityConfigurationGenerator;
+
+    private int validityInDays = 90;
+
+    private String entityId;
+
+    private String applicationType = "web";
+
+    private List<String> responseTypes = new ArrayList<>(List.of("code"));
+
+    private List<String> grantTypes = new ArrayList<>(List.of("authorization_code"));
+
+    private List<String> scopes = new ArrayList<>(List.of("openid", "email", "profile"));
+
+    private List<String> clientRegistrationTypes = new ArrayList<>(List.of("explicit", "automatic"));
+
+    private List<OidcTrustAnchorProperties> trustAnchors = new ArrayList<>();
+
+    private String targetOp;
+
+    private String contactName;
+
+    private List<String> contactEmails = new ArrayList<>();
+
+    private boolean sendTrustChain;
+
+    private String secretExportFile;
+
+    public OidcFederationProperties() {
+        keystore.setCertificatePrefix("oidcfede-signing-cert");
+        keystore.setCertificateExpirationPeriod(Period.ofYears(1));
+        keystore.setKeystoreGenerator(new FileSystemKeystoreGenerator(keystore));
+    }
+}

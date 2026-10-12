@@ -1,0 +1,747 @@
+package controller
+
+import (
+	"database/sql"
+	"fmt"
+
+	"github.com/go-openapi/runtime/middleware"
+	"github.com/jmoiron/sqlx"
+	"github.com/michaelquigley/df/dl"
+	"github.com/openziti/edge-api/rest_model"
+	"github.com/openziti/zrok/v2/controller/automation"
+	"github.com/openziti/zrok/v2/controller/dynamicProxyController"
+	"github.com/openziti/zrok/v2/controller/store"
+	"github.com/openziti/zrok/v2/rest_model_zrok"
+	"github.com/openziti/zrok/v2/rest_server_zrok/operations/share"
+	"github.com/openziti/zrok/v2/sdk/golang/sdk"
+	"github.com/openziti/zrok/v2/util"
+	"github.com/pkg/errors"
+)
+
+type shareHandler struct{}
+
+func newShareHandler() *shareHandler {
+	return &shareHandler{}
+}
+
+func (h *shareHandler) Handle(params share.ShareParams, principal *rest_model_zrok.Principal) middleware.Responder {
+	trx, err := str.Begin()
+	if err != nil {
+		dl.Errorf("error starting transaction: %v", err)
+		return share.NewShareInternalServerError()
+	}
+	defer func() { _ = trx.Rollback() }()
+
+	// validate environment
+	envZId := params.Body.EnvZID
+	envId, err := h.validateEnvironment(envZId, principal, trx)
+	if err != nil {
+		dl.Errorf("environment validation failed: %v", err)
+		return share.NewShareUnauthorized()
+	}
+
+	// check limits
+	if err := h.checkLimits(envId, principal, params, trx); err != nil {
+		dl.Errorf("limits error: %v", err)
+		return share.NewShareUnauthorized()
+	}
+
+	// create share token
+	var shrToken string
+	if sdk.ShareMode(params.Body.ShareMode) == sdk.PrivateShareMode && params.Body.PrivateShareToken != "" {
+		dl.Infof("private share requested share token '%v'", params.Body.PrivateShareToken)
+		if util.IsValidShareToken(params.Body.PrivateShareToken, cfg.Names != nil && cfg.Names.DisableShareTokenProfanityCheck) {
+			shrToken = params.Body.PrivateShareToken
+		} else {
+			dl.Errorf("requested private share token '%v' has invalid unique name", params.Body.PrivateShareToken)
+			return share.NewShareConflict().WithPayload(rest_model_zrok.ErrorMessage(fmt.Sprintf("requested private share token '%v' has invalid unique name", params.Body.PrivateShareToken)))
+		}
+	} else {
+		shrToken, err = createShareToken()
+		if err != nil {
+			dl.Error(err)
+			return share.NewShareInternalServerError()
+		}
+	}
+
+	// process namespace selections
+	var frontendEndpoints []string
+	var nameIds []int
+	var unbinds []pendingMappingUpdate
+	if sdk.ShareMode(params.Body.ShareMode) == sdk.PublicShareMode {
+		frontendEndpoints, nameIds, unbinds, err = h.processNameSelections(params.Body.NameSelections, shrToken, principal, trx)
+		if err != nil {
+			dl.Errorf("namespace selection processing failed: %v", err)
+			var conflict *nameSelectionConflict
+			if errors.As(err, &conflict) {
+				return share.NewShareConflict().WithPayload(rest_model_zrok.ErrorMessage(conflict.Error()))
+			}
+			return share.NewShareInternalServerError()
+		}
+	}
+
+	// resolve per-mode inputs before allocating, so the check after allocation sees its error
+	shareMode := sdk.ShareMode(params.Body.ShareMode)
+	var interstitial bool
+	switch shareMode {
+	case sdk.PublicShareMode:
+		interstitial, err = h.shouldUseInterstitial(params.Body.BackendMode, principal, trx)
+		if err != nil {
+			dl.Errorf("error determining interstitial setting for account '%v': %v", principal.Email, err)
+			return share.NewShareInternalServerError()
+		}
+
+	case sdk.PrivateShareMode:
+		// check private share token availability if provided
+		if params.Body.PrivateShareToken != "" {
+			if err = h.checkPrivateShareTokenAvailability(shrToken); err != nil {
+				if automation.IsRateLimited(err) {
+					dl.Errorf("error checking private share token availability: %v", err)
+					return share.NewShareServiceUnavailable().WithRetryAfter(rateLimitedRetryAfter)
+				}
+				dl.Errorf("private share token conflict: %v", err)
+				return share.NewShareConflict().WithPayload(rest_model_zrok.ErrorMessage(err.Error()))
+			}
+		}
+
+	default:
+		dl.Errorf("unknown share mode '%v'", params.Body.ShareMode)
+		return share.NewShareInternalServerError()
+	}
+
+	// every ziti object created from here on is deleted by id unless the transaction commits
+	compensation := newZitiCompensation(compensatingShare, shrToken)
+	committed := false
+	defer func() {
+		if committed || len(compensation.objects) == 0 {
+			return
+		}
+		ziti, err := automation.NewZitiAutomation(cfg.Ziti)
+		if err != nil {
+			dl.Errorf("error getting ziti automation client to compensate share '%v': %v", shrToken, err)
+			return
+		}
+		compensation.run(ziti)
+	}()
+
+	// allocate resources based on share mode
+	var shrZId string
+	if shareMode == sdk.PublicShareMode {
+		shrZId, frontendEndpoints, err = h.allocatePublicResources(envZId, shrToken, frontendEndpoints, params, interstitial, compensation, trx)
+	} else {
+		shrZId, frontendEndpoints, err = h.allocatePrivateResources(envZId, shrToken, frontendEndpoints, params, compensation, trx)
+	}
+	if err != nil {
+		dl.Errorf("error allocating share resources: %v", err)
+		if automation.IsRateLimited(err) {
+			return share.NewShareServiceUnavailable().WithRetryAfter(rateLimitedRetryAfter)
+		}
+		return share.NewShareInternalServerError()
+	}
+
+	// create share record
+	shareId, err := h.createShareRecord(envId, shrZId, shrToken, params, frontendEndpoints, trx)
+	if err != nil {
+		dl.Errorf("error creating share record: %v", err)
+		return share.NewShareInternalServerError()
+	}
+
+	var updates []pendingMappingUpdate
+	if sdk.ShareMode(params.Body.ShareMode) == sdk.PublicShareMode {
+		// create share name mappings for namespace selections
+		for _, nameId := range nameIds {
+			snm := &store.ShareNameMapping{
+				ShareId: shareId,
+				NameId:  nameId,
+			}
+			_, err := str.CreateShareNameMapping(snm, trx)
+			if err != nil {
+				dl.Errorf("error creating share name mapping for share '%v' and name '%v': %v", shareId, nameId, err)
+				return share.NewShareInternalServerError()
+			}
+		}
+
+		// record frontend mappings for dynamic frontends; their updates are published after commit, behind
+		// the unbinds for any mappings healed off the same names
+		binds, err := h.processDynamicMappings(shrToken, nameIds, trx)
+		if err != nil {
+			dl.Errorf("error recording frontend mappings for share '%v': %v", shrToken, err)
+			return share.NewShareInternalServerError()
+		}
+		updates = append(unbinds, binds...)
+	}
+
+	// handle access grants if closed permission mode
+	if err := h.processAccessGrants(shareId, params.Body.AccessGrants, params.Body.PermissionMode, principal, trx); err != nil {
+		dl.Errorf("error processing access grants: %v", err)
+		return share.NewShareInternalServerError()
+	}
+
+	if err := trx.Commit(); err != nil {
+		dl.Errorf("error committing share record: %v", err)
+		return share.NewShareInternalServerError()
+	}
+	committed = true
+	publishMappingUpdates(updates)
+
+	dl.Infof("recorded share '%v' with id '%v' for '%v'", shrToken, shareId, principal.Email)
+
+	return share.NewShareCreated().WithPayload(&rest_model_zrok.ShareResponse{
+		FrontendProxyEndpoints: frontendEndpoints,
+		ShareToken:             shrToken,
+	})
+}
+
+func (h *shareHandler) validateEnvironment(envZId string, principal *rest_model_zrok.Principal, trx *sqlx.Tx) (int, error) {
+	env, err := str.FindEnvironmentForAccount(envZId, int(principal.ID), trx)
+	if err != nil {
+		return 0, errors.Wrapf(err, "error finding environment '%v' for account '%v'", envZId, principal.Email)
+	}
+	return env.Id, nil
+}
+
+func (h *shareHandler) checkLimits(envId int, principal *rest_model_zrok.Principal, params share.ShareParams, trx *sqlx.Tx) error {
+	if !principal.Limitless {
+		if limitsAgent != nil {
+			shareMode := sdk.ShareMode(params.Body.ShareMode)
+			backendMode := sdk.BackendMode(params.Body.BackendMode)
+
+			// we're going to skip reservation checking because we're moving name creation outside the scope of share
+			// creation. the limits check for name creation will happen in the `/share/name` endpoint instead.
+			ok, err := limitsAgent.CanCreateShare(int(principal.ID), envId, false, false, shareMode, backendMode, trx)
+			if err != nil {
+				return errors.Wrapf(err, "error checking share limits for '%v'", principal.Email)
+			}
+			if !ok {
+				return errors.Errorf("share limit check failed for '%v'", principal.Email)
+			}
+		}
+	}
+	return nil
+}
+
+func (h *shareHandler) shouldUseInterstitial(backendMode string, principal *rest_model_zrok.Principal, trx *sqlx.Tx) (bool, error) {
+	var skipInterstitial bool
+	parsedBackendMode := sdk.BackendMode(backendMode)
+
+	if parsedBackendMode != sdk.DriveBackendMode {
+		var err error
+		skipInterstitial, err = str.IsAccountGrantedSkipInterstitial(int(principal.ID), trx)
+		if err != nil {
+			return false, errors.Wrapf(err, "error checking skip interstitial for account '%v'", principal.Email)
+		}
+	} else {
+		// always skip interstitial for drive backend mode
+		skipInterstitial = true
+	}
+
+	return !skipInterstitial, nil
+}
+
+// nameSelectionConflict is a name selection the request itself cannot have: a name or namespace that does
+// not exist, one the account does not own or is not granted, or a name held by a live share. any other
+// error from processNameSelections is a failure of the controller.
+type nameSelectionConflict struct {
+	msg string
+}
+
+func (c *nameSelectionConflict) Error() string {
+	return c.msg
+}
+
+func newNameSelectionConflict(format string, args ...interface{}) error {
+	return &nameSelectionConflict{msg: fmt.Sprintf(format, args...)}
+}
+
+// processNameSelections resolves the request's names. it also returns the unbinds for any frontend
+// mappings it healed, which the handler publishes after commit ahead of the share's own binds.
+func (h *shareHandler) processNameSelections(selections []*rest_model_zrok.NameSelection, shrToken string, principal *rest_model_zrok.Principal, trx *sqlx.Tx) ([]string, []int, []pendingMappingUpdate, error) {
+	var frontendEndpoints []string
+	var nameIds []int
+	var unbinds []pendingMappingUpdate
+
+	for _, selection := range selections {
+		// find namespace by token
+		ns, err := str.FindNamespaceWithToken(selection.NamespaceToken, trx)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, nil, nil, newNameSelectionConflict("namespace '%v' not found", selection.NamespaceToken)
+			}
+			return nil, nil, nil, errors.Wrapf(err, "error finding namespace with token '%v'", selection.NamespaceToken)
+		}
+
+		var endpoint string
+		var nameId int
+
+		if selection.Name != "" { // user specified a name - validate ownership and availability
+			name, err := str.FindNameByNamespaceAndName(ns.Id, selection.Name, trx)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return nil, nil, nil, newNameSelectionConflict("name '%v' not found in namespace '%v'", selection.Name, ns.Token)
+				}
+				return nil, nil, nil, errors.Wrapf(err, "error finding name '%v' in namespace '%v'", selection.Name, ns.Token)
+			}
+
+			// check if user owns this name
+			if name.AccountId != int(principal.ID) {
+				return nil, nil, nil, newNameSelectionConflict("user '%v' does not own name '%v' in namespace '%v'", principal.Email, selection.Name, ns.Token)
+			}
+
+			// release the name if its holder is a deleted share; a live holder is a conflict
+			conflict, healed, err := healSeveredName(ns, name, trx)
+			if err != nil {
+				return nil, nil, nil, errors.Wrapf(err, "error checking availability of name '%v' in namespace '%v'", selection.Name, ns.Token)
+			}
+			if conflict != nil {
+				return nil, nil, nil, &nameSelectionConflict{msg: conflict.message()}
+			}
+			unbinds = append(unbinds, healed...)
+
+			nameId = name.Id
+			endpoint = util.NameInNamespace(name.Name, ns.Name)
+
+		} else { // no name specified - generate one and create name record
+			// check namespace permissions
+			if !ns.Open {
+				granted, err := str.CheckNamespaceGrant(ns.Id, int(principal.ID), trx)
+				if err != nil {
+					return nil, nil, nil, errors.Wrapf(err, "error checking namespace grant for account '%v' and namespace '%v'", principal.Email, ns.Token)
+				}
+				if !granted {
+					return nil, nil, nil, newNameSelectionConflict("account '%v' is not granted access to namespace '%v'", principal.Email, ns.Token)
+				}
+			}
+
+			// create name record with reserved=false (dynamically allocated)
+			name := &store.Name{
+				NamespaceId: ns.Id,
+				Name:        shrToken,
+				AccountId:   int(principal.ID),
+				Reserved:    false,
+			}
+
+			nameId, err = str.CreateName(name, trx)
+			if err != nil {
+				return nil, nil, nil, errors.Wrapf(err, "error creating allocated name '%v' in namespace '%v' for account '%v'", shrToken, ns.Token, principal.Email)
+			}
+
+			endpoint = util.NameInNamespace(shrToken, ns.Name)
+		}
+
+		frontendEndpoints = append(frontendEndpoints, endpoint)
+		nameIds = append(nameIds, nameId)
+	}
+
+	return frontendEndpoints, nameIds, unbinds, nil
+}
+
+func (h *shareHandler) allocatePublicResources(envZId, shrToken string, frontendEndpoints []string, params share.ShareParams, interstitial bool, compensation *zitiCompensation, trx interface{}) (string, []string, error) {
+	// get shared automation client
+	ziti, err := automation.NewZitiAutomation(cfg.Ziti)
+	if err != nil {
+		return "", nil, errors.Wrap(err, "error getting ziti automation client")
+	}
+
+	// prepare auth users
+	var authUsers []*sdk.AuthUserConfig
+	for _, authUser := range params.Body.BasicAuthUsers {
+		authUsers = append(authUsers, &sdk.AuthUserConfig{Username: authUser.Username, Password: authUser.Password})
+	}
+
+	// parse auth scheme
+	authScheme, err := sdk.ParseAuthScheme(params.Body.AuthScheme)
+	if err != nil {
+		return "", nil, errors.Wrap(err, "error parsing auth scheme")
+	}
+
+	// prepare oauth config
+	var oauthCfg *sdk.OauthConfig
+	if authScheme == sdk.Oauth {
+		oauthCfg = &sdk.OauthConfig{
+			Provider:                   params.Body.OauthProvider,
+			EmailDomains:               params.Body.OauthEmailDomains,
+			AuthorizationCheckInterval: params.Body.OauthRefreshInterval,
+		}
+	}
+
+	// create frontend config
+	frontendConfig := &sdk.FrontendConfig{
+		Interstitial: interstitial,
+		AuthScheme:   authScheme,
+	}
+	if authScheme == sdk.Basic {
+		frontendConfig.BasicAuth = &sdk.BasicAuthConfig{Users: authUsers}
+	}
+	if authScheme == sdk.Oauth && oauthCfg != nil {
+		frontendConfig.OauthAuth = oauthCfg
+	}
+
+	// create config using the global zrokProxyConfigId
+	tags := automation.ZrokShareTags(shrToken)
+	configOpts := &automation.ConfigOptions{
+		BaseOptions: automation.BaseOptions{
+			Name: shrToken,
+			Tags: tags,
+		},
+		ConfigTypeID: zrokProxyConfigId,
+		Data:         frontendConfig,
+	}
+	cfgZId, err := ziti.Configs.Create(configOpts)
+	if err != nil {
+		return "", nil, errors.Wrap(err, "error creating config")
+	}
+	compensation.add(zitiConfig, cfgZId)
+
+	// create share service
+	serviceOpts := &automation.ServiceOptions{
+		BaseOptions: automation.BaseOptions{
+			Name: shrToken,
+			Tags: tags,
+		},
+		Configs:            []string{cfgZId},
+		EncryptionRequired: true,
+	}
+	shrZId, err := ziti.Services.Create(serviceOpts)
+	if err != nil {
+		return "", nil, errors.Wrap(err, "error creating share service")
+	}
+	compensation.add(zitiService, shrZId)
+
+	// create bind policy (backend can bind to this service)
+	bindPolicyName := envZId + "-" + shrZId + "-bind"
+	bindPolicyOpts := &automation.ServicePolicyOptions{
+		BaseOptions: automation.BaseOptions{
+			Name: bindPolicyName,
+			Tags: tags,
+		},
+		IdentityRoles: []string{"@" + envZId},
+		ServiceRoles:  []string{"@" + shrZId},
+		PolicyType:    rest_model.DialBindBind,
+		Semantic:      rest_model.SemanticAllOf,
+	}
+	bindPolicyZId, err := ziti.ServicePolicies.Create(bindPolicyOpts)
+	if err != nil {
+		return "", nil, errors.Wrap(err, "error creating service policy bind")
+	}
+	compensation.add(zitiServicePolicy, bindPolicyZId)
+
+	// create dial policy (frontends can dial this service)
+	// get frontend identities from namespaces
+	var frontendZIds []string
+	for _, selection := range params.Body.NameSelections {
+		ns, err := str.FindNamespaceWithToken(selection.NamespaceToken, trx.(*sqlx.Tx))
+		if err != nil {
+			return "", nil, errors.Wrapf(err, "error finding namespace with token '%v'", selection.NamespaceToken)
+		}
+
+		frontends, err := str.FindFrontendsForNamespace(ns.Id, trx.(*sqlx.Tx))
+		if err != nil {
+			return "", nil, errors.Wrapf(err, "error finding frontends for namespace '%v'", ns.Token)
+		}
+
+		for _, fe := range frontends {
+			frontendZIds = append(frontendZIds, fe.ZId)
+		}
+	}
+
+	if len(frontendZIds) > 0 {
+		dialPolicyName := envZId + "-" + shrZId + "-dial"
+		var dialIdentityRoles []string
+		for _, frontendZId := range frontendZIds {
+			dialIdentityRoles = append(dialIdentityRoles, "@"+frontendZId)
+		}
+		dialPolicyOpts := &automation.ServicePolicyOptions{
+			BaseOptions: automation.BaseOptions{
+				Name: dialPolicyName,
+				Tags: tags,
+			},
+			IdentityRoles: dialIdentityRoles,
+			ServiceRoles:  []string{"@" + shrZId},
+			PolicyType:    rest_model.DialBindDial,
+			Semantic:      rest_model.SemanticAllOf,
+		}
+		var dialPolicyZId string
+		dialPolicyZId, err = ziti.ServicePolicies.Create(dialPolicyOpts)
+		if err != nil {
+			return "", nil, errors.Wrap(err, "error creating service policy dial")
+		}
+		compensation.add(zitiServicePolicy, dialPolicyZId)
+	}
+
+	// create service edge router policy
+	serpPolicyName := envZId + "-" + shrToken + "-serp"
+	serpPolicyOpts := &automation.ServiceEdgeRouterPolicyOptions{
+		BaseOptions: automation.BaseOptions{
+			Name: serpPolicyName,
+			Tags: tags,
+		},
+		ServiceRoles:    []string{"@" + shrZId},
+		EdgeRouterRoles: []string{"#all"},
+		Semantic:        rest_model.SemanticAllOf,
+	}
+	serpPolicyZId, err := ziti.ServiceEdgeRouterPolicies.Create(serpPolicyOpts)
+	if err != nil {
+		return "", nil, errors.Wrap(err, "error creating service edge router policy")
+	}
+	compensation.add(zitiServiceEdgeRouterPolicy, serpPolicyZId)
+
+	dl.Infof("allocated public resources for share '%v' with service id '%v'", shrToken, shrZId)
+	return shrZId, frontendEndpoints, nil
+}
+
+func (h *shareHandler) checkPrivateShareTokenAvailability(privateShareToken string) error {
+	ziti, err := automation.NewZitiAutomation(cfg.Ziti)
+	if err != nil {
+		if automation.IsRateLimited(err) {
+			return err
+		}
+		return errors.Wrap(err, "error getting ziti automation client")
+	}
+
+	// verify the service name is available
+	_, err = ziti.Services.GetByName(privateShareToken)
+	if automation.IsRateLimited(err) {
+		return err
+	}
+	if err == nil {
+		return errors.Errorf("share token '%v' is in use; if the share using it was recently deleted, it is being reclaimed and will be available again shortly", privateShareToken)
+	}
+	return nil
+}
+
+func (h *shareHandler) allocatePrivateResources(envZId, shrToken string, frontendEndpoints []string, params share.ShareParams, compensation *zitiCompensation, trx interface{}) (string, []string, error) {
+	// get shared automation client
+	ziti, err := automation.NewZitiAutomation(cfg.Ziti)
+	if err != nil {
+		return "", nil, errors.Wrap(err, "error getting ziti automation client")
+	}
+
+	// prepare auth users
+	var authUsers []*sdk.AuthUserConfig
+	for _, authUser := range params.Body.BasicAuthUsers {
+		authUsers = append(authUsers, &sdk.AuthUserConfig{Username: authUser.Username, Password: authUser.Password})
+	}
+
+	// parse auth scheme
+	authScheme, err := sdk.ParseAuthScheme(params.Body.AuthScheme)
+	if err != nil {
+		return "", nil, errors.Wrap(err, "error parsing auth scheme")
+	}
+
+	// prepare oauth config
+	var oauthCfg *sdk.OauthConfig
+	if authScheme == sdk.Oauth {
+		oauthCfg = &sdk.OauthConfig{
+			Provider:                   params.Body.OauthProvider,
+			EmailDomains:               params.Body.OauthEmailDomains,
+			AuthorizationCheckInterval: params.Body.OauthRefreshInterval,
+		}
+	}
+
+	// create frontend config (private shares don't use interstitials)
+	frontendConfig := &sdk.FrontendConfig{
+		Interstitial: false,
+		AuthScheme:   authScheme,
+	}
+	if authScheme == sdk.Basic {
+		frontendConfig.BasicAuth = &sdk.BasicAuthConfig{Users: authUsers}
+	}
+	if authScheme == sdk.Oauth && oauthCfg != nil {
+		frontendConfig.OauthAuth = oauthCfg
+	}
+
+	// create config using the global zrokProxyConfigId
+	tags := automation.ZrokShareTags(shrToken)
+	configOpts := &automation.ConfigOptions{
+		BaseOptions: automation.BaseOptions{
+			Name: shrToken,
+			Tags: tags,
+		},
+		ConfigTypeID: zrokProxyConfigId,
+		Data:         frontendConfig,
+	}
+	cfgZId, err := ziti.Configs.Create(configOpts)
+	if err != nil {
+		return "", nil, errors.Wrap(err, "error creating config")
+	}
+	compensation.add(zitiConfig, cfgZId)
+
+	// create share service
+	serviceOpts := &automation.ServiceOptions{
+		BaseOptions: automation.BaseOptions{
+			Name: shrToken,
+			Tags: tags,
+		},
+		Configs:            []string{cfgZId},
+		EncryptionRequired: true,
+	}
+	shrZId, err := ziti.Services.Create(serviceOpts)
+	if err != nil {
+		return "", nil, errors.Wrap(err, "error creating share service")
+	}
+	compensation.add(zitiService, shrZId)
+
+	// create bind policy (backend can bind to this service)
+	bindPolicyName := envZId + "-" + shrZId + "-bind"
+	bindPolicyOpts := &automation.ServicePolicyOptions{
+		BaseOptions: automation.BaseOptions{
+			Name: bindPolicyName,
+			Tags: tags,
+		},
+		IdentityRoles: []string{"@" + envZId},
+		ServiceRoles:  []string{"@" + shrZId},
+		PolicyType:    rest_model.DialBindBind,
+		Semantic:      rest_model.SemanticAllOf,
+	}
+	bindPolicyZId, err := ziti.ServicePolicies.Create(bindPolicyOpts)
+	if err != nil {
+		return "", nil, errors.Wrap(err, "error creating service policy bind")
+	}
+	compensation.add(zitiServicePolicy, bindPolicyZId)
+
+	// create service edge router policy
+	serpPolicyName := envZId + "-" + shrToken + "-serp"
+	serpPolicyOpts := &automation.ServiceEdgeRouterPolicyOptions{
+		BaseOptions: automation.BaseOptions{
+			Name: serpPolicyName,
+			Tags: tags,
+		},
+		ServiceRoles:    []string{"@" + shrZId},
+		EdgeRouterRoles: []string{"#all"},
+		Semantic:        rest_model.SemanticAllOf,
+	}
+	serpPolicyZId, err := ziti.ServiceEdgeRouterPolicies.Create(serpPolicyOpts)
+	if err != nil {
+		return "", nil, errors.Wrap(err, "error creating service edge router policy")
+	}
+	compensation.add(zitiServiceEdgeRouterPolicy, serpPolicyZId)
+
+	// note: private shares don't create dial policies here
+	// dial access is granted separately via the access endpoint
+
+	dl.Infof("allocated private resources for share '%v' with service id '%v'", shrToken, shrZId)
+	return shrZId, frontendEndpoints, nil
+}
+
+func (h *shareHandler) createShareRecord(envId int, shrZId, shrToken string, params share.ShareParams, frontendEndpoints []string, trx interface{}) (int, error) {
+	if shrZId == "" {
+		return 0, errors.Errorf("refusing to create share record for '%v' without a ziti service id", shrToken)
+	}
+
+	strShr := &store.Share{
+		ZId:            shrZId,
+		Token:          shrToken,
+		ShareMode:      params.Body.ShareMode,
+		BackendMode:    params.Body.BackendMode,
+		PermissionMode: store.OpenPermissionMode,
+	}
+
+	// set target as backend proxy endpoint for share12
+	if params.Body.Target != "" {
+		strShr.BackendProxyEndpoint = &params.Body.Target
+	}
+
+	// set permission mode if specified
+	if params.Body.PermissionMode != "" {
+		strShr.PermissionMode = store.PermissionMode(params.Body.PermissionMode)
+	}
+
+	// set frontend endpoint (first one if multiple)
+	if len(frontendEndpoints) > 0 {
+		strShr.FrontendEndpoint = &frontendEndpoints[0]
+	} else if strShr.ShareMode == "private" {
+		// for private shares without frontend endpoints, use the share mode as endpoint
+		strShr.FrontendEndpoint = &strShr.ShareMode
+	}
+
+	// create the share record
+	shareId, err := str.CreateShare(envId, strShr, trx.(*sqlx.Tx))
+	if err != nil {
+		return 0, errors.Wrap(err, "error creating share record")
+	}
+
+	dl.Infof("created share record with id '%v' for share '%v'", shareId, shrToken)
+	return shareId, nil
+}
+
+func (h *shareHandler) processAccessGrants(shareId int, accessGrants []string, permissionMode string, principal *rest_model_zrok.Principal, trx interface{}) error {
+	// only process access grants for closed permission mode
+	if store.PermissionMode(permissionMode) != store.ClosedPermissionMode {
+		return nil
+	}
+
+	// find account IDs for the access grant email addresses
+	var accessGrantAcctIds []int
+	for _, email := range accessGrants {
+		acct, err := str.FindAccountWithEmail(email, trx.(*sqlx.Tx))
+		if err != nil {
+			return errors.Wrapf(err, "unable to find account '%v' for share request from '%v'", email, principal.Email)
+		}
+		dl.Debugf("found id '%d' for '%v'", acct.Id, acct.Email)
+		accessGrantAcctIds = append(accessGrantAcctIds, acct.Id)
+	}
+
+	// create access grants for each account
+	for _, acctId := range accessGrantAcctIds {
+		_, err := str.CreateAccessGrant(shareId, acctId, trx.(*sqlx.Tx))
+		if err != nil {
+			return errors.Wrapf(err, "error creating access grant for share '%v' and account '%v'", shareId, acctId)
+		}
+		dl.Debugf("created access grant for share '%v' and account '%v'", shareId, acctId)
+	}
+
+	if len(accessGrantAcctIds) > 0 {
+		dl.Infof("created %d access grants for closed share '%v'", len(accessGrantAcctIds), shareId)
+	}
+
+	return nil
+}
+
+// processDynamicMappings records a frontend mapping for each dynamic frontend serving each selected
+// name, and returns a pending bind for each row. the first insert failure is returned, so the request
+// fails and its transaction rolls back.
+func (h *shareHandler) processDynamicMappings(shrToken string, nameIds []int, trx *sqlx.Tx) ([]pendingMappingUpdate, error) {
+	var updates []pendingMappingUpdate
+	for _, nameId := range nameIds {
+		// find name record to get the name and namespace
+		name, err := str.GetName(nameId, trx)
+		if err != nil {
+			return nil, errors.Wrapf(err, "error finding name with id '%v'", nameId)
+		}
+
+		// find namespace
+		ns, err := str.GetNamespace(name.NamespaceId, trx)
+		if err != nil {
+			return nil, errors.Wrapf(err, "error finding namespace with id '%v'", name.NamespaceId)
+		}
+
+		// find dynamic frontends for this namespace
+		frontends, err := str.FindDynamicFrontendsForNamespace(ns.Id, trx)
+		if err != nil {
+			return nil, errors.Wrapf(err, "error finding dynamic frontends for namespace '%v'", ns.Token)
+		}
+
+		for _, frontend := range frontends {
+			frontendName := util.NameInNamespace(name.Name, ns.Name)
+			fmId, err := str.CreateFrontendMapping(&store.FrontendMapping{
+				FrontendToken: frontend.Token,
+				Name:          frontendName,
+				ShareToken:    shrToken,
+			}, trx)
+			if err != nil {
+				return nil, errors.Wrapf(err, "error recording frontend mapping '%v' for frontend '%v'", frontendName, frontend.Token)
+			}
+			updates = append(updates, pendingMappingUpdate{
+				frontendToken: frontend.Token,
+				mapping: dynamicProxyController.Mapping{
+					Id:         int64(fmId),
+					Operation:  dynamicProxyController.OperationBind,
+					Name:       frontendName,
+					ShareToken: shrToken,
+				},
+			})
+			dl.Debugf("recorded frontend mapping '%v' for dynamic frontend '%v'", frontendName, frontend.Token)
+		}
+	}
+	return updates, nil
+}

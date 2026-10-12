@@ -1,0 +1,1806 @@
+mod declaration;
+mod file;
+mod gcp;
+mod iam;
+mod k8s;
+mod network;
+mod sys;
+
+pub use file::credential_from_resolved;
+
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use c2::{ExecTtp, TtpExecuted};
+use ran_domain::{Contains, Entity, EntityId, K8sCluster, Namespace};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::external_parser::SystemFieldUpdates;
+use crate::{Campaign, FactsUpdate};
+use declaration::OutputEffect;
+
+pub const PARSER_VERSION: &str = "v1";
+const RAW_PREVIEW_MAX_LEN: usize = 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ParseResult {
+    Parsed,
+    KnownFailure,
+    UnknownFormat,
+    NoParser,
+    ParserBug,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParseAudit {
+    pub cmd_id: String,
+    pub effect_id: String,
+    pub ttp_id: String,
+    pub target_id: String,
+    pub parser_version: String,
+    pub raw_output_hash: String,
+    pub raw_output_preview: String,
+    pub parse_result: ParseResult,
+    pub detail: String,
+    pub inferred_facts_written: usize,
+}
+
+pub struct ParsedEffect {
+    pub updates: FactsUpdate,
+    pub audit: ParseAudit,
+    pub(crate) system_updates: Vec<TargetedSystemUpdate>,
+    pub(crate) captured_files: Vec<CapturedFile>,
+}
+
+#[derive(Debug)]
+pub(crate) struct TargetedSystemUpdate {
+    pub(crate) target_id: String,
+    pub(crate) updates: SystemFieldUpdates,
+    pub(crate) count_in_audit: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct CapturedFile {
+    pub(crate) path: String,
+    pub(crate) content: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) enum ParserOutput {
+    /// Physical system fields, attributed exclusively to persisted executor
+    /// provenance by the dispatcher. Parsers cannot select a fallback host.
+    Success(SystemFieldUpdates, String),
+    /// Resource facts whose attribution is explicit in the emitted entity and
+    /// relation IDs. Kubernetes resources, scan subjects, and IAM identities
+    /// are not implicitly reattributed to the physical command executor.
+    SuccessWithFacts(FactsUpdate, String),
+    KnownFailure(String),
+    UnknownFormat(String),
+}
+
+pub(crate) type ParserFn = fn(&str, &str, &HashMap<String, String>) -> ParserOutput;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EffectSubject {
+    Executor,
+    Target,
+}
+
+/// Split the optional subject binding from an effect declaration.
+///
+/// Existing unbound declarations retain executor attribution for physical
+/// system updates. New or migrated declarations should state the contract as
+/// `executor::<effect>` or `target::<effect>` so placement and fact ownership
+/// cannot be conflated.
+pub(crate) fn split_effect_subject(effect: &str) -> (EffectSubject, &str) {
+    let effect = effect.trim();
+    if let Some(expression) = effect.strip_prefix("target::") {
+        (EffectSubject::Target, expression.trim())
+    } else if let Some(expression) = effect.strip_prefix("executor::") {
+        (EffectSubject::Executor, expression.trim())
+    } else {
+        (EffectSubject::Executor, effect)
+    }
+}
+
+static REGISTRY: OnceLock<HashMap<&'static str, ParserFn>> = OnceLock::new();
+
+fn get_registry() -> &'static HashMap<&'static str, ParserFn> {
+    REGISTRY.get_or_init(|| {
+        let mut m = HashMap::new();
+        sys::register(&mut m);
+        k8s::register(&mut m);
+        network::register(&mut m);
+        gcp::register(&mut m);
+        // Effects that require parameters or source context are declared in
+        // `declaration`; this registry is only for exact parser functions.
+        m
+    })
+}
+
+fn parsed_effect(
+    effect_id: &str,
+    cmd: &ExecTtp,
+    event: &TtpExecuted,
+    result: ParseResult,
+    detail: &str,
+    updates: FactsUpdate,
+) -> ParsedEffect {
+    let facts_written = updates.new_entities.len() + updates.new_relations.len();
+    ParsedEffect {
+        updates,
+        audit: build_audit(effect_id, cmd, event, result, detail, facts_written),
+        system_updates: Vec::new(),
+        captured_files: Vec::new(),
+    }
+}
+
+pub fn parse_output_effect(
+    campaign: &Campaign,
+    effect_id: &str,
+    cmd: &ExecTtp,
+    event: &TtpExecuted,
+) -> Option<ParsedEffect> {
+    let (subject, expression) = split_effect_subject(effect_id);
+    let declaration = OutputEffect::resolve(expression)?;
+    let normalized = expression.to_ascii_lowercase();
+
+    if let OutputEffect::Event(event_effect) = declaration {
+        return Some(parsed_effect(
+            effect_id,
+            cmd,
+            event,
+            ParseResult::Parsed,
+            event_effect.audit_detail(),
+            FactsUpdate::default(),
+        ));
+    }
+
+    if let OutputEffect::DeployContainer = declaration {
+        let parser_output = parse_deploy_container_effect(&normalized, cmd);
+        return match parser_output {
+            ParserOutput::SuccessWithFacts(facts, detail) => Some(parsed_effect(
+                effect_id,
+                cmd,
+                event,
+                ParseResult::Parsed,
+                &detail,
+                facts,
+            )),
+            ParserOutput::KnownFailure(detail) => Some(parsed_effect(
+                effect_id,
+                cmd,
+                event,
+                ParseResult::KnownFailure,
+                &detail,
+                FactsUpdate::default(),
+            )),
+            _ => None,
+        };
+    }
+
+    let stdout = match event.results.first() {
+        Some(s) => s.as_str(),
+        None if declaration.stdout_optional(expression) => "",
+        None => {
+            return Some(parsed_effect(
+                effect_id,
+                cmd,
+                event,
+                ParseResult::KnownFailure,
+                "missing stdout payload",
+                FactsUpdate::default(),
+            ))
+        }
+    };
+    let stderr = event.results.get(1).map(String::as_str).unwrap_or("");
+
+    let mut system_updates = Vec::new();
+    let mut captured_files = Vec::new();
+    let mut file_content_target = None;
+    // TARGET_ID remains the resource subject. EXECUTOR_ID is reserved context,
+    // supplied from persisted provenance, never trusted from submitted args.
+    let mut parser_args = cmd.args.clone();
+    parser_args.insert(
+        "EXECUTOR_ID".into(),
+        resolve_executor_id(campaign, cmd).unwrap_or_default(),
+    );
+
+    let parser_output = match declaration {
+        OutputEffect::SysHasBinary => {
+            let inner = sys::extract_effect_args(expression).unwrap_or("");
+            sys::parse_sys_has_binary(stdout, inner)
+        }
+        OutputEffect::SysHasFile => {
+            let path = sys::extract_effect_args(expression).unwrap_or("");
+            sys::parse_sys_hasfile(stdout, path)
+        }
+        OutputEffect::SysSoftware => sys::parse_sys_software(stdout, stderr, &parser_args),
+        OutputEffect::Nmap => {
+            let source_id = parser_args
+                .get("EXECUTOR_ID")
+                .map(String::as_str)
+                .unwrap_or("");
+            let cidr = cmd.args.get("CIDR").map(String::as_str);
+            network::parse_nmap(stdout, source_id, cidr)
+        }
+        OutputEffect::SelfSubjectRulesReview => {
+            let namespace_arg = cmd.args.get("NS").map(String::as_str).unwrap_or("");
+            let fallback_target = cmd
+                .args
+                .get("TARGET_ID")
+                .map(String::as_str)
+                .unwrap_or(&cmd.target_id);
+            iam::parse_self_subject_rules_review(
+                stdout,
+                stderr,
+                cmd.auth_identity_id.as_deref().unwrap_or(fallback_target),
+                namespace_arg,
+            )
+        }
+        OutputEffect::FileContent => {
+            let path = file::extract_path(expression)
+                .or_else(|| cmd.args.get("PATH").map(String::as_str))
+                .unwrap_or(expression);
+            file_content_target = resolve_effect_subject_id(campaign, cmd, subject);
+            if let Some(target_id) = &file_content_target {
+                system_updates.push(TargetedSystemUpdate {
+                    target_id: target_id.clone(),
+                    updates: SystemFieldUpdates {
+                        files: vec![path.to_string()],
+                        ..Default::default()
+                    },
+                    // The legacy dispatcher applied this bookkeeping update
+                    // before audit construction and did not count it.
+                    count_in_audit: false,
+                });
+            }
+            if !stdout.trim().is_empty() {
+                captured_files.push(CapturedFile {
+                    path: path.to_string(),
+                    content: stdout.to_string(),
+                });
+            }
+            file::parse_file_content(
+                stdout,
+                path,
+                file_content_target.as_deref().unwrap_or(""),
+                &cmd.args,
+            )
+        }
+        OutputEffect::Kubeconfig => {
+            let source_id = resolve_effect_subject_id(campaign, cmd, subject);
+            let source_path = cmd.args.get("PATH").map(String::as_str);
+            if let Some(path) = source_path.filter(|path| !path.trim().is_empty()) {
+                if !stdout.trim().is_empty() {
+                    captured_files.push(CapturedFile {
+                        path: path.to_string(),
+                        content: stdout.to_string(),
+                    });
+                }
+            }
+            file::parse_kubeconfig(stdout, source_id.as_deref().unwrap_or(""), source_path)
+        }
+        OutputEffect::SysNodeName => parse_sys_node_name(campaign, cmd, stdout),
+        OutputEffect::RawServiceAccountToken => {
+            let mut parser_args = cmd.args.clone();
+            if cmd.procedure.run_on_target == Some(false) {
+                parser_args.remove("TARGET_ID");
+            }
+            iam::parse_raw_service_account_token(stdout, stderr, &parser_args)
+        }
+        OutputEffect::Registered(parser) => parser(stdout, stderr, &parser_args),
+        OutputEffect::Event(_) | OutputEffect::DeployContainer => unreachable!(),
+    };
+
+    let mut parsed = match parser_output {
+        ParserOutput::KnownFailure(detail) => parsed_effect(
+            effect_id,
+            cmd,
+            event,
+            ParseResult::KnownFailure,
+            &detail,
+            FactsUpdate::default(),
+        ),
+        ParserOutput::UnknownFormat(detail) => parsed_effect(
+            effect_id,
+            cmd,
+            event,
+            ParseResult::UnknownFormat,
+            &detail,
+            FactsUpdate::default(),
+        ),
+        ParserOutput::SuccessWithFacts(facts, detail) => {
+            let mut facts = facts;
+            if normalized.starts_with("k8s.") {
+                attach_discovered_namespaces_to_command_cluster(campaign, cmd, &mut facts);
+            }
+            parsed_effect(effect_id, cmd, event, ParseResult::Parsed, &detail, facts)
+        }
+        ParserOutput::Success(updates, detail) => {
+            let target_id =
+                file_content_target.or_else(|| resolve_effect_subject_id(campaign, cmd, subject));
+            let Some(target_id) = target_id else {
+                return Some(parsed_effect(
+                    effect_id,
+                    cmd,
+                    event,
+                    ParseResult::KnownFailure,
+                    match subject {
+                        EffectSubject::Executor => "physical executor provenance is missing or does not resolve to a system entity",
+                        EffectSubject::Target => "semantic target is missing or does not resolve to a system entity",
+                    },
+                    FactsUpdate::default(),
+                ));
+            };
+            if !matches!(declaration, OutputEffect::FileContent) {
+                system_updates.push(TargetedSystemUpdate {
+                    target_id,
+                    updates,
+                    count_in_audit: true,
+                });
+            }
+            parsed_effect(
+                effect_id,
+                cmd,
+                event,
+                ParseResult::Parsed,
+                &detail,
+                FactsUpdate::default(),
+            )
+        }
+    };
+    parsed.system_updates = system_updates;
+    parsed.captured_files = captured_files;
+    Some(parsed)
+}
+
+pub(crate) fn resolve_effect_subject_id(
+    campaign: &Campaign,
+    cmd: &ExecTtp,
+    subject: EffectSubject,
+) -> Option<String> {
+    match subject {
+        EffectSubject::Executor => resolve_executor_id(campaign, cmd),
+        EffectSubject::Target => {
+            let target = campaign.canonical_entity_id(&cmd.target_id);
+            campaign.get_system_entity(&target).map(|_| target)
+        }
+    }
+}
+
+/// Preserve the Kubernetes API-server attribution of resources discovered by
+/// an authenticated command.  Namespace IDs are global in the graph, so the
+/// parser cannot recover this relationship from a `PodList` alone.  The
+/// selected authentication identity is the authoritative source: its
+/// `authenticates-to` edge names the API server that returned the list.
+///
+/// A cluster selected directly is also sufficient.  The fallback through the
+/// command target retains attribution for commands issued from a Pod before a
+/// kubeconfig identity is modeled.
+fn attach_discovered_namespaces_to_command_cluster(
+    campaign: &Campaign,
+    cmd: &ExecTtp,
+    facts: &mut FactsUpdate,
+) {
+    let Some(cluster_id) = command_cluster_id(campaign, cmd) else {
+        return;
+    };
+
+    let namespace_ids: Vec<String> = facts
+        .new_entities
+        .iter()
+        .filter_map(|entity| entity.as_any().downcast_ref::<Namespace>())
+        .map(|namespace| namespace.entity_id().0)
+        .collect();
+    for namespace_id in namespace_ids {
+        if !facts.new_relations.iter().any(|relation| {
+            relation.relation_name() == "contains"
+                && relation.source_id().0 == cluster_id.0
+                && relation.target_id().0 == namespace_id
+        }) {
+            facts
+                .new_relations
+                .push(Box::new(Contains::new(cluster_id.0.clone(), namespace_id)));
+        }
+    }
+}
+
+fn command_cluster_id(campaign: &Campaign, cmd: &ExecTtp) -> Option<EntityId> {
+    // An Authenticate As identity identifies the API server even when the
+    // command is physically executed through an unrelated connected Pod.
+    if let Some(identity_id) = cmd.auth_identity_id.as_deref() {
+        let clusters = campaign
+            .graph
+            .targets_of(&EntityId::new(identity_id), "authenticates-to");
+        if let [cluster_id] = clusters.as_slice() {
+            if campaign.entities.contains::<K8sCluster>(cluster_id) {
+                return Some((*cluster_id).clone());
+            }
+        }
+    }
+
+    let target_id = EntityId::new(&cmd.target_id);
+    if campaign.entities.contains::<K8sCluster>(&target_id) {
+        return Some(target_id);
+    }
+
+    // A namespace target already has the direct parent we need.  For a Pod,
+    // first find its Namespace parent, then that Namespace's Cluster parent.
+    let namespace_id = if campaign.entities.contains::<Namespace>(&target_id) {
+        Some(target_id)
+    } else {
+        let parents = campaign.graph.sources_of(&target_id, "contains");
+        match parents.as_slice() {
+            [namespace_id] if campaign.entities.contains::<Namespace>(namespace_id) => {
+                Some((*namespace_id).clone())
+            }
+            _ => None,
+        }
+    }?;
+    let clusters = campaign.graph.sources_of(&namespace_id, "contains");
+    match clusters.as_slice() {
+        [cluster_id] if campaign.entities.contains::<K8sCluster>(cluster_id) => {
+            Some((*cluster_id).clone())
+        }
+        _ => None,
+    }
+}
+
+/// Parse the output of a `hostname` (or equivalent) command run on a K8s node
+/// after a container escape, and resolve the placeholder node entity to its
+/// real name.
+///
+/// The stdout must be a single-line hostname string. On success:
+/// - A real `K8sNode` entity is created with the discovered name.
+/// - An entity alias is emitted from the current node target (placeholder) to
+///   the real node, so `apply_facts` migrates all graph edges and entity data.
+///
+/// Host-resource attribution is explicit:
+/// - If the physical executor is a node (e.g. `node/escape-host-...`),
+///   it is aliased directly.
+/// - For a Pod executor, this host-observation effect uses its `runs-on`
+///   relation to identify the observed host. A local operator or unknown
+///   executor cannot rename a semantic Kubernetes Node target.
+fn parse_sys_node_name(campaign: &Campaign, cmd: &ExecTtp, stdout: &str) -> ParserOutput {
+    use indexmap::IndexSet;
+    use ran_domain::{EntityId, K8sNode, NameConfidence, RunsOn};
+
+    let name = stdout.trim();
+    if name.is_empty() {
+        return ParserOutput::KnownFailure("sys.node-name: empty hostname output".to_string());
+    }
+    if name.contains('\n') || name.contains('/') || name.contains(' ') {
+        return ParserOutput::UnknownFormat(format!(
+            "sys.node-name: unexpected format {:?} - expected a single hostname",
+            name
+        ));
+    }
+
+    let real_node_id = EntityId::new(format!("node/{}", name));
+
+    // Find the stale placeholder node, if any, to alias it to the real ID.
+    let Some(executor) = resolve_executor_id(campaign, cmd) else {
+        return ParserOutput::KnownFailure(
+            "sys.node-name: missing physical executor provenance".into(),
+        );
+    };
+    let target_eid = EntityId::new(&executor);
+    let stale_node_id: Option<EntityId> = if campaign.entities.contains::<K8sNode>(&target_eid) {
+        if target_eid != real_node_id {
+            Some(target_eid)
+        } else {
+            None
+        }
+    } else if campaign.entities.contains::<ran_domain::Pod>(&target_eid) {
+        // The declared effect observes this executor's Kubernetes host.
+        campaign
+            .graph
+            .targets_of(&target_eid, RunsOn::RELATION_NAME)
+            .first()
+            .filter(|n| n.0 != real_node_id.0)
+            .cloned()
+            .cloned()
+    } else {
+        return ParserOutput::KnownFailure(
+            "sys.node-name: executor is not a Kubernetes Node or Pod".into(),
+        );
+    };
+
+    let mut real_node = K8sNode::new(name);
+    real_node.name_confidence = NameConfidence::Authoritative;
+    let mut facts = FactsUpdate {
+        new_entities: vec![Box::new(real_node)],
+        new_relations: vec![],
+        entity_aliases: IndexSet::new(),
+        ..Default::default()
+    };
+    if let Some(stale) = stale_node_id {
+        tracing::info!(
+            stale = %stale.0,
+            real = %real_node_id.0,
+            "merging escape-host placeholder node with discovered real node name"
+        );
+        facts.entity_aliases.insert((stale, real_node_id));
+    }
+
+    ParserOutput::SuccessWithFacts(facts, format!("node name resolved: {}", name))
+}
+
+pub fn build_no_parser_audit(effect_id: &str, cmd: &ExecTtp, event: &TtpExecuted) -> ParseAudit {
+    build_parse_audit(
+        effect_id,
+        cmd,
+        event,
+        ParseResult::NoParser,
+        "no parser registered for effect",
+        0,
+    )
+}
+
+pub fn build_parse_audit(
+    effect_id: &str,
+    cmd: &ExecTtp,
+    event: &TtpExecuted,
+    parse_result: ParseResult,
+    detail: &str,
+    inferred_facts_written: usize,
+) -> ParseAudit {
+    build_audit(
+        effect_id,
+        cmd,
+        event,
+        parse_result,
+        detail,
+        inferred_facts_written,
+    )
+}
+
+/// Physical system facts use persisted executor provenance exclusively.
+/// Neither a displayed transport chain nor an API resource is evidence of
+/// where a command executed. Legacy records without provenance stay unknown.
+pub(crate) fn resolve_executor_id(campaign: &Campaign, cmd: &ExecTtp) -> Option<String> {
+    let executor = cmd.execution_environment.as_ref()?.system_id.as_deref()?;
+    let canonical = campaign.canonical_entity_id(executor);
+    campaign.get_system_entity(&canonical).map(|_| canonical)
+}
+
+fn build_audit(
+    effect_id: &str,
+    cmd: &ExecTtp,
+    event: &TtpExecuted,
+    parse_result: ParseResult,
+    detail: &str,
+    inferred_facts_written: usize,
+) -> ParseAudit {
+    ParseAudit {
+        cmd_id: cmd.id.clone(),
+        effect_id: effect_id.to_string(),
+        ttp_id: cmd.ttp.id.clone(),
+        target_id: cmd.target_id.clone(),
+        parser_version: PARSER_VERSION.to_string(),
+        raw_output_hash: hash_results(&event.results),
+        raw_output_preview: truncate_preview(&join_results(&event.results)),
+        parse_result,
+        detail: detail.to_string(),
+        inferred_facts_written,
+    }
+}
+
+fn join_results(results: &[String]) -> String {
+    if results.is_empty() {
+        String::new()
+    } else {
+        results.join("\n---stderr---\n")
+    }
+}
+
+fn hash_results(results: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    for result in results {
+        hasher.update(result.as_bytes());
+        hasher.update([0x1e]);
+    }
+
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
+}
+
+/// Unwrap the JSON envelope emitted by Ranplant after a kubelet-pod-exec call.
+///
+/// Ranplant writes a single JSON line:
+/// `{"result":"<stdout>","status":"Success|Failure","message":"..."}`.
+///
+/// Returns `(unwrapped_stdout, Some(err))` when the command failed inside the
+/// kubelet API, or `(raw, Some(err))` when the output is not valid JSON
+/// (the Ranplant binary itself likely failed to start).
+/// Returns `(unwrapped_stdout, None)` on clean success.
+///
+pub fn unwrap_kubelet_json_response(stdout: &str) -> (String, Option<String>) {
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        #[serde(default)]
+        result: String,
+        #[serde(default)]
+        status: String,
+        #[serde(default)]
+        message: String,
+    }
+
+    let stdout = stdout.trim();
+    if stdout.is_empty() {
+        return (
+            String::new(),
+            Some("empty response from Ranplant (binary may have failed)".to_string()),
+        );
+    }
+
+    match serde_json::from_str::<Envelope>(stdout) {
+        Ok(env) if env.status == "Failure" => {
+            (env.result, Some(format!("command failed: {}", env.message)))
+        }
+        Ok(env) => (env.result, None),
+        Err(_) => (
+            stdout.to_string(),
+            Some(format!(
+                "Ranplant output is not valid JSON (binary may have failed): {}",
+                stdout
+            )),
+        ),
+    }
+}
+
+/// Extract a string field from a JSON response envelope.
+///
+/// Structured HTTP execution channels use this to turn an application-level
+/// response such as `{"command":"id","output":"uid=100..."}` back into the
+/// stdout produced by the inner command before effect and failure parsers run.
+pub fn unwrap_json_field_response(stdout: &str, field: &str) -> (String, Option<String>) {
+    let stdout = stdout.trim();
+    if stdout.is_empty() {
+        return (
+            String::new(),
+            Some(format!(
+                "empty JSON response while extracting output field '{field}'"
+            )),
+        );
+    }
+
+    let value: serde_json::Value = match serde_json::from_str(stdout) {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                stdout.to_string(),
+                Some(format!(
+                    "execution response is not valid JSON while extracting field '{field}': {error}"
+                )),
+            );
+        }
+    };
+
+    match value.get(field) {
+        Some(serde_json::Value::String(output)) => (output.clone(), None),
+        Some(_) => (
+            stdout.to_string(),
+            Some(format!(
+                "execution response field '{field}' is not a string"
+            )),
+        ),
+        None => (
+            stdout.to_string(),
+            Some(format!(
+                "execution response is missing output field '{field}'"
+            )),
+        ),
+    }
+}
+
+fn truncate_preview(payload: &str) -> String {
+    if payload.len() <= RAW_PREVIEW_MAX_LEN {
+        return payload.to_string();
+    }
+
+    format!("{}...", &payload[..RAW_PREVIEW_MAX_LEN])
+}
+
+/// Dispatch arg-derived effect parsers for the `deploy-container` TTP.
+///
+/// These effects declare facts about what the TTP accomplished (pod created,
+/// namespace ensured, containment relation established) rather than describing
+/// command output to parse. All facts are derived from TTP args.
+fn parse_deploy_container_effect(normalized: &str, cmd: &ExecTtp) -> ParserOutput {
+    if normalized == "create k8s.pod" {
+        parse_deploy_pod(cmd)
+    } else if normalized == "namespace($ns)" {
+        parse_deploy_namespace(cmd)
+    } else if normalized == "ns.contains($p2)" {
+        parse_deploy_contains(cmd)
+    } else {
+        // created(creator:$p1, target:$p2) - informational; the graph already
+        // links the attacker entity via the command record.
+        ParserOutput::SuccessWithFacts(
+            FactsUpdate::default(),
+            "created relation: no graph facts".to_string(),
+        )
+    }
+}
+
+/// Return the namespace Kubernetes uses when Deploy Container leaves it blank.
+fn effective_deploy_namespace(cmd: &ExecTtp) -> &str {
+    cmd.args
+        .get("Namespace")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|namespace| !namespace.is_empty())
+        .unwrap_or("default")
+}
+
+fn parse_deploy_pod(cmd: &ExecTtp) -> ParserOutput {
+    use ran_domain::{
+        Confidence, Container, ContainerPort, Entity, Mount, NameConfidence, Pod, PodPhase,
+    };
+
+    #[derive(serde::Deserialize)]
+    struct RequestedContainerPort {
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(rename = "containerPort")]
+        port: u16,
+        #[serde(default = "default_tcp_protocol")]
+        protocol: String,
+    }
+
+    fn default_tcp_protocol() -> String {
+        "TCP".to_string()
+    }
+
+    let pod_name = cmd.args.get("PodName").map(String::as_str).unwrap_or("");
+    let ns = effective_deploy_namespace(cmd);
+    let image = cmd
+        .args
+        .get("Image")
+        .map(String::as_str)
+        .unwrap_or("unknown");
+    let args = match cmd.args.get("Arguments") {
+        Some(arguments) if !arguments.trim().is_empty() => {
+            match serde_json::from_str::<Vec<String>>(arguments) {
+                Ok(arguments) => arguments,
+                Err(err) => {
+                    return ParserOutput::KnownFailure(format!(
+                        "deploy-container: Arguments must be a JSON array of strings: {err}"
+                    ));
+                }
+            }
+        }
+        _ => Vec::new(),
+    };
+    let ports = match cmd.args.get("Ports") {
+        Some(ports) if !ports.trim().is_empty() => {
+            match serde_json::from_str::<Vec<RequestedContainerPort>>(ports) {
+                Ok(ports) => ports
+                    .into_iter()
+                    .filter(|port| port.port != 0)
+                    .map(|port| ContainerPort {
+                        name: port.name.filter(|name| !name.trim().is_empty()),
+                        port: port.port,
+                        protocol: port.protocol.to_ascii_uppercase(),
+                    })
+                    .collect(),
+                Err(err) => {
+                    return ParserOutput::KnownFailure(format!(
+                        "deploy-container: Ports must be a JSON array of Kubernetes container ports: {err}"
+                    ));
+                }
+            }
+        }
+        _ => Vec::new(),
+    };
+
+    if pod_name.is_empty() {
+        return ParserOutput::KnownFailure("deploy-container: PodName arg is empty".to_string());
+    }
+
+    let mut pod = Pod::new(pod_name.to_string(), ns.to_string());
+    pod.meta.name_confidence = NameConfidence::Authoritative;
+    pod.phase = Some(PodPhase::Running);
+    pod.is_running = true;
+
+    let bool_arg = |key: &str| cmd.args.get(key).map(|s| s == "true").unwrap_or(false);
+    if bool_arg("Privileged") {
+        pod.privileged = Confidence::Yes;
+    }
+    if bool_arg("HostPID") {
+        pod.host_pid = Confidence::Yes;
+    }
+    if bool_arg("HostIPC") {
+        pod.host_ipc = Confidence::Yes;
+    }
+    if bool_arg("HostNetwork") {
+        pod.host_network = Confidence::Yes;
+    }
+
+    let host_mount = if let (Some(host_path), Some(mount_point)) = (
+        cmd.args.get("HostPath").filter(|s| !s.is_empty()),
+        cmd.args.get("Mount").filter(|s| !s.is_empty()),
+    ) {
+        Some(Mount {
+            name: "hostmount".to_string(),
+            mount_root: host_path.clone(),
+            mount_point: mount_point.clone(),
+            mount_type: None,
+            is_host_path: true,
+            read_only: false,
+        })
+    } else {
+        None
+    };
+
+    pod.containers.push(Container {
+        name: pod_name.to_string(),
+        image: image.to_string(),
+        args,
+        ports,
+        volume_mounts: host_mount.iter().cloned().collect(),
+    });
+
+    if let Some(m) = host_mount {
+        pod.volume_mounts.push(m);
+    }
+
+    if let Some(node_name) = cmd.args.get("NodeName").filter(|s| !s.is_empty()) {
+        pod.node_name = Some(node_name.clone());
+    }
+    // Kubernetes defaults an omitted or empty serviceAccountName to `default`.
+    // Record that effective value immediately so the Pod effect has the same
+    // identity information a later API discovery would provide.
+    pod.service_account_name = Some(
+        cmd.args
+            .get("ServiceAccount")
+            .filter(|sa| !sa.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| "default".to_string()),
+    );
+
+    let mut facts = FactsUpdate::default();
+    // This TTP deploys the pod; it did not find one lying around.
+    facts.mark_created(pod.entity_id());
+    facts.new_entities.push(Box::new(pod));
+    ParserOutput::SuccessWithFacts(
+        facts,
+        format!("deploy-container: pod {}/{} created", ns, pod_name),
+    )
+}
+
+fn parse_deploy_namespace(cmd: &ExecTtp) -> ParserOutput {
+    use ran_domain::{Entity, Namespace};
+
+    let ns = effective_deploy_namespace(cmd);
+
+    let mut facts = FactsUpdate::default();
+    let namespace = Namespace::new(ns.to_string());
+    // "Ensured", so this only counts as a creation when the namespace was not
+    // already in the graph - `resolve_outcomes` makes that call.
+    facts.mark_created(namespace.entity_id());
+    facts.new_entities.push(Box::new(namespace));
+    ParserOutput::SuccessWithFacts(facts, format!("deploy-container: namespace {} ensured", ns))
+}
+
+fn parse_deploy_contains(cmd: &ExecTtp) -> ParserOutput {
+    use ran_domain::Contains;
+
+    let pod_name = cmd.args.get("PodName").map(String::as_str).unwrap_or("");
+    let ns = effective_deploy_namespace(cmd);
+
+    if pod_name.is_empty() {
+        return ParserOutput::KnownFailure("deploy-container: PodName arg is empty".to_string());
+    }
+
+    let ns_id = format!("ns/{}", ns);
+    let pod_id = format!("ns/{}/pod/{}", ns, pod_name);
+
+    let mut facts = FactsUpdate::default();
+    if cmd.target_id.starts_with("k8s/cluster/") {
+        facts.new_relations.push(Box::new(Contains::new(
+            cmd.target_id.clone(),
+            ns_id.clone(),
+        )));
+    }
+    facts
+        .new_relations
+        .push(Box::new(Contains::new(ns_id, pod_id)));
+    ParserOutput::SuccessWithFacts(
+        facts,
+        format!("deploy-container: ns/{} contains pod/{}", ns, pod_name),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use armory::{Procedure, Ttp};
+    use c2::ExecTtp;
+    use ran_domain::{
+        AccessLevel, AuthenticatesTo, Contains, K8sCluster, K8sCredential, Pod, Relation,
+        UnknownSystem,
+    };
+    use std::collections::HashMap;
+
+    fn sample_cmd() -> ExecTtp {
+        ExecTtp {
+            id: "cmd-1".to_string(),
+            ttp: Ttp {
+                effects: vec!["sys.envvar".to_string()],
+                procedures: vec![Procedure::new("shell", "env")],
+                ..Ttp::new("dummy-read-env", "Read Env", "Discovery")
+            },
+            procedure: Procedure::new("shell", "env"),
+            operation: c2::ExecutionOperation::Shell {
+                command: "env".to_string(),
+            },
+            args: HashMap::new(),
+            target_id: "ns/default/pod/demo".to_string(),
+            exec_chain: vec!["ns/default/pod/demo".to_string()],
+            exec_system_id: String::new(),
+            execution_environment: Some(ran_domain::ExecutionEnvironment {
+                system_id: Some("ns/default/pod/demo".into()),
+                tool: Some("env".into()),
+                auth_identity_id: None,
+            }),
+            transport_environment: None,
+            auth_identity_id: None,
+            started_at_ms: 0,
+            execution_timeout_seconds: c2::DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+            output_transform: None,
+            is_cleanup: false,
+            reasoning: String::new(),
+        }
+    }
+
+    fn sample_event(results: Vec<String>) -> TtpExecuted {
+        TtpExecuted {
+            id: "evt-1".to_string(),
+            success: true,
+            results,
+            exit_code: 0,
+            fail_reason: String::new(),
+            session_connected: None,
+        }
+    }
+
+    #[test]
+    fn unwrap_json_field_response_extracts_inner_stdout() {
+        let (output, error) = unwrap_json_field_response(
+            r#"{"command":"id","output":"uid=100(oops) gid=101(oops)\n"}"#,
+            "output",
+        );
+
+        assert_eq!(output, "uid=100(oops) gid=101(oops)\n");
+        assert_eq!(error, None);
+    }
+
+    #[test]
+    fn unwrap_json_field_response_rejects_not_found_body() {
+        let (output, error) = unwrap_json_field_response("not found", "output");
+
+        assert_eq!(output, "not found");
+        assert!(error
+            .expect("plain text must not satisfy a structured response contract")
+            .contains("not valid JSON"));
+    }
+
+    fn parse_and_apply_output_effect(
+        campaign: &mut Campaign,
+        effect_id: &str,
+        cmd: &ExecTtp,
+        event: &TtpExecuted,
+    ) -> Option<ParsedEffect> {
+        let mut parsed = parse_output_effect(campaign, effect_id, cmd, event)?;
+        campaign.apply_parsed_effect(&mut parsed);
+        Some(parsed)
+    }
+
+    #[test]
+    fn parse_output_effect_returns_unknown_when_fixture_is_malformed() {
+        let mut campaign = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+        let cmd = sample_cmd();
+        let event = sample_event(vec!["not-an-env-line\njusttext".to_string()]);
+
+        let parsed =
+            parse_and_apply_output_effect(&mut campaign, "sys.envvar", &cmd, &event).unwrap();
+
+        assert!(matches!(
+            parsed.audit.parse_result,
+            ParseResult::UnknownFormat
+        ));
+    }
+
+    #[test]
+    fn parse_output_effect_is_side_effect_free_until_applied() {
+        let mut campaign = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+        campaign.entities.insert_typed(Pod::new("demo", "default"));
+        let cmd = sample_cmd();
+        let event = sample_event(vec!["HOME=/root".to_string()]);
+
+        let mut parsed = parse_output_effect(&campaign, "sys.envvar", &cmd, &event).unwrap();
+
+        assert_eq!(parsed.system_updates.len(), 1);
+        assert!(campaign
+            .get_system_entity("ns/default/pod/demo")
+            .unwrap()
+            .entity()
+            .system()
+            .env_vars
+            .is_empty());
+
+        campaign.apply_parsed_effect(&mut parsed);
+        assert_eq!(
+            campaign
+                .get_system_entity("ns/default/pod/demo")
+                .unwrap()
+                .entity()
+                .system()
+                .env_vars
+                .get("HOME"),
+            Some(&"/root".to_string())
+        );
+    }
+
+    #[test]
+    fn bare_file_content_effect_uses_path_argument_and_parses_kubeconfig() {
+        let mut campaign = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+        let mut cmd = sample_cmd();
+        cmd.args
+            .insert("PATH".to_string(), "/etc/kubernetes/admin.conf".to_string());
+        let kubeconfig = r#"apiVersion: v1
+kind: Config
+clusters:
+- name: dev
+  cluster:
+    server: https://kubernetes.example:6443
+contexts:
+- name: admin@dev
+  context:
+    cluster: dev
+    user: admin
+current-context: admin@dev
+users:
+- name: admin
+  user:
+    token: secret
+"#;
+        let event = sample_event(vec![kubeconfig.to_string()]);
+
+        let parsed = parse_and_apply_output_effect(&mut campaign, "file:content", &cmd, &event)
+            .expect("bare file effect should be recognized");
+
+        assert!(matches!(parsed.audit.parse_result, ParseResult::Parsed));
+        assert_eq!(
+            campaign.get_file_content("/etc/kubernetes/admin.conf"),
+            Some(kubeconfig)
+        );
+        assert!(parsed
+            .updates
+            .new_entities
+            .iter()
+            .any(|entity| entity.as_any().downcast_ref::<K8sCredential>().is_some()));
+    }
+
+    #[test]
+    fn kubeconfig_effect_uses_operator_host_provenance() {
+        let mut campaign = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+        let mut cmd = sample_cmd();
+        cmd.target_id = "system/operator-host".to_string();
+        cmd.execution_environment.as_mut().unwrap().system_id = Some(cmd.target_id.clone());
+        cmd.exec_chain.clear();
+        cmd.args.insert(
+            "PATH".to_string(),
+            "/etc/kubernetes/super-admin.conf".to_string(),
+        );
+        let kubeconfig = r#"apiVersion: v1
+kind: Config
+clusters:
+- name: dev
+  cluster:
+    server: https://kubernetes.example:6443
+contexts:
+- name: default
+  context:
+    cluster: dev
+    user: admin
+current-context: default
+users:
+- name: admin
+  user:
+    token: secret
+"#;
+        let event = sample_event(vec![kubeconfig.to_string()]);
+
+        let parsed = parse_and_apply_output_effect(&mut campaign, "file:kubeconfig", &cmd, &event)
+            .expect("kubeconfig effect should be recognized");
+
+        assert!(matches!(parsed.audit.parse_result, ParseResult::Parsed));
+        assert_eq!(
+            campaign.get_file_content("/etc/kubernetes/super-admin.conf"),
+            Some(kubeconfig)
+        );
+        let credential = parsed
+            .updates
+            .new_entities
+            .iter()
+            .find_map(|entity| entity.as_any().downcast_ref::<K8sCredential>())
+            .expect("credential entity");
+        assert!(credential.active);
+        assert_eq!(credential.entity_name(), "super-admin.conf (default)");
+        assert_eq!(
+            credential.source_path.as_deref(),
+            Some("/etc/kubernetes/super-admin.conf")
+        );
+        assert!(parsed.updates.new_relations.iter().any(|relation| {
+            relation
+                .as_any()
+                .downcast_ref::<Contains>()
+                .is_some_and(|contains| {
+                    contains.source_id().0 == "system/operator-host"
+                        && contains.target_id().0 == credential.entity_id().0
+                })
+        }));
+    }
+
+    #[test]
+    fn pod_list_attaches_all_discovered_namespaces_to_authenticated_cluster() {
+        let target_cluster = K8sCluster::new("target");
+        let target_cluster_id = target_cluster.entity_id();
+        let other_cluster = K8sCluster::new("other");
+        let mut campaign = Campaign::bootstrap("Ran", target_cluster);
+        campaign.insert_entity(&other_cluster);
+
+        let credential = K8sCredential::new("https://target.example").with_name("remote-admin");
+        let credential_id = credential.entity_id();
+        campaign.insert_entity(&credential);
+        campaign.insert_relation(&AuthenticatesTo::new(
+            credential_id.0.clone(),
+            target_cluster_id.0.clone(),
+        ));
+
+        let mut cmd = sample_cmd();
+        cmd.auth_identity_id = Some(credential_id.0);
+        let event = sample_event(vec![r#"{
+            "items": [
+                {"metadata": {"name": "api", "namespace": "payments"}, "spec": {}, "status": {}},
+                {"metadata": {"name": "worker", "namespace": "operations"}, "spec": {}, "status": {}}
+            ]
+        }"#.to_string()]);
+
+        let parsed = parse_and_apply_output_effect(&mut campaign, "k8s.podlist", &cmd, &event)
+            .expect("pod list parser should run");
+        let contains: Vec<_> = parsed
+            .updates
+            .new_relations
+            .iter()
+            .filter_map(|relation| relation.as_any().downcast_ref::<Contains>())
+            .collect();
+
+        for namespace in ["payments", "operations"] {
+            assert!(contains.iter().any(|relation| {
+                relation.source_id().0 == target_cluster_id.0
+                    && relation.target_id().0 == format!("ns/{namespace}")
+            }));
+        }
+        assert!(contains.iter().all(|relation| {
+            relation.source_id().0 != other_cluster.entity_id().0
+                || !["ns/payments", "ns/operations"].contains(&relation.target_id().0.as_str())
+        }));
+    }
+
+    #[test]
+    fn parse_output_effect_registry_lookup_is_case_insensitive() {
+        let mut campaign = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+        let pod = Pod::new("demo", "default");
+        campaign.entities.insert_typed(pod);
+
+        let cmd = sample_cmd();
+        let event = sample_event(vec!["HOME=/root\nPATH=/usr/bin".to_string()]);
+
+        let parsed = parse_and_apply_output_effect(&mut campaign, "sys.envVar", &cmd, &event)
+            .expect("mixed-case effect should resolve parser");
+
+        assert!(matches!(parsed.audit.parse_result, ParseResult::Parsed));
+    }
+
+    #[test]
+    fn parse_output_effect_still_parses_when_stderr_is_present() {
+        let mut campaign = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+        let pod = Pod::new("demo", "default");
+        campaign.entities.insert_typed(pod);
+
+        let cmd = sample_cmd();
+        let event = sample_event(vec![
+            "HOME=/root\nPATH=/usr/bin".to_string(),
+            "warning: something noisy".to_string(),
+        ]);
+
+        let parsed =
+            parse_and_apply_output_effect(&mut campaign, "sys.envvar", &cmd, &event).unwrap();
+
+        assert!(matches!(parsed.audit.parse_result, ParseResult::Parsed));
+        assert!(parsed.audit.detail.contains("stderr had non-fatal content"));
+    }
+
+    #[test]
+    fn parse_output_effect_uses_executor_for_non_system_semantic_targets() {
+        let mut campaign = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+        let pod = Pod::new("demo", "default");
+        campaign.entities.insert_typed(pod);
+
+        let mut cmd = sample_cmd();
+        cmd.target_id = "sa/default/demo".to_string();
+        cmd.exec_chain = vec!["ns/default/pod/demo".to_string()];
+
+        let event = sample_event(vec!["HOME=/root\nPATH=/usr/bin".to_string()]);
+
+        let parsed =
+            parse_and_apply_output_effect(&mut campaign, "sys.envvar", &cmd, &event).unwrap();
+
+        assert!(matches!(parsed.audit.parse_result, ParseResult::Parsed));
+
+        let sys = campaign
+            .get_system_entity("ns/default/pod/demo")
+            .expect("pod should exist")
+            .entity()
+            .system();
+        assert_eq!(sys.env_vars.get("HOME"), Some(&"/root".to_string()));
+        assert_eq!(sys.env_vars.get("PATH"), Some(&"/usr/bin".to_string()));
+    }
+
+    #[test]
+    fn deploy_container_marks_the_pod_it_deploys_as_created() {
+        use crate::FactOutcome;
+        use ran_domain::EntityId;
+
+        let mut cmd = sample_cmd();
+        cmd.args
+            .insert("PodName".to_string(), "attacker".to_string());
+        cmd.args
+            .insert("Namespace".to_string(), "default".to_string());
+
+        let ParserOutput::SuccessWithFacts(facts, _) =
+            parse_deploy_container_effect("create k8s.pod", &cmd)
+        else {
+            panic!("deploying a pod should produce facts");
+        };
+
+        // The TTP put this pod in the cluster; the timeline must not report it
+        // as something the campaign discovered.
+        assert_eq!(
+            facts.outcome_of(&EntityId::new("ns/default/pod/attacker")),
+            FactOutcome::Created
+        );
+    }
+
+    #[test]
+    fn deploy_container_attaches_namespace_to_selected_cluster() {
+        let mut cmd = sample_cmd();
+        cmd.target_id = "k8s/cluster/kind-security-lab".to_string();
+        cmd.args
+            .insert("PodName".to_string(), "attacker".to_string());
+        cmd.args
+            .insert("Namespace".to_string(), "default".to_string());
+
+        let ParserOutput::SuccessWithFacts(facts, _) =
+            parse_deploy_container_effect("ns.contains($p2)", &cmd)
+        else {
+            panic!("deploy containment effect should produce facts");
+        };
+
+        assert!(facts.new_relations.iter().any(|relation| {
+            relation.relation_name() == "contains"
+                && relation.source_id().0 == "k8s/cluster/kind-security-lab"
+                && relation.target_id().0 == "ns/default"
+        }));
+        assert!(facts.new_relations.iter().any(|relation| {
+            relation.relation_name() == "contains"
+                && relation.source_id().0 == "ns/default"
+                && relation.target_id().0 == "ns/default/pod/attacker"
+        }));
+    }
+
+    #[test]
+    fn deploy_container_uses_default_namespace_when_omitted() {
+        use ran_domain::EntityId;
+
+        let mut cmd = sample_cmd();
+        cmd.args.insert("PodName".to_string(), "fee".to_string());
+        cmd.args.insert("Namespace".to_string(), String::new());
+
+        let ParserOutput::SuccessWithFacts(pod_facts, _) =
+            parse_deploy_container_effect("create k8s.pod", &cmd)
+        else {
+            panic!("deploying a pod should produce facts");
+        };
+        assert_eq!(
+            pod_facts.new_entities[0].entity_id(),
+            EntityId::new("ns/default/pod/fee")
+        );
+
+        let ParserOutput::SuccessWithFacts(namespace_facts, _) =
+            parse_deploy_container_effect("namespace($ns)", &cmd)
+        else {
+            panic!("the default namespace should produce facts");
+        };
+        assert_eq!(
+            namespace_facts.new_entities[0].entity_id(),
+            EntityId::new("ns/default")
+        );
+
+        let ParserOutput::SuccessWithFacts(contains_facts, _) =
+            parse_deploy_container_effect("ns.contains($p2)", &cmd)
+        else {
+            panic!("default namespace containment should produce facts");
+        };
+        assert_eq!(contains_facts.new_relations[0].source_id().0, "ns/default");
+        assert_eq!(
+            contains_facts.new_relations[0].target_id().0,
+            "ns/default/pod/fee"
+        );
+    }
+
+    #[test]
+    fn deploy_container_records_requested_container_arguments() {
+        let mut cmd = sample_cmd();
+        cmd.args
+            .insert("PodName".to_string(), "debug-bridge".to_string());
+        cmd.args
+            .insert("Namespace".to_string(), "default".to_string());
+        cmd.args
+            .insert("Image".to_string(), "alpine/socat:1.8.1.3".to_string());
+        cmd.args.insert(
+            "Arguments".to_string(),
+            r#"["TCP-LISTEN:8080,fork,reuseaddr","TCP-CONNECT:example-service:8080"]"#.to_string(),
+        );
+        cmd.args.insert(
+            "Ports".to_string(),
+            r#"[{"containerPort":8080}]"#.to_string(),
+        );
+        cmd.args
+            .insert("ServiceAccount".to_string(), "debugger".to_string());
+
+        let ParserOutput::SuccessWithFacts(facts, _) =
+            parse_deploy_container_effect("create k8s.pod", &cmd)
+        else {
+            panic!("deploying a pod should produce facts");
+        };
+        let pod = facts.new_entities[0]
+            .as_any()
+            .downcast_ref::<Pod>()
+            .expect("created fact should be a Pod");
+
+        assert_eq!(pod.service_account_name.as_deref(), Some("debugger"));
+        assert_eq!(pod.containers[0].image, "alpine/socat:1.8.1.3");
+        assert_eq!(
+            pod.containers[0].args,
+            [
+                "TCP-LISTEN:8080,fork,reuseaddr",
+                "TCP-CONNECT:example-service:8080"
+            ]
+        );
+        assert_eq!(pod.containers[0].ports[0].port, 8080);
+        assert_eq!(pod.containers[0].ports[0].protocol, "TCP");
+    }
+
+    #[test]
+    fn deploy_container_records_kubernetes_default_service_account() {
+        let mut cmd = sample_cmd();
+        cmd.args
+            .insert("PodName".to_string(), "debug-bridge".to_string());
+        cmd.args
+            .insert("Namespace".to_string(), "default".to_string());
+
+        let ParserOutput::SuccessWithFacts(facts, _) =
+            parse_deploy_container_effect("create k8s.pod", &cmd)
+        else {
+            panic!("deploying a pod should produce facts");
+        };
+        let pod = facts.new_entities[0]
+            .as_any()
+            .downcast_ref::<Pod>()
+            .expect("created fact should be a Pod");
+
+        assert_eq!(pod.service_account_name.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn parse_output_effect_uses_executor_provenance_for_lateral_movement() {
+        // Regression: for lateral movement the command runs on src-pod but the
+        // effect should NOT be written to dst-pod (the victim/target).
+        // Persisted provenance takes priority over the logical target.
+        let mut campaign = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+        let src_pod = Pod::new("src-pod", "default");
+        let dst_pod = Pod::new("dst-pod", "default");
+        campaign.entities.insert_typed(src_pod);
+        campaign.entities.insert_typed(dst_pod);
+
+        let mut cmd = sample_cmd();
+        cmd.target_id = "ns/default/pod/dst-pod".to_string();
+        cmd.exec_chain = vec!["ns/default/pod/src-pod".to_string()];
+        cmd.execution_environment.as_mut().unwrap().system_id =
+            Some("ns/default/pod/src-pod".into());
+        cmd.ttp.effects = vec!["sys.has-binary(/usr/bin/redis-cli)".to_string()];
+        // Empty results simulates the tool being absent (exit non-zero / no stdout).
+        let event = sample_event(vec![]);
+
+        let parsed = parse_and_apply_output_effect(
+            &mut campaign,
+            "sys.has-binary(/usr/bin/redis-cli)",
+            &cmd,
+            &event,
+        )
+        .unwrap();
+        assert!(matches!(parsed.audit.parse_result, ParseResult::Parsed));
+
+        use ran_domain::BinaryPresence;
+        let src_sys = campaign
+            .get_system_entity("ns/default/pod/src-pod")
+            .expect("src-pod should exist")
+            .entity()
+            .system();
+        assert_eq!(
+            src_sys.has_binary("redis-cli"),
+            BinaryPresence::Present("/usr/bin/redis-cli".to_string()),
+            "binary fact must be written to the execution host (src-pod)"
+        );
+
+        let dst_sys = campaign
+            .get_system_entity("ns/default/pod/dst-pod")
+            .expect("dst-pod should exist")
+            .entity()
+            .system();
+        assert_eq!(
+            dst_sys.has_binary("redis-cli"),
+            BinaryPresence::Unknown,
+            "dst-pod (victim) must NOT be updated"
+        );
+    }
+
+    #[test]
+    fn unresolved_system_effect_audit_identifies_the_declared_subject() {
+        let mut campaign = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+        let namespace = ran_domain::Namespace::new("resource");
+        let target = namespace.entity_id().0;
+        campaign.entities.insert_typed(namespace);
+        let mut cmd = sample_cmd();
+        cmd.target_id = target;
+        cmd.execution_environment.as_mut().unwrap().system_id = Some("system/operator-host".into());
+        let parsed = parse_output_effect(
+            &campaign,
+            "target::sys.envvar",
+            &cmd,
+            &sample_event(vec!["PROOF=1".into()]),
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed.audit.parse_result,
+            ParseResult::KnownFailure
+        ));
+        assert!(parsed.system_updates.is_empty());
+        assert!(parsed.audit.detail.contains("semantic target"));
+        assert!(!parsed.audit.detail.contains("physical executor"));
+
+        cmd.execution_environment = None;
+        let parsed = parse_output_effect(
+            &campaign,
+            "executor::sys.envvar",
+            &cmd,
+            &sample_event(vec!["PROOF=1".into()]),
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed.audit.parse_result,
+            ParseResult::KnownFailure
+        ));
+        assert!(parsed.system_updates.is_empty());
+        assert!(parsed.audit.detail.contains("physical executor"));
+    }
+
+    #[test]
+    fn missing_executor_provenance_never_writes_physical_system_fields() {
+        for (effect, stdout) in [
+            ("sys.has-binary(/usr/bin/curl)", ""),
+            ("sys.envvar", "LOCAL_PROOF=1"),
+            ("sys.ip", "192.0.2.1"),
+            ("sys.userid", "uid=0(root) gid=0(root)"),
+            ("file:content(/tmp/proof)", "proof"),
+        ] {
+            let mut campaign = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+            campaign.entities.insert_typed(Pod::new("demo", "default"));
+            let mut cmd = sample_cmd();
+            cmd.execution_environment = None;
+            let parsed =
+                parse_output_effect(&campaign, effect, &cmd, &sample_event(vec![stdout.into()]))
+                    .unwrap();
+            assert!(parsed.system_updates.is_empty(), "{effect}");
+        }
+    }
+
+    #[test]
+    fn local_host_observation_cannot_rename_a_semantic_kubernetes_node() {
+        let mut campaign = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+        campaign
+            .entities
+            .insert_typed(ran_domain::K8sNode::new("remote-worker"));
+        let mut cmd = sample_cmd();
+        cmd.target_id = "node/remote-worker".into();
+        cmd.execution_environment.as_mut().unwrap().system_id = Some("system/operator-host".into());
+        let parsed = parse_output_effect(
+            &campaign,
+            "sys.node-name",
+            &cmd,
+            &sample_event(vec!["operator-hostname".into()]),
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed.audit.parse_result,
+            ParseResult::KnownFailure
+        ));
+        assert!(parsed.updates.new_entities.is_empty());
+        assert!(parsed.updates.entity_aliases.is_empty());
+    }
+
+    #[test]
+    fn scan_subjects_remain_resources_but_reachability_uses_physical_executor() {
+        let campaign = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+        let mut cmd = sample_cmd();
+        cmd.args
+            .insert("TARGET_ID".into(), "node/semantic-resource".into());
+        cmd.args
+            .insert("EXECUTOR_ID".into(), "node/submitted-spoof".into());
+        cmd.execution_environment.as_mut().unwrap().system_id = Some("system/operator-host".into());
+        let event = sample_event(vec![
+            "Nmap scan report for 192.0.2.10\nHost is up (0.001s latency).\n".into(),
+        ]);
+        for effect in ["nmap", "network.discovery", "sys.software"] {
+            let parsed = parse_output_effect(&campaign, effect, &cmd, &event).unwrap();
+            assert!(
+                matches!(parsed.audit.parse_result, ParseResult::Parsed),
+                "{effect}"
+            );
+            let reachability = parsed
+                .updates
+                .new_relations
+                .iter()
+                .filter(|r| r.relation_name() == "can-reach")
+                .collect::<Vec<_>>();
+            assert_eq!(reachability.len(), 1);
+            assert_eq!(reachability[0].source_id().0, "system/operator-host");
+            assert!(!parsed.updates.new_entities.is_empty());
+        }
+    }
+
+    #[test]
+    fn parse_output_effect_sys_ip_missing_stdout_returns_known_failure() {
+        let mut campaign = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+        let mut cmd = sample_cmd();
+        cmd.ttp.effects = vec!["sys.ip".to_string()];
+        let event = sample_event(vec![]);
+
+        let parsed = parse_and_apply_output_effect(&mut campaign, "sys.ip", &cmd, &event).unwrap();
+
+        assert!(matches!(
+            parsed.audit.parse_result,
+            ParseResult::KnownFailure
+        ));
+    }
+
+    #[test]
+    fn parse_output_effect_sys_ip_malformed_returns_unknown_format() {
+        let mut campaign = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+        let mut cmd = sample_cmd();
+        cmd.ttp.effects = vec!["sys.ip".to_string()];
+        let event = sample_event(vec!["not-an-ip-at-all".to_string()]);
+
+        let parsed = parse_and_apply_output_effect(&mut campaign, "sys.ip", &cmd, &event).unwrap();
+
+        assert!(matches!(
+            parsed.audit.parse_result,
+            ParseResult::UnknownFormat
+        ));
+    }
+
+    #[test]
+    fn parse_output_effect_sys_ip_writes_ips_to_entity() {
+        let mut campaign = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+        let pod = Pod::new("demo", "default");
+        campaign.entities.insert_typed(pod);
+
+        let mut cmd = sample_cmd();
+        cmd.ttp.effects = vec!["sys.ip".to_string()];
+        let event = sample_event(vec!["10.0.0.1 172.16.0.5".to_string()]);
+
+        let parsed = parse_and_apply_output_effect(&mut campaign, "sys.ip", &cmd, &event).unwrap();
+
+        assert!(matches!(parsed.audit.parse_result, ParseResult::Parsed));
+
+        let sys = campaign
+            .get_system_entity("ns/default/pod/demo")
+            .expect("pod should exist")
+            .entity()
+            .system();
+        assert!(sys.ips.iter().any(|ip| ip.to_string() == "10.0.0.1"));
+        assert!(sys.ips.iter().any(|ip| ip.to_string() == "172.16.0.5"));
+    }
+
+    #[test]
+    fn parse_output_effect_sys_userid_writes_access_level_to_entity() {
+        let mut campaign = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+        let pod = Pod::new("demo", "default");
+        campaign.entities.insert_typed(pod);
+
+        let mut cmd = sample_cmd();
+        cmd.ttp.effects = vec!["sys.userID".to_string()];
+        let event = sample_event(vec!["uid=0(root) gid=0(root) groups=0(root)".to_string()]);
+
+        let parsed =
+            parse_and_apply_output_effect(&mut campaign, "sys.userid", &cmd, &event).unwrap();
+        assert!(matches!(parsed.audit.parse_result, ParseResult::Parsed));
+
+        let sys = campaign
+            .get_system_entity("ns/default/pod/demo")
+            .expect("pod should exist")
+            .entity()
+            .system();
+        assert_eq!(sys.user_id, Some(0));
+        assert_eq!(sys.username.as_deref(), Some("root"));
+        assert_eq!(sys.access_level, AccessLevel::Exec);
+    }
+
+    #[test]
+    fn parse_output_effect_linux_mounts_writes_mounts_to_entity() {
+        let mut campaign = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+        let pod = Pod::new("demo", "default");
+        campaign.entities.insert_typed(pod);
+
+        let mut cmd = sample_cmd();
+        cmd.ttp.effects = vec!["linux.mounts".to_string()];
+        let stdout = "sysfs on /sys type sysfs (rw)\n/dev/sda1 on / type ext4 (rw)\n".to_string();
+        let event = sample_event(vec![stdout]);
+
+        let parsed =
+            parse_and_apply_output_effect(&mut campaign, "linux.mounts", &cmd, &event).unwrap();
+        assert!(matches!(parsed.audit.parse_result, ParseResult::Parsed));
+
+        let sys = campaign
+            .get_system_entity("ns/default/pod/demo")
+            .expect("pod should exist")
+            .entity()
+            .system();
+        assert_eq!(sys.mounts.len(), 2);
+    }
+
+    #[test]
+    fn parse_output_effect_linux_mounts_writes_mounts_to_unknown_system() {
+        let mut campaign = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+        let system = UnknownSystem::new("remote-host");
+        campaign.entities.insert_typed(system);
+
+        let mut cmd = sample_cmd();
+        cmd.target_id = "system/remote-host".to_string();
+        cmd.exec_chain = vec![cmd.target_id.clone()];
+        cmd.execution_environment.as_mut().unwrap().system_id = Some(cmd.target_id.clone());
+        cmd.ttp.effects = vec!["linux.mounts".to_string()];
+        let event = sample_event(vec!["/dev/sda1 on / type ext4 (rw)".to_string()]);
+
+        let parsed =
+            parse_and_apply_output_effect(&mut campaign, "linux.mounts", &cmd, &event).unwrap();
+        assert!(matches!(parsed.audit.parse_result, ParseResult::Parsed));
+
+        let sys = campaign
+            .get_system_entity("system/remote-host")
+            .expect("unknown system should exist")
+            .entity()
+            .system();
+        assert_eq!(sys.mounts.len(), 1);
+        assert_eq!(sys.mounts[0].mount_point, "/");
+    }
+
+    #[test]
+    fn parse_output_effect_sys_processes_writes_to_entity() {
+        let mut campaign = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+        let pod = Pod::new("demo", "default");
+        campaign.entities.insert_typed(pod);
+
+        let mut cmd = sample_cmd();
+        cmd.ttp.effects = vec!["sys.processes".to_string()];
+        let stdout = "USER PID PPID CPU START TTY TIME CMD\n\
+                      root 1 0 0.0 00:00 ? 0:00 /sbin/init\n"
+            .to_string();
+        let event = sample_event(vec![stdout]);
+
+        let parsed =
+            parse_and_apply_output_effect(&mut campaign, "sys.processes", &cmd, &event).unwrap();
+        assert!(matches!(parsed.audit.parse_result, ParseResult::Parsed));
+
+        let sys = campaign
+            .get_system_entity("ns/default/pod/demo")
+            .expect("pod should exist")
+            .entity()
+            .system();
+        assert_eq!(sys.processes.len(), 1);
+        assert_eq!(sys.processes[0].pid, 1);
+        assert_eq!(sys.processes[0].user, Some("root".to_string()));
+    }
+
+    #[test]
+    fn parse_output_effect_has_binary_writes_to_entity() {
+        let mut campaign = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+        let pod = Pod::new("demo", "default");
+        campaign.entities.insert_typed(pod);
+
+        let mut cmd = sample_cmd();
+        cmd.ttp.effects = vec!["sys.has-binary(/usr/bin/curl)".to_string()];
+        let event = sample_event(vec![String::new()]);
+
+        // effect_id is the (already ground-template-substituted) string
+        let parsed = parse_and_apply_output_effect(
+            &mut campaign,
+            "sys.has-binary(/usr/bin/curl)",
+            &cmd,
+            &event,
+        )
+        .unwrap();
+        assert!(matches!(parsed.audit.parse_result, ParseResult::Parsed));
+
+        let sys = campaign
+            .get_system_entity("ns/default/pod/demo")
+            .expect("pod should exist")
+            .entity()
+            .system();
+        use ran_domain::BinaryPresence;
+        assert_eq!(
+            sys.has_binary("curl"),
+            BinaryPresence::Present("/usr/bin/curl".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_output_effect_has_binary_literal_path_no_stdout_still_parses() {
+        // Regression: sys.has-binary(/tmp/ran-ws) with empty results should NOT produce
+        // KnownFailure("missing stdout payload") - the path is in the effect ID itself.
+        let mut campaign = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+        let pod = Pod::new("demo", "default");
+        campaign.entities.insert_typed(pod);
+
+        let mut cmd = sample_cmd();
+        cmd.ttp.effects = vec!["sys.has-binary(/tmp/ran-ws)".to_string()];
+        // No stdout at all - empty results vec
+        let event = sample_event(vec![]);
+
+        let parsed = parse_and_apply_output_effect(
+            &mut campaign,
+            "sys.has-binary(/tmp/ran-ws)",
+            &cmd,
+            &event,
+        )
+        .unwrap();
+        assert!(
+            matches!(parsed.audit.parse_result, ParseResult::Parsed),
+            "expected Parsed, got {:?}: {}",
+            parsed.audit.parse_result,
+            parsed.audit.detail
+        );
+
+        let sys = campaign
+            .get_system_entity("ns/default/pod/demo")
+            .expect("pod should exist")
+            .entity()
+            .system();
+        use ran_domain::BinaryPresence;
+        assert_eq!(
+            sys.has_binary("ran-ws"),
+            BinaryPresence::Present("/tmp/ran-ws".to_string())
+        );
+    }
+}

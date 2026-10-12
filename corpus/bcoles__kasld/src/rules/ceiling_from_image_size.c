@@ -1,0 +1,112 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Rule: KASLR image ceiling from kernel image size.
+//
+// The kernel's placement code
+// never selects a base where base + image_size overflows the top of the
+// randomization window, so the top [WINDOW_MAX - kernel_size, WINDOW_MAX) is
+// forbidden. That yields an upper bound on the base:
+//
+//   base <= (WINDOW_MAX - kernel_size) rounded down to a slot boundary
+//
+// Aligning the ceiling down is sound because the base is itself slot-aligned;
+// it is folded into the C_UPPER_BOUND value rather than tracked as a separate
+// alignment quantity.
+//
+// Reads the image-size lower bound via evidence_image_size_min() plus the
+// resolved alignment quantities. The ceiling is aligned down to the RESOLVED
+// Q_VIRT_KASLR_ALIGN (resp. Q_PHYS_KASLR_ALIGN), not the compile-time
+// KASLR_VIRT_ALIGN: on x86_64 boot_params_kaslr_align raises that quantity to
+// the actual CONFIG_PHYSICAL_ALIGN (e.g. 16 MiB), so the ceiling snaps to that
+// coarser boundary; with no boot_params the quantity is the arch
+// KASLR_VIRT_ALIGN. This makes the rule cross-quantity (it reads est), so the
+// fixpoint loop re-runs it after the alignment rules settle.
+// ---
+// <bcoles@gmail.com>
+
+#include "include/kasld/engine_rules.h"
+
+#include <string.h>
+
+/* Emit an aligned upper-bound ceiling for one quantity, given the window's
+ * [min, max) and slot alignment. Returns the number of constraints written
+ * (0 or 1). */
+static int emit_ceiling(enum kasld_quantity q, unsigned long window_max,
+                        unsigned long window_min, unsigned long align,
+                        unsigned long kernel_size, enum kasld_confidence conf,
+                        uint32_t src, struct constraint *out, int slot,
+                        int out_max) {
+  if (window_max <= window_min || kernel_size >= window_max - window_min)
+    return 0;
+  unsigned long ceiling = window_max - kernel_size;
+  if (q == Q_VIRT_IMAGE_BASE)
+    ceiling = kasld_floor_virt_text_bound(
+        ceiling, align); /* sound on sub-offset arches */
+  else if (align > 0)
+    ceiling &= ~(align - 1); /* phys base carries no usable sub-offset */
+  if (ceiling <= window_min || slot >= out_max)
+    return 0;
+
+  struct constraint *c = &out[slot];
+  memset(c, 0, sizeof(*c));
+  c->q = q;
+  c->op = C_UPPER_BOUND;
+  c->value = ceiling;
+  c->conf = conf;
+  c->derived_from[0] = src;
+  c->lineage_count = 1;
+  snprintf(c->origin, ORIGIN_LEN, "ceiling_from_image_size");
+  return 1;
+}
+
+int rule_ceiling_from_image_size(const struct evidence_set *ev,
+                                 const struct estimate *est,
+                                 struct constraint *out, int out_max) {
+  enum kasld_confidence conf = CONF_UNKNOWN;
+  uint32_t src = 0;
+  unsigned long ksize = evidence_image_size_min(ev, &conf, &src);
+  if (ksize == 0)
+    return 0;
+
+  /* Align to the resolved alignment quantity, never below the arch default
+   * (Q_VIRT_KASLR_ALIGN starts at its lattice top of 1 before any alignment
+   * rule narrows it). */
+  unsigned long valign = est[Q_VIRT_KASLR_ALIGN].lo;
+  if (valign < (unsigned long)KASLR_VIRT_ALIGN)
+    valign = (unsigned long)KASLR_VIRT_ALIGN;
+
+  int n = 0;
+  /* Both window edges are the ANY_CONFIG variants — the honest top/floor of
+   * Q_VIRT_IMAGE_BASE (see quantities.c top_virt_image_base) — NOT the
+   * VIRT_TEXT_MIN_DEFAULT_CONFIG/MAX pair. That pair bakes in the 48-bit
+   * formula's window top and is too low for arm64 sub-48 VA_BITS configs (e.g.
+   * 39-bit KIMAGE_VADDR = 0xffffffc080000000 sits ~30 TiB above
+   * VIRT_TEXT_MAX_DEFAULT_CONFIG); using it as window_max would cap the ceiling
+   * below the true sub-48 text base and exclude it. The two families hold the
+   * same number on arches where the KASLR window already spans every layout
+   * (x86_64, ...), so the distinction only bites on arm64. */
+  n += emit_ceiling(Q_VIRT_IMAGE_BASE, VIRT_TEXT_MAX_ANY_CONFIG,
+                    VIRT_TEXT_MIN_ANY_CONFIG, valign, ksize, conf, src, out, n,
+                    out_max);
+#if !TEXT_TRACKS_DIRECTMAP
+  unsigned long palign = est[Q_PHYS_KASLR_ALIGN].lo;
+  if (palign < (unsigned long)KASLR_PHYS_ALIGN)
+    palign = (unsigned long)KASLR_PHYS_ALIGN;
+  /* PHYS_ADDR_TOP for the same reason, and it is the only ceiling this rule may
+   * use: the architecture declares no default-build physical ceiling, because
+   * the physical base is set by where the board puts DRAM rather than by the VA
+   * layout. PHYS_PLAUSIBLE_MAX is the tempting alternative and is wrong here —
+   * it is a heuristic about where kernels are usually loaded (16 GiB on
+   * x86_64), so a ceiling derived from it sits far inside the window a large
+   * machine can place the image in, and this bound reaches the GUARANTEED
+   * answer at the confidence of whatever measured the image size. The real
+   * narrowing on this axis comes from observed RAM, which the DRAM and memtotal
+   * ceilings already apply with the same image-size subtraction.
+   *
+   * api.h requires PHYS_ADDR_TOP of every arch reaching this branch, so there
+   * is nothing to fall back to. */
+  n += emit_ceiling(Q_PHYS_IMAGE_BASE, PHYS_ADDR_TOP, KERNEL_PHYS_DEFAULT,
+                    palign, ksize, conf, src, out, n, out_max);
+#endif
+  return n;
+}

@@ -1,0 +1,715 @@
+package modules
+
+import (
+	"strings"
+
+	"github.com/akha-security/akca/engine/internal/deeptraversal"
+	"github.com/akha-security/akca/engine/internal/graphqlattack"
+	"github.com/akha-security/akca/engine/internal/httpclient"
+	"github.com/akha-security/akca/engine/internal/nosql"
+	"github.com/akha-security/akca/engine/internal/payloadgen"
+	"github.com/akha-security/akca/engine/internal/verification"
+)
+
+type fpCategory string
+
+const (
+	fpDifferential   fpCategory = "differential"
+	fpContentMatch   fpCategory = "content_match"
+	fpInformational  fpCategory = "informational"
+	fpHeaderEvidence fpCategory = "header_evidence"
+)
+
+func fpCategoryFor(module string) fpCategory {
+	switch module {
+	case "security_headers", "cookie_security", "tls_misconfig", "rate_limit", "api_exposure", "api_versioning":
+		return fpInformational
+	case "secret_exposure", "sensitive_data", "cicd_exposure", "git_recovery",
+		"source_code_disclosure", "cloud_storage", "cloud_posture", "vulnerable_components", "llm_injection":
+		return fpContentMatch
+	case "actuator", "backup_archives", "cloud_takeover", "devops_exposure", "route_auth_bypass", "tenant_isolation", "account_recovery", "webhook_security", "session_lifecycle", "parser_differential",
+		"nginx_alias", "nextjs_bypass", "framework_debug", "iis_discovery",
+		"firebase_misconfig", "spring_cloud_jolokia", "saas_exposure", "pdf_injection",
+		"cpdos", "proxy_path_confusion", "ws_cswsh", "jsonp_callback",
+		"react_rsc_rce", "server_side_js_injection", "csti_detection", "swagger_exposure", "sensitive_file_discovery",
+		"http_smuggling", "race_condition_sync", "oauth_flow_audit",
+		"cloud_native_exposure", "grpc_scan":
+		return fpContentMatch
+	case "cors", "open_redirect", "host_header", "host_poisoning", "crlf", "cache_poisoning", "cache_deception", "jwt", "oauth":
+		return fpHeaderEvidence
+	default:
+		return fpDifferential
+	}
+}
+
+func moduleSignalConfirmed(
+	module string,
+	p payloadgen.Payload,
+	signal string,
+	baseline, probe httpclient.ResponseRecord,
+	domExecuted bool,
+	oastURL string,
+) bool {
+	if signal == "" {
+		return false
+	}
+	if probe.StatusCode == 0 {
+		return false
+	}
+	body, baseBody := probe.Body, baseline.Body
+	baseHeaders, probeHeaders := baseline.Headers, probe.Headers
+	probeStatus, baseStatus := probe.StatusCode, baseline.StatusCode
+
+	switch module {
+	case "sqli":
+		if signal == "oob_sqli" {
+			return false
+		}
+		if signal == "delayed_timing_confirmed" {
+			return true
+		}
+		if signal == "boolean_differential" || signal == "boolean_length" {
+			if clientErrorStatus(probeStatus) && probeStatus != baseStatus {
+				return false
+			}
+		}
+		return sqliSignalConfirmed(p, body, baseBody, signal)
+	case "xss":
+		if (signal == "dom_execution" || signal == "reflected_browser_execution") && domExecuted {
+			return !sqliErrorRe.MatchString(body)
+		}
+		return xssSignalConfirmed(p, body, baseBody, signal)
+	case "ssti":
+		return sstiSignalConfirmed(p, body, baseBody, signal)
+	case "command_injection":
+		if signal == "delayed_timing_confirmed" {
+			return true
+		}
+		return cmdInjSignalConfirmed(p, body, baseBody, signal)
+	case "nosql":
+		if signal == "delayed_timing_confirmed" || signal == "timing_differential" {
+			return true
+		}
+		return nosqlSignalConfirmed(body, baseBody, probeStatus, baseStatus, signal)
+	case "ssrf":
+		if signal == "blind_oast" {
+			return false
+		}
+		return ssrfSignalConfirmed(p, baseline, probe, signal)
+	case "xxe":
+		if signal == "blind_oast" {
+			return false
+		}
+		return xxeSignalConfirmed(body, baseBody, signal)
+	case "lfi":
+		if signal == "rfi_oast" {
+			return false
+		}
+		return deeptraversal.DetectSignal(body, baseBody, signal)
+	case "blind_xss":
+		return false
+	case "open_redirect":
+		return (probeStatus == 301 || probeStatus == 302 || probeStatus == 303 || probeStatus == 307 || probeStatus == 308) && openRedirectHeaderConfirmed(probeHeaders, signal)
+	case "host_header":
+		return hostHeaderSignal(body, baseBody)
+	case "host_poisoning":
+		if strings.HasSuffix(signal, "_body_reflection") {
+			return strings.Contains(strings.ToLower(body), strings.ToLower(p.Value)) &&
+				!strings.Contains(strings.ToLower(baseBody), strings.ToLower(p.Value))
+		}
+		for key, value := range probeHeaders {
+			if strings.EqualFold(key, "Location") && strings.Contains(strings.ToLower(value), strings.ToLower(p.Value)) {
+				return true
+			}
+		}
+		return false
+	case "cors":
+		return probeStatus >= 200 && probeStatus < 300 && corsSignalConfirmed(baseHeaders, probeHeaders, signal, p.Value)
+	case "secret_exposure":
+		return secretExposureConfirmed(body, baseBody, signal)
+	case "sensitive_data":
+		return sensitiveDataSignalConfirmed(body, baseBody, signal, p.Value)
+	case "cicd_exposure":
+		return cicdExposureSignal(p.Value, body)
+	case "rate_limit":
+		if signal == "policy_violation_confirmed" {
+			return probeStatus > 0 && !rateLimitBlockSignal(probeStatus, body)
+		}
+		if signal == "rate_limit_threshold_discovered" {
+			return rateLimitBlockSignal(probeStatus, body)
+		}
+		if signal == "missing_rate_limiting" {
+			return rateLimitAttemptProcessed(probeStatus, body)
+		}
+		return probeStatus >= 200 && probeStatus < 400
+	case "security_headers", "cookie_security", "tls_misconfig", "api_exposure", "api_versioning":
+		return probeStatus >= 200 && probeStatus < 400
+	case "llm_injection":
+		if signal == "llm_private_canary_disclosure" {
+			return len(p.ExpectedSignal) >= 12 && !strings.Contains(p.Value, p.ExpectedSignal) && !strings.Contains(baseBody, p.ExpectedSignal) && probeStatus == 200 && strings.Contains(extractLLMCompletionOrSanitizedText(body), p.ExpectedSignal)
+		}
+		pr := llmProbe{
+			payload:     p.Value,
+			signal:      signal,
+			matchMarker: p.Value,
+		}
+		if strings.Contains(p.Value, "AKCA_SYSTEM_PROMPT_LEAK:") {
+			pr.matchMarker = "AKCA_SYSTEM_PROMPT_LEAK:"
+			pr.instructionEcho = "ignore previous instructions"
+		} else if strings.Contains(p.Value, "AKCA_INSTRUCTION_OVERRIDE_CONFIRMED") {
+			pr.matchMarker = "AKCA_INSTRUCTION_OVERRIDE_CONFIRMED"
+			pr.instructionEcho = "---end of user input---"
+		} else if strings.Contains(p.Value, "AKCA_PROMPT_DEBUG_MODE_CONFIRMED") {
+			pr.matchMarker = "AKCA_PROMPT_DEBUG_MODE_CONFIRMED"
+			pr.instructionEcho = "[inst] <<sys>>"
+		}
+		return isLegitimateLLMOutput(probe, baseline, pr)
+	case "oauth":
+		if signal == "redirect_uri_location_confirmed" {
+			return oauthProofSignal(p, baseline, probe)
+		}
+		return oauthModuleConfirmed(body, baseBody, signal, probeStatus, baseStatus)
+	case "cache_poisoning":
+		return cachePoisonPersisted(baseBody, body, probeHeaders, p.Value)
+	case "cache_deception":
+		return signal == "private_canary_anonymous_cache_hit" &&
+			probeStatus == 200 && body != baseBody && !isUncacheableResponse(probeHeaders)
+	case "broken_auth":
+		return brokenAuthSignal(probe, baseline)
+	case "route_auth_bypass":
+		return isRouteBypassSuccessful(probe, baseline)
+	case "tenant_isolation":
+		return signal == "cross_tenant_access_confirmed" && successfulResourceResponse(probe)
+	case "account_recovery":
+		return signal == "recovery_state_mutation" && probeStatus >= 200 && probeStatus < 300 &&
+			resourceFingerprint(body) != resourceFingerprint(baseBody)
+	case "webhook_security":
+		return signal == "unauthenticated_webhook_state_mutation" && probeStatus >= 200 && probeStatus < 300 &&
+			resourceFingerprint(body) != resourceFingerprint(baseBody)
+	case "session_lifecycle":
+		return probe.StatusCode == 200 && privateAuthResourceEvidence(probe.Body)
+	case "parser_differential":
+		return probe.StatusCode == 200 && probe.Body != baseline.Body && len(strings.TrimSpace(probe.Body)) > 20
+	case "bfla":
+		if signal == "privileged_read_access" {
+			return successfulResourceResponse(probe) && privateAuthResourceEvidence(body) &&
+				resourceFingerprint(body) != resourceFingerprint(baseBody)
+		}
+		return signal == "protected_state_mutation" &&
+			probeStatus >= 200 && probeStatus < 300 &&
+			resourceFingerprint(body) != resourceFingerprint(baseBody)
+	case "client_ssti":
+		if domExecuted && signal == "angular_dom_execution" {
+			return true
+		}
+		return clientSSTIModuleConfirmed(body, baseBody, p.Value, signal, probeStatus, baseStatus)
+	case "smuggling":
+		return smugglingModuleConfirmed(probeHeaders, body, baseBody, probeStatus, baseStatus)
+	case "ldap_xpath_injection":
+		return ldapXPathModuleConfirmed(body, baseBody, p.Value, signal, probeStatus, baseStatus)
+	case "crlf":
+		return crlfSignalConfirmed(baseHeaders, probeHeaders, baseBody, body, p.Value, signal)
+	case "debug_admin":
+		return debugAdminSignal(body, probeStatus)
+	case "actuator":
+		return actuatorSignalConfirmed(signal, probe)
+	case "backup_archives":
+		return backupArchiveSignalConfirmed(signal, probe)
+	case "cloud_takeover":
+		return cloudTakeoverSignalConfirmed(signal, probe)
+	case "devops_exposure":
+		return devopsExposureSignalConfirmed(signal, probeStatus, body)
+	case "http_methods":
+		return (signal == "http_put_unauthenticated_upload" && probeStatus == 200 && strings.Contains(body, p.Value)) ||
+			(signal == "http_trace_xst" && probeStatus == 200 && strings.Contains(body, p.Value))
+	case "ldap":
+		return strings.HasPrefix(signal, "ldap_error_") && ldapErrorSignal(body, baseBody)
+	case "xpath":
+		return strings.HasPrefix(signal, "xpath_error_") && xpathErrorSignal(body, baseBody)
+	case "race_condition":
+		return signal == "multiple_unique_side_effects" &&
+			probeStatus >= 200 && probeStatus < 300 &&
+			resourceFingerprint(body) != resourceFingerprint(baseBody)
+	case "business_logic":
+		return signal == "forbidden_state_persisted" &&
+			probeStatus >= 200 && probeStatus < 300 &&
+			resourceFingerprint(body) != resourceFingerprint(baseBody)
+	case "hpp":
+		if signal == "privilege_response_differential" {
+			return probeStatus >= 200 && probeStatus < 300 && hppSignal(body, baseBody)
+		}
+		return signal == "forbidden_state_persisted" && probeStatus >= 200 && probeStatus < 300 &&
+			resourceFingerprint(body) != resourceFingerprint(baseBody)
+	case "file_upload":
+		return signal == "retrieved_hash_confirmed" && probeStatus == 200 &&
+			p.Value != "" && strings.Contains(body, p.Value)
+	case "second_order":
+		if signal == "stored_xss_executable" {
+			return domExecuted && p.Value != "" && strings.Contains(body, p.Value)
+		}
+		if p.Value != "" && strings.Contains(body, p.Value) && !strings.Contains(baseBody, p.Value) {
+			return true
+		}
+		return differentialWithStatusGuard(body, baseBody, p.Value, probeStatus, baseStatus)
+	case "git_recovery":
+		return probeStatus == 200 && !probe.Redirected && body != baseBody && len(strings.TrimSpace(body)) > 4 &&
+			isGitContent(body)
+	case "mass_assignment":
+		return (strings.HasPrefix(signal, "mass_assignment_") || signal == "role_escalation" || signal == "hidden_admin_flag" || signal == "permission_injection") &&
+			probeStatus >= 200 && probeStatus < 300 &&
+			resourceFingerprint(body) != resourceFingerprint(baseBody)
+	case "idor":
+		return signal == "foreign_object_access" &&
+			probeStatus >= 200 && probeStatus < 300 &&
+			(baseStatus == 401 || baseStatus == 403 || !successfulResourceResponse(baseline)) &&
+			successfulResourceResponse(probe)
+	case "nginx_alias":
+		return signal == "alias_traversal" && probeStatus == 200 && len(body) >= 50
+	case "nextjs_bypass":
+		return nextJSBypassSignalConfirmed(signal, body, probeStatus, baseStatus)
+	case "framework_debug":
+		return frameworkDebugSignalConfirmed(signal, body, probeStatus)
+	case "iis_discovery":
+		return (signal == "iis_shortname" && probeStatus != baseStatus && probeStatus > 0 && baseStatus > 0) ||
+			(signal == "iis_source_disclosure" && probeStatus == 200 &&
+				(strings.Contains(body, "<%@") || strings.Contains(body, "<script runat") || strings.Contains(body, "<?php")))
+	case "firebase_misconfig":
+		return firebaseSignalConfirmed(signal, body, probeStatus)
+	case "spring_cloud_jolokia":
+		return springCloudJolokiaSignalConfirmed(signal, body, probeStatus)
+	case "saas_exposure":
+		return saasExposureSignalConfirmed(signal, body, probeStatus)
+	case "pdf_injection":
+		return pdfInjectionSignalConfirmed(signal, body, probeStatus)
+	case "cpdos":
+		return (probeStatus == 400 || probeStatus == 405 || probeStatus == 500 || probeStatus == 501 || probeStatus == 502) && baseStatus == 200
+	case "proxy_path_confusion":
+		return probeStatus == 200 && (baseStatus == 401 || baseStatus == 403)
+	case "ws_cswsh":
+		return (signal == "browser_private_read" || signal == "cross_origin_upgrade_with_cookie") && probeStatus == 101
+	case "jsonp_callback":
+		return signal == "browser_private_read" && probeStatus == 200 && strings.Contains(body, p.Value)
+	case "react_rsc_rce":
+		return signal == "decoder_crash_differential" && reactRSCDecoderCrash(probe) && !reactRSCDecoderCrash(baseline)
+	case "server_side_js_injection":
+		return ssjsSignalConfirmed(body, baseBody, signal, probeStatus, baseStatus)
+	case "csti_detection":
+		return probeStatus == 200 && ((domExecuted && signal == "angular_dom_execution") ||
+			signal == "csti_expression_evaluated" && cstiSignalConfirmed(body, baseBody, p.Value, signal, probeStatus))
+	case "swagger_exposure":
+		return swaggerExposureSignalConfirmed(signal, body, probeStatus)
+	case "sensitive_file_discovery":
+		return sensitiveFileSignalConfirmed(signal, probe)
+	case "http_smuggling":
+		return httpSmugglingSignalConfirmed(signal, body, p.Value, probeStatus, baseStatus)
+	case "race_condition_sync":
+		return signal == "race_condition_limit_bypass" && probeStatus >= 200 && probeStatus < 300
+	case "oauth_flow_audit":
+		return signal == "oauth_token_query_response" && oauthTokenInQuery(probeHeaders)
+	case "cloud_native_exposure":
+		return cloudNativeSignalConfirmed(signal, probeStatus, body)
+	case "grpc_scan":
+		return grpcSignalConfirmed(signal, probe)
+	case "graphql":
+		return graphqlSignalConfirmed(body, baseBody, signal, probeStatus, baseStatus)
+	case "csrf":
+		return signal == "cross_site_state_mutation" && probeStatus >= 200 && probeStatus < 300 &&
+			resourceFingerprint(body) != resourceFingerprint(baseBody)
+	case "prototype_pollution":
+		if signal == "client_prototype_pollution" {
+			return domExecuted
+		}
+		if strings.HasPrefix(signal, "client_") || signal == "prototype_behavior_change" || signal == "prototype_error_disclosure" {
+			return false
+		}
+		return differentialWithStatusGuard(body, baseBody, p.Value, probeStatus, baseStatus)
+	case "account_enum",
+		"wordpress_fuzz", "websocket",
+		"cloud_posture",
+		"source_code_disclosure", "script_source",
+		"vulnerable_components", "cloud_storage":
+		return differentialWithStatusGuard(body, baseBody, p.Value, probeStatus, baseStatus)
+	default:
+		if isPendingOASTSignal(signal, oastURL) {
+			return false
+		}
+		return differentialWithStatusGuard(body, baseBody, p.Value, probeStatus, baseStatus)
+	}
+}
+
+func differentialBodyConfirmed(body, baseline, payload string) bool {
+	normBody := normalizeVolatileFields(body)
+	normBase := normalizeVolatileFields(baseline)
+	if normBody == normBase {
+		return false
+	}
+	if injectionPayloadReflected(payload, body, baseline) {
+		return bodyDiffRatio(normBase, normBody) >= 0.15
+	}
+	return bodyDiffRatio(normBase, normBody) >= 0.12
+}
+
+func nosqlSignalConfirmed(body, baseline string, probeStatus, baseStatus int, signal string) bool {
+	if body == baseline && probeStatus == baseStatus {
+		return false
+	}
+	if signal == "nosql_error_disclosure" {
+		// MongoDB/operator exceptions commonly use HTTP 500. Accept only the
+		// provider-specific marker set; generic status changes and framework
+		// error pages remain insufficient.
+		return nosql.IsMongoErrorDisclosure(body, baseline)
+	}
+	if statusOnlyDifferential(probeStatus, baseStatus) {
+		return false
+	}
+	switch signal {
+	case "nosql_auth_bypass":
+		if probeStatus < 200 || probeStatus >= 300 {
+			return false
+		}
+		lower := strings.ToLower(body)
+		for _, tok := range []string{"access_token", "token", "authenticated", "success", "session"} {
+			if strings.Contains(lower, tok) && !strings.Contains(strings.ToLower(baseline), tok) {
+				return true
+			}
+		}
+		return false
+	default:
+		return bodyDiffRatio(baseline, body) >= 0.06
+	}
+}
+
+func ssrfSignalConfirmed(p payloadgen.Payload, baseline, probe httpclient.ResponseRecord, signal string) bool {
+	body := strings.ToLower(probe.Body)
+	base := strings.ToLower(baseline.Body)
+	if body == base || strings.TrimSpace(body) == "" {
+		return false
+	}
+	// Never confirm SSRF on 404 Not Found or other client/infrastructure error responses.
+	if probe.StatusCode == 404 || probe.StatusCode >= 400 || clientErrorStatus(probe.StatusCode) || isInfrastructureError(probe.StatusCode) {
+		return false
+	}
+	if probe.StatusCode != 0 && baseline.StatusCode != 0 && statusOnlyDifferential(probe.StatusCode, baseline.StatusCode) {
+		return false
+	}
+	if injectionPayloadReflected(p.Value, probe.Body, baseline.Body) {
+		return false
+	}
+	if strings.Contains(body, "blocked by policy") || strings.Contains(body, "is blocked") ||
+		strings.Contains(body, "request blocked") || strings.Contains(body, "access denied") {
+		return false
+	}
+	signal = canonicalSSRFSignal(p, signal)
+	if signal == "" {
+		return false
+	}
+	switch signal {
+	case "aws_metadata":
+		return newMarkerCount(body, base, []string{
+			"ami-id", "instance-id", "instance-type", "local-hostname",
+			"iam/security-credentials", "security-credentials/",
+		}) >= 2
+	case "gcp_metadata":
+		if strings.EqualFold(headerCI(probe.Headers, "Metadata-Flavor"), "Google") {
+			return newMarkerCount(body, base, []string{
+				"project/project-id", "instance/id", "service-accounts/", "hostname",
+			}) >= 1
+		}
+		return newMarkerCount(body, base, []string{
+			"computemetadata", "project/project-id", "instance/id", "service-accounts/",
+			"service-accounts/default/token", "email", "scopes",
+		}) >= 2
+	case "azure_metadata":
+		return newMarkerCount(body, base, []string{
+			"vmid", "subscriptionid", "resourcegroupname", "microsoft.compute", "azureenvironment",
+		}) >= 2
+	case "alibaba_metadata":
+		return newMarkerCount(body, base, []string{
+			"owner-account-id", "region-id", "zone-id", "image-id", "instance/instance-type",
+		}) >= 2
+	case "do_metadata":
+		if strings.Contains(body, "droplet_id") && !strings.Contains(base, "droplet_id") {
+			return true
+		}
+		return newMarkerCount(body, base, []string{
+			"vendor_data", "public_keys", "region", "hostname",
+		}) >= 2
+	case "oracle_metadata":
+		return newMarkerCount(body, base, []string{
+			"compartmentid", "canonicalregionname", "ocid1.", "oraclecloud.com", "shape",
+		}) >= 2
+	case "tencent_metadata":
+		return newMarkerCount(body, base, []string{
+			"app-id", "placement/region", "instance/instance-name", "instance/instance-id",
+		}) >= 2
+	case "packet_metadata":
+		return newMarkerCount(body, base, []string{
+			"bonding_mode", "facility", "operating_system", "iqn",
+		}) >= 2
+	case "internal_ip":
+		// Disallow matching AWS metadata markers on internal IP probes
+		if strings.Contains(body, "ami-id") || strings.Contains(body, "instance-id") {
+			return false
+		}
+		// Probe must be a successful response
+		if probe.StatusCode != 0 && (probe.StatusCode < 200 || probe.StatusCode >= 300) {
+			return false
+		}
+		// Check for internal service markers
+		for _, marker := range []string{
+			"docker engine", "kubernetes.io/serviceaccount",
+			"redis_version", "+pong", "root:x:0:0:",
+		} {
+			if strings.Contains(body, marker) && !strings.Contains(base, marker) {
+				return true
+			}
+		}
+		if newMarkerCount(body, base, []string{"apiversion", "goversion", "gitcommit", "kernelversion"}) >= 2 {
+			return true
+		}
+		if newMarkerCount(body, base, []string{"datacenter", "node_name", "node_id", "server_name"}) >= 2 {
+			return true
+		}
+		return newMarkerCount(body, base, []string{"apiversion", `"kind"`, `"items"`}) >= 2
+	case "protocol_smuggling":
+		if probe.StatusCode != 0 && (probe.StatusCode < 200 || probe.StatusCode >= 300) {
+			return false
+		}
+		if strings.Contains(body, "+pong") && !strings.Contains(base, "+pong") {
+			return true
+		}
+		if newMarkerCount(body, base, []string{"redis_version", "role:master", "used_memory", "tcp_port"}) >= 2 {
+			return true
+		}
+		if newMarkerCount(body, base, []string{"stat pid", "stat uptime", "stat version"}) >= 2 {
+			return true
+		}
+		return newMarkerCount(body, base, []string{"objectclass", "namingcontexts", "supportedldapversion"}) >= 2
+	default:
+		return false
+	}
+}
+
+func canonicalSSRFSignal(p payloadgen.Payload, signal string) string {
+	raw := strings.ToLower(strings.TrimSpace(signal))
+	if raw == "" {
+		raw = strings.ToLower(strings.TrimSpace(p.ExpectedSignal))
+	}
+	if raw == "cloud_metadata" {
+		raw = ""
+	}
+	switch raw {
+	case "aws_metadata", "aws_iam_role", "aws_iam_credentials", "aws_token":
+		return "aws_metadata"
+	case "gcp_metadata", "gcp_token", "gcp_service_account":
+		return "gcp_metadata"
+	case "azure_metadata", "azure_token", "azure_identity_token":
+		return "azure_metadata"
+	case "alibaba_metadata", "do_metadata", "oracle_metadata", "tencent_metadata", "packet_metadata":
+		return raw
+	case "docker_api", "consul_api", "k8s_secrets", "internal_ip":
+		return "internal_ip"
+	case "redis_service", "memcached_service", "protocol_smuggling":
+		return "protocol_smuggling"
+	}
+	value := strings.ToLower(p.Value)
+	switch {
+	case strings.Contains(value, "metadata.google"):
+		return "gcp_metadata"
+	case strings.Contains(value, "metadata/instance") || strings.Contains(value, "identity/oauth2"):
+		return "azure_metadata"
+	case strings.Contains(value, "100.100.100.200"):
+		return "alibaba_metadata"
+	case strings.Contains(value, "metadata/v1.json") || strings.Contains(value, "metadata/v1/"):
+		return "do_metadata"
+	case strings.Contains(value, "192.0.0.192"):
+		return "oracle_metadata"
+	case strings.Contains(value, "metadata.tencentyun.com"):
+		return "tencent_metadata"
+	case strings.Contains(value, "metadata.packet.net"):
+		return "packet_metadata"
+	case strings.Contains(value, "docker"), strings.Contains(value, "2375/version"),
+		strings.Contains(value, "consul"), strings.Contains(value, "8500/v1/agent"),
+		strings.Contains(value, "kubernetes"), strings.Contains(value, "serviceaccount"):
+		return "internal_ip"
+	case strings.HasPrefix(value, "gopher://"), strings.HasPrefix(value, "dict://"),
+		strings.HasPrefix(value, "ldap://"):
+		return "protocol_smuggling"
+	case strings.Contains(value, "169.254.169.254"), strings.Contains(value, "2852039166"),
+		strings.Contains(value, "0xa9fea9fe"), strings.Contains(value, "0251.0372.0251.0372"):
+		return "aws_metadata"
+	}
+	return raw
+}
+
+func newMarkerCount(body, baseline string, markers []string) int {
+	count := 0
+	for _, marker := range markers {
+		if strings.Contains(body, marker) && !strings.Contains(baseline, marker) {
+			count++
+		}
+	}
+	return count
+}
+
+func xxeSignalConfirmed(body, baseline, signal string) bool {
+	switch signal {
+	case "classic_entity":
+		return strings.Contains(body, "AKCA_XXE_TEST") && !strings.Contains(baseline, "AKCA_XXE_TEST")
+	case "soap_xxe":
+		return strings.Contains(strings.ToLower(body), "soap") &&
+			strings.Contains(body, "AKCA_XXE_TEST") && !strings.Contains(baseline, "AKCA_XXE_TEST")
+	case "file_disclosure":
+		// Detect /etc/passwd or win.ini content
+		lower := strings.ToLower(body)
+		baseLower := strings.ToLower(baseline)
+		markers := []string{"root:x:0:0:", "root:*:0:0:", "[fonts]", "[extensions]", "[mail]", "for 16-bit app support"}
+		for _, m := range markers {
+			if strings.Contains(lower, m) && !strings.Contains(baseLower, m) {
+				return true
+			}
+		}
+		return false
+	case "error_based_file_entity":
+		lower := strings.ToLower(body)
+		baseLower := strings.ToLower(baseline)
+		if !strings.Contains(lower, "akca-xxe-proof-file") || strings.Contains(baseLower, "akca-xxe-proof-file") {
+			return false
+		}
+		for _, marker := range []string{"filenotfoundexception", "no such file", "failed to load external entity", "could not resolve entity", "systemid"} {
+			if strings.Contains(lower, marker) && !strings.Contains(baseLower, marker) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func openRedirectHeaderConfirmed(headers map[string]string, signal string) bool {
+	return redirectDestinationIsCanary(headerCI(headers, "Location"))
+}
+
+func corsSignalConfirmed(baseHeaders, probeHeaders map[string]string, signal, origin string) bool {
+	acao := headerCI(probeHeaders, "Access-Control-Allow-Origin")
+	if acao == "" {
+		return false
+	}
+	baseAcao := headerCI(baseHeaders, "Access-Control-Allow-Origin")
+	if acao == baseAcao && signal != "wildcard_credentials" {
+		return false
+	}
+	switch signal {
+	case "wildcard_public_read":
+		return acao == "*"
+	case "null_origin":
+		return strings.EqualFold(acao, "null")
+	case "origin_reflection", "partial_origin_match", "pre_domain_match", "protocol_downgrade",
+		"localhost_origin", "cloud_metadata_origin", "intranet_origin", "unquoted_regex_dot_bypass", "special_char_bypass":
+		return acao == origin
+	case "private_network_access":
+		pna := headerCI(probeHeaders, "Access-Control-Allow-Private-Network")
+		return strings.EqualFold(pna, "true") && acao != ""
+	case "wildcard_credentials":
+		// While browsers don't send credentials with ACAO:*, this misconfiguration
+		// indicates weak CORS policy and may be exploitable with other techniques.
+		return true
+	default:
+		return false
+	}
+}
+
+func headerCI(headers map[string]string, name string) string {
+	for k, v := range headers {
+		if strings.EqualFold(k, name) {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func clientErrorStatus(code int) bool {
+	switch code {
+	case 400, 403, 404, 405, 415, 422, 429:
+		return true
+	default:
+		return false
+	}
+}
+
+// isCDNErrorStatus returns true for Cloudflare-specific status codes (520-527)
+// and other reverse-proxy / CDN infrastructure errors that indicate network-layer
+// problems — NOT application-level SQL errors or vulnerability evidence.
+//
+//	520 = Web server returned an unknown error
+//	521 = Web server is down
+//	522 = Connection timed out
+//	523 = Origin is unreachable
+//	524 = A timeout occurred
+//	525 = SSL handshake failed
+//	526 = Invalid SSL certificate
+//	527 = Railgun error
+func isCDNErrorStatus(code int) bool {
+	return code >= 520 && code <= 530
+}
+
+// isInfrastructureError returns true for status codes that indicate
+// infrastructure / reverse-proxy failures rather than application behavior.
+// These should not be treated as evidence of injection vulnerabilities.
+func isInfrastructureError(code int) bool {
+	if isCDNErrorStatus(code) {
+		return true
+	}
+	// 500/501 can carry genuine SQL/application error messages, so we only
+	// treat 502+ as infrastructure noise (proxy/gateway/timeout errors).
+	return code >= 502 && code <= 599
+}
+
+func shouldSuppressLowConfidence(module string, signal string, score float64, conf string) bool {
+	_ = conf
+	cat := fpCategoryFor(module)
+	switch cat {
+	case fpInformational:
+		return score < 0.45
+	case fpContentMatch:
+		return score < 0.55
+	case fpHeaderEvidence:
+		return score < 0.45
+	default:
+		if strings.Contains(strings.ToLower(signal), "timing") || strings.Contains(strings.ToLower(signal), "oast") {
+			return score < 0.70
+		}
+		switch module {
+		case "xss", "sqli", "ssti", "xxe", "command_injection", "lfi", "ssrf", "nosql":
+			return score < 0.60
+		default:
+			return score < 0.60
+		}
+	}
+}
+
+func isGitContent(body string) bool {
+	lower := strings.ToLower(body)
+	if strings.Contains(lower, "<html") || strings.Contains(lower, "<!doctype") || strings.Contains(lower, "<head") {
+		return false
+	}
+	return strings.HasPrefix(body, "ref:") ||
+		strings.HasPrefix(body, "PACK") ||
+		strings.HasPrefix(body, "DIRC") ||
+		strings.Contains(body, "HEAD\x00") ||
+		strings.Contains(body, "[core]")
+}
+
+func normalizeVolatileFields(body string) string {
+	return verification.NormalizeVolatileFields(body)
+}
+
+func graphqlSignalConfirmed(body, baseBody, signal string, probeStatus, baseStatus int) bool {
+	// GraphQL errors can legitimately use 400 or 500. Require a parsed envelope
+	// with typed disclosure evidence, never an HTML proxy/WAF error.
+	if probeStatus < 200 || probeStatus == 401 || probeStatus == 403 || probeStatus == 429 || probeStatus >= 502 {
+		return false
+	}
+	return graphqlattack.Confirmed(body, signal)
+}

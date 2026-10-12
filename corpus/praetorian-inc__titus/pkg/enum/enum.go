@@ -1,0 +1,85 @@
+package enum
+
+import (
+	"context"
+	"fmt"
+	"net/url"
+	"strings"
+
+	"github.com/praetorian-inc/titus/pkg/types"
+)
+
+// Enumerator discovers content to scan from a source.
+type Enumerator interface {
+	// Enumerate yields blobs from the source.
+	// The callback receives blob content, its ID, and provenance information.
+	Enumerate(ctx context.Context, callback func(content []byte, blobID types.BlobID, prov types.Provenance) error) error
+}
+
+// ExtractionLimits defines safety limits for archive extraction.
+type ExtractionLimits struct {
+	MaxSize        int64 // Max uncompressed size per file (10MB default)
+	MaxTotal       int64 // Max total bytes extracted from one archive (100MB default)
+	MaxDepth       int   // Max nested archive depth (5 default)
+	MaxPages       int   // Max pages to extract from PDF files (50 default, 0 = unlimited)
+	SQLiteRowLimit int   // Max rows per table for SQLite extraction (0 = unlimited, default 1000)
+}
+
+// DefaultExtractionLimits returns the default extraction safety limits.
+func DefaultExtractionLimits() ExtractionLimits {
+	return ExtractionLimits{
+		MaxSize:        10 * 1024 * 1024,
+		MaxTotal:       100 * 1024 * 1024,
+		MaxDepth:       5,
+		MaxPages:       50,
+		SQLiteRowLimit: 1000,
+	}
+}
+
+// Config for enumeration.
+type Config struct {
+	// Root is the starting path for enumeration.
+	Root string
+
+	// MaxFileSize is the maximum file size to process (0 = no limit).
+	MaxFileSize int64
+
+	// FollowSymlinks follows symbolic links.
+	FollowSymlinks bool
+
+	// ExtractArchives enables text extraction from binary files (extensions: xlsx,docx,pdf,zip or 'all').
+	ExtractArchives string
+
+	// ExtractLimits specifies safety limits for archive extraction.
+	ExtractLimits ExtractionLimits
+
+	// IgnoreFile is a path to a gitignore-style file of path patterns to skip.
+	// If empty, the embedded default ignore.conf is used.
+	// Use "/dev/null" to disable all ignore patterns.
+	IgnoreFile string
+
+	// NumReaders is the number of parallel file readers (0 = runtime.NumCPU()).
+	NumReaders int
+}
+
+// ValidateBaseURL checks that a user-supplied base URL uses HTTP(S).
+// Returns an error for non-HTTP(S) schemes to prevent token leakage via file://, ftp://, etc.
+// Returns true if the scheme is plaintext HTTP (caller should warn about token security).
+func ValidateBaseURL(rawURL string) (insecure bool, err error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false, fmt.Errorf("invalid base URL: %w", err)
+	}
+
+	scheme := strings.ToLower(u.Scheme)
+	switch scheme {
+	case "https":
+		return false, nil
+	case "http":
+		return true, nil
+	case "":
+		return false, fmt.Errorf("base URL must include scheme (e.g., https://github.example.com)")
+	default:
+		return false, fmt.Errorf("base URL scheme %q is not supported; use https:// (or http:// for testing)", scheme)
+	}
+}

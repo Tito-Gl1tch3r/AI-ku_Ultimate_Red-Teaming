@@ -1,0 +1,657 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Tetragon
+
+package v1alpha1
+
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	ciliumio "github.com/cilium/tetragon/pkg/k8s/apis/cilium.io"
+	slimv1 "github.com/cilium/tetragon/pkg/k8s/slim/k8s/apis/meta/v1"
+)
+
+const (
+	// PodInfo (PI) is the custom resource that stores pod related information
+
+	// PIPluralName is the plural name of Tetragon Pod Info
+	PIPluralName = "podinfo"
+
+	// PIKindDefinition is the Kind name of the Tetragon Pod Info
+	PIKindDefinition = "PodInfo"
+
+	// PIName is the full name of the Tetragon Pod Info
+	PIName = PIPluralName + "." + ciliumio.GroupName
+)
+
+type KprobeIgnore struct {
+	// Ignores calls that are not present in the system
+	// +kubebuilder:validation:Optional
+	CallNotFound bool `json:"callNotFound,omitempty"`
+}
+
+// +kubebuilder:validation:XValidation:rule="!has(self.return) || (!self.return || has(self.returnArg))",message="ReturnArg not specified with Return=true."
+type KProbeSpec struct {
+	// Name of the function to apply the kprobe spec to.
+	Call string `json:"call"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=false
+	// Indicates whether to collect return value of the traced function.
+	Return bool `json:"return"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=true
+	// Indicates whether the traced function is a syscall.
+	Syscall bool `json:"syscall"`
+	// +kubebuilder:validation:Optional
+	// A short message of 256 characters max that will be included
+	// in the event output to inform users what is going on.
+	Message string `json:"message"`
+	// +kubebuilder:validation:Optional
+	// A list of function arguments to include in the trace output.
+	Args []KProbeArg `json:"args,omitempty"`
+	// +kubebuilder:validation:Optional
+	// A list of data to include in the trace output.
+	Data []KProbeArg `json:"data,omitempty"`
+	// +kubebuilder:validation:Optional
+	// A return argument to include in the trace output.
+	ReturnArg *KProbeArg `json:"returnArg,omitempty"`
+	// +kubebuilder:validation:Optional
+	// An action to perform on the return value.
+	// Use returnArg to include the return value in the event output.
+	// Supported actions are: TrackSock;UntrackSock
+	ReturnArgAction string `json:"returnArgAction,omitempty"`
+	// +kubebuilder:validation:Optional
+	// Selectors to apply before producing trace output. Selectors are ORed and short-circuited.
+	Selectors []KProbeSelector `json:"selectors,omitempty"`
+	// +kubebuilder:validation:optional
+	// +kubebuilder:validation:MaxItems=16
+	// Tags to categorize the event, will be include in the event output.
+	// Maximum of 16 Tags are supported.
+	Tags []string `json:"tags,omitempty"`
+	// +kubebuilder:validation:Optional
+	// Conditions for ignoring this kprobe
+	Ignore *KprobeIgnore `json:"ignore,omitempty"`
+}
+
+type KProbeArg struct {
+	// +kubebuilder:validation:Minimum=0
+	// Position of the argument.
+	Index uint32 `json:"index"`
+	// +kubebuilder:validation:Enum=auto;int;sint8;int8;uint8;sint16;int16;uint16;uint32;sint32;int32;ulong;uint64;size_t;long;sint64;int64;char_buf;char_iovec;skb;sock;sockaddr;socket;sockaddr_un;string;fd;file;filename;path;nop;bpf_attr;perf_event;bpf_map;user_namespace;capability;kiocb;iov_iter;cred;const_buf;load_info;module;syscall64;kernel_cap_t;cap_inheritable;cap_permitted;cap_effective;linux_binprm;data_loc;net_device;bpf_cmd;dentry;bpf_prog;
+	// +kubebuilder:default=auto
+	// Argument type.
+	Type string `json:"type"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=""
+	// Resolve the path to a specific attribute
+	Resolve string `json:"resolve"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	// Specifies the position of the corresponding size argument for this argument.
+	// This field is used only for char_buf and char_iovec types.
+	SizeArgIndex uint32 `json:"sizeArgIndex"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=false
+	// This field is used only for char_buf and char_iovec types. It indicates
+	// that this argument should be read later (when the kretprobe for the
+	// symbol is triggered) because it might not be populated when the kprobe
+	// is triggered at the entrance of the function. For example, a buffer
+	// supplied to read(2) won't have content until kretprobe is triggered.
+	ReturnCopy bool `json:"returnCopy"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=false
+	// Read maximum possible data (currently 327360). This field is only used
+	// for char_buff data. When this value is false (default), the bpf program
+	// will fetch at most 4096 bytes. In later kernels (>=5.4) tetragon
+	// supports fetching up to 327360 bytes if this flag is turned on
+	MaxData bool `json:"maxData"`
+	// +kubebuilder:validation:Optional
+	// Label to output in the JSON
+	Label string `json:"label"`
+	// +kubebuilder:validation:Optional
+	// Source of the data, if missing the default if function arguments
+	Source string `json:"source"`
+	// +kubebuilder:validation:Optional
+	// Type to use as the initial resolve type. For kprobe args it looks up the named struct
+	// from the kernel BTF, casting the argument's type before traversing the resolve path.
+	// For UprobeSpecs and UsdtSpecs it looks up the type from the BTF file defined by BTFPath.
+	BTFType string `json:"btfType,omitempty"`
+	// +kubebuilder:validation:Optional
+	// Kernel module that contains the BTFType. This is used only for kprobe args.
+	// The module must already be loaded and expose BTF in /sys/kernel/btf.
+	BTFTypeModule string `json:"btfTypeModule,omitempty"`
+}
+
+type BinarySelector struct {
+	// +kubebuilder:validation:Enum=In;NotIn;Prefix;NotPrefix;Postfix;NotPostfix
+	// Filter operation.
+	Operator string `json:"operator"`
+	// Value to compare the argument against.
+	Values []string `json:"values"`
+	// In addition to binaries, match children processes of specified binaries.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=false
+	FollowChildren bool `json:"followChildren"`
+}
+
+// KProbeSelector selects function calls for kprobe based on PIDs and function arguments. The
+// results of MatchPIDs and MatchArgs are ANDed.
+type KProbeSelector struct {
+	// +kubebuilder:validation:Optional
+	// Human-readable selector label used in status and metrics.
+	Label string `json:"label,omitempty"`
+	// +kubebuilder:validation:Optional
+	// A list of process ID filters. MatchPIDs are ANDed.
+	MatchPIDs []PIDSelector `json:"matchPIDs,omitempty"`
+	// +kubebuilder:validation:Optional
+	// A list of argument filters. MatchArgs are ANDed.
+	MatchArgs []ArgSelector `json:"matchArgs,omitempty"`
+	// +kubebuilder:validation:Optional
+	// A list of command-line argument filters. MatchCmdArgs are ANDed.
+	// Indexes are zero-based and exclude argv[0].
+	MatchCmdArgs []CmdArgSelector `json:"matchCmdArgs,omitempty"`
+	// +kubebuilder:validation:Optional
+	// A list of argument filters. MatchData are ANDed.
+	MatchData []ArgSelector `json:"matchData,omitempty"`
+	// +kubebuilder:validation:Optional
+	// A list of actions to execute when this selector matches
+	MatchActions []ActionSelector `json:"matchActions,omitempty"`
+	// +kubebuilder:validation:Optional
+	// A list of argument filters. MatchReturnArgs are ANDed.
+	MatchReturnArgs []ArgSelector `json:"matchReturnArgs,omitempty"`
+	// +kubebuilder:validation:Optional
+	// A list of actions to execute when MatchReturnArgs selector matches
+	MatchReturnActions []ActionSelector `json:"matchReturnActions,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:MaxItems=1
+	// A list of binary exec name filters.
+	MatchBinaries []BinarySelector `json:"matchBinaries,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:MaxItems=1
+	// A list of process parent exec name filters.
+	MatchParentBinaries []BinarySelector `json:"matchParentBinaries,omitempty"`
+	// +kubebuilder:validation:Optional
+	// A list of namespaces and IDs
+	MatchNamespaces []NamespaceSelector `json:"matchNamespaces,omitempty"`
+	// +kubebuilder:validation:Optional
+	// IDs for namespace changes
+	MatchNamespaceChanges []NamespaceChangesSelector `json:"matchNamespaceChanges,omitempty"`
+	// +kubebuilder:validation:Optional
+	// A list of capabilities and IDs
+	MatchCapabilities []CapabilitiesSelector `json:"matchCapabilities,omitempty"`
+	// +kubebuilder:validation:Optional
+	// IDs for capabilities changes
+	MatchCapabilityChanges []CapabilitiesSelector `json:"matchCapabilityChanges,omitempty"`
+	// +kubebuilder:validation:Optional
+	// Workloads to match
+	MatchWorkloads *WorkloadsSelector `json:"matchWorkloads,omitempty"`
+	// +kubebuilder:validation:Optional
+	// A list of caller filters. MatchUserCallers are ANDed. Only supported for uprobes.
+	MatchUserCallers []UserCallerSelector `json:"matchUserCallers,omitempty"`
+	// +kubebuilder:validation:Optional
+	// A list of macros names, defined in spec.selectorsMacros.
+	// Filters specified in macros will be appended to corresponding filters of the selector.
+	Macros []string `json:"macros,omitempty"`
+	// +kubebuilder:validation:Optional
+	// Match CEL expression. The CEL expression may include:
+	//  argX (e.g., arg0) where X is the index of the argument in the Args array.
+	//  dataX where X is the index of the data in the Data array.
+	MatchCEL *CELExprSelector `json:"matchCEL,omitempty"`
+}
+
+type NamespaceChangesSelector struct {
+	// +kubebuilder:validation:Enum=In;NotIn
+	// Namespace selector operator.
+	Operator string `json:"operator"`
+	// Namespace types (e.g., Mnt, Pid) to match.
+	Values []string `json:"values"`
+}
+
+type NamespaceSelector struct {
+	// +kubebuilder:validation:Enum=Uts;Ipc;Mnt;Pid;PidForChildren;Net;Time;TimeForChildren;Cgroup;User
+	// Namespace selector name.
+	Namespace string `json:"namespace"`
+	// +kubebuilder:validation:Enum=In;NotIn
+	// Namespace selector operator.
+	Operator string `json:"operator"`
+	// Namespace IDs (or host_ns for host namespace) of namespaces to match.
+	Values []string `json:"values"`
+}
+
+type CapabilitiesSelector struct {
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Enum=Effective;Inheritable;Permitted
+	// +kubebuilder:default=Effective
+	// Type of capabilities
+	Type string `json:"type"`
+	// +kubebuilder:validation:Enum=In;NotIn
+	// Namespace selector operator.
+	Operator string `json:"operator"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=false
+	// Indicates whether these caps are namespace caps.
+	IsNamespaceCapability bool `json:"isNamespaceCapability"`
+	// Capabilities to match.
+	Values []string `json:"values"`
+}
+
+type CELExprSelector struct {
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Expr string `json:"expr"`
+}
+
+type WorkloadsSelector struct {
+	// +kubebuilder:validation:Optional
+	// PodSelector selects pods that this policy applies to
+	PodSelector *slimv1.LabelSelector `json:"podSelector"`
+	// +kubebuilder:validation:Optional
+	// ContainerSelector selects containers that this policy applies to.
+	// A map of container fields will be constructed in the same way as a map of labels.
+	// The name of the field represents the label "key", and the value of the field - label "value".
+	// Currently, only the "name" field is supported.
+	ContainerSelector *slimv1.LabelSelector `json:"containerSelector"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:XValidation:rule="!has(self.matchLabels) && !has(self.matchExpressions)",message="The hostSelector should be either null or {}."
+	// HostSelector selects hosts that this policy applies to.
+	// For now only ~ (none) and {} (all) is supported.
+	HostSelector *slimv1.LabelSelector `json:"hostSelector"`
+}
+
+type UserCallerSelector struct {
+	// +kubebuilder:validation:Pattern=`^(any|[1-9][0-9]*)$`
+	// Depth is the distance from the probed function to the caller.
+	// Depth of 1 means the immediate caller, depth of 2 means the caller's caller, and so on.
+	// Depth of "any" means any of the last 15 callers in the stack.
+	Depth string `json:"depth"`
+	// +kubebuilder:validation:Optional
+	// Path to the binary of the caller function.
+	// If not specified, the symbol will be looked up in the binary located at the path of the probe.
+	// This is used if the caller function is in a different binary from the probed function, e.g.,
+	// when probing a function in a shared library.
+	Path string `json:"path"`
+	// +kubebuilder:validation:Optional
+	// Symbol of the caller function in the binary specified by Path.
+	// If Path is not specified, the symbol will be looked up in binary located at the path of the probe.
+	// Specify either Symbol or StartRange and EndRange to match the caller function.
+	Symbol string `json:"symbol"`
+	// +kubebuilder:validation:Optional
+	// StartRange and EndRange specify a range of caller address to match. Both should be specified together.
+	// You can get those values from the binary's symbol table.
+	// Specify either Symbol or StartRange and EndRange to match the caller function.
+	StartRange uint64 `json:"startRange,omitempty"`
+	// +kubebuilder:validation:Optional
+	// StartRange and EndRange specify a range of caller address to match. Both should be specified together.
+	// Specify either Symbol or StartRange and EndRange to match the caller function.
+	EndRange uint64 `json:"endRange,omitempty"`
+}
+
+type PIDSelector struct {
+	// +kubebuilder:validation:Enum=In;NotIn
+	// PID selector operator.
+	Operator string `json:"operator"`
+	// +kubebuilder:validation:MaxItems=4
+	// Process IDs to match. Only the first 4 are matched by the kernel.
+	Values []uint32 `json:"values"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=false
+	// Indicates whether PIDs are namespace PIDs.
+	IsNamespacePID bool `json:"isNamespacePID"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=false
+	// Matches any descendant processes of the matching PIDs.
+	FollowForks bool `json:"followForks"`
+}
+
+type ArgSelector struct {
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	// Position of the argument (in function prototype) to apply the filter to.
+	Index uint32 `json:"index"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:items:Minimum=0
+	// Position of the operator arguments (in spec file) to apply the filter to.
+	Args []uint32 `json:"args,omitempty"`
+	// Filter operation.
+	//
+	// Note: The CelExpr operator is deprecated and will be removed in Tetragon OSS v1.9.0. Use the MatchCEL selector instead.
+	// +kubebuilder:validation:Enum=Equal;NotEqual;Prefix;NotPrefix;Postfix;NotPostfix;GreaterThan;LessThan;GT;LT;Mask;SPort;NotSPort;SPortPriv;NotSportPriv;DPort;NotDPort;DPortPriv;NotDPortPriv;SAddr;NotSAddr;DAddr;NotDAddr;Protocol;Family;State;InMap;NotInMap;CapabilitiesGained;InRange;NotInRange;SubString;SubStringIgnCase;CelExpr;FileType;NotFileType
+	Operator string `json:"operator"`
+	// Value to compare the argument against.
+	Values []string `json:"values,omitempty"`
+}
+
+type CmdArgSelector struct {
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=31
+	// Position of the command-line argument to apply the filter to. Indexes
+	// are zero-based and exclude argv[0], which is represented by the binary.
+	Index uint32 `json:"index"`
+	// +kubebuilder:validation:Enum=Equal;NotEqual;Prefix;NotPrefix;Postfix;NotPostfix
+	// Filter operation.
+	Operator string `json:"operator"`
+	// Values to compare the command-line argument against.
+	Values []string `json:"values"`
+}
+
+// +kubebuilder:validation:XValidation:rule="!(has(self.argNewSymbol) && has(self.argNewAddr)) && !(has(self.argNewSymbol) && has(self.argNewOffset)) && !(has(self.argNewAddr) && has(self.argNewOffset))",message="override action needs at most one of argNewSymbol, argNewAddr or argNewOffset defined"
+type ActionSelector struct {
+	// +kubebuilder:validation:Enum=Post;Sigkill;Override;GetUrl;DnsLookup;NoPost;Signal;TrackSock;UntrackSock;NotifyEnforcer;CleanupEnforcerNotification;Set
+	// Action to execute.
+	// The Override action has three variants, depending on what arguments are set
+	//   1. Override the return value of function
+	//        Supported hooks: kprobes, uprobes, lsm
+	//        Arguments: ArgError (return value)
+	//   2. Override the value of a register
+	//        Supported hooks: uprobes
+	//        Arguments: ArgRegs
+	//   3. Override a function call
+	//        Supported hooks: uprobes
+	//        Arguments: One of:
+	//        - ArgNewSymbol: override call to a new symbol (in the binary)
+	//	      - ArgNewAddr: override call to a new address (in the binary)
+	//	      - ArgNewOffset: override call to an offset (in the binary)
+	Action string `json:"action"`
+	// +kubebuilder:validation:Optional
+	// A URL for the getUrl action
+	ArgUrl string `json:"argUrl"`
+	// +kubebuilder:validation:Optional
+	// A FQDN to lookup for the dnsLookup action
+	ArgFqdn string `json:"argFqdn"`
+	// +kubebuilder:validation:Optional
+	// error value for override action
+	ArgError int32 `json:"argError"`
+	// +kubebuilder:validation:Optional
+	// A signal number for signal action
+	ArgSig uint32 `json:"argSig"`
+	// +kubebuilder:validation:Optional
+	// An arg index for the sock for trackSock and untrackSock actions
+	ArgSock uint32 `json:"argSock"`
+	// +kubebuilder:validation:Optional
+	// An arg index for the set action
+	ArgIndex uint32 `json:"argIndex"`
+	// +kubebuilder:validation:Optional
+	// An arg value for the set action
+	ArgValue uint64 `json:"argValue"`
+	// +kubebuilder:validation:Optional
+	// An arg value for the override action, uprobe only.
+	ArgRegs []string `json:"argRegs,omitempty"`
+	// +kubebuilder:validation:Optional
+	// An arg value for the override action, uprobe only.
+	// The new symbol name.
+	// Beware that the symbol MUST be binary compatible with the traced uprobe symbol.
+	ArgNewSymbol string `json:"argNewSymbol,omitempty"`
+	// +kubebuilder:validation:Optional
+	// An arg value for the override action, uprobe only.
+	// The new symbol's address.
+	// Beware that the symbol MUST be binary compatible with the traced uprobe symbol.
+	ArgNewAddr uint64 `json:"argNewAddr,omitempty"`
+	// +kubebuilder:validation:Optional
+	// An arg value for the override action, uprobe only.
+	// The new symbol's offset.
+	// Beware that the symbol MUST be binary compatible with the traced uprobe symbol.
+	ArgNewOffset int64 `json:"argNewOffset,omitempty"`
+	// +kubebuilder:validation:Optional
+	// A time period within which repeated messages will not be posted. Can be
+	// specified in seconds (default or with 's' suffix), minutes ('m' suffix)
+	// or hours ('h' suffix). Only valid with the post action.
+	RateLimit string `json:"rateLimit"`
+	// +kubebuilder:validation:Optional
+	// The scope of the provided rate limit argument. Can be "thread" (default),
+	// "process" (all threads for the same process), or "global". If "thread" is
+	// selected then rate limiting applies per thread; if "process" is selected
+	// then rate limiting applies per process; if "global" is selected then rate
+	// limiting applies regardless of which process or thread caused the action.
+	// Only valid with the post action and with a rateLimit specified.
+	RateLimitScope string `json:"rateLimitScope"`
+	// +kubebuilder:validation:Optional
+	// Enable kernel stack trace export. Only valid with the post action.
+	KernelStackTrace bool `json:"kernelStackTrace"`
+	// +kubebuilder:validation:Optional
+	// Enable user stack trace export. Only valid with the post action.
+	UserStackTrace bool `json:"userStackTrace"`
+	// +kubebuilder:validation:Optional
+	// Enable collection of file hashes from integrity subsystem.
+	// Only valid with the post action.
+	ImaHash bool `json:"imaHash"`
+
+	// NB: Describing the use of this is complicated. It is only used when a missed enforcer
+	// notification (via the NotifyEnforcer action) is detected. In this case, we increase a
+	// counter that resides in a bpf map to track the missed notification. One of the main uses
+	// of NotifyEnforcer is for raw_syscalls/sys_enter. In this case, if we want to know what
+	// was the syscall for which we missed the notification, we need to use the value of the
+	// first argument. The value here stores the index of the argument we want to use.
+	//
+	// Given the complexity and limited use of this field, we do not expose it to users (at
+	// least for now) and set it internally as needed.
+	EnforcerNotifyActionArgIndex *uint32 `json:"-"`
+}
+
+type TracepointSpec struct {
+	// Tracepoint subsystem
+	// +kubebuilder:validation:Pattern=`^[a-zA-Z0-9_][a-zA-Z0-9_-]*$`
+	Subsystem string `json:"subsystem"`
+	// Tracepoint event
+	// +kubebuilder:validation:Pattern=`^[a-zA-Z0-9_][a-zA-Z0-9_-]*$`
+	Event string `json:"event"`
+	// +kubebuilder:validation:Optional
+	// A short message of 256 characters max that will be included
+	// in the event output to inform users what is going on.
+	Message string `json:"message"`
+	// +kubebuilder:validation:Optional
+	// A list of function arguments to include in the trace output.
+	Args []KProbeArg `json:"args,omitempty"`
+	// +kubebuilder:validation:Optional
+	// Selectors to apply before producing trace output. Selectors are ORed.
+	Selectors []KProbeSelector `json:"selectors,omitempty"`
+	// +kubebuilder:validation:optional
+	// +kubebuilder:validation:MaxItems=16
+	// Tags to categorize the event, will be include in the event output.
+	// Maximum of 16 Tags are supported.
+	Tags []string `json:"tags,omitempty"`
+	// +kubebuilder:validation:Optional
+	// Enable raw tracepoint arguments
+	Raw bool `json:"raw,omitempty"`
+}
+
+type UprobeIgnore struct {
+	// Ignores uprobe where the digest verification of the traced binary fails
+	// +kubebuilder:validation:Optional
+	DigestVerificationFailure bool `json:"digestVerificationFailure,omitempty"`
+}
+
+// +kubebuilder:validation:XValidation:rule="!(has(self.symbols) && has(self.addrs)) && !(has(self.symbols) && has(self.offsets)) && !(has(self.addrs) && has(self.offsets))",message="uprobe needs at most one of symbols, addrs or offsets defined"
+// +kubebuilder:validation:XValidation:rule="!has(self.return) || (!self.return || has(self.returnArg))",message="ReturnArg not specified with Return=true."
+type UProbeSpec struct {
+	// Name of the traced binary
+	Path string `json:"path"`
+	// +kubebuilder:validation:optional
+	// path for a BTF file for the traced binary
+	BTFPath string `json:"btfPath,omitempty"`
+	// +kubebuilder:validation:Optional
+	// List of the traced symbols
+	Symbols []string `json:"symbols,omitempty"`
+	// +kubebuilder:validation:Optional
+	// List of the traced offsets
+	Offsets []uint64 `json:"offsets,omitempty"`
+	// +kubebuilder:validation:Optional
+	// List of the traced addresses
+	Addrs []uint64 `json:"addrs,omitempty"`
+	// +kubebuilder:validation:Optional
+	// List of the traced ref_ctr_offsets
+	RefCtrOffsets []uint64 `json:"refCtrOffsets,omitempty"`
+	// +kubebuilder:validation:Optional
+	// A short message of 256 characters max that will be included
+	// in the event output to inform users what is going on.
+	Message string `json:"message"`
+	// +kubebuilder:validation:Optional
+	// Selectors to apply before producing trace output. Selectors are ORed.
+	Selectors []KProbeSelector `json:"selectors,omitempty"`
+	// +kubebuilder:validation:Optional
+	// A list of function arguments to include in the trace output.
+	Args []KProbeArg `json:"args,omitempty"`
+	// +kubebuilder:validation:Optional
+	// A list of data to include in the trace output.
+	Data []KProbeArg `json:"data,omitempty"`
+	// +kubebuilder:validation:optional
+	// +kubebuilder:validation:MaxItems=16
+	// Tags to categorize the event, will be include in the event output.
+	// Maximum of 16 Tags are supported.
+	Tags []string `json:"tags,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=false
+	// Indicates whether to collect return value of the traced function.
+	Return bool `json:"return"`
+	// +kubebuilder:validation:Optional
+	// A return argument to include in the trace output.
+	ReturnArg *KProbeArg `json:"returnArg,omitempty"`
+	// +kubebuilder:validation:Optional
+	// BinaryDigests specifies a set of digests for the traced binary.
+	// The uprobe/hook is installed only if the digest of the traced binary matches a digest in the set.
+	// Tetragon's tracing policy status API can be used to see each hook's status in order to determine
+	// if the hook was attached or not.
+	BinaryDigests []string `json:"binaryDigests,omitempty"`
+	// +kubebuilder:validation:Optional
+	// Conditions for ignoring this uprobe
+	Ignore *UprobeIgnore `json:"ignore,omitempty"`
+}
+
+type UsdtSpec struct {
+	// Name of the traced binary
+	Path string `json:"path"`
+	// +kubebuilder:validation:optional
+	// path for a BTF file for the traced binary
+	BTFPath string `json:"btfPath,omitempty"`
+	// Usdt provider name
+	Provider string `json:"provider"`
+	// Usdt name
+	Name string `json:"name"`
+	// +kubebuilder:validation:optional
+	// +kubebuilder:validation:MaxItems=16
+	// Tags to categorize the event, will be include in the event output.
+	// Maximum of 16 Tags are supported.
+	Tags []string `json:"tags,omitempty"`
+	// +kubebuilder:validation:Optional
+	// A short message of 256 characters max that will be included
+	// in the event output to inform users what is going on.
+	Message string `json:"message"`
+	// +kubebuilder:validation:Optional
+	// A list of function arguments to include in the trace output.
+	Args []KProbeArg `json:"args,omitempty"`
+	// +kubebuilder:validation:Optional
+	// Selectors to apply before producing trace output. Selectors are ORed.
+	Selectors []KProbeSelector `json:"selectors,omitempty"`
+}
+
+type LsmHookSpec struct {
+	// Name of the function to apply the kprobe spec to.
+	Hook string `json:"hook"`
+	// +kubebuilder:validation:Optional
+	// A short message of 256 characters max that will be included
+	// in the event output to inform users what is going on.
+	Message string `json:"message"`
+	// +kubebuilder:validation:Optional
+	// A list of function arguments to include in the trace output.
+	Args []KProbeArg `json:"args,omitempty"`
+	// +kubebuilder:validation:Optional
+	// Selectors to apply before producing trace output. Selectors are ORed.
+	Selectors []KProbeSelector `json:"selectors,omitempty"`
+	// +kubebuilder:validation:optional
+	// +kubebuilder:validation:MaxItems=16
+	// Tags to categorize the event, will be include in the event output.
+	// Maximum of 16 Tags are supported.
+	Tags []string `json:"tags,omitempty"`
+}
+
+type ListSpec struct {
+	// Name of the list
+	Name string `json:"name"`
+	// +kubebuilder:validation:Optional
+	// Values of the list
+	Values []string `json:"values,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Enum=syscalls;generated_syscalls;generated_ftrace
+	// Indicates the type of the list values.
+	Type string `json:"type,omitempty"`
+	// +kubebuilder:validation:Optional
+	// Pattern for 'generated' lists.
+	Pattern *string `json:"pattern,omitempty"`
+	// +kubebuilder:validation:Optional
+	// List was validated
+	Validated bool `json:"validated"`
+}
+
+type OptionSpec struct {
+	// Name of the option
+	Name string `json:"name"`
+	// +kubebuilder:validation:Optional
+	// Value of the option
+	Value string `json:"value"`
+}
+
+type PodInfoSpec struct {
+	// Host networking requested for this pod. Use the host's network namespace.
+	// If this option is set, the ports that will be used must be specified.
+	HostNetwork bool `json:"hostNetwork,omitempty"`
+	// NodeName is the name of the node that the pod is schduled to run on.
+	NodeName string `json:"nodeName,omitempty"`
+}
+
+type PodInfoStatus struct {
+	// IP address allocated to the pod. Routable at least within the cluster.
+	// Empty if not yet allocated.
+	PodIP string `json:"podIP,omitempty"`
+
+	// List of Ip addresses allocated to the pod. 0th entry must be same as PodIP.
+	PodIPs []PodIP `json:"podIPs,omitempty"`
+}
+
+type PodIP struct {
+	// IP is an IP address (IPv4 or IPv6) assigned to the pod
+	IP string `json:"IP,omitempty"`
+}
+
+// WorkloadObjectMeta is metadata associated with workloads that create pods.
+type WorkloadObjectMeta struct {
+	// Name of the object.
+	// +optional
+	Name string `json:"name,omitempty"`
+
+	// Namespace of this object.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+}
+
+// +genclient
+// +kubebuilder:object:root=true
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +kubebuilder:resource:singular="podinfo",path="podinfo",scope="Namespaced",shortName={tgpi}
+
+// PodInfo is the Scheme for the Podinfo API
+type PodInfo struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   PodInfoSpec   `json:"spec,omitempty"`
+	Status PodInfoStatus `json:"status,omitempty"`
+
+	// Workload type (e.g. "Deployment", "Daemonset") that created this pod.
+	WorkloadType metav1.TypeMeta `json:"workloadType,omitempty"`
+	// Workload that created this pod.
+	WorkloadObject WorkloadObjectMeta `json:"workloadObject,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// PodInfoList contains a list of Podinfo
+type PodInfoList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []PodInfo `json:"items"`
+}
+
+type EnforcerSpec struct {
+	// Calls where enforcer is executed in
+	Calls []string `json:"calls"`
+}

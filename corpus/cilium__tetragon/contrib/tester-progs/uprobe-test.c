@@ -1,0 +1,54 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+#include "tester-lib.h"
+
+void uprobe_test_lib(void);
+
+// argument test functions
+int uprobe_test_lib_arg1(int a1);
+int uprobe_test_lib_arg2(char a1, short a2);
+int uprobe_test_lib_arg3(unsigned long a1, unsigned int a2, void *a3);
+int uprobe_test_lib_arg4(long a1, int a2, char a3, void *a4);
+int uprobe_test_lib_arg5(int a1, char a2, unsigned long a3, short a4, void *a5);
+int uprobe_test_lib_string_arg(char *str);
+int uprobe_test_lib_string_arg_empty(char *str);
+int uprobe_test_lib_string_arg_null(char *str);
+int uprobe_test_lib_string_arg_substring(char *str);
+int uprobe_test_lib_string_arg0(char *str, int two, int three, int four, int five);
+int uprobe_test_lib_string_arg1(int one, char *str, int three, int four, int five);
+int uprobe_test_lib_string_arg2(int one, int two, char *str, int four, int five);
+int uprobe_test_lib_string_arg3(int one, int two, int three, char *str, int five);
+int uprobe_test_lib_string_arg4(int one, int two, int three, int four, char *str);
+
+int main(int argc, char *argv[])
+{
+	if (argc > 1) {
+		return uprobe_test_lib_string_arg1(atoi(argv[1]), "two", 3, 4, 5);
+	}
+
+	char *str_arg = "hello world!";
+
+	uprobe_test_lib();
+	uprobe_test_lib_arg1(123);
+	uprobe_test_lib_arg2('a', 4321);
+	uprobe_test_lib_arg3(1, 0xdeadbeef, NULL);
+	uprobe_test_lib_arg4(-321, -2, 'b', (void *) 1);
+	uprobe_test_lib_arg5(1, 'c', 0xcafe, 1234, (void *) 2);
+	uprobe_test_lib_string_arg(pageout(str_arg, strlen(str_arg) + 1));
+	if (uprobe_test_lib_string_arg_empty("") != 0) {
+		// we are testing the override argNewSymbol for uprobe
+		// return 100 to signal that the symbol was indeed overridden.
+		return 100;
+	}
+	uprobe_test_lib_string_arg_null(NULL);
+	uprobe_test_lib_string_arg_substring("test");
+	uprobe_test_lib_string_arg0("one", 2, 3, 4, 5);
+	uprobe_test_lib_string_arg1(1, "two", 3, 4, 5);
+	uprobe_test_lib_string_arg2(1, 2, "three", 4, 5);
+	uprobe_test_lib_string_arg3(1, 2, 3, "four", 5);
+	uprobe_test_lib_string_arg4(1, 2, 3, 4, "five");
+	return 0;
+}

@@ -1,0 +1,633 @@
+import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { SqliteFindingStore, isFindingsStorageAvailable } from "../src/findings/storage";
+import { cliFalsePositiveTelemetryEvent } from "../src/telemetry";
+import type { Finding } from "../src/types";
+
+test("stores scan runs and findings in SQLite", async (context) => {
+  if (!isFindingsStorageAvailable()) {
+    context.skip("node:sqlite is not available in this runtime");
+    return;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-findings-"));
+  const store = new SqliteFindingStore(path.join(tempDir, "findings.db"));
+  const completedAt = 123456;
+
+  const run = store.recordScanRun({
+    scanId: "scan_test",
+    startedAt: completedAt - 25,
+    completedAt,
+    cwd: tempDir,
+    targetPaths: [path.join(tempDir, "app.ts")],
+    fileCount: 1,
+    findings: [
+      finding({ id: "active", file: path.join(tempDir, "app.ts") }),
+      finding({ id: "dismissed", dismissed: true, dismissed_reason: "ignored in tests" })
+    ],
+    findingAuthors: {
+      active: { name: "Ada Lovelace", email: "ada@example.com" },
+      dismissed: { name: "Ada Lovelace", email: "ada@example.com" }
+    }
+  });
+  const activeFindings = store.listFindings();
+  const allFindings = store.listFindings({ includeDismissed: true });
+  const stats = store.stats();
+  const runs = store.listScanRuns();
+
+  assert.equal(run.findingCount, 2);
+  assert.equal(run.activeCount, 1);
+  assert.equal(run.dismissedCount, 1);
+  assert.equal(activeFindings.length, 1);
+  assert.equal(activeFindings[0].id, "active");
+  assert.equal(allFindings.length, 2);
+  assert.equal(allFindings.find((item) => item.id === "dismissed")?.dismissed_reason, "ignored in tests");
+  assert.equal(allFindings.find((item) => item.id === "active")?.authorName, "Ada Lovelace");
+  assert.equal(allFindings.find((item) => item.id === "active")?.authorEmail, "ada@example.com");
+  assert.equal(stats.scanCount, 1);
+  assert.equal(stats.findingCount, 2);
+  assert.equal(stats.activeCount, 1);
+  assert.equal(stats.dismissedCount, 1);
+  assert.equal(stats.latestScanAt, completedAt);
+  assert.equal(runs[0].targetPaths.length, 1);
+  store.close();
+});
+
+test("summarizes findings history for trend dashboards", async (context) => {
+  if (!isFindingsStorageAvailable()) {
+    context.skip("node:sqlite is not available in this runtime");
+    return;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-findings-summary-"));
+  const store = new SqliteFindingStore(path.join(tempDir, "findings.db"));
+  const dayOne = Date.UTC(2026, 0, 1, 12);
+  const dayTwo = Date.UTC(2026, 0, 2, 12);
+
+  store.recordScanRun({
+    scanId: "day_one",
+    startedAt: dayOne - 100,
+    completedAt: dayOne,
+    cwd: tempDir,
+    targetPaths: ["day-one.ts"],
+    fileCount: 1,
+    findings: [
+      finding({ id: "old_sql", timestamp: dayOne, detection_rule: "sast_sql_template_interpolation" }),
+      finding({
+        id: "old_secret",
+        type: "hardcoded_secret",
+        severity: "critical",
+        detection_layer: "L1",
+        detection_rule: "secret_google_api_key",
+        timestamp: dayOne
+      })
+    ],
+    findingAuthors: {
+      old_sql: { name: "Ada Lovelace", email: "ada@example.com" },
+      old_secret: { name: "Ada Lovelace", email: "ada@example.com" }
+    }
+  });
+  store.recordScanRun({
+    scanId: "day_two",
+    startedAt: dayTwo - 100,
+    completedAt: dayTwo,
+    cwd: tempDir,
+    targetPaths: ["day-two.ts"],
+    fileCount: 1,
+    findings: [
+      finding({ id: "new_sql", timestamp: dayTwo, detection_rule: "sast_sql_template_interpolation" }),
+      finding({
+        id: "dismissed_sql",
+        timestamp: dayTwo,
+        detection_rule: "sast_sql_template_interpolation",
+        dismissed: true,
+        dismissed_reason: "false_positive: covered elsewhere"
+      }),
+      finding({
+        id: "dismissed_unspecified",
+        type: "hardcoded_secret",
+        severity: "critical",
+        detection_layer: "L1",
+        detection_rule: "secret_google_api_key",
+        timestamp: dayTwo,
+        dismissed: true,
+        dismissed_reason: ""
+      }),
+      finding({
+        id: "new_xss",
+        type: "xss",
+        severity: "medium",
+        detection_rule: "sast_inner_html_assignment",
+        timestamp: dayTwo
+      })
+    ],
+    findingAuthors: {
+      new_sql: { name: "Grace Hopper", email: "grace@example.com" },
+      dismissed_sql: { name: "Grace Hopper", email: "grace@example.com" },
+      dismissed_unspecified: { name: "Ada Lovelace", email: "ada@example.com" },
+      new_xss: { name: "Grace Hopper", email: "grace@example.com" }
+    }
+  });
+
+  const summary = store.summary({ topLimit: 2 });
+  const highSeverity = summary.severityCounts.find((bucket) => bucket.key === "high");
+  const sqlType = summary.typeCounts.find((bucket) => bucket.key === "sql_injection");
+
+  assert.equal(summary.scanCount, 2);
+  assert.equal(summary.findingCount, 6);
+  assert.equal(summary.activeCount, 4);
+  assert.equal(summary.dismissedCount, 2);
+  assert.equal(summary.latestScanAt, dayTwo);
+  assert.deepEqual(summary.latestScanDelta, {
+    previousScanId: "day_one",
+    currentScanId: "day_two",
+    currentCompletedAt: dayTwo,
+    introducedCount: 2,
+    resolvedCount: 2,
+    persistentCount: 0
+  });
+  assert.equal(highSeverity?.count, 3);
+  assert.equal(highSeverity?.activeCount, 2);
+  assert.equal(highSeverity?.dismissedCount, 1);
+  assert.equal(sqlType?.count, 3);
+  assert.deepEqual(
+    summary.dismissedReasonCounts.map((bucket) => [bucket.key, bucket.count, bucket.activeCount, bucket.dismissedCount]),
+    [
+      ["false_positive: covered elsewhere", 1, 0, 1],
+      ["unspecified", 1, 0, 1]
+    ]
+  );
+  assert.deepEqual(
+    summary.authorCounts.map((bucket) => [
+      bucket.name,
+      bucket.email,
+      bucket.count,
+      bucket.activeCount,
+      bucket.dismissedCount,
+      bucket.highRiskCount,
+      bucket.highRiskRate
+    ]),
+    [
+      ["Ada Lovelace", "ada@example.com", 3, 2, 1, 2, 1],
+      ["Grace Hopper", "grace@example.com", 3, 2, 1, 1, 0.5]
+    ]
+  );
+  assert.equal(summary.topRules.length, 2);
+  assert.equal(summary.topRules[0].key, "sast_sql_template_interpolation");
+  assert.equal(summary.topRules[0].count, 3);
+  assert.equal(summary.topRules[0].falsePositiveCount, 1);
+  assert.equal(summary.topRules[0].falsePositiveRate, 1 / 3);
+  assert.deepEqual(
+    summary.falsePositiveRules.map((rule) => [rule.key, rule.falsePositiveCount, rule.falsePositiveRate]),
+    [["sast_sql_template_interpolation", 1, 1 / 3]]
+  );
+  assert.deepEqual(
+    summary.trend.map((point) => [point.date, point.scanCount, point.findingCount, point.activeCount, point.dismissedCount]),
+    [
+      ["2026-01-01", 1, 2, 2, 0],
+      ["2026-01-02", 1, 4, 2, 2]
+    ]
+  );
+
+  const recentSummary = store.summary({ since: dayTwo - 1 });
+  assert.equal(recentSummary.scanCount, 1);
+  assert.equal(recentSummary.findingCount, 4);
+  assert.equal(recentSummary.dismissedReasonCounts.length, 2);
+  assert.equal(recentSummary.latestScanDelta, undefined);
+  assert.deepEqual(
+    recentSummary.falsePositiveRules.map((rule) => [rule.key, rule.falsePositiveCount, rule.falsePositiveRate]),
+    [["sast_sql_template_interpolation", 1, 1 / 2]]
+  );
+  assert.deepEqual(recentSummary.trend.map((point) => point.date), ["2026-01-02"]);
+  store.close();
+});
+
+test("aggregates opt-in anonymous false-positive telemetry by UTC day without raw finding data", async (context) => {
+  if (!isFindingsStorageAvailable()) {
+    context.skip("node:sqlite is not available in this runtime");
+    return;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-anonymous-telemetry-"));
+  const store = new SqliteFindingStore(path.join(tempDir, "findings.db"));
+  const timestamp = Date.UTC(2026, 0, 3, 12);
+  const global = cliFalsePositiveTelemetryEvent("internal_rule_name", "cli", "global");
+  const file = cliFalsePositiveTelemetryEvent("internal_rule_name", "cli", "file");
+
+  store.recordAnonymousFalsePositiveTelemetry(global, timestamp);
+  store.recordAnonymousFalsePositiveTelemetry(global, timestamp + 1);
+  store.recordAnonymousFalsePositiveTelemetry(file, timestamp + 2);
+
+  const feedback = store.summary({ since: timestamp - 1 }).anonymousFalsePositiveTelemetry;
+  assert.deepEqual(feedback, [
+    {
+      ruleFingerprint: global.ruleFingerprint,
+      eventCount: 3,
+      sources: ["cli"],
+      scopes: ["file", "global"],
+      firstReceivedAt: timestamp,
+      lastReceivedAt: timestamp + 2
+    }
+  ]);
+  assert.equal(JSON.stringify(feedback).includes("internal_rule_name"), false);
+  assert.deepEqual(store.summary({ project: "acme/payments-api" }).anonymousFalsePositiveTelemetry, []);
+
+  const pruned = store.pruneBefore(timestamp + 10);
+  assert.equal(pruned.deletedTelemetryBuckets, 2);
+  assert.deepEqual(store.summary().anonymousFalsePositiveTelemetry, []);
+  store.close();
+});
+
+test("matches anonymous feedback fingerprints to rules only when the local scan history knows the rule", async (context) => {
+  if (!isFindingsStorageAvailable()) {
+    context.skip("node:sqlite is not available in this runtime");
+    return;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-anonymous-telemetry-rule-match-"));
+  const store = new SqliteFindingStore(path.join(tempDir, "findings.db"));
+  const timestamp = Date.UTC(2026, 0, 4, 12);
+  const rule = "custom.company_no_example";
+  const event = cliFalsePositiveTelemetryEvent(rule, "cli", "global");
+  store.recordScanRun({
+    scanId: "known-rule",
+    startedAt: timestamp - 10,
+    completedAt: timestamp - 1,
+    cwd: tempDir,
+    targetPaths: ["app.ts"],
+    fileCount: 1,
+    findings: [finding({ id: "known-rule-finding", detection_rule: rule })]
+  });
+  store.recordAnonymousFalsePositiveTelemetry(event, timestamp);
+
+  const feedback = store.summary().anonymousFalsePositiveTelemetry;
+  assert.equal(JSON.stringify(event).includes(rule), false);
+  assert.equal(feedback?.[0]?.ruleFingerprint, event.ruleFingerprint);
+  assert.equal(feedback?.[0]?.matchedRule, rule);
+  store.close();
+});
+
+test("prunes stored scans and findings before a cutoff", async (context) => {
+  if (!isFindingsStorageAvailable()) {
+    context.skip("node:sqlite is not available in this runtime");
+    return;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-findings-prune-"));
+  const store = new SqliteFindingStore(path.join(tempDir, "findings.db"));
+  store.recordScanRun({
+    scanId: "old",
+    startedAt: 1,
+    completedAt: 10,
+    cwd: tempDir,
+    targetPaths: ["old.ts"],
+    fileCount: 1,
+    findings: [finding({ id: "old_finding" })]
+  });
+  store.recordScanRun({
+    scanId: "new",
+    startedAt: 90,
+    completedAt: 100,
+    cwd: tempDir,
+    targetPaths: ["new.ts"],
+    fileCount: 1,
+    findings: [finding({ id: "new_finding" })]
+  });
+
+  const result = store.pruneBefore(50);
+  const findings = store.listFindings({ includeDismissed: true });
+  const stats = store.stats();
+
+  assert.equal(result.deletedScans, 1);
+  assert.equal(result.deletedFindings, 1);
+  assert.deepEqual(findings.map((item) => item.id), ["new_finding"]);
+  assert.equal(stats.scanCount, 1);
+  store.close();
+});
+
+test("compacts oldest scan history when the findings database exceeds its storage budget", async (context) => {
+  if (!isFindingsStorageAvailable()) {
+    context.skip("node:sqlite is not available in this runtime");
+    return;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-findings-cap-"));
+  const maxDatabaseBytes = 1_200_000;
+  const store = new SqliteFindingStore(path.join(tempDir, "findings.db"), { maxDatabaseBytes });
+  const evidence = "x".repeat(600_000);
+  store.recordScanRun({
+    scanId: "old",
+    startedAt: 1,
+    completedAt: 10,
+    cwd: tempDir,
+    targetPaths: ["old.ts"],
+    fileCount: 1,
+    findings: [finding({ id: "old_finding", evidence })]
+  });
+  store.recordScanRun({
+    scanId: "current",
+    startedAt: 90,
+    completedAt: 100,
+    cwd: tempDir,
+    targetPaths: ["current.ts"],
+    fileCount: 1,
+    findings: [finding({ id: "current_finding", evidence })]
+  });
+
+  const stats = store.stats();
+  assert.equal(stats.maxDatabaseBytes, maxDatabaseBytes);
+  assert.ok((stats.databaseBytes ?? Number.POSITIVE_INFINITY) <= maxDatabaseBytes);
+  assert.deepEqual(store.listScanRuns().map((run) => run.scanId), ["current"]);
+  assert.deepEqual(store.listFindings({ includeDismissed: true }).map((item) => item.id), ["current_finding"]);
+  store.close();
+});
+
+test("rejects a single scan that cannot fit within the findings storage budget", async (context) => {
+  if (!isFindingsStorageAvailable()) {
+    context.skip("node:sqlite is not available in this runtime");
+    return;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-findings-cap-single-"));
+  const maxDatabaseBytes = 1_200_000;
+  const store = new SqliteFindingStore(path.join(tempDir, "findings.db"), { maxDatabaseBytes });
+
+  assert.throws(
+    () =>
+      store.recordScanRun({
+        scanId: "oversized",
+        startedAt: 1,
+        completedAt: 10,
+        cwd: tempDir,
+        targetPaths: ["oversized.ts"],
+        fileCount: 1,
+        findings: [finding({ id: "oversized_finding", evidence: "x".repeat(1_500_000) })]
+      }),
+    /could not be persisted within the 1200000-byte findings storage budget/
+  );
+
+  const stats = store.stats();
+  assert.equal(stats.scanCount, 0);
+  assert.ok((stats.databaseBytes ?? Number.POSITIVE_INFINITY) <= maxDatabaseBytes);
+  store.close();
+});
+
+test("stores bounded dashboard audit events without authentication material", async (context) => {
+  if (!isFindingsStorageAvailable()) {
+    context.skip("node:sqlite is not available in this runtime");
+    return;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-findings-audit-"));
+  const store = new SqliteFindingStore(path.join(tempDir, "findings.db"));
+  const extraDetails = Object.fromEntries(
+    Array.from({ length: 20 }, (_, index) => [`field_${index.toString().padStart(2, "0")}`, "x".repeat(300)])
+  );
+  store.recordAuditEvent({
+    timestamp: 10,
+    subject: "security@example.com",
+    role: "analyst",
+    authentication: "oidc",
+    action: "dashboard.compliance_viewed",
+    details: {
+      path: "/api/compliance",
+      authorization: "must-not-be-stored",
+      access_token: "must-not-be-stored",
+      api_key: "must-not-be-stored",
+      credential: "must-not-be-stored",
+      count: 2,
+      ...extraDetails
+    }
+  });
+  store.recordAuditEvent({
+    timestamp: 20,
+    subject: "admin@example.com",
+    role: "admin",
+    authentication: "oidc",
+    action: "dashboard.audit_log_viewed"
+  });
+
+  const events = store.listAuditEvents();
+  assert.equal(events.length, 2);
+  assert.equal(events[0].action, "dashboard.audit_log_viewed");
+  assert.equal(events[1].details.path, "/api/compliance");
+  assert.equal(events[1].details.count, 2);
+  assert.equal(events[1].details.authorization, undefined);
+  assert.equal(Object.keys(events[1].details).length, 16);
+  assert.equal(store.listAuditEvents({ since: 15 }).length, 1);
+  const prune = store.pruneBefore(15);
+  assert.equal(prune.deletedAuditEvents, 1);
+  assert.equal(store.listAuditEvents().length, 1);
+  store.close();
+});
+
+test("retains the current audit event when storage compaction removes older audit history", async (context) => {
+  if (!isFindingsStorageAvailable()) {
+    context.skip("node:sqlite is not available in this runtime");
+    return;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-findings-audit-cap-"));
+  const maxDatabaseBytes = 640_000;
+  const store = new SqliteFindingStore(path.join(tempDir, "findings.db"), { maxDatabaseBytes });
+  const details = Object.fromEntries(
+    Array.from({ length: 16 }, (_, index) => [`field_${index.toString().padStart(2, "0")}`, "x".repeat(256)])
+  );
+  for (let index = 0; index < 20; index += 1) {
+    store.recordAuditEvent({
+      timestamp: 100 + index,
+      authentication: "token",
+      action: `older.${index}`,
+      details
+    });
+  }
+
+  store.recordAuditEvent({
+    timestamp: 1,
+    authentication: "token",
+    action: "current.low_timestamp",
+    details
+  });
+
+  const events = store.listAuditEvents({ limit: 1000 });
+  assert.ok(events.some((event) => event.action === "current.low_timestamp"));
+  assert.equal(events.some((event) => event.action === "older.0"), false);
+  assert.ok((store.stats().databaseBytes ?? Number.POSITIVE_INFINITY) <= maxDatabaseBytes);
+  store.close();
+});
+
+test("issues, rotates, and revokes project-scoped ingest credentials without storing raw tokens", async (context) => {
+  if (!isFindingsStorageAvailable()) {
+    context.skip("node:sqlite is not available in this runtime");
+    return;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-project-credentials-"));
+  const dbPath = path.join(tempDir, "findings.db");
+  const store = new SqliteFindingStore(dbPath);
+  const first = store.issueProjectIngestCredential("acme/payments-api");
+  assert.ok(first);
+  assert.equal(first.created, true);
+  assert.match(first.token, /^vgpi_/);
+  assert.equal(store.projectForIngestToken(first.token), "acme/payments-api");
+  assert.equal(store.issueProjectIngestCredential("acme/payments-api"), undefined);
+
+  const rotated = store.issueProjectIngestCredential("acme/payments-api", true);
+  assert.ok(rotated);
+  assert.equal(rotated.created, false);
+  assert.notEqual(rotated.token, first.token);
+  assert.equal(store.projectForIngestToken(first.token), undefined);
+  assert.equal(store.projectForIngestToken(rotated.token), "acme/payments-api");
+  assert.deepEqual(store.listProjectIngestCredentials().map((item) => item.project), ["acme/payments-api"]);
+  store.close();
+
+  const database = new DatabaseSync(dbPath);
+  const persisted = database.prepare("SELECT token_hash FROM project_ingest_credential").get();
+  database.close();
+  assert.equal(typeof persisted?.token_hash, "string");
+  assert.equal(String(persisted?.token_hash).length, 64);
+  assert.equal(String(persisted?.token_hash).includes(rotated.token), false);
+
+  const reopened = new SqliteFindingStore(dbPath);
+  assert.equal(reopened.revokeProjectIngestCredential("acme/payments-api"), true);
+  assert.equal(reopened.projectForIngestToken(rotated.token), undefined);
+  assert.equal(reopened.revokeProjectIngestCredential("acme/payments-api"), false);
+  reopened.close();
+});
+
+test("stores project custom rules with bounded metadata and supports deletion", async (context) => {
+  if (!isFindingsStorageAvailable()) {
+    context.skip("node:sqlite is not available in this runtime");
+    return;
+  }
+
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-project-rules-"));
+  const store = new SqliteFindingStore(path.join(tempDir, "findings.db"));
+  const yaml = `rules:
+  - id: company_no_example
+    pattern: example-insecure-setting
+    severity: medium
+    type: insecure_config
+    layer: L1
+    message: Use the approved configuration.
+`;
+
+  const saved = store.saveProjectCustomRules("acme/payments-api", yaml, 1);
+  assert.equal(saved.project, "acme/payments-api");
+  assert.equal(saved.ruleCount, 1);
+  assert.equal(saved.yaml, yaml);
+  assert.deepEqual(store.listProjectCustomRules().map((entry) => ({ project: entry.project, ruleCount: entry.ruleCount })), [
+    { project: "acme/payments-api", ruleCount: 1 }
+  ]);
+  assert.deepEqual(store.getProjectCustomRules("acme/payments-api"), saved);
+  assert.equal(store.deleteProjectCustomRules("acme/payments-api"), true);
+  assert.equal(store.getProjectCustomRules("acme/payments-api"), undefined);
+  assert.equal(store.deleteProjectCustomRules("acme/payments-api"), false);
+  store.close();
+});
+
+test("migrates legacy scan history and aggregates findings by project", async (context) => {
+  if (!isFindingsStorageAvailable()) {
+    context.skip("node:sqlite is not available in this runtime");
+    return;
+  }
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "vibeguard-findings-projects-"));
+  const dbPath = path.join(tempDir, "findings.db");
+  const legacy = new DatabaseSync(dbPath);
+  legacy.exec(`
+    CREATE TABLE scan_run (
+      scan_id TEXT PRIMARY KEY,
+      started_at INTEGER NOT NULL,
+      completed_at INTEGER NOT NULL,
+      cwd TEXT NOT NULL,
+      target_paths TEXT NOT NULL,
+      file_count INTEGER NOT NULL,
+      finding_count INTEGER NOT NULL,
+      active_count INTEGER NOT NULL,
+      dismissed_count INTEGER NOT NULL
+    );
+  `);
+  legacy.close();
+
+  const store = new SqliteFindingStore(dbPath);
+  store.recordScanRun({
+    scanId: "alpha",
+    startedAt: 1,
+    completedAt: 2,
+    project: "acme/payments-api",
+    cwd: tempDir,
+    targetPaths: ["payments.ts"],
+    fileCount: 1,
+    findings: [finding({ id: "payments" })]
+  });
+  store.recordScanRun({
+    scanId: "beta",
+    startedAt: 3,
+    completedAt: 4,
+    project: "acme/web-app",
+    cwd: tempDir,
+    targetPaths: ["web.ts"],
+    fileCount: 1,
+    findings: [finding({ id: "web", severity: "medium" })]
+  });
+  store.recordScanRun({
+    scanId: "gamma",
+    startedAt: 5,
+    completedAt: 6,
+    project: "acme/payments-api",
+    cwd: tempDir,
+    targetPaths: ["payments.ts"],
+    fileCount: 1,
+    findings: [finding({ id: "payments" }), finding({ id: "payments-new" })]
+  });
+
+  const all = store.summary({ topLimit: 10 });
+  const payments = store.summary({ project: "acme/payments-api" });
+  assert.deepEqual(
+    all.projectCounts.map((project) => [project.key, project.scanCount, project.activeCount, project.highRiskCount]),
+    [
+      ["acme/payments-api", 2, 3, 3],
+      ["acme/web-app", 1, 1, 0]
+    ]
+  );
+  assert.equal(payments.project, "acme/payments-api");
+  assert.equal(payments.scanCount, 2);
+  assert.equal(payments.findingCount, 3);
+  assert.deepEqual(payments.latestScanDelta, {
+    previousScanId: "alpha",
+    currentScanId: "gamma",
+    currentCompletedAt: 6,
+    introducedCount: 1,
+    resolvedCount: 0,
+    persistentCount: 1
+  });
+  assert.equal(store.stats("acme/web-app").scanCount, 1);
+  assert.equal(store.listFindings({ project: "acme/payments-api" })[0]?.project, "acme/payments-api");
+  assert.equal(store.listScanRuns(10, "acme/web-app")[0]?.project, "acme/web-app");
+  store.close();
+});
+
+function finding(overrides: Partial<Finding> = {}): Finding {
+  return {
+    id: "finding",
+    type: "sql_injection",
+    severity: "high",
+    message: "SQL query uses template interpolation.",
+    file: "app.ts",
+    line: 1,
+    column: 1,
+    endLine: 1,
+    endColumn: 20,
+    evidence: "SELECT ${id}",
+    suggestion: "Use parameterized queries.",
+    detection_layer: "L2",
+    detection_rule: "sast_sql_template_interpolation",
+    timestamp: 1,
+    dismissed: false,
+    ...overrides
+  };
+}

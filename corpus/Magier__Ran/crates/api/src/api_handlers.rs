@@ -1,0 +1,1267 @@
+use std::collections::HashMap;
+
+use axum::extract::{Path, Query, State};
+use chrono::{DateTime, Utc};
+
+use campaign::ttp_applicability::{eligible_auth_identities, resolve_target_context};
+
+use crate::operations::{applicable_ttps, ApplicableTtpsError};
+use crate::sse::events_handler;
+use crate::state_conversions::{campaign_to_campaign_state, campaign_to_graph};
+use crate::{ApiError, ApiService, CampaignState, ErrorResponse, GetArmoryParams, Graph, UiConfig};
+use campaign::action_resolution::{
+    resolve_action, resolve_action_with_context, summarize, ActionResolution,
+    ActionResolutionInput, ArmoryAction,
+};
+
+#[cfg(debug_assertions)]
+use axum::{
+    body::to_bytes,
+    http::{header::HOST, HeaderMap},
+};
+
+#[cfg(debug_assertions)]
+use axum::{body::Body, response::IntoResponse};
+
+#[cfg(debug_assertions)]
+use reqwest::Client;
+
+#[cfg(not(debug_assertions))]
+use axum::{
+    http::{header, StatusCode, Uri},
+    response::{IntoResponse, Response},
+};
+
+#[cfg(not(debug_assertions))]
+use rust_embed::RustEmbed;
+
+// ---------------------------------------------------------------------------
+// OpenAPI spec + Swagger UI (no State needed - purely static content)
+// ---------------------------------------------------------------------------
+
+const OPENAPI_SPEC: &str = include_str!("../../../api/openapi.yaml");
+
+const SWAGGER_UI_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Ran API Documentation</title>
+  <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css" />
+  <style>
+    html { box-sizing: border-box; overflow: -moz-scrollbars-vertical; overflow-y: scroll; }
+    *, *:before, *:after { box-sizing: inherit; }
+    body { margin: 0; padding: 0; }
+  </style>
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-standalone-preset.js"></script>
+  <script>
+    window.onload = function() {
+      window.ui = SwaggerUIBundle({
+        url: "/api/openapi.yaml",
+        dom_id: '#swagger-ui',
+        deepLinking: true,
+        presets: [
+          SwaggerUIBundle.presets.apis,
+          SwaggerUIStandalonePreset
+        ],
+        plugins: [
+          SwaggerUIBundle.plugins.DownloadUrl
+        ],
+        layout: "StandaloneLayout"
+      });
+    };
+  </script>
+</body>
+</html>"#;
+
+pub(crate) async fn openapi_spec_handler() -> impl axum::response::IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/yaml")],
+        OPENAPI_SPEC,
+    )
+}
+
+pub(crate) async fn swagger_ui_handler() -> impl axum::response::IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        SWAGGER_UI_HTML,
+    )
+}
+
+// --- Request / response types -----------------------------------------------
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct GetApplicableTtpsParams {
+    #[serde(rename = "targetId")]
+    pub(crate) target_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct GetEligibleAuthIdentitiesParams {
+    #[serde(rename = "actionId")]
+    pub(crate) action_id: String,
+    #[serde(rename = "targetId")]
+    pub(crate) target_id: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct GetActionResolutionParams {
+    #[serde(rename = "targetId")]
+    pub(crate) target_id: String,
+    #[serde(rename = "execSystemId")]
+    pub(crate) exec_system_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub(crate) struct ResolveActionPayload {
+    #[serde(rename = "targetId")]
+    pub(crate) target_id: String,
+    #[serde(default)]
+    pub(crate) args: HashMap<String, String>,
+    #[serde(rename = "authIdentityId")]
+    pub(crate) auth_identity_id: Option<String>,
+    #[serde(rename = "procedureId")]
+    pub(crate) procedure_id: Option<String>,
+    #[serde(rename = "execSystemId")]
+    pub(crate) exec_system_id: Option<String>,
+}
+
+impl ResolveActionPayload {
+    fn into_input(self) -> ActionResolutionInput {
+        ActionResolutionInput {
+            args: self.args,
+            auth_identity_id: self.auth_identity_id,
+            procedure_id: self.procedure_id,
+            exec_system_id: self.exec_system_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct GetRecommendationsParams {
+    /// Optional: restrict recommendations to a single target entity.
+    #[serde(rename = "targetId")]
+    pub(crate) target_id: Option<String>,
+    /// Optional: cap the number of ranked candidates returned.
+    pub(crate) limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct ExecuteActionCmdPayload {
+    #[serde(rename = "actionId")]
+    pub(crate) action_id: String,
+    #[serde(rename = "execSystemId")]
+    pub(crate) exec_system_id: Option<String>,
+    #[serde(rename = "authIdentityId")]
+    pub(crate) auth_identity_id: Option<String>,
+    #[serde(rename = "targetId")]
+    pub(crate) target_id: String,
+    #[serde(rename = "procedureId")]
+    pub(crate) procedure_id: Option<String>,
+    pub(crate) args: Option<HashMap<String, String>>,
+    #[serde(rename = "executionTimeoutSeconds")]
+    pub(crate) execution_timeout_seconds: Option<u64>,
+    /// Optional free-text rationale for this step, recorded on the resulting
+    /// execution record. Strongly encouraged when driving the campaign
+    /// programmatically so the timeline explains itself.
+    pub(crate) reasoning: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ExecuteActionAck {
+    id: String,
+    success: bool,
+    queued: bool,
+    status: &'static str,
+    #[serde(rename = "cmdId")]
+    cmd_id: String,
+}
+
+// --- Handlers ----------------------------------------------------------------
+
+pub(crate) async fn events_sse_handler<S: ApiService>(
+    State(service): State<S>,
+) -> impl axum::response::IntoResponse {
+    let armory = service
+        .get_armory(GetArmoryParams {
+            tactic: None,
+            target_id: None,
+        })
+        .await
+        .unwrap_or_default();
+    events_handler(armory).await
+}
+
+pub(crate) async fn graph_handler<S: ApiService>(
+    State(service): State<S>,
+) -> Result<axum::Json<Graph>, ApiError> {
+    let campaign = service.get_campaign().await?;
+    let graph = campaign_to_graph(&campaign, &service.kubetier_catalog());
+    Ok(axum::Json(graph))
+}
+
+/// Return the small, safe subset of startup configuration needed to render the
+/// graph. Do not expose the full ran.yaml because it can contain local paths
+/// and scenario credential metadata.
+pub(crate) async fn ui_config_handler<S: ApiService>(
+    State(service): State<S>,
+) -> axum::Json<UiConfig> {
+    axum::Json(service.ui_config())
+}
+
+pub(crate) async fn armory_handler<S: ApiService>(
+    State(service): State<S>,
+    Query(params): Query<GetArmoryParams>,
+) -> Result<axum::Json<Vec<ArmoryAction>>, ApiError> {
+    let target_id = params
+        .target_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|target_id| !target_id.is_empty())
+        .map(str::to_string);
+    let ttps = service
+        .get_armory(GetArmoryParams {
+            tactic: params.tactic,
+            target_id: None,
+        })
+        .await?;
+    let Some(target_id) = target_id else {
+        return Ok(axum::Json(
+            ttps.into_iter().map(ArmoryAction::static_action).collect(),
+        ));
+    };
+    let campaign = service.get_campaign().await?;
+    if resolve_target_context(&campaign, &target_id).is_none() {
+        return Err(ApiError::not_found(format!(
+            "failed to get target entity: {target_id}"
+        )));
+    }
+    let planning = campaign::ExecutionPlanningContext::new(&campaign);
+    Ok(axum::Json(
+        ttps.into_iter()
+            .map(|ttp| {
+                let action_state = resolve_action_with_context(
+                    &ttp,
+                    &campaign,
+                    &target_id,
+                    &ActionResolutionInput::default(),
+                    &planning,
+                )
+                .map(|resolution| summarize(&resolution));
+                ArmoryAction { ttp, action_state }
+            })
+            .collect(),
+    ))
+}
+
+pub(crate) async fn armory_vocabulary_handler(
+) -> Result<axum::Json<armory::ArmoryVocabulary>, ApiError> {
+    armory::bundled_vocabulary()
+        .map(axum::Json)
+        .map_err(|error| ApiError::internal(error.to_string()))
+}
+
+pub(crate) async fn action_resolution_handler<S: ApiService>(
+    State(service): State<S>,
+    Path(action_id): Path<String>,
+    Query(params): Query<GetActionResolutionParams>,
+) -> Result<axum::Json<ActionResolution>, ApiError> {
+    let ttp = service
+        .get_armory(GetArmoryParams {
+            tactic: None,
+            target_id: None,
+        })
+        .await?
+        .into_iter()
+        .find(|ttp| ttp.id == action_id)
+        .ok_or_else(|| ApiError::not_found(format!("unknown action '{action_id}'")))?;
+    let campaign = service.get_campaign().await?;
+    let resolution = resolve_action(
+        &ttp,
+        &campaign,
+        &params.target_id,
+        &ActionResolutionInput {
+            exec_system_id: params.exec_system_id,
+            ..ActionResolutionInput::default()
+        },
+    )
+    .ok_or_else(|| {
+        ApiError::not_found(format!("failed to get target entity: {}", params.target_id))
+    })?;
+    Ok(axum::Json(resolution))
+}
+
+pub(crate) async fn resolve_action_handler<S: ApiService>(
+    State(service): State<S>,
+    Path(action_id): Path<String>,
+    axum::Json(payload): axum::Json<ResolveActionPayload>,
+) -> Result<axum::Json<ActionResolution>, ApiError> {
+    let ttp = service
+        .get_armory(GetArmoryParams {
+            tactic: None,
+            target_id: None,
+        })
+        .await?
+        .into_iter()
+        .find(|ttp| ttp.id == action_id)
+        .ok_or_else(|| ApiError::not_found(format!("unknown action '{action_id}'")))?;
+    let campaign = service.get_campaign().await?;
+    let target_id = payload.target_id.clone();
+    let input = payload.into_input();
+    let resolution = resolve_action(&ttp, &campaign, &target_id, &input)
+        .ok_or_else(|| ApiError::not_found(format!("failed to get target entity: {target_id}")))?;
+    Ok(axum::Json(resolution))
+}
+
+pub(crate) async fn applicable_ttps_handler<S: ApiService>(
+    State(service): State<S>,
+    Query(params): Query<GetApplicableTtpsParams>,
+) -> Result<axum::Json<Vec<armory::Ttp>>, ApiError> {
+    let ttps = applicable_ttps(&service, params.target_id.as_deref())
+        .await
+        .map_err(|error| match error {
+            ApplicableTtpsError::Api(error) => error,
+            ApplicableTtpsError::UnknownTarget(target_id) => {
+                ApiError::not_found(format!("failed to get target entity: {target_id}"))
+            }
+        })?;
+    Ok(axum::Json(ttps))
+}
+
+pub(crate) async fn eligible_auth_identities_handler<S: ApiService>(
+    State(service): State<S>,
+    Query(params): Query<GetEligibleAuthIdentitiesParams>,
+) -> Result<axum::Json<Vec<campaign::AuthIdentitySummary>>, ApiError> {
+    let ttp = service
+        .get_armory(GetArmoryParams {
+            tactic: None,
+            target_id: None,
+        })
+        .await?
+        .into_iter()
+        .find(|ttp| ttp.id == params.action_id)
+        .ok_or_else(|| ApiError::not_found(format!("unknown action '{}'", params.action_id)))?;
+    let campaign = service.get_campaign().await?;
+    if !campaign
+        .get_entities()
+        .iter()
+        .any(|entity| entity.entity_id().0 == params.target_id)
+    {
+        return Err(ApiError::not_found(format!(
+            "unknown target '{}'",
+            params.target_id
+        )));
+    }
+    Ok(axum::Json(eligible_auth_identities(
+        &ttp,
+        &campaign,
+        &params.target_id,
+    )))
+}
+
+/// Rank applicable `(TTP × target)` actions by utility for the current campaign
+/// state, using the default scoring profile. Advisory: the caller chooses what
+/// (if anything) to execute. Each candidate carries a per-consideration
+/// breakdown for explainability.
+pub(crate) async fn recommendations_handler<S: ApiService>(
+    State(service): State<S>,
+    Query(params): Query<GetRecommendationsParams>,
+) -> Result<axum::Json<Vec<utility_ai::ScoredCandidate>>, ApiError> {
+    if !service.scoring_enabled() {
+        return Err(ApiError {
+            status: axum::http::StatusCode::NOT_FOUND,
+            body: ErrorResponse {
+                error: "utility AI is disabled (set scoring.enabled: true in ran.yaml)".to_string(),
+                details: None,
+                id: None,
+                cmd_id: None,
+            },
+        });
+    }
+    let all_ttps = service
+        .get_armory(GetArmoryParams {
+            tactic: None,
+            target_id: None,
+        })
+        .await?;
+    let campaign = service.get_campaign().await?;
+
+    let scorer = utility_ai::Scorer::with_defaults(service.scoring_profile());
+    let mut ranked = scorer.rank(&campaign, &all_ttps);
+
+    if let Some(target_id) = params
+        .target_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        ranked.retain(|c| c.target_id == target_id);
+    }
+
+    if let Some(limit) = params.limit {
+        ranked.truncate(limit);
+    }
+
+    Ok(axum::Json(ranked))
+}
+
+// ---------------------------------------------------------------------------
+// Scoring profile (response-curve / weight tuning)
+// ---------------------------------------------------------------------------
+
+/// One consideration's tunable config, tagged with its name.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct NamedConsideration {
+    pub name: String,
+    pub weight: f32,
+    pub curve: utility_ai::ResponseCurve,
+    pub enabled: bool,
+    pub veto: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ScoringProfileResponse {
+    pub enabled: bool,
+    pub combination: utility_ai::CombinationMode,
+    #[serde(rename = "tuningEnabled")]
+    pub tuning_enabled: bool,
+    pub considerations: Vec<NamedConsideration>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct ScoringProfileUpdate {
+    pub combination: utility_ai::CombinationMode,
+    pub considerations: Vec<NamedConsideration>,
+}
+
+fn profile_to_response(
+    profile: &utility_ai::Profile,
+    enabled: bool,
+    tuning_enabled: bool,
+) -> ScoringProfileResponse {
+    let considerations = utility_ai::consideration_names()
+        .into_iter()
+        .map(|name| {
+            let cfg = profile.config(name);
+            NamedConsideration {
+                name: name.to_string(),
+                weight: cfg.weight,
+                curve: cfg.curve,
+                enabled: cfg.enabled,
+                veto: cfg.veto,
+            }
+        })
+        .collect();
+    ScoringProfileResponse {
+        enabled,
+        combination: profile.combination,
+        tuning_enabled,
+        considerations,
+    }
+}
+
+/// Return the live scoring profile: combination mode, the tuning feature flag,
+/// and every registered consideration's current weight/curve/enabled/veto.
+pub(crate) async fn get_scoring_profile_handler<S: ApiService>(
+    State(service): State<S>,
+) -> Result<axum::Json<ScoringProfileResponse>, ApiError> {
+    let profile = service.scoring_profile();
+    Ok(axum::Json(profile_to_response(
+        &profile,
+        service.scoring_enabled(),
+        service.scoring_tuning_enabled(),
+    )))
+}
+
+/// Replace the live scoring profile. Gated on the tuning feature flag. Returns
+/// the resulting profile so the client can confirm what was applied.
+pub(crate) async fn update_scoring_profile_handler<S: ApiService>(
+    State(service): State<S>,
+    axum::Json(update): axum::Json<ScoringProfileUpdate>,
+) -> Result<axum::Json<ScoringProfileResponse>, ApiError> {
+    require_tuning(&service)?;
+
+    let considerations = update
+        .considerations
+        .into_iter()
+        .map(|c| {
+            (
+                c.name,
+                utility_ai::ConsiderationConfig {
+                    weight: c.weight,
+                    curve: c.curve,
+                    enabled: c.enabled,
+                    veto: c.veto,
+                },
+            )
+        })
+        .collect();
+
+    let profile = utility_ai::Profile {
+        name: "tuned".to_string(),
+        combination: update.combination,
+        considerations,
+    };
+    service.set_scoring_profile(profile.clone());
+
+    Ok(axum::Json(profile_to_response(&profile, true, true)))
+}
+
+fn require_tuning<S: ApiService>(service: &S) -> Result<(), ApiError> {
+    if service.scoring_tuning_enabled() {
+        Ok(())
+    } else {
+        Err(ApiError {
+            status: axum::http::StatusCode::FORBIDDEN,
+            body: ErrorResponse {
+                error: "scoring tuning is disabled (set scoring.tuning_ui: true in ran.yaml)"
+                    .to_string(),
+                details: None,
+                id: None,
+                cmd_id: None,
+            },
+        })
+    }
+}
+
+/// Persist the live scoring profile to its sidecar file so it survives restarts.
+pub(crate) async fn save_scoring_profile_handler<S: ApiService>(
+    State(service): State<S>,
+) -> Result<axum::Json<ScoringProfileResponse>, ApiError> {
+    require_tuning(&service)?;
+    service.save_scoring_profile().map_err(ApiError::internal)?;
+    Ok(axum::Json(profile_to_response(
+        &service.scoring_profile(),
+        true,
+        true,
+    )))
+}
+
+/// Revert the live scoring profile to the configured base and drop persisted
+/// overrides.
+pub(crate) async fn reset_scoring_profile_handler<S: ApiService>(
+    State(service): State<S>,
+) -> Result<axum::Json<ScoringProfileResponse>, ApiError> {
+    require_tuning(&service)?;
+    let profile = service.reset_scoring_profile();
+    Ok(axum::Json(profile_to_response(&profile, true, true)))
+}
+
+/// Fit-quality metrics returned alongside a calibration preview.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct CalibrationMetrics {
+    pub decisions: usize,
+    #[serde(rename = "top1Accuracy")]
+    pub top1_accuracy: f32,
+    #[serde(rename = "meanChosenProb")]
+    pub mean_chosen_prob: f32,
+    #[serde(rename = "minChosenProb")]
+    pub min_chosen_prob: f32,
+    #[serde(rename = "logLikelihood")]
+    pub log_likelihood: f32,
+    pub infeasible: usize,
+    pub converged: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct CalibrationResult {
+    pub profile: ScoringProfileResponse,
+    pub metrics: CalibrationMetrics,
+}
+
+/// Fit a scoring profile from captured operator decisions and return it as a
+/// preview (not applied) plus fit metrics. Gated on the tuning flag; 409 when no
+/// decisions have been captured.
+pub(crate) async fn calibrate_scoring_handler<S: ApiService>(
+    State(service): State<S>,
+) -> Result<axum::Json<CalibrationResult>, ApiError> {
+    require_tuning(&service)?;
+
+    let calibration = service.calibrate_scoring().ok_or_else(|| ApiError {
+        status: axum::http::StatusCode::CONFLICT,
+        body: ErrorResponse {
+            error: "no operator decisions captured yet - execute some actions first".to_string(),
+            details: None,
+            id: None,
+            cmd_id: None,
+        },
+    })?;
+
+    // Preview the fitted weights in the live combination mode, without applying.
+    let combination = service.scoring_profile().combination;
+    let profile = calibration.into_profile("calibrated", combination);
+
+    let metrics = CalibrationMetrics {
+        decisions: calibration.per_decision.len(),
+        top1_accuracy: calibration.top1_accuracy,
+        mean_chosen_prob: calibration.mean_chosen_prob,
+        min_chosen_prob: calibration.min_chosen_prob,
+        log_likelihood: calibration.log_likelihood,
+        infeasible: calibration.infeasible.len(),
+        converged: calibration.converged,
+    };
+
+    Ok(axum::Json(CalibrationResult {
+        profile: profile_to_response(&profile, true, true),
+        metrics,
+    }))
+}
+
+pub(crate) async fn execute_action_handler<S: ApiService>(
+    State(service): State<S>,
+    axum::Json(cmd): axum::Json<ExecuteActionCmdPayload>,
+) -> Result<(axum::http::StatusCode, axum::Json<ExecuteActionAck>), ApiError> {
+    let execution = service
+        .execute_action(campaign::ExecuteActionRequest {
+            action_id: cmd.action_id,
+            exec_system_id: cmd.exec_system_id,
+            auth_identity_id: cmd.auth_identity_id,
+            target_id: cmd.target_id,
+            procedure_id: cmd.procedure_id,
+            args: cmd.args.unwrap_or_default(),
+            execution_timeout_seconds: cmd.execution_timeout_seconds,
+            reasoning: cmd.reasoning,
+        })
+        .await?;
+
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        axum::Json(ExecuteActionAck {
+            id: execution.cmd_id.clone(),
+            success: true,
+            queued: true,
+            status: "queued",
+            cmd_id: execution.cmd_id,
+        }),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Execution records
+// ---------------------------------------------------------------------------
+
+/// A single execution record joined with the parse audits produced by its
+/// effects.  Returned by `GET /api/execution-records` and
+/// `GET /api/execution-records/:id`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ExecutionRecordEntry {
+    #[serde(flatten)]
+    pub record: campaign::ExecutionRecord,
+    #[serde(rename = "parseAudits")]
+    pub parse_audits: Vec<campaign::ParseAudit>,
+}
+
+pub(crate) async fn execution_records_handler<S: ApiService>(
+    State(service): State<S>,
+) -> Result<axum::Json<Vec<ExecutionRecordEntry>>, ApiError> {
+    let campaign = service.get_campaign().await?;
+    let audits = campaign.get_parse_audits();
+    let entries = campaign
+        .get_execution_records()
+        .iter()
+        .map(|record| {
+            let parse_audits = audits
+                .iter()
+                .filter(|a| a.cmd_id == record.id)
+                .cloned()
+                .collect();
+            ExecutionRecordEntry {
+                record: record.clone(),
+                parse_audits,
+            }
+        })
+        .collect();
+    Ok(axum::Json(entries))
+}
+
+pub(crate) async fn execution_record_by_id_handler<S: ApiService>(
+    State(service): State<S>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<axum::Json<ExecutionRecordEntry>, ApiError> {
+    let campaign = service.get_campaign().await?;
+    let record = campaign
+        .get_execution_records()
+        .iter()
+        .find(|r| r.id == id)
+        .cloned()
+        .ok_or_else(|| ApiError {
+            status: axum::http::StatusCode::NOT_FOUND,
+            body: ErrorResponse {
+                error: format!("execution record '{}' not found", id),
+                details: None,
+                id: None,
+                cmd_id: None,
+            },
+        })?;
+    let parse_audits = campaign
+        .get_parse_audits()
+        .iter()
+        .filter(|a| a.cmd_id == id)
+        .cloned()
+        .collect();
+    Ok(axum::Json(ExecutionRecordEntry {
+        record,
+        parse_audits,
+    }))
+}
+
+pub(crate) async fn campaign_state_handler<S: ApiService>(
+    State(service): State<S>,
+) -> Result<axum::Json<CampaignState>, ApiError> {
+    let campaign = service.get_campaign().await?;
+    let state = campaign_to_campaign_state(&campaign, &service.kubetier_catalog());
+    Ok(axum::Json(state))
+}
+
+pub(crate) async fn kubetier_handler<S: ApiService>(
+    State(service): State<S>,
+) -> axum::Json<kubetier::Catalog> {
+    axum::Json(service.kubetier_catalog())
+}
+
+pub(crate) async fn reset_campaign_handler<S: ApiService>(
+    State(service): State<S>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    service.reset_campaign().await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct GetFileContentParams {
+    pub(crate) path: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct FileContentResponse {
+    pub(crate) path: String,
+    pub(crate) content: String,
+}
+
+pub(crate) async fn file_content_handler<S: ApiService>(
+    State(service): State<S>,
+    Query(params): Query<GetFileContentParams>,
+) -> Result<axum::Json<FileContentResponse>, ApiError> {
+    let campaign = service.get_campaign().await?;
+    let content = campaign
+        .get_file_content(&params.path)
+        .ok_or_else(|| ApiError {
+            status: axum::http::StatusCode::NOT_FOUND,
+            body: ErrorResponse {
+                error: format!("file content not found for path: {}", params.path),
+                details: None,
+                id: None,
+                cmd_id: None,
+            },
+        })?
+        .to_string();
+    Ok(axum::Json(FileContentResponse {
+        path: params.path,
+        content,
+    }))
+}
+
+fn ms_to_iso8601(ms: u64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(ms as i64)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct FlowEdge {
+    pub id: String,
+    #[serde(rename = "sourceId")]
+    pub source_id: String,
+    #[serde(rename = "targetId")]
+    pub target_id: String,
+}
+
+/// One segment of a multi-hop command traversal, surfaced to the timeline UI.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct AttackStepHop {
+    #[serde(rename = "fromId")]
+    pub from_id: String,
+    #[serde(rename = "toId")]
+    pub to_id: String,
+    pub relation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub envelope: Option<String>,
+    #[serde(rename = "embeddedCommand", skip_serializing_if = "Option::is_none")]
+    pub embedded_command: Option<String>,
+    pub command: String,
+}
+
+impl From<&campaign::TraversalHop> for AttackStepHop {
+    fn from(h: &campaign::TraversalHop) -> Self {
+        Self {
+            from_id: h.from_id.clone(),
+            to_id: h.to_id.clone(),
+            relation: h.relation.clone(),
+            envelope: h.envelope.clone(),
+            embedded_command: h.embedded_command.clone(),
+            command: h.command.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct AttackStepTTP {
+    pub id: String,
+    pub name: String,
+    pub tactic: String,
+    pub techniques: Vec<String>,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct AttackStep {
+    pub id: String,
+    #[serde(rename = "targetId")]
+    pub target_id: String,
+    pub command: String,
+    /// Per-hop traversal breakdown for multi-system commands, outermost (C2) →
+    /// innermost (target). Empty for direct/single-hop commands.
+    pub traversal: Vec<AttackStepHop>,
+    /// The bare inner command as it runs on the final target, before envelopes.
+    /// Empty when there is no multi-hop traversal.
+    #[serde(rename = "innerCommand")]
+    pub inner_command: String,
+    #[serde(rename = "routeWarnings")]
+    pub route_warnings: Vec<campaign::RouteWarning>,
+    /// Free-text rationale supplied by the operator when this action was run.
+    /// Empty when none was given.
+    pub reasoning: String,
+    pub args: std::collections::HashMap<String, String>,
+    #[serde(rename = "procedureId")]
+    pub procedure_id: String,
+    #[serde(rename = "TTP")]
+    pub ttp: AttackStepTTP,
+    pub results: Vec<String>,
+    /// Explicit streams for live and completed output. `results` remains for
+    /// compatibility with existing API consumers.
+    pub stdout: String,
+    pub stderr: String,
+    #[serde(rename = "outputTruncated")]
+    pub output_truncated: bool,
+    #[serde(rename = "outputSequence")]
+    pub output_sequence: u64,
+    #[serde(rename = "stdoutBytes")]
+    pub stdout_bytes: u64,
+    #[serde(rename = "stderrBytes")]
+    pub stderr_bytes: u64,
+    pub success: bool,
+    pub status: &'static str,
+    #[serde(rename = "startedAt")]
+    pub started_at: String,
+    #[serde(rename = "completedAt")]
+    pub completed_at: String,
+    #[serde(rename = "executedOn")]
+    pub executed_on: String,
+}
+
+impl From<&campaign::ExecutionRecord> for AttackStep {
+    fn from(r: &campaign::ExecutionRecord) -> Self {
+        Self {
+            id: r.id.clone(),
+            target_id: r.target_id.clone(),
+            command: r.command.clone(),
+            // Traversal is joined separately from the campaign side map by id.
+            traversal: Vec::new(),
+            inner_command: String::new(),
+            route_warnings: Vec::new(),
+            reasoning: r.reasoning.clone(),
+            args: r.args.clone(),
+            procedure_id: r.procedure_id.clone(),
+            ttp: AttackStepTTP {
+                id: r.ttp_id.clone(),
+                name: r.ttp_name.clone(),
+                tactic: r.tactic.clone(),
+                techniques: Vec::new(),
+                description: String::new(),
+            },
+            results: {
+                let mut results: Vec<String> = r
+                    .results
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .cloned()
+                    .collect();
+                if results.is_empty() && !r.fail_reason.is_empty() {
+                    results.push(r.fail_reason.clone());
+                }
+                results
+            },
+            stdout: r.results.first().cloned().unwrap_or_default(),
+            stderr: r.results.get(1).cloned().unwrap_or_default(),
+            output_truncated: false,
+            output_sequence: 0,
+            stdout_bytes: r.results.first().map_or(0, |value| value.len() as u64),
+            stderr_bytes: r.results.get(1).map_or(0, |value| value.len() as u64),
+            success: r.success,
+            status: if !r.success {
+                "Failed"
+            } else if r.partial {
+                "Partial"
+            } else {
+                "Success"
+            },
+            started_at: ms_to_iso8601(r.started_at_ms),
+            completed_at: ms_to_iso8601(r.completed_at_ms),
+            executed_on: r.exec_system_id.clone(),
+        }
+    }
+}
+
+impl From<&campaign::ExecTtp> for AttackStep {
+    fn from(exec: &campaign::ExecTtp) -> Self {
+        Self {
+            id: exec.id.clone(),
+            target_id: exec.target_id.clone(),
+            command: exec.procedure.command.clone(),
+            // Traversal is joined separately from the campaign side map by id.
+            traversal: Vec::new(),
+            inner_command: String::new(),
+            route_warnings: Vec::new(),
+            reasoning: exec.reasoning.clone(),
+            args: exec.args.clone(),
+            procedure_id: exec.procedure.id.clone(),
+            ttp: AttackStepTTP {
+                id: exec.ttp.id.clone(),
+                name: exec.ttp.name.clone(),
+                tactic: exec.ttp.tactic.clone(),
+                techniques: Vec::new(),
+                description: String::new(),
+            },
+            results: Vec::new(),
+            stdout: String::new(),
+            stderr: String::new(),
+            output_truncated: false,
+            output_sequence: 0,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            success: false,
+            status: "Ongoing",
+            started_at: ms_to_iso8601(exec.started_at_ms),
+            completed_at: String::new(),
+            executed_on: exec.exec_entity().to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct AttackFlow {
+    pub steps: Vec<AttackStep>,
+    pub edges: Vec<FlowEdge>,
+}
+
+#[cfg(test)]
+mod flow_contract_tests {
+    use super::*;
+
+    #[test]
+    fn execute_action_ack_exposes_record_id_and_queue_status() {
+        let value = serde_json::to_value(ExecuteActionAck {
+            id: "cmd-123".to_string(),
+            success: true,
+            queued: true,
+            status: "queued",
+            cmd_id: "cmd-123".to_string(),
+        })
+        .expect("execute action acknowledgement should serialize");
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "id": "cmd-123",
+                "cmdId": "cmd-123",
+                "status": "queued",
+                "success": true,
+                "queued": true,
+            })
+        );
+    }
+
+    #[test]
+    fn execution_error_can_expose_the_record_id() {
+        let value = serde_json::to_value(ErrorResponse {
+            error: "no route to target".to_string(),
+            details: None,
+            id: Some("cmd-456".to_string()),
+            cmd_id: Some("cmd-456".to_string()),
+        })
+        .expect("execution error should serialize");
+
+        assert_eq!(value["id"], "cmd-456");
+        assert_eq!(value["cmdId"], "cmd-456");
+        assert!(value.get("details").is_none());
+    }
+
+    #[test]
+    fn campaign_flow_serializes_the_documented_ran_json_shape() {
+        let flow = AttackFlow {
+            steps: vec![AttackStep {
+                id: "cmd-1".to_string(),
+                target_id: "ns/default/pod/demo".to_string(),
+                command: "id".to_string(),
+                traversal: Vec::new(),
+                inner_command: String::new(),
+                route_warnings: Vec::new(),
+                reasoning: "Confirm the action can identify the current user".to_string(),
+                args: HashMap::new(),
+                procedure_id: "shell".to_string(),
+                ttp: AttackStepTTP {
+                    id: "whoami".to_string(),
+                    name: "Who am I".to_string(),
+                    tactic: "Discovery".to_string(),
+                    techniques: vec!["T1033".to_string()],
+                    description: "Identify the current user".to_string(),
+                },
+                results: vec!["uid=1000".to_string()],
+                stdout: "uid=1000".to_string(),
+                stderr: String::new(),
+                output_truncated: false,
+                output_sequence: 0,
+                stdout_bytes: 8,
+                stderr_bytes: 0,
+                success: true,
+                status: "Success",
+                started_at: "2026-08-15T09:10:11Z".to_string(),
+                completed_at: "2026-08-15T09:10:12Z".to_string(),
+                executed_on: "c2/Ran".to_string(),
+            }],
+            edges: vec![FlowEdge {
+                id: "cmd-0->cmd-1".to_string(),
+                source_id: "cmd-0".to_string(),
+                target_id: "cmd-1".to_string(),
+            }],
+        };
+
+        let value = serde_json::to_value(flow).expect("campaign flow should serialize");
+        assert_eq!(value["steps"][0]["TTP"]["id"], "whoami");
+        assert_eq!(
+            value["steps"][0]["reasoning"],
+            "Confirm the action can identify the current user"
+        );
+        assert_eq!(value["steps"][0]["routeWarnings"], serde_json::json!([]));
+        assert!(value["steps"][0].get("routeReason").is_none());
+        assert_eq!(value["edges"][0]["sourceId"], "cmd-0");
+        assert!(value.get("rootNodeId").is_none());
+        assert!(value["steps"][0].get("observables").is_none());
+        assert!(value["steps"][0].get("defense").is_none());
+    }
+}
+
+pub(crate) async fn flow_handler<S: ApiService>(
+    State(service): State<S>,
+) -> Result<axum::Json<AttackFlow>, ApiError> {
+    let campaign = service.get_campaign().await?;
+    let records = campaign.get_execution_records();
+    let open = campaign.get_open_steps();
+
+    let mut steps: Vec<AttackStep> = records.iter().map(AttackStep::from).collect();
+    steps.extend(open.iter().map(AttackStep::from));
+
+    // Join the multi-hop traversal breakdown (campaign side map, keyed by
+    // command id) onto each step - kept off the execution record itself.
+    for step in &mut steps {
+        if step.status == "Ongoing" {
+            if let Some(output) = campaign.get_in_flight_output(&step.id) {
+                step.stdout.clone_from(&output.stdout);
+                step.stderr.clone_from(&output.stderr);
+                step.output_truncated = output.stdout_truncated || output.stderr_truncated;
+                step.output_sequence = output.last_sequence;
+                step.stdout_bytes = output.stdout_bytes;
+                step.stderr_bytes = output.stderr_bytes;
+                step.results = if output.stderr.is_empty() {
+                    vec![output.stdout.clone()]
+                } else {
+                    vec![output.stdout.clone(), output.stderr.clone()]
+                };
+            }
+        }
+        if let Some(ct) = campaign.command_traversal(&step.id) {
+            step.traversal = ct.hops.iter().map(AttackStepHop::from).collect();
+            step.inner_command = ct.inner_command.clone();
+            step.route_warnings.clone_from(&ct.warnings);
+        }
+    }
+
+    let mut edges = Vec::new();
+    let mut last_success_id: Option<String> = None;
+
+    for step in &steps {
+        if let Some(ref src) = last_success_id {
+            edges.push(FlowEdge {
+                id: format!("{}->{}", src, step.id),
+                source_id: src.clone(),
+                target_id: step.id.clone(),
+            });
+        }
+
+        if matches!(step.status, "Success" | "Partial") {
+            last_success_id = Some(step.id.clone());
+        }
+    }
+
+    Ok(axum::Json(AttackFlow { steps, edges }))
+}
+
+// ---------------------------------------------------------------------------
+// Plan handlers
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn execute_plan_handler<S: ApiService>(
+    State(service): State<S>,
+    body: String,
+) -> Result<axum::Json<serde_json::Value>, ApiError> {
+    let plan_id = service.execute_plan(body).await?;
+    Ok(axum::Json(serde_json::json!({ "plan_id": plan_id })))
+}
+
+pub(crate) async fn plan_status_handler<S: ApiService>(
+    State(service): State<S>,
+    axum::extract::Path(plan_id): axum::extract::Path<String>,
+) -> Result<axum::Json<serde_json::Value>, ApiError> {
+    let status = service.get_plan_status(&plan_id).await?;
+    Ok(axum::Json(status))
+}
+
+pub(crate) async fn export_plan_handler<S: ApiService>(
+    State(service): State<S>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<([(axum::http::HeaderName, &'static str); 1], String), ApiError> {
+    let include_failed = params
+        .get("include_failed")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    let name = params.get("name").cloned();
+    let description = params.get("description").cloned();
+    let yaml = service
+        .export_plan(include_failed, name, description)
+        .await?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/yaml")],
+        yaml,
+    ))
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct LoadPlanRequest {
+    filename: String,
+}
+
+pub(crate) async fn list_plans_handler<S: ApiService>(
+    State(service): State<S>,
+) -> Result<axum::Json<Vec<serde_json::Value>>, ApiError> {
+    let plans = service.list_plans().await?;
+    Ok(axum::Json(plans))
+}
+
+pub(crate) async fn load_plan_handler<S: ApiService>(
+    State(service): State<S>,
+    axum::Json(body): axum::Json<LoadPlanRequest>,
+) -> Result<axum::Json<serde_json::Value>, ApiError> {
+    let plan_id = service.load_plan(body.filename).await?;
+    Ok(axum::Json(serde_json::json!({ "plan_id": plan_id })))
+}
+
+// --- Frontend handler -------------------------------------------------------
+
+#[cfg(not(debug_assertions))]
+#[derive(RustEmbed)]
+#[folder = "../../frontend/build"]
+struct StaticAssets;
+
+#[cfg(debug_assertions)]
+pub async fn frontend_handler(req: axum::extract::Request) -> impl axum::response::IntoResponse {
+    let vite_origin =
+        std::env::var("RAN_VITE_ORIGIN").unwrap_or_else(|_| "http://localhost:5173".to_string());
+    let vite_origin = vite_origin.trim_end_matches('/');
+    let client = Client::new();
+
+    let (parts, body) = req.into_parts();
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    let url = format!("{vite_origin}{path_and_query}");
+
+    let mut headers = HeaderMap::new();
+    for (name, value) in parts.headers.iter() {
+        if name == HOST {
+            continue;
+        }
+        headers.append(name.clone(), value.clone());
+    }
+
+    let request_body = match to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                "failed to read request body for Vite proxy",
+            )
+                .into_response();
+        }
+    };
+
+    let upstream = client
+        .request(parts.method, &url)
+        .headers(headers)
+        .body(request_body)
+        .send()
+        .await;
+
+    match upstream {
+        Ok(resp) => {
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let body = resp.bytes().await.unwrap_or_default();
+
+            let mut response = axum::response::Response::new(Body::from(body));
+            *response.status_mut() = status;
+            *response.headers_mut() = headers;
+            response
+        }
+        Err(_) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            "Vite dev server not running; start it with `pnpm dev` in frontend/",
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(not(debug_assertions))]
+pub async fn frontend_handler(uri: Uri) -> impl axum::response::IntoResponse {
+    let path = uri.path().trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+
+    match StaticAssets::get(path) {
+        Some(content) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            (
+                [(header::CONTENT_TYPE, mime.as_ref())],
+                content.data.into_owned(),
+            )
+                .into_response()
+        }
+        None => {
+            if let Some(index) = StaticAssets::get("index.html") {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    index.data.into_owned(),
+                )
+                    .into_response()
+            } else {
+                Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(axum::body::Body::from("frontend build assets not found"))
+                    .unwrap_or_else(|_| StatusCode::NOT_FOUND.into_response())
+            }
+        }
+    }
+}

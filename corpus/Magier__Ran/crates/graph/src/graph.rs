@@ -1,0 +1,1194 @@
+//! [`KnowledgeGraph`] - directed multigraph of [`EntityId`] nodes.
+
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
+
+use petgraph::algo::astar;
+use petgraph::stable_graph::{EdgeIndex, NodeIndex, StableGraph};
+use petgraph::visit::{EdgeFiltered, EdgeRef};
+use petgraph::Direction;
+use ran_domain::{EntityId, RelationSummary};
+
+use crate::edge::EdgeData;
+
+fn ordered_float_cost(cost: f32) -> u32 {
+    // Search admits only nonnegative finite costs, whose bit order is numeric.
+    cost.to_bits()
+}
+
+/// Exact transport selected by search. Generation prevents a deleted edge's
+/// recycled graph index from silently becoming a different channel.
+#[derive(Clone, PartialEq)]
+pub struct SelectedExecEdge {
+    pub source: EntityId,
+    pub target: EntityId,
+    pub data: EdgeData,
+    index: EdgeIndex,
+    generation: u64,
+}
+
+impl std::fmt::Debug for SelectedExecEdge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SelectedExecEdge")
+            .field("source", &self.source)
+            .field("target", &self.target)
+            .field("relation", &self.data.relation_name)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecPath {
+    pub cost: f32,
+    pub nodes: Vec<EntityId>,
+    pub edges: Vec<SelectedExecEdge>,
+}
+
+#[derive(PartialEq)]
+struct ExecSearchEntry {
+    cost: f32,
+    id: String,
+    node: NodeIndex,
+}
+
+impl Eq for ExecSearchEntry {}
+
+impl Ord for ExecSearchEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .cost
+            .total_cmp(&self.cost)
+            .then_with(|| other.id.cmp(&self.id))
+    }
+}
+
+impl PartialOrd for ExecSearchEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Directed multigraph of [`EntityId`] nodes and [`EdgeData`] edges.
+///
+/// Nodes carry only entity identity; entity *data* lives in the campaign's
+/// typed maps.  The graph owns topology and edge metadata only.
+///
+/// ## Invariants enforced on insert
+///
+/// - **NoSelfEdge** - source and target must differ (hard reject).
+/// - **PodSingleNode** - a pod may carry at most one `runs-on` edge; an
+///   incoming one replaces the old one (K8s rescheduling is valid).
+/// - **SingleContainer** - an entity may have at most one incoming `contains`
+///   edge; a more specific parent replaces its previous parent.
+/// - **SingleSession** - at most one `c2.session` edge per `src → tgt` pair; a
+///   reconnected session replaces the previous (possibly broken) one.
+#[derive(Debug, Clone)]
+pub struct KnowledgeGraph {
+    pub(crate) graph: StableGraph<EntityId, EdgeData>,
+    /// `O(1)` lookup from entity id to its node index.
+    pub(crate) index: HashMap<EntityId, NodeIndex>,
+    edge_generations: HashMap<EdgeIndex, u64>,
+    next_edge_generation: u64,
+}
+
+impl Default for KnowledgeGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KnowledgeGraph {
+    pub fn new() -> Self {
+        Self {
+            graph: StableGraph::new(),
+            index: HashMap::new(),
+            edge_generations: HashMap::new(),
+            next_edge_generation: 0,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Node management
+    // -----------------------------------------------------------------------
+
+    /// Ensure a node for `id` exists. Returns the `NodeIndex` (new or existing).
+    pub fn ensure_node(&mut self, id: EntityId) -> NodeIndex {
+        if let Some(&idx) = self.index.get(&id) {
+            return idx;
+        }
+        let idx = self.graph.add_node(id.clone());
+        self.index.insert(id, idx);
+        idx
+    }
+
+    /// Remove an entity and all edges connected to it.
+    pub fn remove_entity(&mut self, id: &EntityId) {
+        if let Some(idx) = self.index.remove(id) {
+            self.graph.remove_node(idx);
+        }
+    }
+
+    /// Merge `discard` into `keep`: retarget every edge that touched `discard`
+    /// so it now touches `keep` instead.  Duplicate edges (same relation name)
+    /// are dropped.  Entity *data* merging is the caller's responsibility.
+    pub fn merge_entities(&mut self, keep: &EntityId, discard: &EntityId) {
+        let (Some(&keep_idx), Some(&discard_idx)) = (self.index.get(keep), self.index.get(discard))
+        else {
+            return;
+        };
+        if keep_idx == discard_idx {
+            return;
+        }
+
+        // Snapshot edges before mutation - can't borrow mutably and immutably
+        // at the same time.
+        let outgoing: Vec<(NodeIndex, EdgeData)> = self
+            .graph
+            .edges_directed(discard_idx, Direction::Outgoing)
+            .map(|e| (e.target(), e.weight().clone()))
+            .collect();
+
+        let incoming: Vec<(NodeIndex, EdgeData)> = self
+            .graph
+            .edges_directed(discard_idx, Direction::Incoming)
+            .map(|e| (e.source(), e.weight().clone()))
+            .collect();
+
+        // Remove the discard node (also removes all its edges).
+        self.graph.remove_node(discard_idx);
+        self.index.remove(discard);
+
+        // Re-insert edges, replacing discard with keep.
+        for (tgt, data) in outgoing {
+            // tgt == discard_idx was a self-edge on discard; skip.
+            // After removal the index is gone, so we can only check by value -
+            // use the fact that the node was just removed (its weight is gone).
+            if self.graph.node_weight(tgt).is_none() {
+                continue;
+            }
+            if !self.has_edge_between(keep_idx, tgt, &data.relation_name) {
+                self.add_edge(keep_idx, tgt, data);
+            }
+        }
+
+        for (src, data) in incoming {
+            if self.graph.node_weight(src).is_none() {
+                continue;
+            }
+            if !self.has_edge_between(src, keep_idx, &data.relation_name) {
+                self.add_edge(src, keep_idx, data);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Edge management
+    // -----------------------------------------------------------------------
+
+    /// Insert a directed edge `src → tgt`.  Creates missing nodes as a side-effect.
+    ///
+    /// Invariants enforced:
+    /// - **NoSelfEdge**: returns `None` if `src == tgt`.
+    /// - **PodSingleNode**: any existing `runs-on` edge from `src` is removed
+    ///   before the new one is added (K8s rescheduling is valid).
+    /// - **SingleContainer**: a new `contains` edge replaces any existing
+    ///   containment parent of `tgt`.
+    /// - **SingleSession**: a new `c2.session` edge replaces any existing
+    ///   `c2.session` edge for the same `src → tgt` pair (a reconnected shell
+    ///   supersedes the dead one instead of leaving it as an artifact).
+    ///
+    /// Parallel edges (same `src`/`tgt`, different `relation_name`) are allowed.
+    pub fn insert_edge(
+        &mut self,
+        src: &EntityId,
+        tgt: &EntityId,
+        data: EdgeData,
+    ) -> Option<EdgeIndex> {
+        if src == tgt {
+            return None;
+        }
+
+        let src_idx = self.ensure_node(src.clone());
+        let tgt_idx = self.ensure_node(tgt.clone());
+
+        // PodSingleNode: replace any existing runs-on from this source.
+        if data.relation_name == "runs-on" {
+            let stale: Vec<EdgeIndex> = self
+                .graph
+                .edges_directed(src_idx, Direction::Outgoing)
+                .filter(|e| e.weight().relation_name == "runs-on")
+                .map(|e| e.id())
+                .collect();
+            for idx in stale {
+                self.graph.remove_edge(idx);
+            }
+        }
+
+        if data.relation_name == "contains" {
+            let stale: Vec<EdgeIndex> = self
+                .graph
+                .edges_directed(tgt_idx, Direction::Incoming)
+                .filter(|e| e.weight().relation_name == "contains")
+                .map(|e| e.id())
+                .collect();
+            for idx in stale {
+                self.graph.remove_edge(idx);
+            }
+        }
+
+        // SingleSession: a fresh `c2.session` edge supersedes any prior session
+        // edge for the same source→target pair. A reconnected shell replaces the
+        // dead one outright - a broken session edge carries no epistemic value
+        // once a live session to the same target exists, so it is not kept as a
+        // graph artifact.
+        if data.relation_name == "c2.session" {
+            let stale: Vec<EdgeIndex> = self
+                .graph
+                .edges_connecting(src_idx, tgt_idx)
+                .filter(|e| e.weight().relation_name == "c2.session")
+                .map(|e| e.id())
+                .collect();
+            for idx in stale {
+                self.graph.remove_edge(idx);
+            }
+        }
+
+        Some(self.add_edge(src_idx, tgt_idx, data))
+    }
+
+    fn add_edge(&mut self, src: NodeIndex, tgt: NodeIndex, data: EdgeData) -> EdgeIndex {
+        let index = self.graph.add_edge(src, tgt, data);
+        self.next_edge_generation += 1;
+        self.edge_generations
+            .insert(index, self.next_edge_generation);
+        index
+    }
+
+    pub fn validate_selected_edge(&self, selected: &SelectedExecEdge) -> bool {
+        self.edge_generations.get(&selected.index) == Some(&selected.generation)
+            && self
+                .graph
+                .edge_endpoints(selected.index)
+                .is_some_and(|(src, tgt)| {
+                    self.graph[src] == selected.source && self.graph[tgt] == selected.target
+                })
+            && self
+                .graph
+                .edge_weight(selected.index)
+                .is_some_and(|data| !data.broken && data == &selected.data)
+    }
+
+    fn select_edge(&self, index: EdgeIndex) -> SelectedExecEdge {
+        let (src, tgt) = self
+            .graph
+            .edge_endpoints(index)
+            .expect("search edge exists");
+        SelectedExecEdge {
+            source: self.graph[src].clone(),
+            target: self.graph[tgt].clone(),
+            data: self.graph[index].clone(),
+            index,
+            generation: self.edge_generations[&index],
+        }
+    }
+
+    /// Search realizable transports, carrying terminal/transit and output-
+    /// transform state. Invalid shortcuts cannot hide a longer valid route.
+    pub fn executable_paths(
+        &self,
+        seeds: &[EntityId],
+        excluded: Option<&EntityId>,
+    ) -> HashMap<EntityId, ExecPath> {
+        self.executable_paths_with_transforms(seeds, excluded, true)
+    }
+
+    pub fn executable_paths_with_transforms(
+        &self,
+        seeds: &[EntityId],
+        excluded: Option<&EntityId>,
+        allow_output_transform: bool,
+    ) -> HashMap<EntityId, ExecPath> {
+        self.executable_paths_filtered(seeds, excluded, allow_output_transform, |_, _, _| true)
+    }
+
+    pub fn executable_paths_filtered(
+        &self,
+        seeds: &[EntityId],
+        excluded: Option<&EntityId>,
+        allow_output_transform: bool,
+        usable: impl Fn(&EntityId, &EntityId, &EdgeData) -> bool,
+    ) -> HashMap<EntityId, ExecPath> {
+        type State = (NodeIndex, bool, bool);
+        let excluded_idx = excluded.and_then(|id| self.index.get(id)).copied();
+        let mut costs: HashMap<State, f32> = HashMap::new();
+        let mut previous: HashMap<State, (State, EdgeIndex)> = HashMap::new();
+        // Reverse tuple ordering gives deterministic cost, entity, and state ties.
+        let mut queue = BinaryHeap::new();
+        for seed in seeds {
+            if let Some(&node) = self.index.get(seed) {
+                if Some(node) != excluded_idx {
+                    costs.insert((node, false, false), 0.0);
+                    queue.push(std::cmp::Reverse((
+                        ordered_float_cost(0.0),
+                        seed.0.clone(),
+                        node,
+                        false,
+                        false,
+                    )));
+                }
+            }
+        }
+        while let Some(std::cmp::Reverse((bits, _, node, transit, transformed))) = queue.pop() {
+            let cost = f32::from_bits(bits);
+            let state = (node, transit, transformed);
+            if cost > costs[&state] {
+                continue;
+            }
+            let mut edges = self
+                .graph
+                .edges_directed(node, Direction::Outgoing)
+                .filter(|edge| {
+                    let data = edge.weight();
+                    Some(edge.target()) != excluded_idx
+                        && data.is_realizable(&self.graph[edge.target()])
+                        && data.relation_name != "c2.session"
+                        && usable(&self.graph[node], &self.graph[edge.target()], data)
+                        && (data.relation_name == "kubelet-pod-exec") == transit
+                        && !(transformed && data.realization_output_transform().is_some())
+                        && (allow_output_transform || data.realization_output_transform().is_none())
+                })
+                .collect::<Vec<_>>();
+            edges.sort_by(|a, b| {
+                self.graph[a.target()]
+                    .0
+                    .cmp(&self.graph[b.target()].0)
+                    .then_with(|| a.weight().weight.total_cmp(&b.weight().weight))
+                    .then_with(|| a.weight().relation_name.cmp(&b.weight().relation_name))
+                    .then_with(|| a.weight().envelope.cmp(&b.weight().envelope))
+                    .then_with(|| a.weight().session_id.cmp(&b.weight().session_id))
+                    .then_with(|| {
+                        a.weight()
+                            .output_transform
+                            .cmp(&b.weight().output_transform)
+                    })
+            });
+            for edge in edges {
+                let next = (
+                    edge.target(),
+                    !edge.weight().grants_target_execution(),
+                    transformed || edge.weight().realization_output_transform().is_some(),
+                );
+                let next_cost = cost + edge.weight().weight;
+                if next_cost.is_finite() && costs.get(&next).is_none_or(|known| next_cost < *known)
+                {
+                    costs.insert(next, next_cost);
+                    previous.insert(next, (state, edge.id()));
+                    queue.push(std::cmp::Reverse((
+                        ordered_float_cost(next_cost),
+                        self.graph[next.0].0.clone(),
+                        next.0,
+                        next.1,
+                        next.2,
+                    )));
+                }
+            }
+        }
+        let mut destinations = costs
+            .iter()
+            .filter(|((_, transit, _), _)| !transit)
+            .collect::<Vec<_>>();
+        destinations.sort_by(|(a, ac), (b, bc)| ac.total_cmp(bc).then_with(|| a.2.cmp(&b.2)));
+        let mut paths = HashMap::new();
+        for (&state, &cost) in destinations {
+            let id = self.graph[state.0].clone();
+            if paths.contains_key(&id) {
+                continue;
+            }
+            let mut edges = Vec::new();
+            let mut current = state;
+            while let Some(&(parent, edge)) = previous.get(&current) {
+                edges.push(self.select_edge(edge));
+                current = parent;
+            }
+            edges.reverse();
+            let mut nodes = vec![self.graph[current.0].clone()];
+            nodes.extend(edges.iter().map(|edge| edge.target.clone()));
+            paths.insert(id, ExecPath { cost, nodes, edges });
+        }
+        paths
+    }
+
+    /// Remove all edges from `src` to `tgt` with the given relation name.
+    pub fn remove_edges(&mut self, src: &EntityId, tgt: &EntityId, relation_name: &str) {
+        let (Some(&si), Some(&ti)) = (self.index.get(src), self.index.get(tgt)) else {
+            return;
+        };
+        let to_remove: Vec<EdgeIndex> = self
+            .graph
+            .edges_connecting(si, ti)
+            .filter(|e| e.weight().relation_name == relation_name)
+            .map(|e| e.id())
+            .collect();
+        for idx in to_remove {
+            self.graph.remove_edge(idx);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Queries
+    // -----------------------------------------------------------------------
+
+    /// Whether `id` has a node in the graph (entity may or may not have data).
+    pub fn contains(&self, id: &EntityId) -> bool {
+        self.index.contains_key(id)
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.graph.node_count()
+    }
+
+    pub fn edge_count(&self) -> usize {
+        self.graph.edge_count()
+    }
+
+    /// Outgoing edges from `id` as `(target_id, &EdgeData)` pairs.
+    pub fn outgoing(&self, id: &EntityId) -> Vec<(&EntityId, &EdgeData)> {
+        let Some(&idx) = self.index.get(id) else {
+            return Vec::new();
+        };
+        self.graph
+            .edges_directed(idx, Direction::Outgoing)
+            .filter_map(|e| Some((self.graph.node_weight(e.target())?, e.weight())))
+            .collect()
+    }
+
+    /// Incoming edges to `id` as `(source_id, &EdgeData)` pairs.
+    pub fn incoming(&self, id: &EntityId) -> Vec<(&EntityId, &EdgeData)> {
+        let Some(&idx) = self.index.get(id) else {
+            return Vec::new();
+        };
+        self.graph
+            .edges_directed(idx, Direction::Incoming)
+            .filter_map(|e| Some((self.graph.node_weight(e.source())?, e.weight())))
+            .collect()
+    }
+
+    /// All entities with a `relation_name` edge pointing at `id`.
+    pub fn sources_of(&self, id: &EntityId, relation_name: &str) -> Vec<&EntityId> {
+        self.incoming(id)
+            .into_iter()
+            .filter(|(_, d)| d.relation_name == relation_name)
+            .map(|(src, _)| src)
+            .collect()
+    }
+
+    /// All entities pointed to by `relation_name` edges originating at `id`.
+    pub fn targets_of(&self, id: &EntityId, relation_name: &str) -> Vec<&EntityId> {
+        self.outgoing(id)
+            .into_iter()
+            .filter(|(_, d)| d.relation_name == relation_name)
+            .map(|(tgt, _)| tgt)
+            .collect()
+    }
+
+    /// All exec-channel edges in the graph as `(source_id, target_id, &EdgeData)`.
+    pub fn exec_edges(&self) -> Vec<(&EntityId, &EntityId, &EdgeData)> {
+        self.graph
+            .edge_indices()
+            .filter_map(|ei| {
+                let data = self.graph.edge_weight(ei)?;
+                if !data.is_exec_channel || data.broken {
+                    return None;
+                }
+                let (si, ti) = self.graph.edge_endpoints(ei)?;
+                Some((
+                    self.graph.node_weight(si)?,
+                    self.graph.node_weight(ti)?,
+                    data,
+                ))
+            })
+            .collect()
+    }
+
+    /// All entity IDs reachable from any of `seeds` following exec-channel edges
+    /// (BFS, seeds themselves are not included in the result).
+    pub fn reachable_via_exec(&self, seeds: &[EntityId]) -> Vec<EntityId> {
+        let mut visited: std::collections::HashSet<NodeIndex> = std::collections::HashSet::new();
+        let mut queue: std::collections::VecDeque<NodeIndex> = std::collections::VecDeque::new();
+
+        for seed in seeds {
+            if let Some(&idx) = self.index.get(seed) {
+                if visited.insert(idx) {
+                    queue.push_back(idx);
+                }
+            }
+        }
+
+        let mut result = Vec::new();
+        while let Some(nx) = queue.pop_front() {
+            for edge in self.graph.edges_directed(nx, Direction::Outgoing) {
+                if !edge.weight().is_exec_channel
+                    || edge.weight().broken
+                    || !edge.weight().weight.is_finite()
+                    || edge.weight().weight < 0.0
+                {
+                    continue;
+                }
+                let tgt = edge.target();
+                if visited.insert(tgt) {
+                    queue.push_back(tgt);
+                    if let Some(id) = self.graph.node_weight(tgt) {
+                        if !seeds.iter().any(|s| s == id) {
+                            result.push(id.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Shortest weighted exec-channel path from any of `seeds` to `target`.
+    ///
+    /// Uses Dijkstra (A* with zero heuristic) over exec-channel edges only.
+    /// Returns `(total_cost, path)` where `path` is `[seed, …, target]` inclusive,
+    /// or `None` if the target is unreachable from every seed.
+    pub fn shortest_exec_path(
+        &self,
+        seeds: &[EntityId],
+        target: &EntityId,
+    ) -> Option<(f32, Vec<EntityId>)> {
+        let &target_idx = self.index.get(target)?;
+
+        let exec_graph = EdgeFiltered::from_fn(
+            &self.graph,
+            |e: petgraph::stable_graph::EdgeReference<EdgeData>| {
+                e.weight().is_exec_channel
+                    && !e.weight().broken
+                    && e.weight().weight.is_finite()
+                    && e.weight().weight >= 0.0
+            },
+        );
+
+        let mut best: Option<(f32, Vec<NodeIndex>)> = None;
+
+        for seed in seeds {
+            let Some(&seed_idx) = self.index.get(seed) else {
+                continue;
+            };
+
+            let result = astar(
+                &exec_graph,
+                seed_idx,
+                |n| n == target_idx,
+                |e| e.weight().weight,
+                |_| 0.0f32,
+            );
+
+            if let Some((cost, path)) = result.filter(|(cost, _)| cost.is_finite()) {
+                if best.as_ref().is_none_or(|(c, _)| cost < *c) {
+                    best = Some((cost, path));
+                }
+            }
+        }
+
+        best.map(|(cost, path)| {
+            let ids = path
+                .iter()
+                .filter_map(|&nx| self.graph.node_weight(nx).cloned())
+                .collect();
+            (cost, ids)
+        })
+    }
+
+    /// Resolve routes to all reachable destinations in one multi-source
+    /// Dijkstra search. Equal-cost choices use entity IDs, not insertion order.
+    /// An excluded entity is neither a seed nor an intermediate destination.
+    /// Search costs O((V + E) log V), plus materializing the returned paths.
+    pub fn shortest_exec_paths(
+        &self,
+        seeds: &[EntityId],
+        excluded: Option<&EntityId>,
+    ) -> HashMap<EntityId, (f32, Vec<EntityId>)> {
+        let excluded_idx = excluded.and_then(|id| self.index.get(id)).copied();
+        let mut costs = HashMap::new();
+        let mut predecessors = HashMap::new();
+        let mut queue = BinaryHeap::new();
+        for seed in seeds {
+            let Some(&node) = self.index.get(seed) else {
+                continue;
+            };
+            if Some(node) == excluded_idx || costs.insert(node, 0.0).is_some() {
+                continue;
+            }
+            queue.push(ExecSearchEntry {
+                cost: 0.0,
+                id: seed.0.clone(),
+                node,
+            });
+        }
+        while let Some(ExecSearchEntry { cost, node, .. }) = queue.pop() {
+            if cost > costs[&node] {
+                continue;
+            }
+            let mut neighbors = self
+                .graph
+                .edges_directed(node, Direction::Outgoing)
+                .filter(|edge| {
+                    edge.weight().is_exec_channel
+                        && !edge.weight().broken
+                        && edge.weight().weight.is_finite()
+                        && edge.weight().weight >= 0.0
+                        && Some(edge.target()) != excluded_idx
+                })
+                .map(|edge| (edge.target(), edge.weight().weight))
+                .collect::<Vec<_>>();
+            neighbors.sort_by(|(left, left_weight), (right, right_weight)| {
+                self.graph[*left]
+                    .0
+                    .cmp(&self.graph[*right].0)
+                    .then_with(|| left_weight.total_cmp(right_weight))
+            });
+            for (next, weight) in neighbors {
+                let next_cost = cost + weight;
+                if !next_cost.is_finite() {
+                    continue;
+                }
+                if costs.get(&next).is_none_or(|known| next_cost < *known) {
+                    costs.insert(next, next_cost);
+                    predecessors.insert(next, node);
+                    queue.push(ExecSearchEntry {
+                        cost: next_cost,
+                        id: self.graph[next].0.clone(),
+                        node: next,
+                    });
+                }
+            }
+        }
+        costs
+            .into_iter()
+            .map(|(node, cost)| {
+                let mut path = vec![self.graph[node].clone()];
+                let mut current = node;
+                while let Some(&previous) = predecessors.get(&current) {
+                    path.push(self.graph[previous].clone());
+                    current = previous;
+                }
+                path.reverse();
+                (self.graph[node].clone(), (cost, path))
+            })
+            .collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // Serialization view
+    // -----------------------------------------------------------------------
+
+    /// Set `session_id` on the first incoming exec-channel edge pointing to `tgt`.
+    /// Returns `true` when a matching edge was found and updated.
+    ///
+    /// This is used when a session is established over an existing exec path
+    /// (e.g. `k8s.can-exec`, `rce.can-exec`, `c2.session`) so the session
+    /// state lives on the edge that already represents the execution channel,
+    /// instead of creating a redundant new relation.
+    pub fn activate_session_on_incoming_exec(
+        &mut self,
+        tgt: &EntityId,
+        session_id: String,
+    ) -> bool {
+        let Some(&ti) = self.index.get(tgt) else {
+            return false;
+        };
+        let idxs: Vec<petgraph::stable_graph::EdgeIndex> = self
+            .graph
+            .edges_directed(ti, petgraph::Direction::Incoming)
+            .filter(|e| e.weight().grants_target_execution())
+            .map(|e| e.id())
+            .collect();
+        let found = !idxs.is_empty();
+        for idx in idxs {
+            if let Some(data) = self.graph.edge_weight_mut(idx) {
+                data.session_id = Some(session_id.clone());
+                // A (re)connecting session clears any prior broken mark so the
+                // edge becomes traversable again.
+                data.broken = false;
+            }
+            self.next_edge_generation += 1;
+            self.edge_generations.insert(idx, self.next_edge_generation);
+        }
+        found
+    }
+
+    /// Mark every exec-channel edge carrying `backend_id` as broken.
+    ///
+    /// Called when a live session dies (e.g. the shell closed unexpectedly).
+    /// The edge is intentionally kept, and its `session_id` is preserved, so a
+    /// reconnecting session can be matched back to it and clear the mark. While
+    /// broken, the edge is skipped by all exec-channel traversal queries.
+    /// Returns the number of edges marked.
+    pub fn mark_session_broken(&mut self, backend_id: &str) -> usize {
+        let idxs: Vec<petgraph::stable_graph::EdgeIndex> = self
+            .graph
+            .edge_indices()
+            .filter(|&ei| {
+                self.graph
+                    .edge_weight(ei)
+                    .and_then(|d| d.session_id.as_deref())
+                    == Some(backend_id)
+            })
+            .collect();
+        let mut marked = 0;
+        for idx in idxs {
+            if let Some(data) = self.graph.edge_weight_mut(idx) {
+                data.broken = true;
+                marked += 1;
+            }
+            self.next_edge_generation += 1;
+            self.edge_generations.insert(idx, self.next_edge_generation);
+        }
+        marked
+    }
+
+    /// Clear `session_id` from every edge where `session_id == Some(backend_id)`.
+    /// Called when a session is lost so the exec-channel edges revert to
+    /// their inactive (one-shot) appearance.
+    pub fn deactivate_session(&mut self, backend_id: &str) {
+        let idxs: Vec<petgraph::stable_graph::EdgeIndex> = self
+            .graph
+            .edge_indices()
+            .filter(|&ei| {
+                self.graph
+                    .edge_weight(ei)
+                    .and_then(|d| d.session_id.as_deref())
+                    == Some(backend_id)
+            })
+            .collect();
+        for idx in idxs {
+            if let Some(data) = self.graph.edge_weight_mut(idx) {
+                data.session_id = None;
+            }
+        }
+    }
+
+    /// Snapshot all edges as [`RelationSummary`] values for serialization.
+    pub fn to_relation_summaries(&self) -> Vec<RelationSummary> {
+        self.graph
+            .edge_indices()
+            .filter_map(|ei| {
+                let (si, ti) = self.graph.edge_endpoints(ei)?;
+                let data = self.graph.edge_weight(ei)?;
+                let src = self.graph.node_weight(si)?;
+                let tgt = self.graph.node_weight(ti)?;
+                Some(RelationSummary {
+                    name: data.relation_name.clone(),
+                    source_id: src.0.clone(),
+                    target_id: tgt.0.clone(),
+                    is_exec_channel: data.is_exec_channel,
+                    envelope: data.envelope.clone(),
+                    output_transform: data.output_transform.clone(),
+                    weight: data.weight,
+                    session_id: data.session_id.clone(),
+                    broken: data.broken,
+                })
+            })
+            .collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // Private helpers
+    // -----------------------------------------------------------------------
+
+    fn has_edge_between(&self, src: NodeIndex, tgt: NodeIndex, relation_name: &str) -> bool {
+        self.graph
+            .edges_connecting(src, tgt)
+            .any(|e| e.weight().relation_name == relation_name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::edge::edge_data_for;
+
+    #[test]
+    fn executable_routes_preserve_live_cheapest_parallel_edges_in_any_insertion_order() {
+        for reverse in [false, true] {
+            let mut graph = KnowledgeGraph::new();
+            let source = EntityId::new("ns/default/pod/source");
+            let target = EntityId::new("ns/default/pod/target");
+            let mut broken = EdgeData::new("container.escape", 0.1, true)
+                .with_envelope(Some("BROKEN ${CMD}".into()));
+            broken.broken = true;
+            let expensive = EdgeData::new("k8s.can-exec", 4.0, true)
+                .with_envelope(Some("EXPENSIVE ${CMD}".into()));
+            let cheap =
+                EdgeData::new("rce.can-exec", 2.0, true).with_envelope(Some("SAFE ${CMD}".into()));
+            let mut edges = vec![broken, expensive, cheap];
+            if reverse {
+                edges.reverse();
+            }
+            for edge in edges {
+                graph.insert_edge(&source, &target, edge);
+            }
+            let path = graph
+                .executable_paths(&[source], None)
+                .remove(&target)
+                .unwrap();
+            assert_eq!(path.cost, 2.0);
+            assert_eq!(path.edges[0].data.envelope.as_deref(), Some("SAFE ${CMD}"));
+            assert!(graph.validate_selected_edge(&path.edges[0]));
+        }
+    }
+
+    #[test]
+    fn selected_transport_is_invalid_after_invalidation_or_index_recycling() {
+        let mut graph = KnowledgeGraph::new();
+        let source = EntityId::new("ns/default/pod/source");
+        let target = EntityId::new("ns/default/pod/target");
+        let data =
+            EdgeData::new("rce.can-exec", 1.0, true).with_envelope(Some("SAFE ${CMD}".into()));
+        graph.insert_edge(&source, &target, data.clone());
+        let selected = graph
+            .executable_paths(std::slice::from_ref(&source), None)
+            .remove(&target)
+            .unwrap()
+            .edges
+            .remove(0);
+        graph.graph[selected.index].broken = true;
+        assert!(!graph.validate_selected_edge(&selected));
+        graph.remove_edges(&source, &target, "rce.can-exec");
+        graph.insert_edge(&source, &target, data);
+        assert!(!graph.validate_selected_edge(&selected));
+    }
+
+    #[test]
+    fn a_recovered_session_requires_a_fresh_selected_transport() {
+        let mut graph = KnowledgeGraph::new();
+        let source = EntityId::new("ns/default/pod/source");
+        let target = EntityId::new("ns/default/pod/target");
+        graph.insert_edge(&source, &target, edge_data_for("k8s.can-exec", None, None));
+        graph.activate_session_on_incoming_exec(&target, "session/live".into());
+        let selected = graph
+            .executable_paths(std::slice::from_ref(&source), None)
+            .remove(&target)
+            .unwrap()
+            .edges
+            .remove(0);
+        graph.mark_session_broken("session/live");
+        graph.activate_session_on_incoming_exec(&target, "session/live".into());
+        assert!(!graph.validate_selected_edge(&selected));
+        let fresh = graph
+            .executable_paths(&[source], None)
+            .remove(&target)
+            .unwrap()
+            .edges
+            .remove(0);
+        assert!(graph.validate_selected_edge(&fresh));
+    }
+
+    #[test]
+    fn unrealizable_shortcuts_do_not_hide_longer_realizable_routes() {
+        let mut graph = KnowledgeGraph::new();
+        let source = EntityId::new("ns/default/pod/source");
+        let middle = EntityId::new("ns/default/pod/middle");
+        let target = EntityId::new("ns/default/pod/target");
+        graph.insert_edge(&source, &target, EdgeData::new("rce.can-exec", 0.1, true));
+        graph.insert_edge(&source, &middle, edge_data_for("k8s.can-exec", None, None));
+        graph.insert_edge(&middle, &target, edge_data_for("k8s.can-exec", None, None));
+        let path = graph
+            .executable_paths(&[source], None)
+            .remove(&target)
+            .unwrap();
+        assert_eq!(path.nodes.len(), 3);
+        assert_eq!(path.cost, 2.0);
+    }
+
+    #[test]
+    fn kubelet_transit_cannot_terminate_or_continue_into_arbitrary_host_channels() {
+        let mut graph = KnowledgeGraph::new();
+        let source = EntityId::new("ns/default/pod/source");
+        let node = EntityId::new("node/worker");
+        let pod = EntityId::new("ns/default/pod/target");
+        let host = EntityId::new("node/other");
+        graph.insert_edge(
+            &source,
+            &node,
+            edge_data_for("kubelet-exec", Some("kubelet ${CMD}".into()), None),
+        );
+        graph.insert_edge(&node, &pod, edge_data_for("kubelet-pod-exec", None, None));
+        graph.insert_edge(
+            &node,
+            &host,
+            edge_data_for("rce.can-exec", Some("host-rce ${CMD}".into()), None),
+        );
+        let paths = graph.executable_paths(&[source], None);
+        assert!(!paths.contains_key(&node));
+        assert!(!paths.contains_key(&host));
+        assert_eq!(paths[&pod].edges.len(), 2);
+    }
+
+    #[test]
+    fn discovered_kubelet_pair_is_typed_transit_with_an_output_transform() {
+        let mut graph = KnowledgeGraph::new();
+        let source = EntityId::new("ns/controlled/pod/source");
+        let node = EntityId::new("node/worker");
+        let pod = EntityId::new("ns/other/pod/target");
+        graph.insert_edge(&source, &node, edge_data_for("kubelet-exec", None, None));
+        graph.insert_edge(&node, &pod, edge_data_for("kubelet-pod-exec", None, None));
+        let paths = graph.executable_paths(std::slice::from_ref(&source), None);
+        assert!(!paths.contains_key(&node));
+        assert_eq!(paths[&pod].edges.len(), 2);
+        assert_eq!(
+            paths[&pod].edges[0].data.realization_output_transform(),
+            Some(ran_domain::OutputTransformKind::JsonEnvelope)
+        );
+        assert!(!graph
+            .executable_paths_with_transforms(&[source], None, false)
+            .contains_key(&pod));
+    }
+
+    #[test]
+    fn multi_source_exec_paths_match_individual_searches_and_skip_broken_context_edges() {
+        let mut graph = KnowledgeGraph::new();
+        let sources = [EntityId::new("source/a"), EntityId::new("source/b")];
+        for number in 0..100 {
+            let target = EntityId::new(format!("target/{number:03}"));
+            graph.insert_edge(
+                &sources[number % 2],
+                &target,
+                edge_data_for("k8s.can-exec", None, None),
+            );
+        }
+        let context = EntityId::new("context");
+        graph.insert_edge(&sources[0], &context, edge_data_for("uses", None, None));
+        let broken = EntityId::new("broken");
+        let mut edge = edge_data_for("rce.can-exec", None, None);
+        edge.broken = true;
+        graph.insert_edge(&sources[1], &broken, edge);
+        let routes = graph.shortest_exec_paths(&sources, None);
+        assert_eq!(routes.len(), 102);
+        assert!(!routes.contains_key(&context));
+        assert!(!routes.contains_key(&broken));
+        for (target, route) in routes {
+            assert_eq!(Some(route), graph.shortest_exec_path(&sources, &target));
+        }
+    }
+
+    #[test]
+    fn exec_searches_reject_negative_and_non_finite_edge_costs() {
+        let mut graph = KnowledgeGraph::new();
+        let source = EntityId::new("source");
+        for (name, weight) in [
+            ("negative", -1.0),
+            ("nan", f32::NAN),
+            ("infinite", f32::INFINITY),
+        ] {
+            graph.insert_edge(
+                &source,
+                &EntityId::new(name),
+                EdgeData::new("rce.can-exec", weight, true)
+                    .with_envelope(Some("run ${CMD}".into())),
+            );
+        }
+        let valid = EntityId::new("valid");
+        graph.insert_edge(
+            &source,
+            &valid,
+            EdgeData::new("rce.can-exec", 1.0, true).with_envelope(Some("run ${CMD}".into())),
+        );
+        let huge = EntityId::new("huge");
+        let overflow = EntityId::new("overflow");
+        graph.insert_edge(
+            &source,
+            &huge,
+            EdgeData::new("rce.can-exec", f32::MAX, true).with_envelope(Some("run ${CMD}".into())),
+        );
+        graph.insert_edge(
+            &huge,
+            &overflow,
+            EdgeData::new("rce.can-exec", f32::MAX, true).with_envelope(Some("run ${CMD}".into())),
+        );
+
+        let routes = graph.shortest_exec_paths(std::slice::from_ref(&source), None);
+        assert_eq!(routes.len(), 3);
+        assert!(routes.contains_key(&source));
+        assert!(routes.contains_key(&valid));
+        assert!(routes.contains_key(&huge));
+        assert!(!routes.contains_key(&overflow));
+        assert_eq!(
+            graph.shortest_exec_path(std::slice::from_ref(&source), &valid),
+            Some((1.0, vec![source.clone(), valid]))
+        );
+        assert_eq!(
+            graph.shortest_exec_path(std::slice::from_ref(&source), &overflow),
+            None
+        );
+    }
+
+    #[test]
+    fn multi_source_routes_are_independent_of_edge_and_seed_insertion_order() {
+        let edges = [
+            ("a", "c"),
+            ("b", "d"),
+            ("c", "sink"),
+            ("d", "sink"),
+            ("sink", "c"),
+        ];
+        let build = |reverse: bool| {
+            let mut graph = KnowledgeGraph::new();
+            let mut ordered = edges.to_vec();
+            if reverse {
+                ordered.reverse();
+            }
+            for (source, target) in ordered {
+                graph.insert_edge(
+                    &EntityId::new(source),
+                    &EntityId::new(target),
+                    edge_data_for("k8s.can-exec", None, None),
+                );
+            }
+            let mut seeds = vec![EntityId::new("a"), EntityId::new("b")];
+            if reverse {
+                seeds.reverse();
+            }
+            graph.shortest_exec_paths(&seeds, None)
+        };
+        assert_eq!(build(false), build(true));
+    }
+
+    #[test]
+    fn excluded_entity_is_neither_an_execution_origin_nor_a_transit_hop() {
+        let mut graph = KnowledgeGraph::new();
+        for (source, target) in [
+            ("origin", "excluded"),
+            ("excluded", "sink"),
+            ("origin", "safe-a"),
+            ("safe-a", "safe-b"),
+            ("safe-b", "sink"),
+        ] {
+            graph.insert_edge(
+                &EntityId::new(source),
+                &EntityId::new(target),
+                edge_data_for("k8s.can-exec", None, None),
+            );
+        }
+        let excluded = EntityId::new("excluded");
+        let routes = graph.shortest_exec_paths(
+            &[EntityId::new("origin"), excluded.clone()],
+            Some(&excluded),
+        );
+        assert!(!routes.contains_key(&excluded));
+        assert_eq!(
+            routes[&EntityId::new("sink")].1,
+            ["origin", "safe-a", "safe-b", "sink"].map(EntityId::new)
+        );
+    }
+
+    #[test]
+    fn contains_replaces_the_previous_parent() {
+        let mut graph = KnowledgeGraph::new();
+        let cluster = EntityId::new("k8s/cluster/dev");
+        let namespace = EntityId::new("ns/prod");
+        let pod = EntityId::new("ns/prod/pod/api");
+
+        graph.insert_edge(&cluster, &pod, edge_data_for("contains", None, None));
+        graph.insert_edge(&namespace, &pod, edge_data_for("contains", None, None));
+
+        let contains: Vec<_> = graph
+            .to_relation_summaries()
+            .into_iter()
+            .filter(|relation| relation.name == "contains" && relation.target_id == pod.0)
+            .collect();
+        assert_eq!(contains.len(), 1);
+        assert_eq!(contains[0].source_id, namespace.0);
+    }
+
+    /// A can-exec edge carrying a session that breaks becomes non-traversable
+    /// but is retained, and a reconnecting session recovers it.
+    #[test]
+    fn broken_session_edge_is_non_traversable_until_recovered() {
+        let mut graph = KnowledgeGraph::new();
+        let attacker = EntityId::new("ns/default/pod/attacker");
+        let victim = EntityId::new("ns/default/pod/victim");
+
+        graph.insert_edge(
+            &attacker,
+            &victim,
+            edge_data_for("k8s.can-exec", None, None),
+        );
+        // Session is live on the edge - the path exists.
+        assert!(graph.activate_session_on_incoming_exec(&victim, "session/victim-1".to_string()));
+        assert!(graph
+            .shortest_exec_path(std::slice::from_ref(&attacker), &victim)
+            .is_some());
+
+        // The shell dies: mark the session's edge broken.
+        assert_eq!(graph.mark_session_broken("session/victim-1"), 1);
+
+        // The edge is no longer traversable, and reachability skips it...
+        assert!(graph
+            .shortest_exec_path(std::slice::from_ref(&attacker), &victim)
+            .is_none());
+        assert!(graph
+            .reachable_via_exec(std::slice::from_ref(&attacker))
+            .is_empty());
+
+        // ...but it is kept (not removed) and surfaced as broken for the UI.
+        let summary = graph
+            .to_relation_summaries()
+            .into_iter()
+            .find(|r| r.name == "k8s.can-exec")
+            .expect("edge should still exist");
+        assert!(summary.broken);
+        assert_eq!(summary.session_id.as_deref(), Some("session/victim-1"));
+
+        // A reconnecting session on the same edge clears the break.
+        assert!(graph.activate_session_on_incoming_exec(&victim, "session/victim-1".to_string()));
+        assert!(graph
+            .shortest_exec_path(std::slice::from_ref(&attacker), &victim)
+            .is_some());
+        let recovered = graph
+            .to_relation_summaries()
+            .into_iter()
+            .find(|r| r.name == "k8s.can-exec")
+            .expect("edge should still exist");
+        assert!(!recovered.broken);
+    }
+
+    /// A reconnected session's edge replaces the prior broken one for the same
+    /// pair, rather than accumulating as a stale artifact.
+    #[test]
+    fn new_c2_session_edge_replaces_the_prior_broken_one() {
+        let mut graph = KnowledgeGraph::new();
+        let c2 = EntityId::new("c2/ran");
+        let victim = EntityId::new("node/victim");
+
+        // Establish a session, then break it.
+        let mut first = edge_data_for("c2.session", None, None);
+        first.session_id = Some("session/victim-1".to_string());
+        graph.insert_edge(&c2, &victim, first);
+        assert_eq!(graph.mark_session_broken("session/victim-1"), 1);
+
+        // A reconnected session inserts a fresh c2.session edge for the same pair.
+        let mut second = edge_data_for("c2.session", None, None);
+        second.session_id = Some("session/victim-2".to_string());
+        graph.insert_edge(&c2, &victim, second);
+
+        // Exactly one c2.session edge remains, and it is the live (unbroken) one.
+        let sessions: Vec<_> = graph
+            .to_relation_summaries()
+            .into_iter()
+            .filter(|r| r.name == "c2.session")
+            .collect();
+        assert_eq!(
+            sessions.len(),
+            1,
+            "the broken session edge must be replaced"
+        );
+        assert!(!sessions[0].broken);
+        assert_eq!(sessions[0].session_id.as_deref(), Some("session/victim-2"));
+    }
+}

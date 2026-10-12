@@ -1,0 +1,735 @@
+//go:build !wasm && cgo && vectorscan
+
+package matcher
+
+import (
+	"bytes"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/praetorian-inc/titus/pkg/rule"
+	"github.com/praetorian-inc/titus/pkg/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestVectorscanMatcher_BasicMatch(t *testing.T) {
+	rules := []*types.Rule{
+		{
+			ID:      "test-rule-1",
+			Name:    "Test AWS Key",
+			Pattern: `AKIA[0-9A-Z]{16}`,
+		},
+	}
+
+	matcher, err := NewVectorscan(rules, 2, nil)
+	require.NoError(t, err)
+	defer matcher.Close()
+
+	content := []byte("Found key: AKIAIOSFODNN7EXAMPLE in config")
+	matches, err := matcher.Match(content)
+	require.NoError(t, err)
+	assert.Len(t, matches, 1)
+	assert.Equal(t, "test-rule-1", matches[0].RuleID)
+}
+
+func TestVectorscanMatcher_NoMatch(t *testing.T) {
+	rules := []*types.Rule{
+		{
+			ID:      "test-rule-1",
+			Name:    "Test Pattern",
+			Pattern: `secret_[a-z]+`,
+		},
+	}
+
+	matcher, err := NewVectorscan(rules, 2, nil)
+	require.NoError(t, err)
+	defer matcher.Close()
+
+	content := []byte("No secrets here, just regular text")
+	matches, err := matcher.Match(content)
+	require.NoError(t, err)
+	assert.Len(t, matches, 0)
+}
+
+func TestVectorscanMatcher_ExtendedMode(t *testing.T) {
+	// Test that extended mode patterns work after preprocessing
+	rules := []*types.Rule{
+		{
+			ID:   "extended-rule",
+			Name: "Extended Mode Test",
+			Pattern: `(?x)
+				secret_    # prefix
+				[a-z]+     # identifier
+			`,
+		},
+	}
+
+	matcher, err := NewVectorscan(rules, 2, nil)
+	require.NoError(t, err)
+	defer matcher.Close()
+
+	content := []byte("Found: secret_token in the file")
+	matches, err := matcher.Match(content)
+	require.NoError(t, err)
+	assert.Len(t, matches, 1)
+}
+
+func TestVectorscanMatcher_CaseInsensitive(t *testing.T) {
+	rules := []*types.Rule{
+		{
+			ID:      "case-insensitive",
+			Name:    "Case Insensitive Test",
+			Pattern: `(?i)password\s*=\s*["'][^"']+["']`,
+		},
+	}
+
+	matcher, err := NewVectorscan(rules, 2, nil)
+	require.NoError(t, err)
+	defer matcher.Close()
+
+	content := []byte(`PASSWORD = "secret123"`)
+	matches, err := matcher.Match(content)
+	require.NoError(t, err)
+	assert.Len(t, matches, 1)
+}
+
+func TestVectorscanMatcher_DefaultFlagsConfiguration(t *testing.T) {
+	// Test that we use the NoseyParker approach: no flags by default
+	// This allows maximum pattern compatibility (450 vs 267 compiled patterns)
+	//
+	// Context: NoseyParker uses Flag::default() (no flags) which allows ALL 196 NP rules
+	// to compile. Using SomLeftMost | Utf8Mode causes 183 rules to fall back to regexp2.
+	//
+	// This test verifies we follow NoseyParker's approach for maximum compatibility.
+
+	rules := []*types.Rule{
+		{
+			ID:   "basic-pattern",
+			Name: "Basic Pattern",
+			// Simple pattern that should compile with any flag configuration
+			Pattern: `password`,
+		},
+	}
+
+	matcher, err := NewVectorscan(rules, 0, nil)
+	require.NoError(t, err)
+	defer matcher.Close()
+
+	// The actual verification is implicit: if we were using SomLeftMost | Utf8Mode,
+	// many more patterns would fall back to regexp2 (183 vs 36 fallback rules in benchmarks).
+	//
+	// By checking that compilation succeeded and didn't fall back for a simple pattern,
+	// we verify the basic mechanism works. The real test is the build command verification.
+	assert.Equal(t, 1, len(matcher.hsRules), "Basic pattern should compile to Hyperscan")
+	assert.Equal(t, 0, len(matcher.fallbackRules), "Basic pattern should not fall back to regexp2")
+}
+
+func TestVectorscanMatcher_MultipleRules(t *testing.T) {
+	rules := []*types.Rule{
+		{
+			ID:      "rule-1",
+			Name:    "AWS Key",
+			Pattern: `AKIA[0-9A-Z]{16}`,
+		},
+		{
+			ID:      "rule-2",
+			Name:    "Generic Secret",
+			Pattern: `secret_[a-z0-9]+`,
+		},
+	}
+
+	matcher, err := NewVectorscan(rules, 2, nil)
+	require.NoError(t, err)
+	defer matcher.Close()
+
+	content := []byte("AWS: AKIAIOSFODNN7EXAMPLE and secret_abc123")
+	matches, err := matcher.Match(content)
+	require.NoError(t, err)
+	assert.Len(t, matches, 2)
+}
+
+func TestVectorscanAvailable(t *testing.T) {
+	// When built with vectorscan tag, should return true
+	assert.True(t, VectorscanAvailable())
+}
+
+func TestVectorscanInfo(t *testing.T) {
+	info := VectorscanInfo()
+	assert.Contains(t, info, "hyperscan")
+}
+
+func TestVectorscanMatcher_Close(t *testing.T) {
+	rules := []*types.Rule{
+		{
+			ID:      "test-rule",
+			Name:    "Test",
+			Pattern: `test`,
+		},
+	}
+
+	matcher, err := NewVectorscan(rules, 2, nil)
+	require.NoError(t, err)
+
+	// Close should not error
+	err = matcher.Close()
+	assert.NoError(t, err)
+}
+
+func TestVectorscanMatcher_CloseDoesNotHang(t *testing.T) {
+	// Regression test for infinite loop in Close() when draining sync.Pool
+	// Bug: Pool.Get() calls Pool.New() when empty, creating infinite loop
+	rules := []*types.Rule{
+		{
+			ID:      "test-rule",
+			Name:    "Test",
+			Pattern: `test`,
+		},
+	}
+
+	matcher, err := NewVectorscan(rules, 2, nil)
+	require.NoError(t, err)
+
+	// Perform some matches to populate the scratch pool
+	content := []byte("test content with test patterns")
+	_, err = matcher.Match(content)
+	require.NoError(t, err)
+
+	// Close should complete quickly without hanging
+	// Use a timeout to detect if Close() hangs
+	done := make(chan error, 1)
+	go func() {
+		done <- matcher.Close()
+	}()
+
+	select {
+	case err := <-done:
+		assert.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close() hung for >5 seconds - infinite loop detected")
+	}
+}
+
+func TestVectorscanMatcher_EmptyRules(t *testing.T) {
+	rules := []*types.Rule{}
+	_, err := NewVectorscan(rules, 2, nil)
+	assert.Error(t, err)
+}
+
+func TestVectorscanMatcher_DotAllMode(t *testing.T) {
+	rules := []*types.Rule{
+		{
+			ID:      "dotall-rule",
+			Name:    "Dot All Test",
+			Pattern: `(?s)BEGIN.*END`,
+		},
+	}
+
+	matcher, err := NewVectorscan(rules, 2, nil)
+	require.NoError(t, err)
+	defer matcher.Close()
+
+	content := []byte("BEGIN\nsome\nmultiline\ntext\nEND")
+	matches, err := matcher.Match(content)
+	require.NoError(t, err)
+	assert.Len(t, matches, 1)
+}
+
+func TestVectorscanMatcher_MultilineMode(t *testing.T) {
+	rules := []*types.Rule{
+		{
+			ID:      "multiline-rule",
+			Name:    "Multiline Test",
+			Pattern: `(?m)^secret`,
+		},
+	}
+
+	matcher, err := NewVectorscan(rules, 2, nil)
+	require.NoError(t, err)
+	defer matcher.Close()
+
+	content := []byte("line1\nsecret on new line")
+	matches, err := matcher.Match(content)
+	require.NoError(t, err)
+	assert.Len(t, matches, 1)
+}
+
+func TestVectorscanMatcher_CaptureGroups(t *testing.T) {
+	rules := []*types.Rule{
+		{
+			ID:      "capture-rule",
+			Name:    "Capture Groups Test",
+			Pattern: `key:\s*([A-Z0-9]+)`,
+		},
+	}
+
+	matcher, err := NewVectorscan(rules, 2, nil)
+	require.NoError(t, err)
+	defer matcher.Close()
+
+	content := []byte("key: AKIAIOSFODNN7EXAMPLE")
+	matches, err := matcher.Match(content)
+	require.NoError(t, err)
+	require.Len(t, matches, 1)
+
+	// Check that capture groups were extracted
+	assert.NotEmpty(t, matches[0].Groups)
+	assert.Equal(t, "AKIAIOSFODNN7EXAMPLE", string(matches[0].Groups[0]))
+}
+
+func TestVectorscanMatcher_NamedCaptureGroups(t *testing.T) {
+	rules := []*types.Rule{
+		{
+			ID:      "named-capture-rule",
+			Name:    "Named Capture Test",
+			Pattern: `(?P<keytype>AKIA)(?P<keyid>[0-9A-Z]{16})`,
+		},
+	}
+
+	matcher, err := NewVectorscan(rules, 2, nil)
+	require.NoError(t, err)
+	defer matcher.Close()
+
+	content := []byte("Found: AKIAIOSFODNN7EXAMPLE")
+	matches, err := matcher.Match(content)
+	require.NoError(t, err)
+	require.Len(t, matches, 1)
+
+	// Check named capture groups
+	assert.NotNil(t, matches[0].NamedGroups)
+	assert.Equal(t, "AKIA", string(matches[0].NamedGroups["keytype"]))
+	assert.Equal(t, "IOSFODNN7EXAMPLE", string(matches[0].NamedGroups["keyid"]))
+}
+
+func TestVectorscanMatcher_ContextExtraction(t *testing.T) {
+	rules := []*types.Rule{
+		{
+			ID:      "context-rule",
+			Name:    "Context Test",
+			Pattern: `secret_token`,
+		},
+	}
+
+	matcher, err := NewVectorscan(rules, 2, nil)
+	require.NoError(t, err)
+	defer matcher.Close()
+
+	content := []byte("line1\nline2\nsecret_token found\nline4\nline5")
+	matches, err := matcher.Match(content)
+	require.NoError(t, err)
+	require.Len(t, matches, 1)
+
+	// Check snippet extraction
+	assert.NotEmpty(t, matches[0].Snippet.Before)
+	assert.NotEmpty(t, matches[0].Snippet.Matching)
+	assert.NotEmpty(t, matches[0].Snippet.After)
+	assert.Equal(t, "secret_token", string(matches[0].Snippet.Matching))
+}
+
+func TestVectorscanMatcher_GoSourceLines(t *testing.T) {
+	rules := []*types.Rule{
+		{
+			ID:      "go-secret",
+			Name:    "Go Secret",
+			Pattern: `0123456789abcdef0123456789abcdef`,
+		},
+	}
+	matcher, err := NewVectorscan(rules, 2, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, matcher.Close()) })
+
+	content := []byte(`package main
+
+import "fmt"
+
+func main() {
+	const secret = "0123456789abcdef0123456789abcdef"
+	fmt.Println("ok")
+}
+`)
+	matches, err := matcher.Match(content)
+	require.NoError(t, err)
+	require.Len(t, matches, 1)
+
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	start := bytes.Index(content, secret)
+	assert.Equal(t, int64(start), matches[0].Location.Offset.Start)
+	assert.Equal(t, int64(start+len(secret)), matches[0].Location.Offset.End)
+	assert.Equal(t, "\nfunc main() {\n\tconst secret = \"", string(matches[0].Snippet.Before))
+	assert.Equal(t, secret, matches[0].Snippet.Matching)
+	assert.Equal(t, "\"\n\tfmt.Println(\"ok\")\n", string(matches[0].Snippet.After))
+}
+
+func TestVectorscanMatcher_Deduplication(t *testing.T) {
+	rules := []*types.Rule{
+		{
+			ID:      "dedup-rule",
+			Name:    "Dedup Test",
+			Pattern: `token`,
+		},
+	}
+
+	matcher, err := NewVectorscan(rules, 2, nil)
+	require.NoError(t, err)
+	defer matcher.Close()
+
+	// Same token appears multiple times with same blob
+	content := []byte("token token token")
+	blobID := types.ComputeBlobID(content)
+
+	matches, err := matcher.MatchWithBlobID(content, blobID)
+	require.NoError(t, err)
+
+	// Should deduplicate matches at same location
+	// (Implementation deduplicates by structural ID which includes offset)
+	// Since all matches have different offsets, we expect 3 matches
+	assert.Len(t, matches, 3)
+}
+
+func TestVectorscanMatcher_LargeContent(t *testing.T) {
+	rules := []*types.Rule{
+		{
+			ID:      "large-rule",
+			Name:    "Large Content Test",
+			Pattern: `secret_[0-9]+`,
+		},
+	}
+
+	matcher, err := NewVectorscan(rules, 2, nil)
+	require.NoError(t, err)
+	defer matcher.Close()
+
+	// Create large content that triggers chunking
+	largeContent := make([]byte, 5*1024*1024) // 5MB
+	copy(largeContent, []byte("secret_123"))
+
+	matches, err := matcher.Match(largeContent)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, len(matches), 1)
+}
+
+func TestVectorscanMatcher_InvalidPattern(t *testing.T) {
+	rules := []*types.Rule{
+		{
+			ID:      "invalid-rule",
+			Name:    "Invalid Pattern",
+			Pattern: `[`, // Invalid regex
+		},
+	}
+
+	_, err := NewVectorscan(rules, 2, nil)
+	assert.Error(t, err)
+}
+
+func TestVectorscanMatcher_UTF8Content(t *testing.T) {
+	rules := []*types.Rule{
+		{
+			ID:      "utf8-rule",
+			Name:    "UTF-8 Test",
+			Pattern: `secret`,
+		},
+	}
+
+	matcher, err := NewVectorscan(rules, 2, nil)
+	require.NoError(t, err)
+	defer matcher.Close()
+
+	// UTF-8 content with various characters
+	content := []byte("日本語 secret token 中文")
+	matches, err := matcher.Match(content)
+	require.NoError(t, err)
+	assert.Len(t, matches, 1)
+}
+
+func TestVectorscanMatcher_ConcurrentMatching(t *testing.T) {
+	rules := []*types.Rule{
+		{
+			ID:      "concurrent-rule",
+			Name:    "Concurrent Test",
+			Pattern: `secret_[0-9]+`,
+		},
+	}
+
+	matcher, err := NewVectorscan(rules, 2, nil)
+	require.NoError(t, err)
+	defer matcher.Close()
+
+	// Run concurrent matches to verify thread safety
+	done := make(chan bool)
+	for i := 0; i < 10; i++ {
+		go func(id int) {
+			content := []byte("secret_123 in file")
+			_, err := matcher.Match(content)
+			assert.NoError(t, err)
+			done <- true
+		}(i)
+	}
+
+	// Wait for all goroutines
+	for i := 0; i < 10; i++ {
+		<-done
+	}
+}
+
+func TestPreprocessPatternForHyperscan(t *testing.T) {
+	tests := []struct {
+		name     string
+		pattern  string
+		expected string
+	}{
+		{
+			name:     "strip extended mode",
+			pattern:  `(?x) secret _ [a-z]+`,
+			expected: `secret_[a-z]+`,
+		},
+		{
+			name:     "remove case insensitive flag",
+			pattern:  `(?i)password`,
+			expected: `password`,
+		},
+		{
+			name:     "remove dot all flag",
+			pattern:  `(?s)BEGIN.*END`,
+			expected: `BEGIN.*END`,
+		},
+		{
+			name:     "remove multiline flag",
+			pattern:  `(?m)^secret`,
+			expected: `^secret`,
+		},
+		{
+			name:     "no flags",
+			pattern:  `secret_token`,
+			expected: `secret_token`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := preprocessPatternForHyperscan(tt.pattern)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestVectorscanMatcher_BlobIDConsistency(t *testing.T) {
+	rules := []*types.Rule{
+		{
+			ID:      "blob-rule",
+			Name:    "Blob Test",
+			Pattern: `secret`,
+		},
+	}
+
+	matcher, err := NewVectorscan(rules, 2, nil)
+	require.NoError(t, err)
+	defer matcher.Close()
+
+	content := []byte("secret token")
+	blobID := types.ComputeBlobID(content)
+
+	matches, err := matcher.MatchWithBlobID(content, blobID)
+	require.NoError(t, err)
+	require.Len(t, matches, 1)
+
+	// Verify blob ID is set correctly
+	assert.Equal(t, blobID, matches[0].BlobID)
+}
+
+func TestVectorscanMatcher_LocationAccuracy(t *testing.T) {
+	rules := []*types.Rule{
+		{
+			ID:      "location-rule",
+			Name:    "Location Test",
+			Pattern: `secret`,
+		},
+	}
+
+	matcher, err := NewVectorscan(rules, 2, nil)
+	require.NoError(t, err)
+	defer matcher.Close()
+
+	content := []byte("prefix secret suffix")
+	matches, err := matcher.Match(content)
+	require.NoError(t, err)
+	require.Len(t, matches, 1)
+
+	// Verify location offsets
+	assert.Equal(t, int64(7), matches[0].Location.Offset.Start)
+	assert.Equal(t, int64(13), matches[0].Location.Offset.End)
+
+	// Verify matched content
+	matchedContent := content[matches[0].Location.Offset.Start:matches[0].Location.Offset.End]
+	assert.Equal(t, "secret", string(matchedContent))
+}
+
+func TestHasFlag(t *testing.T) {
+	tests := []struct {
+		name     string
+		pattern  string
+		flag     byte
+		expected bool
+	}{
+		{"(?i) has i", "(?i)test", 'i', true},
+		{"(?i) no s", "(?i)test", 's', false},
+		{"(?xi) has i", "(?xi)test", 'i', true},
+		{"(?xi) has x", "(?xi)test", 'x', true},
+		{"(?xis) has s", "(?xis)test", 's', true},
+		{"(?xis) has m", "(?xis)test", 'm', false},
+		{"(?ixm) has m", "(?ixm)test", 'm', true},
+		{"no flags", "test", 'i', false},
+		{"(?:) non-capturing no flags", "(?:test)", 'i', false},
+		{"(?=) lookahead no flags", "(?=test)", 'i', false},
+		{"inline (?s) in middle", "test(?s)pattern", 's', true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := hasFlag(tt.pattern, tt.flag)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestVectorscanMatcher_CombinedFlagsCaseInsensitive(t *testing.T) {
+	// Test that combined flags like (?xi) properly detect case-insensitivity
+	rules := []*types.Rule{
+		{
+			ID:   "combined-xi",
+			Name: "Combined (?xi) Test",
+			Pattern: `(?xi)
+				secret   # keyword
+				_key     # suffix
+			`,
+		},
+	}
+
+	matcher, err := NewVectorscan(rules, 2, nil)
+	require.NoError(t, err)
+	defer matcher.Close()
+
+	// Test case-insensitive matching (SECRET_KEY should match secret_key pattern)
+	content := []byte(`Found SECRET_KEY in the config`)
+	matches, err := matcher.Match(content)
+	require.NoError(t, err)
+	assert.Len(t, matches, 1, "(?xi) pattern should match case-insensitively")
+}
+
+// TestVectorscanMatcher_FallbackTimedOutBlobsAreRetried verifies that blobs which timed
+// out during matchFallbackRules (regexp2 fallback for Hyperscan-incompatible patterns) are
+// queued and recovered by DrainTimedOut, preventing silent finding drops.
+//
+// The test directly injects a retryJob (package-internal struct) to simulate a timeout
+// that occurred during the fallback pass, then verifies DrainTimedOut recovers the match.
+// This avoids any dependency on real wall-clock timing or CPU load.
+func TestVectorscanMatcher_FallbackTimedOutBlobsAreRetried(t *testing.T) {
+	// Use a pattern with a lookahead so it falls into fallbackRules
+	// (lookbehind/lookahead often route to the fallback path).
+	// We use a simple benign pattern here since we inject the job directly.
+	rule := &types.Rule{
+		ID:      "fallback-timeout-rule",
+		Name:    "Fallback Timeout Rule",
+		Pattern: `SECRET_KEY=([A-Z0-9]{20})`,
+	}
+
+	content := []byte("SECRET_KEY=ABCDEFGHIJ1234567890\nsome other content\n")
+	blobID := types.ComputeBlobID(content)
+
+	matcher, err := NewVectorscan([]*types.Rule{rule}, 0, nil)
+	require.NoError(t, err)
+	defer matcher.Close()
+
+	// Simulate a timeout by directly injecting a retry job, exactly as matchFallbackRules
+	// will do once the retry queue is wired up. This decouples the test from real timing.
+	matcher.retryMu.Lock()
+	matcher.retryJobs = append(matcher.retryJobs, retryJob{content: content, blobID: blobID, rule: rule})
+	matcher.retryMu.Unlock()
+
+	// DrainTimedOut must replay the queued job single-threaded with a longer timeout
+	// and recover findings that were dropped during the fallback pass.
+	retried, err := matcher.DrainTimedOut()
+	require.NoError(t, err)
+	require.NotEmpty(t, retried, "DrainTimedOut must recover timed-out findings from fallback path")
+
+	ruleIDs := make(map[string]bool)
+	for _, match := range retried {
+		ruleIDs[match.RuleID] = true
+	}
+	assert.True(t, ruleIDs["fallback-timeout-rule"], "fallback-timeout-rule findings must be recovered by DrainTimedOut")
+
+	// After draining, the queue must be empty.
+	retried2, err := matcher.DrainTimedOut()
+	require.NoError(t, err)
+	assert.Empty(t, retried2, "second DrainTimedOut call must return nothing (queue cleared)")
+}
+
+func TestVectorscanMatcher_BinaryChunkOverlap(t *testing.T) {
+	rules, err := rule.NewLoader().LoadBuiltinRules()
+	require.NoError(t, err)
+	index := slices.IndexFunc(rules, func(r *types.Rule) bool {
+		return r.ID == "np.generic.1"
+	})
+	require.NotEqual(t, -1, index)
+	generic := rules[index]
+
+	matcher, err := NewVectorscan([]*types.Rule{generic}, 3, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, matcher.Close()) })
+	require.Len(t, matcher.hsRules, 1)
+
+	content, wantOffsets := binaryWithSecrets()
+	matches, err := matcher.MatchWithBlobID(content, types.ComputeBlobID(content))
+	require.NoError(t, err)
+	require.Empty(t, matcher.retryJobs, "a timeout would make this a partial scan")
+
+	// Compare metadata, not matches: a failed assertion must not dump megabytes of binary context.
+	counts := make(map[types.OffsetSpan]int)
+	var contextBytes, staleIDs int
+	for _, match := range matches {
+		counts[match.Location.Offset]++
+		contextBytes += cap(match.Snippet.Before) + cap(match.Snippet.After)
+		if match.StructuralID != match.ComputeStructuralID(generic.StructuralID) {
+			staleIDs++
+		}
+	}
+	t.Logf(
+		"input=%.2f MB matches=%d unique_locations=%d retained_context=%.2f MB stale_ids=%d",
+		float64(len(content))/1e6,
+		len(matches),
+		len(counts),
+		float64(contextBytes)/1e6,
+		staleIDs,
+	)
+
+	wantCounts := make(map[types.OffsetSpan]int)
+	for _, offset := range wantOffsets {
+		wantCounts[offset]++
+	}
+	assert.Equal(t, wantCounts, counts)
+	assert.Zero(t, staleIDs, "match identities must use file-absolute offsets")
+	assert.LessOrEqual(t, contextBytes, len(content), "two small matches must not retain more context than the entire input")
+}
+
+func binaryWithSecrets() ([]byte, []types.OffsetSpan) {
+	content := []byte("\x7fELF\x02\x01\x01\x00\n")
+	content = append(content, bytes.Repeat([]byte{0x01, 0x00, '\n'}, 20)...)
+	lineStart := len(content)
+
+	// Exceed the default 5-MiB chunk size without a newline, as an executable's data can.
+	content = append(content, bytes.Repeat([]byte{0x00, 0xff}, 3*1024*1024)...)
+	secret := []byte("secret = 0123456789abcdef0123456789abcdef")
+	var offsets []types.OffsetSpan
+	for _, relativeOffset := range []int{1024 * 1024, 5*1024*1024 + 1024} {
+		start := lineStart + relativeOffset
+		copy(content[start:], secret)
+		offsets = append(offsets, types.OffsetSpan{
+			Start: int64(start),
+			End:   int64(start + len(secret)),
+		})
+	}
+
+	content = append(content, '\n')
+	content = append(content, bytes.Repeat([]byte{0x01, 0x00, '\n'}, 20)...)
+	return content, offsets
+}

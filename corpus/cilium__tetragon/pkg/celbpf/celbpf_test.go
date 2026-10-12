@@ -1,0 +1,331 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Tetragon
+
+// Cel -> BPF code generation
+// Heavily based on an earlier implementation by Yutaro Hayakawa <yutaro.hayakawa@isovalent.com>
+
+//go:build !windows
+
+package celbpf
+
+import (
+	"encoding/binary"
+	"errors"
+	"math"
+	"os/exec"
+	"strconv"
+	"testing"
+	"unsafe"
+
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/btf"
+	"github.com/stretchr/testify/require"
+
+	"github.com/cilium/tetragon/pkg/k8s/apis/cilium.io/v1alpha1"
+)
+
+func dumpProg(t *testing.T, prog *ebpf.Program) {
+	info, err := prog.Info()
+	if err != nil {
+		return
+	}
+
+	id, ok := info.ID()
+	if !ok {
+		return
+	}
+
+	cmd := exec.Command("bpftool", "prog", "dump", "xlated", "id", strconv.Itoa(int(id)))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return
+	}
+	t.Logf("%s\n", string(out))
+}
+
+// emulate msg_generic_kprobe for testing
+type DummyMsg struct {
+	argsoff [5]int64
+	args    [24000]uint8
+}
+
+func prepareArgs(t *testing.T, hookArgs []any) (DummyMsg, []v1alpha1.KProbeArg) {
+	var args []v1alpha1.KProbeArg
+	var msg DummyMsg
+	argsOff := 0
+	for i := range 5 {
+		if i < len(hookArgs) {
+			val := hookArgs[i]
+			n, err := binary.Encode(msg.args[argsOff:], binary.LittleEndian, val)
+			if err != nil {
+				t.Fatal(err)
+			}
+			msg.argsoff[i] = int64(argsOff)
+			argsOff += n
+		} else {
+			msg.argsoff[i] = math.MaxInt64
+		}
+	}
+
+	for _, hArg := range hookArgs {
+		switch hArg.(type) {
+		case int8:
+			args = append(args, v1alpha1.KProbeArg{
+				Type: "int8",
+			})
+		case int16:
+			args = append(args, v1alpha1.KProbeArg{
+				Type: "int16",
+			})
+		case int32:
+			args = append(args, v1alpha1.KProbeArg{
+				Type: "int32",
+			})
+		case int64:
+			args = append(args, v1alpha1.KProbeArg{
+				Type: "int64",
+			})
+		case uint8:
+			args = append(args, v1alpha1.KProbeArg{
+				Type: "uint8",
+			})
+		case uint16:
+			args = append(args, v1alpha1.KProbeArg{
+				Type: "uint16",
+			})
+		case uint32:
+			args = append(args, v1alpha1.KProbeArg{
+				Type: "uint32",
+			})
+		case uint64:
+			args = append(args, v1alpha1.KProbeArg{
+				Type: "uint64",
+			})
+		default:
+			t.Fatalf("unknown type %T", hArg)
+		}
+	}
+
+	return msg, args
+}
+
+func btfTestArgExprFnTy(fnName string) *btf.Func {
+	return &btf.Func{
+		Name: fnName,
+		Type: &btf.FuncProto{
+			Return: &btf.Int{
+				Name:     "s32",
+				Size:     4,
+				Encoding: btf.Signed,
+			},
+			Params: []btf.FuncParam{
+				{Name: "ctx", Type: &btf.Pointer{
+					Target: &btf.Int{
+						Name:     "u64",
+						Size:     8,
+						Encoding: btf.Unsigned,
+					},
+				}},
+			},
+		},
+		Linkage: btf.StaticFunc,
+	}
+}
+
+var argTestCases = []struct {
+	expr     string
+	ret      uint32
+	hookArgs []any
+}{
+	{
+		expr:     "arg0 == 42u",
+		ret:      1,
+		hookArgs: []any{uint64(42)},
+	},
+	{
+		expr:     "arg0 == 43u",
+		ret:      0,
+		hookArgs: []any{uint64(42)},
+	},
+	{
+		expr:     "arg0 == 0xaaaaaaaaaaaaaaaau",
+		ret:      1,
+		hookArgs: []any{uint64(0xaaaaaaaaaaaaaaaa)},
+	},
+	{
+		expr:     "arg0 == 0xaaaaaaaaaaaaaaaau",
+		ret:      0,
+		hookArgs: []any{uint64(0xbaaaaaaaaaaaaaab)},
+	},
+	{
+		expr:     "arg0 == uint32(42u)",
+		ret:      1,
+		hookArgs: []any{uint32(42)},
+	},
+	{
+		expr:     "arg0 == uint32(43u)",
+		ret:      0,
+		hookArgs: []any{uint32(42)},
+	},
+	{
+		expr:     "arg0 == int16(-1)",
+		ret:      1,
+		hookArgs: []any{int16(-1)},
+	},
+	{
+		expr:     "arg0 == uint8(255u)",
+		ret:      1,
+		hookArgs: []any{uint8(255)},
+	},
+	{
+		expr:     "arg2 == int32(42)",
+		ret:      1,
+		hookArgs: []any{int32(0), uint64(0), int32(42)},
+	},
+	{
+		expr:     "arg0 == int32(-1)",
+		ret:      1,
+		hookArgs: []any{int32(-1)},
+	},
+	{
+		expr:     "arg2 == int32(0)",
+		ret:      0,
+		hookArgs: []any{int32(0), uint64(0), int32(42)},
+	},
+	{
+		expr:     "arg2 == arg0",
+		ret:      1,
+		hookArgs: []any{int32(42), uint64(0), int32(42)},
+	},
+	{
+		expr:     "arg2 - int32(10) == int32(32)",
+		ret:      1,
+		hookArgs: []any{int32(30), uint64(0), int32(42)},
+	},
+	{
+		expr:     "arg2 - int32(10) == int32(2) + arg0",
+		ret:      1,
+		hookArgs: []any{int32(30), uint64(0), int32(42)},
+	},
+	{
+		expr:     "arg2 - int32(-10) == int32(12) + arg0",
+		ret:      1,
+		hookArgs: []any{int32(30), uint64(0), int32(32)},
+	},
+	{
+		expr: "int32(2147483647) + int32(1) == int32(-2147483648)",
+		ret:  1,
+	},
+	{
+		expr: "uint32(4294967295u) + uint32(1u) == uint32(0u)",
+		ret:  1,
+	},
+	{
+		expr:     "arg0 + arg1 == arg2 + 101",
+		hookArgs: []any{int64(51), int64(100), int64(50)},
+		ret:      1,
+	},
+	{
+		expr:     "arg0 + arg1 == -9223372036854775808",
+		hookArgs: []any{int64(9223372036854775807), int64(1)},
+		ret:      1,
+	},
+	{
+		expr:     "arg0 - arg1 == 9223372036854775807",
+		hookArgs: []any{int64(-9223372036854775808), int64(1)},
+		ret:      1,
+	},
+	{
+		expr:     "arg0 + arg1 == 0u",
+		hookArgs: []any{uint64(18446744073709551615), uint64(1)},
+		ret:      1,
+	},
+	{
+		expr:     "arg0 - arg1 == 18446744073709551615u",
+		hookArgs: []any{uint64(0), uint64(1)},
+		ret:      1,
+	},
+	{
+		expr:     "arg0 != arg1 && !(arg2 >= arg3)",
+		hookArgs: []any{int32(42), int32(41), uint64(41), uint64(42)},
+		ret:      1,
+	},
+	{
+		expr:     "arg0 == arg1 || arg2 != arg3",
+		hookArgs: []any{int64(42), int64(41), uint32(42), uint32(41)},
+		ret:      1,
+	},
+}
+
+func evalCELBPF(t *testing.T, expr string, hookArgs []any, expectedVal uint32) {
+	t.Helper()
+
+	m, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type:       ebpf.Array,
+		KeySize:    4,
+		ValueSize:  uint32(unsafe.Sizeof(DummyMsg{})),
+		MaxEntries: 1,
+	})
+	require.NoError(t, err)
+	defer m.Close()
+
+	data, args := prepareArgs(t, hookArgs)
+
+	err = m.Update(new(uint32(0)), &data, 0)
+	require.NoError(t, err, "update map value")
+
+	fnName := "myfn"
+	insns, _, err := CompileFn(fnName, expr, args, nil)
+	require.NoError(t, err)
+	prelude := asm.Instructions{
+		// R1 map
+		asm.LoadMapPtr(asm.R1, m.FD()),
+		// R2 key
+		asm.Mov.Reg(asm.R2, asm.R10),
+		asm.Add.Imm(asm.R2, -4),
+		asm.StoreImm(asm.R2, 0, 0, asm.Word),
+		// Lookup map[0]
+		asm.FnMapLookupElem.Call(),
+		asm.JEq.Imm(asm.R0, 0, "ret"),
+
+		// set arguments for call
+		// R1: ->argsoff
+		// R2: ->args
+		asm.Mov.Reg(asm.R1, asm.R0),
+		asm.Mov.Reg(asm.R2, asm.R1),
+		asm.Add.Imm(asm.R2, 5*8),
+		asm.Call.Label(fnName),
+		asm.Return().WithSymbol("ret"),
+	}
+	fnTy := btfTestArgExprFnTy("main")
+	prelude[0] = btf.WithFuncMetadata(prelude[0].WithSymbol(fnTy.Name), fnTy).WithSource(s{"main"})
+	insns = append(prelude, insns...)
+	prog, err := ebpf.NewProgramWithOptions(&ebpf.ProgramSpec{
+		Type:         ebpf.RawTracepoint,
+		Instructions: insns,
+		License:      "Dual BSD/GPL",
+	}, ebpf.ProgramOptions{LogLevel: ebpf.LogLevelInstruction})
+	if ve, ok := errors.AsType[*ebpf.VerifierError](err); ok {
+		t.Logf("verifier error: %+v", ve)
+		t.FailNow()
+	}
+	require.NoError(t, err)
+	defer prog.Close()
+	val, err := prog.Run(&ebpf.RunOptions{})
+	require.NoError(t, err)
+	if expectedVal != val {
+		t.Logf("insns:\n%s\n", insns)
+		dumpProg(t, prog)
+	}
+	require.Equal(t, expectedVal, val, "result of %q was %d and not %d", expr, val, expectedVal)
+}
+
+func TestArgExprs(t *testing.T) {
+	if !Supported() {
+		t.Skip()
+	}
+	for _, tc := range argTestCases {
+		evalCELBPF(t, tc.expr, tc.hookArgs, tc.ret)
+	}
+}

@@ -1,0 +1,1125 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Rendering layer entry point: shared helpers used across the per-mode
+// renderers, plus the render_summary() dispatcher that routes a fully-
+// resolved struct summary to the chosen output mode.
+//
+// The output modes themselves live in src/render/*.c:
+//   render/text.c      — default and verbose (-v) text, readout, layout maps
+//   render/json.c      — JSON output (--json / -j), plus json_print_escaped
+//   render/oneline.c   — one-line summary (--oneline / -1)
+//   render/markdown.c  — markdown table (--markdown / -m)
+//   render/hardening.c — hardening assessment (-H), text + JSON flavours
+//
+// Cross-file glue (shared helpers, per-mode entry points) is declared in
+// src/include/kasld/render_internal.h.
+//
+// Resolution (the engine) runs in the orchestrator layer BEFORE
+// render_summary() is called — rendering is a pure consumer and never
+// drives inference.
+// ---
+// <bcoles@gmail.com>
+
+#include "include/kasld/internal.h"
+#include "include/kasld/render_internal.h"
+#include "include/kasld/report.h"
+
+#include <limits.h>
+#include <stdio.h>
+#include <string.h>
+
+/* Human-readable size: format bytes as "N.N KiB/MiB/GiB/TiB" */
+const char *human_size(unsigned long bytes, char *buf, size_t bufsz) {
+#if ULONG_MAX > 0xFFFFFFFFul
+  if (bytes >= PB)
+    snprintf(buf, bufsz, "%.1f PiB", (double)bytes / (double)PB);
+  else if (bytes >= TB)
+    snprintf(buf, bufsz, "%.1f TiB", (double)bytes / (double)TB);
+  else
+#endif
+      if (bytes >= GB)
+    snprintf(buf, bufsz, "%.1f GiB", (double)bytes / (double)GB);
+  else if (bytes >= MB)
+    snprintf(buf, bufsz, "%.1f MiB", (double)bytes / (double)MB);
+  else if (bytes >= KB)
+    snprintf(buf, bufsz, "%.1f KiB", (double)bytes / (double)KB);
+  else
+    snprintf(buf, bufsz, "%lu B", bytes);
+  return buf;
+}
+
+/* -------------------------------------------------------------------------
+ * Result-model helpers
+ *
+ * Mirror the orchestrator's anchor_addr() and the result_in_bounds()
+ * convention. A merged record carries method_set (the union of its
+ * contributors' methods); the single display value is the strongest method
+ * present, which stays consistent with the record's resolved confidence.
+ * -------------------------------------------------------------------------
+ */
+/* anchor_addr() is defined as a static inline in kasld/internal.h. */
+
+/* The oracle rows' two vocabularies, defined once so no format can invent a
+ * third. Both answer the same axis: `status` is the machine token, `answer` the
+ * human phrasing that keeps the row readable as a reply to "Readable <path>:".
+ * "unknown" is a real answer -- the state where nothing observed separates a
+ * refusal from an absence -- not a placeholder for one of the others. */
+const char *kasld_oracle_status_name(enum oracle_access a) {
+  switch (a) {
+  case ORACLE_READABLE:
+    return "readable";
+  case ORACLE_DENIED:
+    return "denied";
+  case ORACLE_ABSENT:
+    return "absent";
+  case ORACLE_UNKNOWN:
+    break;
+  }
+  return "unknown";
+}
+
+const char *kasld_oracle_answer(enum oracle_access a) {
+  switch (a) {
+  case ORACLE_READABLE:
+    return "yes";
+  case ORACLE_DENIED:
+    return "no (denied)";
+  case ORACLE_ABSENT:
+    return "no (absent)";
+  case ORACLE_UNKNOWN:
+    break;
+  }
+  return "unknown";
+}
+
+const char *result_method(const struct result *r) {
+  if (!r)
+    return "unknown";
+  return kasld_method_set_strongest(r->method_set);
+}
+
+const char *result_section(const struct result *r) {
+  if (!r)
+    return "";
+  return region_info[r->region].section_name;
+}
+
+int in_bounds(const struct result *r) { return result_in_bounds(r, &layout); }
+
+/* Canonical section iteration order shared by every renderer's per-(type,
+ * section) grouping. NULL-terminated. type_order stays per-mode (markdown
+ * lists physical first), so only the section list is shared here. */
+const char *const kasld_render_sections[] = {
+    "text", "module", "directmap", "data", "bss", "dram", "mmio", NULL};
+
+/* The compile-time default, phrased as a remark on the resolved image base.
+ *
+ * The default is a link-time constant, not a measurement, so it fits neither
+ * grade the output uses: it is not proven, and it is not a guess drawn from
+ * evidence. Every format states it as a plain sentence — which cannot be
+ * mistaken for a resolved value — carrying the only thing evidence has to say
+ * about it: whether the resolved bounds leave it standing. One sentence, built
+ * here, so no two formats can word the same fact differently.
+ *
+ * The verdict is a property of the bounds and never of how a format drew them,
+ * so a single test covers a pin, a closed range and either half-bound: the
+ * default is ruled out exactly when a known edge lies on the wrong side of it.
+ * An unknown edge rules nothing out. A pin that is not the default falls out of
+ * the same test, with no separate case.
+ *
+ * Containment is not corroboration. An Alpine armv7 kernel built VMSPLIT_2G has
+ * _text at 0x80008000 while the arch default 0xc0008000 sits inside the proven
+ * bounds, so the surviving verdict claims only that the default is possible.
+ *
+ * Returns NULL when there is nothing to say: no default, nothing resolved, or
+ * the default IS the resolved base — restating a printed address reads as a
+ * competing claim. `addr_text` is the caller's rendering of `def`, so each
+ * format keeps its own address style. */
+const char *default_base_remark(unsigned long def, unsigned long lo,
+                                unsigned long hi, const char *addr_text,
+                                char *buf, size_t bufsz) {
+  if (!def || (!lo && !hi) || (def == lo && def == hi))
+    return NULL;
+  int ruled_out = (lo && def < lo) || (hi && def > hi);
+  snprintf(buf, bufsz,
+           "The compile-time default for this architecture is %s, %s.",
+           addr_text, ruled_out ? "ruled out" : "still possible");
+  return buf;
+}
+
+/* Slot pitch without a trailing ".0" — the pitch is exact by construction, so
+ * the decimal is noise. Trimmed here rather than in human_size(), which also
+ * formats measured sizes elsewhere (and oneline's fixed-schema `dram=`).
+ * The map's gap sizes share it: a gap between two exact edges is exact too,
+ * and "16.0 MiB" claims a precision the ".0" does not carry. */
+const char *kasld_grain(unsigned long align, char *buf, size_t sz) {
+  char t[32];
+  human_size(align, t, sizeof(t));
+  char *dot = strstr(t, ".0");
+  if (dot)
+    memmove(dot, dot + 2, strlen(dot + 2) + 1);
+  snprintf(buf, sz, "%s", t);
+  return buf;
+}
+
+/* A decimal count with thousands separators, for the figures a reader is meant
+ * to weigh rather than parse: candidate counts run to fifteen digits on an
+ * architecture that narrows nothing, and an undivided run of digits that long
+ * is read by counting them.
+ *
+ * The separator is fixed rather than taken from the locale. Only LC_CTYPE is
+ * set, and deliberately -- it selects the glyph set and nothing else -- so
+ * LC_NUMERIC stays "C" and printf's grouping flag would do nothing. Widening
+ * the locale instead would make the same run render differently on two hosts,
+ * which the byte-exact output comparisons cannot admit; a fixed comma is one
+ * rendering everywhere.
+ *
+ * Machine formats never call this. JSON numbers cannot carry separators and
+ * the one-line schema is parsed positionally, so both emit the raw value. */
+const char *kasld_decimal(unsigned long v, char *buf, size_t sz) {
+  char d[KASLD_DECIMAL_MAX];
+  int n = snprintf(d, sizeof(d), "%lu", v);
+  int groups = (n - 1) / 3; /* separators to insert */
+  size_t need = (size_t)n + (size_t)groups + 1;
+  int out = 0;
+
+  if (sz == 0)
+    return buf;
+  /* No room to group. The plain digits are the closest true thing that fits. */
+  if (need > sz) {
+    snprintf(buf, sz, "%s", d);
+    return buf;
+  }
+  for (int i = 0; i < n; i++) {
+    if (i && (n - i) % 3 == 0)
+      buf[out++] = ',';
+    buf[out++] = d[i];
+  }
+  buf[out] = '\0';
+  return buf;
+}
+
+/* Hex digits an address occupies, so a column can be sized to its contents. */
+int readout_hex_digits(unsigned long v) {
+  int n = 0;
+  do {
+    n++;
+    v >>= 4;
+  } while (v);
+  return n;
+}
+
+/* An address right-aligned to `digits` hex digits, never zero-padded: relative
+ * magnitude stays legible, and a 16 MiB physical address does not wear the
+ * costume of a 64-bit kernel pointer. The padding is written directly rather
+ * than through a runtime "%*s" width, which no bound can be proved through. */
+const char *readout_addr(unsigned long v, int digits, char *buf, size_t sz) {
+  char t[32];
+  int n = snprintf(t, sizeof(t), "0x%lx", v);
+  int want = (digits < 0 ? 0 : digits) + 2;
+  int pad = want - n;
+  if (sz == 0)
+    return buf;
+  if (pad < 0)
+    pad = 0;
+  if ((size_t)pad > sz - 1)
+    pad = (int)(sz - 1);
+  memset(buf, ' ', (size_t)pad);
+  snprintf(buf + pad, sz - (size_t)pad, "%s", t);
+  return buf;
+}
+
+/* A candidate count whose log2 is exact, so ceil(log2) rounded nothing: the "~"
+ * that marks a rounded bit-count is then wrong and is dropped. */
+static int count_is_exact_pow2(unsigned long v) {
+  return v != 0 && (v & (v - 1)) == 0;
+}
+
+/* Residual entropy, against the entropy the window started with where that
+ * baseline is known: "5 bits" alone says nothing about how much was recovered.
+ * The count is the exact figure; bits is ceil(log2) of it and rounds, so each
+ * bit-count carries a "~" unless its candidate count is an exact power of two.
+ */
+const char *kasld_entropy_phrase(int bits, int bits_top,
+                                 unsigned long candidates, unsigned long top,
+                                 char *buf, size_t bufsz) {
+  /* Stated whenever a baseline exists, equal figures included, so that a bare
+   * "N bits" means no baseline is modelled -- the same rule the Layout table's
+   * Candidates cell follows. `bits_top > 0` is what separates "no baseline"
+   * from one that happens to be zero. A baseline below the residual is not one
+   * this line can stand on, and is withheld rather than inverted.
+   *
+   * The comparison is the Candidates cell's, applied AFTER ceil(log2) rather
+   * than before, so the two can disagree on one run. A count that passes its
+   * baseline by less than the rounding suppresses the count's ratio while both
+   * figures still round to the same number of bits, and this line keeps its
+   * ratio where the cell has dropped one. That is the rule degrading correctly
+   * rather than two policies: push the count far enough past the baseline and
+   * the bit forms separate too, and this falls back to a bare residual. Both
+   * statements are true either way, so a caller wanting them adjacent needs no
+   * extra gate.
+   *
+   * Stated as the condition rather than as a row that meets it. Which rows do
+   * is a property of the run and of what the model covers, and a count that
+   * passes its baseline is a defect wherever it appears -- check-slots-subset
+   * exists to catch exactly that, so any example named here is one somebody is
+   * working to remove. */
+  if (bits_top > 0 && bits_top >= bits) {
+    /* Both figures are shown, so the mark is dropped only when neither rounded.
+     */
+    const char *mark =
+        count_is_exact_pow2(candidates) && count_is_exact_pow2(top) ? "" : "~";
+    snprintf(buf, bufsz, "%s%d of %d bits", mark, bits, bits_top);
+  } else {
+    const char *mark = count_is_exact_pow2(candidates) ? "" : "~";
+    snprintf(buf, bufsz, "%s%d bits", mark, bits);
+  }
+  return buf;
+}
+
+/* The displacement of a base from the un-randomized one it was drawn against,
+ * as a trailing note on the address rather than a column: it is the same value
+ * in another coordinate system, and only a concrete base has one. */
+const char *readout_slide(long slide, char *buf, size_t sz) {
+  unsigned long mag = (unsigned long)(slide < 0 ? -slide : slide);
+  snprintf(buf, sz, "slide %s0x%lx", slide < 0 ? "-" : "+", mag);
+  return buf;
+}
+
+/* What a component actually disclosed this run, read off the records the
+ * orchestrator attributed to it rather than off a declaration.
+ *
+ * Both kinds carry their producer: an address record's origin_set is indexed by
+ * discovery slot, and a scalar fact stores the slot outright. A component that
+ * reached OUTCOME_SUCCESS emitted at least one of the two by construction --
+ * kasld_classify_outcome() sets it from had_tagged, and handle_component_line()
+ * counts only address and scalar records toward that, never an R disposition.
+ * So for any succeeding component this answers exactly, and cannot drift from
+ * what was actually observed the way a hand-declared field can.
+ *
+ * Returns NULL when the component disclosed nothing this run, which is the
+ * caller's cue that it has nothing to say rather than an invitation to guess.
+ */
+const char *component_disclosed(int slot) {
+  int virt = 0, phys = 0, facts = 0;
+  if (slot < 0)
+    return NULL;
+  for (int i = 0; i < num_results; i++) {
+    if (!origin_set_has(&results[i].origins, slot))
+      continue;
+    if (results[i].type == KASLD_TYPE_VIRT)
+      virt = 1;
+    else if (results[i].type == KASLD_TYPE_PHYS)
+      phys = 1;
+  }
+  for (int i = 0; i < num_scalar_facts; i++)
+    if (scalar_facts[i].origin == slot)
+      facts = 1;
+  if (virt && phys)
+    return DISCLOSE_BOTH;
+  if (virt)
+    return DISCLOSE_VIRT;
+  if (phys)
+    return DISCLOSE_PHYS;
+  if (facts)
+    return DISCLOSE_FACTS;
+  return NULL;
+}
+
+/* The same phrase from a DECLARED `discloses:` value, for the report sections
+ * that list a component whether or not it produced anything -- a side channel
+ * that stayed flat, or a compiled-in surface that never ran. There is nothing
+ * to observe there, so the technique's own claim is all there is.
+ *
+ * Returns NULL for an absent or unrecognised value. Callers must not substitute
+ * a default: an unstated disclosure is unknown, and rendering it as one of the
+ * kinds states something the component never claimed. */
+const char *disclosure_descr(const char *declared) {
+  if (!declared)
+    return NULL;
+  if (strcmp(declared, "virtual") == 0)
+    return DISCLOSE_VIRT;
+  if (strcmp(declared, "physical") == 0)
+    return DISCLOSE_PHYS;
+  if (strcmp(declared, "both") == 0)
+    return DISCLOSE_BOTH;
+  if (strcmp(declared, "facts") == 0)
+    return DISCLOSE_FACTS;
+  return NULL;
+}
+
+/* ---------------------------------------------------------------------------
+ * The Layout table's row model.
+ *
+ * Built once here and rendered by each format, so the text readout and the
+ * markdown report cannot describe the same resolved state differently -- the
+ * failure this layer has had to be corrected for twice. A row carries only
+ * strings: which cells are emphasised, and how, is a presentation decision each
+ * renderer makes for itself.
+ * ------------------------------------------------------------------------- */
+
+struct layout_row layout_rows[LAYOUT_MAX_ROWS];
+int n_layout_rows;
+
+/* Column names, chosen for what each cell actually holds.
+ *
+ * Certainty, not Basis: the cell says how much the claim can be trusted, and
+ * "guaranteed" is a level of assurance rather than a foundation.
+ *
+ * Window, not Range: the cell holds a pin, a half-bound, or a span whose
+ * interior may be carved -- "range" is accurate for only one of the three and
+ * asserts a contiguity the others do not have.
+ *
+ * Candidates, not a count of placements or slots: the quantity being counted is
+ * not always a location, and a paging level has candidates but no slots.
+ *
+ * Grain, not Align: the cell gives the spacing the candidates sit on, which is
+ * what makes the count beside it mean anything, and does not claim the value is
+ * exact where the engine knows only a floor. */
+const char *const layout_hdr[LAYOUT_COLS] = {"Quantity", "Certainty", "Window",
+                                             "Candidates", "Grain"};
+
+/* The candidate count, against the set the row narrows. A GUARANTEED row states
+ * its denominator: the window the kernel randomized over is a figure that
+ * appears nowhere else on screen, and the ratio is how much of it the evidence
+ * took away. A LIKELY row states none, because the set it narrows is the
+ * guaranteed count printed directly above it in this column -- a likely row is
+ * only ever emitted after its guaranteed one, so the comparison is a line of
+ * sight rather than a repetition. Restating it cost seventeen columns on the
+ * widest line the tool draws.
+ *
+ * Every guaranteed row therefore says "of" something -- a figure, or the
+ * column's own token for one that is not known. A bare count belongs to likely
+ * rows alone, which is what keeps the two apart: dropping the denominator
+ * where none exists would render a quantity with no model identically to a row
+ * whose model is simply stated one line up.
+ *
+ * The column reports the size of the set still to be searched, whether or not
+ * evidence shrank it. A row that narrowed nothing still has a size worth
+ * stating -- it is what a baseline run is for -- so a figure is withheld only
+ * where there is no count to give. That is the sole meaning of "-", and it is
+ * the count that is missing rather than the set: a quantity whose window sits
+ * on no modelled grid has no pitch to count on, and one whose admissible set is
+ * carved away entirely has nothing left to count. Those are the two ways
+ * quantity_slots answers zero, and the bare "-" is the pair of them meeting a
+ * row that also has no set to divide -- otherwise the set alone is stated, as
+ * "- of N" below.
+ *
+ * Stated as the conditions rather than as the quantities that meet them. Which
+ * quantities those are is a property of the run and of what the model covers,
+ * both of which move: a region acquires a modelled set the moment something
+ * bounds it, and a list of names written when it had none reads as a claim
+ * about the region long after it stopped being true. "Nothing was learned" is
+ * carried by the Window column reading `not narrowed`, not by a blank here.
+ *
+ * An omitted denominator asserts nothing. It arises three ways -- no set is
+ * modelled for the quantity, a set is modelled but sits below the count and so
+ * cannot divide it, or the row is a likely one whose set is the line above --
+ * and the column does not distinguish them, because a token saying "no set
+ * exists" would be false in two of the three. What a bare figure says is that
+ * nothing was counted against, which is true in all of them.
+ *
+ * `top` is a raw count: 2^bits would over-state it, since ilog2 rounds up. It
+ * is dropped as a denominator when it does not exceed the row's own count,
+ * since a window that narrowed nothing has no fraction to report. Where the
+ * estimate carries no bounds at all, `top` alone is the answer. A count above
+ * its baseline is not a contradiction: the engine is willing to search wider
+ * than the kernel picks from, so the figure withheld there is the ratio, not
+ * the count. */
+static void layout_fmt_space(char *buf, size_t sz, unsigned long slots,
+                             unsigned long top) {
+  char sb[KASLD_DECIMAL_MAX], tb[KASLD_DECIMAL_MAX];
+  if (!slots && !top)
+    snprintf(buf, sz, "-");
+  else if (!slots)
+    /* No count, but the set it would have been counted against is known. A
+     * quantity sitting on no modelled grid has no pitch to count on, and one
+     * whose admissible set has been carved away entirely has nothing left to
+     * count; neither is a number. The denominator alone was printed here, which
+     * in a column headed Candidates asserts that figure AS the count. Stating
+     * it as "- of N" keeps the size of the problem visible and says outright
+     * that nothing was counted. A run that narrowed nothing still shows a bare
+     * total, because there the count and the denominator are one figure and
+     * `slots` carries it. */
+    snprintf(buf, sz, "- of %s", kasld_decimal(top, tb, sizeof(tb)));
+  else if (top >= slots)
+    /* Stated whenever a baseline exists, including where it equals the count.
+     * "N of N" says the set the row narrows is known and evidence excluded
+     * nothing from it; a bare count says no baseline is modelled for this
+     * quantity at all. Collapsing those two onto a bare count made them
+     * indistinguishable, and the documented reading -- "nothing narrowed" --
+     * was the wrong one for whichever quantity had no model. */
+    snprintf(buf, sz, "%s of %s", kasld_decimal(slots, sb, sizeof(sb)),
+             kasld_decimal(top, tb, sizeof(tb)));
+  else
+    /* A baseline below the count is not a baseline this row can stand on: the
+     * count would exceed the set it is counted against. Withheld rather than
+     * printed as an incoherent ratio, which puts the row in the same state as
+     * having no model -- which is what it amounts to.
+     *
+     * Withheld, and not replaced by a token saying no set exists: whether one
+     * exists is a question about the kernel, and this column states only what
+     * was counted. An absent denominator says nothing either way. */
+    snprintf(buf, sz, "%s", kasld_decimal(slots, sb, sizeof(sb)));
+}
+
+/* Addresses are never zero-padded here, matching the rest of the readout: a
+ * 16 MiB physical address does not wear the costume of a 64-bit pointer. */
+static void layout_fmt_range(char *buf, size_t sz, unsigned long lo, int has_lo,
+                             unsigned long hi, int has_hi, const char *note) {
+  char tail[32];
+  tail[0] = '\0';
+  if (note && *note)
+    snprintf(tail, sizeof(tail), " %s", note);
+  /* Which edges exist, not which happen to be non-zero. Reading it off the
+   * VALUE conflates a stated floor of zero with no floor at all, and the two
+   * are opposite statements: a quantity pinned at zero -- an s390 built without
+   * CONFIG_RANDOMIZE_IDENTITY_BASE has __identity_base == 0 -- rendered as
+   * "not narrowed", reporting a base the engine resolved exactly as one it
+   * knows nothing about. A window from a stated zero floor lost its floor the
+   * same way, leaving a row whose candidate count could not be reconciled with
+   * the range printed beside it. */
+  if (has_lo && has_hi && lo == hi)
+    snprintf(buf, sz, "0x%lx%s", lo, tail);
+  else if (has_lo && has_hi)
+    snprintf(buf, sz, "0x%lx - 0x%lx%s", lo, hi, tail);
+  else if (has_lo)
+    snprintf(buf, sz, ">= 0x%lx%s", lo, tail);
+  else if (has_hi)
+    snprintf(buf, sz, "<= 0x%lx%s", hi, tail);
+  else
+    snprintf(buf, sz, "not narrowed");
+}
+
+/* A row. `slots` of 0 withholds the search space -- the caller decides what is
+ * a bound worth acting on; `top` is the set the row narrows, and is dropped
+ * unless it exceeds `slots`.
+ *
+ * Not called directly by the projection below: it takes loose scalars, which is
+ * what let a row state a number no window held. layout_add_window() is the way
+ * in; this stays private to it and to the set-shaped row, which has values
+ * rather than edges. */
+static void layout_add(const char *quantity, const char *basis,
+                       unsigned long slots, unsigned long top, unsigned long lo,
+                       int has_lo, unsigned long hi, int has_hi,
+                       const char *note, unsigned long align, int align_exact) {
+  char gb[32];
+  struct layout_row *r;
+  if (n_layout_rows >= LAYOUT_MAX_ROWS)
+    return;
+  r = &layout_rows[n_layout_rows++];
+  memset(r, 0, sizeof(*r));
+  snprintf(r->cell[0], LAYOUT_CELL, "%s", quantity);
+  snprintf(r->cell[1], LAYOUT_CELL, "%s", basis);
+  layout_fmt_range(r->cell[2], LAYOUT_CELL, lo, has_lo, hi, has_hi, note);
+  layout_fmt_space(r->cell[3], LAYOUT_CELL, slots, top);
+  r->lo = lo;
+  r->hi = hi;
+  r->has_lo = has_lo;
+  r->has_hi = has_hi;
+  r->slots = slots;
+  r->top = top;
+  r->align = align;
+  snprintf(r->note, sizeof(r->note), "%s", note ? note : "");
+  /* A grain the engine knows only a floor for is marked as one, in the same
+   * vocabulary the Window cell uses for a one-sided bound. The mark is not
+   * decoration: a coarser true alignment means fewer candidates than the count
+   * beside it, so the number is a ceiling wherever this appears. */
+  r->align_exact = align_exact;
+  if (!align)
+    snprintf(r->cell[4], LAYOUT_CELL, "-");
+  else if (align_exact)
+    snprintf(r->cell[4], LAYOUT_CELL, "%s", kasld_grain(align, gb, sizeof(gb)));
+  else
+    snprintf(r->cell[4], LAYOUT_CELL, ">= %s",
+             kasld_grain(align, gb, sizeof(gb)));
+  r->dim = (!lo && !hi);
+  r->one_address = (lo && lo == hi);
+}
+
+/* The set a row narrows: the kernel's own randomization window for a proven
+ * row, and the proven row's own count for the speculative one beneath it.
+ * Determined by which grade the row carries, so no caller chooses it. */
+/* What the proven row narrows depends on the KIND of quantity. An interval
+ * narrows the window the kernel randomizes over, and where the architecture
+ * models no such window there is no denominator to state -- a region base is
+ * bounded by structure rather than by a randomization range. A set narrows the
+ * values the architecture admits, and that count is its denominator: "1 of 2"
+ * says one of the two paging levels this target could be running.
+ *
+ * Shared so the readout, the map and the row model cannot state a residual
+ * against three different denominators. Mirrors report.c's own choice for
+ * `top_bits`. */
+unsigned long kasld_entropy_top(const struct kasld_report_quantity *it) {
+  return it->guaranteed.shape == RSHAPE_SET ? it->search_top : it->entropy_top;
+}
+
+/* The baseline a COUNT may be stated against, or 0 where none can be.
+ *
+ * Same set as kasld_entropy_top, minus the case where it cannot serve as a
+ * denominator: the engine deliberately searches wider than the kernel
+ * randomizes, so a guaranteed count above the kernel's own window is legitimate
+ * and the ratio it would form is not. Withheld there rather than inverted,
+ * which leaves the row saying only what was counted -- and an absent
+ * denominator claims nothing about whether a set exists, which is a question
+ * about the kernel rather than about this run.
+ *
+ * Shared, because this judgement drifted once already: the readout and the
+ * entropy line each applied it and the JSON did not, so one format published a
+ * residual above the baseline printed beside it while the others withheld the
+ * baseline on the same run.
+ *
+ * Counts only. kasld_entropy_phrase applies the same comparison after
+ * ceil(log2), and the two are deliberately allowed to disagree on one run:
+ * 29355 candidates against a top of 28843 cannot state a count ratio while both
+ * round to 15 bits and state a bit one. A format publishing both figures gates
+ * each on its own comparison -- see kasld_entropy_baseline_bits -- so that it
+ * withholds exactly what the readout withholds and no more. */
+unsigned long kasld_entropy_baseline(const struct kasld_report_quantity *it,
+                                     const struct kasld_report_window *w) {
+  unsigned long top = kasld_entropy_top(it);
+  if (top && w && w->candidates && top < w->candidates)
+    return 0;
+  return top;
+}
+
+/* The same judgement in BITS, which is the form kasld_entropy_phrase states and
+ * therefore the one a format must match to agree with the readout. Separate
+ * from the count form on purpose: ceil(log2) can bring a baseline back above a
+ * count that exceeded it, and where it does the readout prints the bit ratio
+ * and withholds the count ratio. Returns 0 where no bit ratio may be stated. */
+int kasld_entropy_baseline_bits(const struct kasld_report_quantity *it,
+                                const struct kasld_report_window *w) {
+  if (it->top_bits <= 0 || !w)
+    return 0;
+  if (w->candidates && it->top_bits < w->bits)
+    return 0;
+  return it->top_bits;
+}
+
+static unsigned long layout_row_top(const struct kasld_report_quantity *it,
+                                    const char *basis) {
+  if (strcmp(basis, GRADE_GUARANTEED) != 0)
+    /* Omitted, not stated: the set a likely row narrows is the guaranteed
+     * count printed directly above it in this column, and a likely row is only
+     * ever emitted after its guaranteed one. Restating it spent seventeen
+     * columns on the widest line the tool draws to repeat the line above. */
+    return 0;
+  return kasld_entropy_baseline(it, &it->guaranteed);
+}
+
+/* The slide note for a row, or NULL.
+ *
+ * A slide is the displacement of a RESOLVED value from the un-randomized base,
+ * so it belongs to a window that names one address and to no other: measured
+ * from one end of a range it is not a measurement of anything. The picked base
+ * must also BE that address -- the slide was computed from the pick, and
+ * attaching it to a window resolved elsewhere would label one value with the
+ * displacement of another. */
+static const char *layout_row_slide(const struct kasld_report_quantity *it,
+                                    const struct kasld_report_window *w,
+                                    char *buf, size_t bufsz) {
+  if (!it->has_slide || w->candidates != 1 || !w->has_lo || !w->has_hi)
+    return NULL;
+  if (w->lo != w->hi)
+    return NULL;
+  if (it->has_point && it->point != w->lo)
+    return NULL;
+  return readout_slide(it->slide, buf, bufsz);
+}
+
+/* One row, drawn from one resolved window.
+ *
+ * Everything the row states is read from the model: the addresses from the
+ * window's edges, the count from the window's own `candidates`, the pitch from
+ * the item's grain. A caller supplies WHICH window to draw and, at most, a note
+ * beside it -- it cannot supply the numbers.
+ *
+ * That is the whole point of the signature. A signature taking the count as a
+ * plain parameter lets a caller that believes it has the answer pass a literal
+ * beside a window holding many candidates, so a row reads "1 of 472" while the
+ * engine, and json reading the same engine, say 33. A format that can assert a
+ * count can contradict the engine, and two formats asserting separately can
+ * contradict each other. Here there is nothing to assert. */
+static void layout_add_window(const struct kasld_report_quantity *it,
+                              const char *basis,
+                              const struct kasld_report_window *w,
+                              const char *note) {
+  layout_add(it->label, basis, w->candidates, layout_row_top(it, basis),
+             w->has_lo ? w->lo : 0, w->has_lo, w->has_hi ? w->hi : 0, w->has_hi,
+             note, it->align_min, it->align_exact);
+}
+
+/* A row stating a set of admissible values.
+ *
+ * The Window cell holds the values, comma-separated, because that IS the set --
+ * writing them out is not a flattening the way squeezing them into endpoints
+ * would be. There is no grid under a set, so the Grain cell stays empty, and
+ * the count is exact rather than an upper bound: the values are enumerated, not
+ * counted over a pitch. */
+static void layout_add_set(const char *quantity, const char *basis,
+                           const unsigned long *values, int n_values,
+                           unsigned long top) {
+  struct layout_row *r;
+  int used = 0;
+  if (n_layout_rows >= LAYOUT_MAX_ROWS || n_values <= 0)
+    return;
+  r = &layout_rows[n_layout_rows++];
+  memset(r, 0, sizeof(*r));
+  snprintf(r->cell[0], LAYOUT_CELL, "%s", quantity);
+  snprintf(r->cell[1], LAYOUT_CELL, "%s", basis);
+  for (int i = 0; i < n_values && used < LAYOUT_CELL - 1; i++)
+    used += snprintf(r->cell[2] + used, (size_t)(LAYOUT_CELL - used), "%s%lu",
+                     i ? ", " : "", values[i]);
+  layout_fmt_space(r->cell[3], LAYOUT_CELL, (unsigned long)n_values, top);
+  snprintf(r->cell[4], LAYOUT_CELL, "-");
+  r->slots = (unsigned long)n_values;
+  r->top = top;
+  r->is_set = 1;
+  /* `one_address` stays clear even for a set resolved to a single value: a
+   * paging level is a parameter of the search, not a placement recovered by it,
+   * so it does not take the weight the readout reserves for an address. A
+   * single remaining value is already legible as resolved -- it is the only one
+   * in the cell. */
+}
+
+/* Build the rows for this run, in the fixed order the readout presents.
+ */
+/* Project the report model into the table's rows.
+ *
+ * One loop over the items, not a passage per quantity: the model decides which
+ * unknowns this machine has and what is proven about each, so a format's job is
+ * to lay them out, never to choose them. That is what stops two formats naming
+ * different sets, and what stops a posture quietly presenting its own.
+ *
+ * An item becomes one row, or two where a speculative answer exists beneath the
+ * proven window. A row is a presentation of a grade; the item carries both
+ * grades, and which of them becomes a row is decided here rather than stored.
+ */
+void layout_build(void) {
+  const struct kasld_report *rep = render_report();
+  char note[48];
+
+  n_layout_rows = 0;
+  if (!rep)
+    return;
+
+  for (int i = 0; i < rep->n_quantities; i++) {
+    const struct kasld_report_quantity *it = &rep->quantities[i];
+    const struct kasld_report_window *g = &it->guaranteed;
+    int pinned;
+
+    /* A set of admissible values is not a window: it has no endpoints and no
+     * grid, so it gets a row shaped for a set rather than being squeezed into
+     * the range cell. */
+    if (g->shape == RSHAPE_SET) {
+      if (!g->present)
+        continue;
+      layout_add_set(it->label, GRADE_GUARANTEED, g->values, g->n_values,
+                     layout_row_top(it, GRADE_GUARANTEED));
+      if (kasld_report_likely_is_tighter(it))
+        layout_add_set(it->label, GRADE_LIKELY, it->likely.values,
+                       it->likely.n_values, layout_row_top(it, GRADE_LIKELY));
+      continue;
+    }
+    if (!g->present)
+      continue;
+
+    pinned = g->has_lo && g->has_hi && g->lo == g->hi;
+
+    /* A slide is a displacement from the un-randomized base, so it carries
+     * meaning only where something randomized. In the static postures the line
+     * above the table already says nothing did, and the note would restate it
+     * in a form that reads as evidence of movement. */
+    layout_add_window(it, GRADE_GUARANTEED, g,
+                      layout_row_slide(it, g, note, sizeof(note)));
+
+    if (pinned)
+      continue; /* the proven row already states the single answer */
+
+    /* The speculative window beneath the proven one, where the all-signals
+     * resolution reached further.
+     *
+     * The concrete headline base is NOT drawn here, and that is deliberate. It
+     * is picked by scanning the observations, and the observation it comes from
+     * has already been given to the engine -- so whatever it establishes is in
+     * this window already. Where it witnesses a base the engine pinned it, and
+     * the window says one candidate; where it is an interior sample the engine
+     * bounded the region, and the window's top edge IS that sample. Drawing the
+     * point beside the window therefore adds nothing in the first case and
+     * contradicts the window in the second, by presenting a ceiling as an
+     * answer and one candidate where the engine counted many. The window is the
+     * authority on how much is left; a picked address can only ever name one of
+     * the values it admits. */
+    if (kasld_report_likely_is_tighter(it)) {
+      const struct kasld_report_window *l = &it->likely;
+      const char *n = NULL;
+      /* The direct map has no compile-time default to slide from, but it does
+       * have an offset from the base the kernel would have used un-randomized
+       * -- the same value in another coordinate system, so it takes the slide's
+       * place. Shown only once the window admits a single value, since an
+       * offset measured from one end of a range is not a measurement of the
+       * base. Measured against the base for the paging level actually in force:
+       * the two are 59.6 PiB apart, so the wrong one renders as a large
+       * negative number that still reads as a measurement. */
+      if (l->candidates == 1 && l->has_hi && it->q == Q_PAGE_OFFSET &&
+          layout.virt_page_offset_unrandomized) {
+        long d = (long)(l->hi - layout.virt_page_offset_unrandomized);
+        snprintf(note, sizeof(note), "off %s0x%lx", d < 0 ? "-" : "+",
+                 (unsigned long)(d < 0 ? -d : d));
+        n = note;
+      }
+      if (!n)
+        n = layout_row_slide(it, l, note, sizeof(note));
+      layout_add_window(it, GRADE_LIKELY, l, n);
+    }
+  }
+}
+
+/* Whether the row model resolved anything worth drawing.
+ *
+ * A row is dim exactly when neither edge was bounded, so a model with no
+ * un-dim row describes a run that resolved nothing and has no table to show.
+ * Asked of the model rather than of the summary's slot counts: the two agree
+ * wherever KASLR ran, and diverge exactly where it did not -- a disabled kernel
+ * has no slots to count, since nothing was randomized, while its rows carry a
+ * fully resolved window. A format gating on the counts therefore drew nothing
+ * in the one posture whose answer is already known. */
+int layout_has_resolved(void) {
+  for (int i = 0; i < n_layout_rows; i++)
+    if (!layout_rows[i].dim)
+      return 1;
+  return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * Output helpers
+ * -------------------------------------------------------------------------
+ */
+/* Display heading for a (type, section) bucket. Every section can in
+ * principle receive both virt and phys observations — components like
+ * dmesg_check_for_initrd emit each leaked initrd address twice (one
+ * V/INITRD sample, one P/INITRD sample via directmap_virt_to_phys()) —
+ * so the heading must distinguish the two so the user doesn't see a
+ * "Physical DRAM" line full of 0xc000... virt addresses on a coupled
+ * arch. Phys-rooted sections (dram / mmio) carry a type-aware label so
+ * that a VIRT directmap mirror renders as "(virtual mirror via direct
+ * map)" instead of "Physical" - the address IS virtual, but the
+ * underlying region is the same phys instance. */
+const char *section_display_name(enum kasld_addr_type type,
+                                 const char *section) {
+  int virt = (type == KASLD_TYPE_VIRT);
+  if (strcmp(section, "text") == 0)
+    return virt ? "Kernel text (virtual)" : "Kernel text (physical)";
+  if (strcmp(section, "module") == 0)
+    return virt ? "Kernel modules (virtual)" : "Kernel modules (physical)";
+  if (strcmp(section, "directmap") == 0)
+    return "Direct map (virtual)"; /* directmap is virt by definition */
+  if (strcmp(section, "data") == 0)
+    return virt ? "Kernel data (virtual)" : "Kernel data (physical)";
+  if (strcmp(section, "bss") == 0)
+    return virt ? "Kernel BSS (virtual)" : "Kernel BSS (physical)";
+  if (strcmp(section, "dram") == 0)
+    return virt ? "DRAM region (virtual mirror)" : "Physical DRAM";
+  if (strcmp(section, "mmio") == 0)
+    return virt ? "MMIO region (virtual mirror)" : "Physical MMIO";
+  if (strcmp(section, "pageoffset") == 0)
+    return NULL; /* metadata, not a leak group */
+  return "Unknown";
+}
+
+/* Span of the in-bounds results in a (type, section, optional region_filter).
+ * The filter scope MUST match what the caller displays, so the reported span
+ * describes the same records the consumer sees — the same requirement the
+ * consensus helpers carry. */
+void section_range(enum kasld_addr_type type, const char *section,
+                   enum kasld_region region_filter, unsigned long *out_lo,
+                   unsigned long *out_hi) {
+  unsigned long lo = 0, hi = 0;
+  int found = 0;
+  for (int i = 0; i < num_results; i++) {
+    const struct result *r = &results[i];
+    if (r->type != type || strcmp(result_section(r), section) != 0)
+      continue;
+    if (region_filter != REGION_UNKNOWN && r->region != region_filter)
+      continue;
+    if (!in_bounds(r))
+      continue;
+    unsigned long rlo =
+        HAS_LO(r) ? r->lo : (HAS_SAMPLE(r) ? r->sample : anchor_addr(r));
+    unsigned long rhi =
+        HAS_HI(r) ? r->hi : (HAS_SAMPLE(r) ? r->sample : anchor_addr(r));
+    if (!found || rlo < lo)
+      lo = rlo;
+    if (rhi > hi)
+      hi = rhi;
+    found = 1;
+  }
+  *out_lo = found ? lo : 0;
+  *out_hi = found ? hi : 0;
+}
+
+/* Pick the most-base-like in-bounds record for a (type, section, optional
+ * region_filter): every observation in a section satisfies
+ *
+ *     addr = region_base + non_negative_offset
+ *
+ * so the address closest to the base is the most informative consensus for
+ * "where does this region start?" — true for every section the renderer
+ * emits (text/data/bss start at their lowest address; directmap, dram,
+ * mmio, module each have an offset-from-base interpretation per
+ * observation). Picking by address alone would be fragile against a
+ * spurious low-confidence outlier, and picking by "first highest-conf"
+ * (the previous rule) gave order-dependent output that surfaced confusing
+ * results — e.g. directmap consensus landing on a NUMA top instead of the
+ * directmap base when three CONF_PARSED dmesg observations tied on
+ * confidence. The ordering used here is layered:
+ *
+ *   1. Highest CONF (an exact landmark trumps a dmesg snippet).
+ *   2. Prefer POS_BASE over POS_INTERIOR/POS_TOP at that confidence
+ *      (an explicit "base of this region" observation trumps a sample
+ *      that merely lives inside the region).
+ *   3. Lowest anchor address (closest to the base — the tightest
+ *      upper bound on the true base among same-grade observations).
+ *
+ * `region_filter`: REGION_UNKNOWN includes every region in the section;
+ * any other value restricts to that exact region. Subgroup-displayed
+ * blocks (e.g. "Physical DRAM / crashkernel") must pass the same filter
+ * they use for the displayed records, otherwise the printed `==>` value
+ * may not appear in the printed record list — exposed on ppc64 where the
+ * section-wide DRAM consensus (the lowest initrd record) was being
+ * displayed in the crashkernel subgroup's `==>` line.
+ *
+ * Returns NULL when no in-bounds record matches. Shared by
+ * section_consensus and section_consensus_info so the printed value and
+ * the printed source/conflict counts always describe the same record.
+ */
+static const struct result *
+section_consensus_pick(enum kasld_addr_type type, const char *section,
+                       enum kasld_region region_filter) {
+  const struct result *anchor = NULL;
+  int best_w = -1;
+  int best_is_base = 0;
+  unsigned long best_addr = 0;
+  for (int i = 0; i < num_results; i++) {
+    const struct result *r = &results[i];
+    if (r->type != type || strcmp(result_section(r), section) != 0)
+      continue;
+    if (region_filter != REGION_UNKNOWN && r->region != region_filter)
+      continue;
+    if (!in_bounds(r))
+      continue;
+    int w = conf_weight(r->conf);
+    int is_base = (r->pos == POS_BASE);
+    unsigned long a = anchor_addr(r);
+    int better = 0;
+    if (w > best_w)
+      better = 1; /* layer 1: higher confidence wins outright */
+    else if (w == best_w && is_base && !best_is_base)
+      better = 1; /* layer 2: prefer POS_BASE at this confidence */
+    else if (w == best_w && is_base == best_is_base &&
+             (!anchor || a < best_addr))
+      better = 1; /* layer 3: prefer the lowest anchor (closest to base) */
+    if (better) {
+      best_w = w;
+      best_is_base = is_base;
+      best_addr = a;
+      anchor = r;
+    }
+  }
+  return anchor;
+}
+
+/* The address that represents an edge-carrying group.
+ *
+ * NOT section_consensus(): that ranks confidence above position, so a
+ * high-confidence interior sample outranks a base and the group is represented
+ * by an address inside the region rather than the edge of it. Here only records
+ * stating an edge are eligible, and the strongest of those wins -- the same
+ * choice the readout's Evidence rows make, so two formats naming the same group
+ * name the same address.
+ *
+ * Returns 0 when the group states no edge at all; the caller then has an extent
+ * to report rather than a position. */
+int section_edge_addr(enum kasld_addr_type type, const char *section,
+                      enum kasld_region region_filter, unsigned long *out) {
+  const struct result *edge = NULL;
+  int best_w = -1;
+  for (int i = 0; i < num_results; i++) {
+    const struct result *r = &results[i];
+    if (r->type != type || strcmp(result_section(r), section) != 0)
+      continue;
+    if (region_filter != REGION_UNKNOWN && r->region != region_filter)
+      continue;
+    if (!in_bounds(r) || !(HAS_LO(r) || HAS_HI(r)))
+      continue;
+    if (conf_weight(r->conf) > best_w) {
+      best_w = conf_weight(r->conf);
+      edge = r;
+    }
+  }
+  if (!edge)
+    return 0;
+  *out = anchor_addr(edge);
+  return 1;
+}
+
+/* Count the distinct component origins contributing in-bounds records to a
+ * (type, section, optional region_filter). A record may credit several
+ * components (merged provenance); each distinct origin counts once. */
+int section_source_count(enum kasld_addr_type type, const char *section,
+                         enum kasld_region region_filter) {
+  struct origin_set seen;
+  memset(&seen, 0, sizeof(seen));
+  for (int i = 0; i < num_results; i++) {
+    const struct result *r = &results[i];
+    if (r->type != type || strcmp(result_section(r), section) != 0)
+      continue;
+    if (region_filter != REGION_UNKNOWN && r->region != region_filter)
+      continue;
+    if (!in_bounds(r))
+      continue;
+    /* Contributors are a set, so accumulating across records de-duplicates
+     * for free. */
+    origin_set_union(&seen, &r->origins);
+  }
+  return origin_set_count(&seen);
+}
+
+/* True when a (type, section, optional region_filter) carries no edge (lo/hi)
+ * record — every in-bounds record is a bare interior sample. Such a section
+ * has no single "base": the samples corroborate an extent, they do not compete
+ * for one address, so consensus/conflict counting does not apply to it. */
+int section_is_interior_only(enum kasld_addr_type type, const char *section,
+                             enum kasld_region region_filter) {
+  int found = 0;
+  for (int i = 0; i < num_results; i++) {
+    const struct result *r = &results[i];
+    if (r->type != type || strcmp(result_section(r), section) != 0)
+      continue;
+    if (region_filter != REGION_UNKNOWN && r->region != region_filter)
+      continue;
+    if (!in_bounds(r))
+      continue;
+    if (HAS_LO(r) || HAS_HI(r))
+      return 0; /* an edge claim exists → not interior-only */
+    found = 1;
+  }
+  return found;
+}
+
+/* Scan results[] for (type, section, optional region_filter) and report:
+ *   *best_method   — method of the consensus record
+ *   *n_sources     — for an edge section, records whose anchor equals the
+ *                    consensus anchor ("agreeing" sources); for an
+ * interior-only section, the distinct contributing components *n_conflicts   —
+ * records with a different anchor for an edge section; always 0 for an
+ * interior-only section (interior samples corroborate an extent, they never
+ * conflict) *interior_only — 1 when the section carries only interior samples
+ * (no edge), so callers can present a span instead of a single "base"
+ *
+ * The filter scope MUST match what the displayed records use, so the
+ * printed `==>` line is computed over the same set the user sees.
+ */
+void section_consensus_info(enum kasld_addr_type type, const char *section,
+                            enum kasld_region region_filter,
+                            const char **best_method, int *n_sources,
+                            int *n_conflicts, int *interior_only) {
+  const struct result *anchor =
+      section_consensus_pick(type, section, region_filter);
+  if (!anchor) {
+    *best_method = "unknown";
+    *n_sources = 0;
+    *n_conflicts = 0;
+    *interior_only = 0;
+    return;
+  }
+  *best_method = result_method(anchor);
+  /* Sources are the distinct contributing components — the intuitive "how many
+   * components found this region", not the records that happen to share the
+   * winning address (which undercounts when they corroborate at different
+   * points). */
+  *n_sources = section_source_count(type, section, region_filter);
+  *interior_only = section_is_interior_only(type, section, region_filter);
+
+  /* Conflicts count genuine disagreements about the region's base: distinct
+   * lo-edge (base) addresses beyond the first. Interior-only sections have no
+   * base to disagree on, and dram/mmio are multi-segment coverings (every
+   * segment carries its own base) rather than one contested base — both are 0.
+   * Interior samples and top edges are never base claims, so they corroborate
+   * the region rather than conflicting with it. */
+  if (*interior_only || strcmp(section, "dram") == 0 ||
+      strcmp(section, "mmio") == 0) {
+    *n_conflicts = 0;
+    return;
+  }
+  unsigned long bases[MAX_RESULTS];
+  int nb = 0;
+  for (int i = 0; i < num_results; i++) {
+    const struct result *r = &results[i];
+    if (r->type != type || strcmp(result_section(r), section) != 0)
+      continue;
+    if (region_filter != REGION_UNKNOWN && r->region != region_filter)
+      continue;
+    if (!in_bounds(r) || !HAS_LO(r))
+      continue;
+    int dup = 0;
+    for (int j = 0; j < nb; j++)
+      if (bases[j] == r->lo) {
+        dup = 1;
+        break;
+      }
+    if (!dup && nb < MAX_RESULTS)
+      bases[nb++] = r->lo;
+  }
+  *n_conflicts = nb > 1 ? nb - 1 : 0;
+}
+
+/* Anchor address for a (type, section, optional region_filter). See
+ * section_consensus_pick for the selection rule; returns 0 when no
+ * in-bounds record matches. */
+unsigned long section_consensus(enum kasld_addr_type type, const char *section,
+                                enum kasld_region region_filter) {
+  const struct result *anchor =
+      section_consensus_pick(type, section, region_filter);
+  return anchor ? anchor_addr(anchor) : 0;
+}
+
+/* Count of CONF_DERIVED records currently in results[]. Shared between
+ * text and markdown renderers (both gate the "Derived" block on it). */
+int count_derived(void) {
+  int n = 0;
+  for (int i = 0; i < num_results; i++)
+    if (results[i].conf == CONF_DERIVED)
+      n++;
+  return n;
+}
+
+/* -------------------------------------------------------------------------
+ * Summary renderer: dispatch a fully-computed summary to the chosen format.
+ * Pure consumer — resolution (the engine) runs in the orchestrator layer
+ * (emit_summary -> compute_kaslr_info) BEFORE this is called, so rendering
+ * never drives inference.
+ * -------------------------------------------------------------------------
+ */
+/* The report model for the run being rendered.
+ *
+ * Held here for the duration of a render rather than threaded through every
+ * format, because layout_build() is called from five places inside the format
+ * modules and none of them should have to carry it. One pointer to the
+ * finished model, rather than four separate globals each read on its own. */
+static const struct kasld_report *g_render_report;
+
+const struct kasld_report *render_report(void) { return g_render_report; }
+
+void render_summary(const struct summary *s, const struct kasld_report *rep) {
+  g_render_report = rep;
+  if (json_output)
+    render_json(s);
+  else if (oneline_output)
+    render_oneline(s);
+  else if (markdown_output)
+    render_markdown(s);
+  else
+    render_text(s);
+}

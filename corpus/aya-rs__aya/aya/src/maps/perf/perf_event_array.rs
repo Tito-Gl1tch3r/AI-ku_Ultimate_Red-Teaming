@@ -1,0 +1,174 @@
+//! A map that can be used to receive events from eBPF programs using the linux [`perf`] API
+//!
+//! [`perf`]: https://perf.wiki.kernel.org/index.php/Main_Page.
+
+use std::{
+    borrow::{Borrow, BorrowMut},
+    os::fd::{AsFd, AsRawFd as _},
+    path::Path,
+};
+
+use crate::maps::{MapData, MapError, PinError, check_bounds, hash_map};
+
+/// A map that can be used to receive events from eBPF programs using the linux [`perf`] API.
+///
+/// Each element of a [`PerfEventArray`] can contain either a perf event array buffer that receives
+/// data written by `bpf_perf_event_output()` or a perf event whose counter can be read by
+/// `bpf_perf_event_read_value()`.
+///
+/// To receive events you need to:
+/// * call [`PerfEventArrayBuffer::open`](super::PerfEventArrayBuffer::open)
+/// * insert the buffer into the map with [`PerfEventArray::set`]
+/// * poll the returned [`PerfEventArrayBuffer`](super::PerfEventArrayBuffer) to
+///   be notified when events are inserted in the buffer
+/// * drain events with [`PerfEventArrayBuffer::for_each`](super::PerfEventArrayBuffer::for_each)
+///   (or [`fold`]/[`try_fold`])
+///
+/// [`fold`]: super::PerfEventArrayBuffer::fold
+/// [`try_fold`]: super::PerfEventArrayBuffer::try_fold
+///
+/// # Minimum kernel version
+///
+/// The minimum kernel version required to use this feature is 4.3.
+///
+/// # Examples
+///
+/// A common way to use a perf array is to have one perf buffer for each
+/// available CPU:
+///
+/// ```no_run
+/// # use aya::maps::perf::{PerfEvent, PerfEventArrayBuffer};
+/// # struct Poll;
+/// # impl Poll {
+/// #    fn poll_readable(&self) -> &mut [PerfEventArrayBuffer] {
+/// #        &mut []
+/// #    }
+/// # }
+/// # fn poll_buffers(bufs: Vec<PerfEventArrayBuffer>) -> Poll {
+/// #    Poll
+/// # }
+/// # #[derive(thiserror::Error, Debug)]
+/// # enum Error {
+/// #    #[error(transparent)]
+/// #    IO(#[from] std::io::Error),
+/// #    #[error(transparent)]
+/// #    Map(#[from] aya::maps::MapError),
+/// #    #[error(transparent)]
+/// #    Ebpf(#[from] aya::EbpfError),
+/// #    #[error(transparent)]
+/// #    PerfBuf(#[from] aya::maps::perf::PerfBufferError),
+/// # }
+/// # let mut bpf = aya::Ebpf::load(&[])?;
+/// use aya::maps::PerfEventArray;
+/// use aya::util::online_cpus;
+///
+/// let mut perf_array = PerfEventArray::try_from(bpf.map_mut("EVENTS").unwrap())?;
+///
+/// // eBPF programs are going to write to the EVENTS perf array, using the id of the CPU they're
+/// // running on as the array index.
+/// let mut perf_buffers = Vec::new();
+/// for cpu_id in online_cpus().map_err(|(_, error)| error)? {
+///     // this perf buffer will receive events generated on the CPU with id cpu_id
+///     let perf_buffer = PerfEventArrayBuffer::open(cpu_id, 2)?;
+///     perf_array.set(cpu_id, &perf_buffer)?;
+///     perf_buffers.push(perf_buffer);
+/// }
+///
+/// // poll the buffers to know when they have queued events
+/// let poll = poll_buffers(perf_buffers);
+/// loop {
+///     for perf_buf in poll.poll_readable() {
+///         perf_buf.for_each(|event| match event {
+///             PerfEvent::Sample { head, tail } => {
+///                 // process the sample bytes (`tail` is empty unless the sample wraps)
+///             }
+///             PerfEvent::Lost { count } => {
+///                 // record the dropped-events counter
+///             }
+///         });
+///     }
+/// }
+///
+/// # Ok::<(), Error>(())
+/// ```
+///
+/// # Polling and avoiding lost events
+///
+/// In the example above the implementation of `poll_buffers()` and `poll.poll_readable()` is not
+/// given. [`PerfEventArrayBuffer`](super::PerfEventArrayBuffer) implements the
+/// [`AsRawFd`](std::os::fd::AsRawFd) trait, so you can implement polling
+/// using any crate that can poll file descriptors, like [epoll], [mio] etc.
+///
+/// Perf buffers are internally implemented as ring buffers. If your eBPF programs produce large
+/// amounts of data, in order not to lose events you might want to process each
+/// [`PerfEventArrayBuffer`](super::PerfEventArrayBuffer) on a different thread.
+///
+/// [`perf`]: https://perf.wiki.kernel.org/index.php/Main_Page
+/// [epoll]: https://docs.rs/epoll
+/// [mio]: https://docs.rs/mio
+#[doc(alias = "BPF_MAP_TYPE_PERF_EVENT_ARRAY")]
+pub struct PerfEventArray<T> {
+    map: T,
+}
+
+impl<T: Borrow<MapData>> PerfEventArray<T> {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "keeps constructor signatures consistent across map types"
+    )]
+    pub(crate) const fn new(map: T) -> Result<Self, MapError> {
+        Ok(Self { map })
+    }
+
+    /// Pins the map to a BPF filesystem.
+    ///
+    /// When a map is pinned it will remain loaded until the corresponding file
+    /// is deleted. All parent directories in the given `path` must already exist.
+    pub fn pin<P: AsRef<Path>>(&self, path: P) -> Result<(), PinError> {
+        let data = self.map.borrow();
+        data.pin(path)
+    }
+
+    pub(crate) fn map_data(&self) -> &MapData {
+        self.map.borrow()
+    }
+}
+
+impl<T: BorrowMut<MapData>> PerfEventArray<T> {
+    /// Stores `event` at `index`.
+    ///
+    /// The object that owns `event`, such as a
+    /// [`PerfEventArrayBuffer`](super::PerfEventArrayBuffer) or
+    /// [`PerfEventGroup`](crate::programs::perf_event::PerfEventGroup), must
+    /// remain alive for as long as the event is in use. Both types disable
+    /// their perf events when dropped.
+    ///
+    /// The event remains stored at `index` until it is replaced or removed with
+    /// [`PerfEventArray::unset`]
+    ///
+    /// All the events are cleared when the map is dropped, even if the map still exists in the
+    /// kernel (for example because it's pinned), unless `BPF_F_PRESERVE_ELEMS` was passed as a flag
+    /// when loading the map.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MapError::OutOfBounds`] if `index` is out of bounds, or
+    /// [`MapError::SyscallError`] if `bpf_map_update_elem` fails.
+    pub fn set(&mut self, index: u32, event: &impl AsFd) -> Result<(), MapError> {
+        let map_data = self.map.borrow();
+        check_bounds(map_data, index)?;
+        hash_map::insert(map_data, &index, &event.as_fd().as_raw_fd(), 0)
+    }
+
+    /// Removes the perf event stored at `index`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MapError::OutOfBounds`] if `index` is out of bounds, or
+    /// [`MapError::SyscallError`] if `bpf_map_delete_elem` fails.
+    pub fn unset(&mut self, index: u32) -> Result<(), MapError> {
+        let map_data = self.map.borrow();
+        check_bounds(map_data, index)?;
+        hash_map::remove(map_data, &index)
+    }
+}

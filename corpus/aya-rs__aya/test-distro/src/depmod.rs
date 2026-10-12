@@ -1,0 +1,165 @@
+//! depmod is used to build the modules.alias file to assist with loading
+//! kernel modules.
+//!
+//! This implementation is incredibly naive and is only designed to work within
+//! the constraints of the test environment. Not for production use.
+
+use std::{
+    io::BufWriter,
+    path::{Path, PathBuf},
+    str::Utf8Error,
+};
+
+use anyhow::{Context as _, anyhow};
+use clap::Parser;
+use object::{Object as _, ObjectSection as _, Section};
+use test_distro::{Compression, read_to_end, resolve_modules_dir};
+use walkdir::WalkDir;
+
+#[derive(Parser)]
+struct Args {
+    #[clap(long, short)]
+    base_dir: Option<PathBuf>,
+}
+
+fn main() -> anyhow::Result<()> {
+    let Args { base_dir } = Parser::parse();
+
+    let modules_dir = if let Some(base_dir) = base_dir.as_deref() {
+        base_dir
+    } else {
+        let modules_dir = resolve_modules_dir().context("failed to resolve modules dir")?;
+        Path::new(modules_dir)
+    };
+
+    let modules_alias = modules_dir.join("modules.alias");
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&modules_alias)
+        .with_context(|| format!("failed to open: {}", modules_alias.display()))?;
+    let mut output = BufWriter::new(&f);
+    for entry in WalkDir::new(modules_dir) {
+        let entry = entry.context("failed to read entry in walkdir")?;
+        #[expect(clippy::filetype_is_file, reason = "only regular files can be modules")]
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+
+        let module_name = path
+            .file_name()
+            .ok_or_else(|| anyhow!("{} does not have a file name", path.display()))?
+            .to_str()
+            .ok_or_else(|| anyhow!("{} is not valid utf-8", path.display()))?;
+
+        let (module_name, compression) = match module_name.rsplit_once('.') {
+            Some((module_name, "xz")) => (module_name, Compression::Xz),
+            Some((module_name, "zst")) => (module_name, Compression::Zstd),
+            _ => (module_name, Compression::None),
+        };
+
+        let Some(module_name) = module_name.strip_suffix(".ko") else {
+            // Not a kernel module
+            continue;
+        };
+
+        let contents = read_to_end(path, compression)
+            .with_context(|| format!("read_to_end({})", path.display()))?;
+
+        read_aliases_from_module(&contents, module_name, &mut output)
+            .with_context(|| format!("failed to read aliases from module {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn read_aliases_from_module(
+    contents: &[u8],
+    module_name: &str,
+    output: &mut impl std::io::Write,
+) -> Result<(), anyhow::Error> {
+    let obj = object::read::File::parse(contents).context("failed to parse")?;
+
+    let section = (|| -> anyhow::Result<Option<Section<'_, '_, &[u8]>>> {
+        for s in obj.sections() {
+            let name = s
+                .name_bytes()
+                .with_context(|| format!("failed to get name of section idx {}", s.index()))?;
+            if name == b".modinfo" {
+                return Ok(Some(s));
+            }
+        }
+        Ok(None)
+    })()?;
+    let section = section.context("failed to find .modinfo section")?;
+    let data = section
+        .data()
+        .context("failed to get modinfo section data")?;
+
+    write_aliases_from_modinfo(data, module_name, output)
+}
+
+fn modinfo_entries(data: &[u8]) -> Result<Vec<&str>, Utf8Error> {
+    data.split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(std::str::from_utf8)
+        .collect()
+}
+
+fn write_aliases_from_modinfo(
+    data: &[u8],
+    module_name: &str,
+    output: &mut impl std::io::Write,
+) -> Result<(), anyhow::Error> {
+    for entry in modinfo_entries(data).context("failed to decode .modinfo entries as utf-8")? {
+        if let Some(alias) = entry.strip_prefix("alias=") {
+            writeln!(output, "alias {alias} {module_name}").expect("write");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use assert_matches::assert_matches;
+
+    use super::{modinfo_entries, write_aliases_from_modinfo};
+
+    #[test]
+    fn modinfo_entries_reads_nul_delimited_records() {
+        let entries = modinfo_entries(
+            b"description=test module\0alias=net-sch-clsact\0alias=net-sch-ingress\0",
+        )
+        .unwrap();
+
+        assert_eq!(
+            entries,
+            vec![
+                "description=test module",
+                "alias=net-sch-clsact",
+                "alias=net-sch-ingress"
+            ]
+        );
+    }
+
+    #[test]
+    fn modinfo_entries_rejects_invalid_utf8() {
+        assert_matches!(modinfo_entries(b"alias=\xff\0"), Err(err) => { assert_eq!(err.valid_up_to(), 6) });
+    }
+
+    #[test]
+    fn write_aliases_from_modinfo_extracts_multiple_aliases() {
+        let modinfo =
+            b"description=test module\0alias=net-sch-clsact\0alias=net-sch-ingress\0name=sch_ingress\0";
+        let mut output = Vec::new();
+
+        write_aliases_from_modinfo(modinfo, "sch_ingress", &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(
+            output,
+            "alias net-sch-clsact sch_ingress\nalias net-sch-ingress sch_ingress\n",
+        );
+    }
+}

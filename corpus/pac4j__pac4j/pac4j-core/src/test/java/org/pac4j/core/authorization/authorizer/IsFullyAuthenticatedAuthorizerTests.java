@@ -1,0 +1,40 @@
+package org.pac4j.core.authorization.authorizer;
+
+import org.junit.jupiter.api.Test;
+import org.pac4j.core.exception.http.HttpAction;
+import org.pac4j.core.profile.AnonymousProfile;
+import org.pac4j.test.context.MockWebContext;
+import org.pac4j.test.context.session.MockSessionStore;
+import org.pac4j.test.util.TestsHelper;
+
+import static org.junit.jupiter.api.Assertions.assertFalse;
+
+/**
+ * Tests {@link IsFullyAuthenticatedAuthorizer}.
+ *
+ * @author Jerome Leleu
+ * @since 1.9.0
+ */
+public final class IsFullyAuthenticatedAuthorizerTests extends IsAuthenticatedAuthorizerTests {
+
+    @Override
+    protected Authorizer newAuthorizer() {
+        return new IsFullyAuthenticatedAuthorizer();
+    }
+
+    @Override
+    @Test
+    public void testAnonymousProfileRedirectionUrl() {
+        profiles.add(new AnonymousProfile());
+        ((IsFullyAuthenticatedAuthorizer) authorizer).setRedirectionUrl(PAC4J_URL);
+        TestsHelper.expectException(() -> authorizer.isAuthorized(MockWebContext.create(), new MockSessionStore(), profiles),
+            HttpAction.class, "Performing a 302 HTTP action");
+    }
+
+    @Test
+    public void testCommonRmeProfile() {
+        profile.setRemembered(true);
+        profiles.add(profile);
+        assertFalse(authorizer.isAuthorized(null, new MockSessionStore(), profiles));
+    }
+}

@@ -1,0 +1,498 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Definitions for S390 64-bit (s390x / z/Architecture)
+//
+// s390x support is limited. The s390 virtual memory layout differs
+// significantly from other architectures (no kernel/user split, separate
+// ASCEs, identity mapping as directmap). Many KASLD components will
+// produce no useful results on s390x.
+//
+// KASLR support added in commit b2d24b97b2a9691351920e700bfda4368c177232,
+// merged 2019-04-29, first released in kernel v5.2.
+//
+// s390x memory layout (arch/s390/mm documentation):
+//   - Identity mapping at __identity_base: virt = phys + __identity_base
+//     (__identity_base = 0 by default; randomized with RANDOMIZE_IDENTITY_BASE)
+//   - Kernel text mapped separately at __kaslr_offset (virtual) with physical
+//     load at __kaslr_offset_phys. The two are independently randomized.
+//   - Modules: 2 GiB region (MODULES_LEN) placed just below kernel text.
+//   - ASCE limit: 4 TiB (3-level) or 8 PiB (4-level).
+//   - IMAGE_BASE_OFFSET = 0x100000 (1 MiB): .text starts 1 MiB into image.
+//   - Physical alignment: _SEGMENT_SIZE (1 MiB).
+//   - Virtual alignment: THREAD_SIZE (typically 16 KiB).
+//
+// Note: The above layout describes v6.10+ kernels with CONFIG_KERNEL_IMAGE_BASE
+// (introduced ~v6.10). Pre-v6.10 kernels ran identity-mapped: virtual =
+// physical, with _stext at IMAGE_BASE_OFFSET (0x100000) and physical-only KASLR
+// randomization (THREAD_SIZE alignment within the identity map).
+//
+// Note: s390 does NOT have a traditional kernel/user address space split.
+// Kernel and user addresses occupy separate ASCEs (address space control
+// elements), not separate halves of the virtual range. The entire virtual
+// range [0, ASCE_LIMIT) is available to both kernel and user (in their
+// respective ASCEs).
+//
+// References:
+// https://github.com/torvalds/linux/commit/b2d24b97b2a9691351920e700bfda4368c177232
+// https://www.kernel.org/doc/html/latest/arch/s390/mm.html
+// https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/s390/include/asm/page.h
+// https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/s390/include/asm/pgtable.h
+// https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/s390/boot/startup.c
+// https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/s390/boot/kaslr.c
+// ---
+// <bcoles@gmail.com>
+
+#ifndef KASLD_S390_H
+#define KASLD_S390_H
+
+// Identity mapping base (__identity_base): 0 without RANDOMIZE_IDENTITY_BASE.
+// https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/s390/include/asm/page.h
+// #define PAGE_OFFSET __identity_base
+#define PAGE_OFFSET 0ul
+
+// Continuous: __identity_base shifts at boot, so only the window is known.
+// Admissible kernel address-space widths. s390x sets the ASCE limit to exactly
+// one of two region-table sizes at boot -- _REGION2_SIZE (1 << 42, 3-level
+// paging) or _REGION1_SIZE (1 << 53, 4-level) -- per arch/s390/boot/startup.c,
+// with the shifts in arch/s390/include/asm/pgtable.h. _REGION3_SIZE (1 << 31)
+// is a table-entry size here, never an ASCE limit, so it is not a candidate.
+//
+// The level is not OBSERVABLE, but it is DERIVABLE, and the set is unresolved
+// only until something derives it.
+//
+// Not observable: an mmap boundary probe measures the wrong address space.
+// TASK_SIZE is TASK_SIZE_MAX unconditionally (asm/processor.h), every mm starts
+// at an ASCE limit of _REGION2_SIZE (asm/mmu_context.h), and a MAP_FIXED
+// request above that limit calls crst_table_upgrade() rather than failing
+// (asm/pgalloc.h check_asce_limit, mm/pgalloc.c). The user limit is therefore
+// per-address-space and grows on demand, unrelated to the kernel's own
+// asce_limit, and a probe reports the 4-level width on a kernel running
+// 3-level.
+//
+// Derivable: the kernel picks the level from three things, and two are facts
+// already collected. setup_kernel_memory_layout() takes _REGION1_SIZE when
+//   CONFIG_KASAN                      (SF_KASAN_ENABLED)
+//   || __NO_KASLR_END_KERNEL > _REGION2_SIZE
+//                                     (SF_VIRT_KERNEL_IMAGE_BASE + the 512 MiB
+//                                      KERNEL_IMAGE_SIZE, asm/page.h)
+//   || (vsize > _REGION2_SIZE && kaslr_enabled())
+//                                     (the vmem estimate, from the RAM extent,
+//                                      sizeof(struct page) and vmalloc_size)
+// and _REGION2_SIZE otherwise. Any disjunct proven true gives 4-level; all
+// three proven false gives 3-level. The same vmem estimate bounds the KASLR
+// placement range, so a rule that computes one has the inputs for both.
+#define VA_BITS_CANDIDATES {42ul, 53ul}
+
+// Admissible kernel page sizes on this architecture. PAGE_SIZE_KNOWN_AT_BUILD
+// is derived from the pair in api.h and gates pfn_to_phys(); a page-frame
+// number may only be converted with a compile-time constant where the two
+// edges coincide. Where they differ the runtime SF_PAGE_SIZE observation is
+// the only sound multiplier.
+// s390 fixes the base page at 4 KiB; arch/s390 selects
+// HAVE_PAGE_SIZE_4KB and offers no alternative.
+#define PAGE_SIZE_MIN 0x1000ul
+#define PAGE_SIZE_MAX 0x1000ul
+
+#define PAGE_OFFSET_MIN KERNEL_VIRT_VAS_START
+#define PAGE_OFFSET_MAX KERNEL_VIRT_VAS_END
+
+// Physical memory starts at address 0.
+#define PHYS_OFFSET 0ul
+
+// On s390 v6.10+, PAGE_OFFSET (= __identity_base) may be runtime-randomized
+// when CONFIG_RANDOMIZE_IDENTITY_BASE is set; the compile-time formula is
+// then NOT a sound runtime directmap projection. Treat as runtime
+// conservatively — phys_to_directmap_virt() is left undefined (see gate at
+// end of file). Kernel text (__kaslr_offset) and identity base move
+// independently, so text does not track the directmap.
+// Relationship: phys == (kvirt - __kaslr_offset) + __kaslr_offset_phys.
+// LINEAR_MAP_ANCHOR: __va(x) = x + __identity_base, so physical 0 maps to
+// the linear-map base and the anchor is the compile-time PHYS_OFFSET (0).
+// RANDOMIZE_IDENTITY_BASE randomises __identity_base — the VIRTUAL side —
+// which is why DIRECTMAP_STATIC is 0 here while the anchor stays known.
+// NOT LM_ANCHOR_DRAM_BASE: the anchor is the constant 0, and coincides with
+// the DRAM base only because s390 memory starts at 0. Classifying it as a
+// DRAM discovery would be right by accident and wrong on any machine that
+// reported RAM starting higher.
+// arch/s390/include/asm/page.h __va() / __identity_base
+#define LINEAR_MAP_ANCHOR LM_ANCHOR_PHYS_OFFSET
+#define DIRECTMAP_STATIC 0
+#define TEXT_TRACKS_DIRECTMAP 0
+
+// Kernel VAS: entire address space up to the ASCE limit.
+// 3-level paging: _REGION2_SIZE = 1 << 42 = 0x40000000000   (4 TiB)
+// 4-level paging: _REGION1_SIZE = 1 << 53 = 0x20000000000000 (8 PiB)
+// Use the 4-level limit for broadest coverage.
+#define KERNEL_VIRT_VAS_START 0ul
+#define KERNEL_VIRT_VAS_END 0x20000000000000ul
+
+// The two ASCE limits as ADDRESSES, for the rules that reason about which one
+// the kernel chose. VA_BITS_CANDIDATES names the same pair as widths; the
+// assertions below tie the three statements together so none can drift.
+#define S390_ASCE_LIMIT_3LEVEL (1ul << 42)
+#define S390_ASCE_LIMIT_4LEVEL (1ul << 53)
+
+// The span reserved for the image above CONFIG_KERNEL_IMAGE_BASE, so
+// __NO_KASLR_END_KERNEL is that base plus this. A plain constant in
+// arch/s390/include/asm/page.h, introduced by the same commit as the knob it
+// accompanies and unchanged since; it is not a Kconfig symbol.
+#define S390_KERNEL_IMAGE_SIZE (512ul * MB)
+
+// Terms of the vmem estimate the boot code weighs against the 3-level limit
+// when it picks the paging level -- get_vmem_size() in
+// arch/s390/boot/startup.c, called with _REGION3_SIZE as its rounding
+// granularity. Each is a plain constant in the kernel, not a Kconfig symbol,
+// so a build cannot move one without moving the header it lives in:
+//   MAX_DCSS_ADDR      asm/extmem.h    -- the floor under max_mappable, which
+//                                         is max(ident_map_size, this), so
+//                                         installed memory below it does not
+//                                         enter the estimate at all
+//   MODULES_LEN        asm/pgtable.h
+//   KASLR_LEN          asm/pgtable.h   -- 0 without CONFIG_RANDOMIZE_BASE,
+//                                         so this value is the upper bound
+//   VMALLOC_DEFAULT_SIZE  asm/pgtable.h -- what the kernel uses absent a
+//                                         `vmalloc=` token
+//   _REGION3_SIZE      asm/pgtable.h   -- 1 << _REGION3_SHIFT (31)
+//   _SEGMENT_SIZE      the granularity `vmalloc=` is rounded up to by the
+//                      boot parser (arch/s390/boot/ipl_parm.c)
+#define S390_MAX_DCSS_ADDR (512ul * GB)
+#define S390_MODULES_LEN (1ul << 31)
+#define S390_KASLR_LEN (1ul << 31)
+#define S390_VMALLOC_DEFAULT_SIZE ((512ul * GB) - S390_MODULES_LEN)
+#define S390_REGION3_SIZE (1ul << 31)
+#define S390_SEGMENT_SIZE (1ul * MB)
+
+// Kernel text virtual address range.
+// CONFIG_KERNEL_IMAGE_BASE:
+//   range  0x100000 .. 0x1FFFFFE0000000 (without KASAN)
+//   default 0x3FFE0000000  (= _REGION2_SIZE - KERNEL_IMAGE_SIZE = 4 TiB - 512
+//   MiB)
+// With KASLR, the kernel is placed near the top of the ASCE limit within a
+// 2 GiB window (KASLR_LEN = 1 << 31).
+#define VIRT_TEXT_PLAUSIBLE_MIN 0ul
+#define VIRT_TEXT_PLAUSIBLE_MAX 0x20000000000000ul
+
+// Modules: 2 GiB (MODULES_LEN = 1 << 31) placed immediately below the kernel
+// image base. MODULES_END = round_down(__kaslr_offset, _SEGMENT_SIZE) ≈
+// __kaslr_offset = _stext - IMAGE_BASE_OFFSET. MODULES_START = MODULES_END - 2
+// GiB.
+//
+// Any observed module address vmod constrains image_base in both directions:
+//   Upper bound (from minimum vmod_lo):
+//     MODULES_END = round_down(__kaslr_offset, _SEGMENT_SIZE) ≤ vmod_lo +
+//     MODULES_LEN
+//     __kaslr_offset is IMAGE_ALIGN-aligned, so the gap
+//       __kaslr_offset − MODULES_END ∈ [0, _SEGMENT_SIZE − IMAGE_ALIGN]
+//     __kaslr_offset ≤ vmod_lo + MODULES_LEN + (_SEGMENT_SIZE − IMAGE_ALIGN)
+//     _stext ≤ vmod_lo + MODULES_LEN + (_SEGMENT_SIZE − IMAGE_ALIGN) +
+//     IMAGE_BASE_OFFSET
+//   Lower bound (from maximum vmod_hi):
+//     __kaslr_offset > vmod_hi  →  __kaslr_offset ≥ align_down(vmod_hi,
+//     IMAGE_ALIGN) + IMAGE_ALIGN
+//     _stext ≥ align_down(vmod_hi, IMAGE_ALIGN) + IMAGE_ALIGN +
+//     IMAGE_BASE_OFFSET
+//
+// MODULES_BELOW_TEXT_START signals that MODULES_END is anchored to the image
+// start (_stext - IMAGE_BASE_OFFSET), not to image end (_end) as on riscv64.
+// The module_text_bound rule uses this flag to select the correct formula and
+// to derive a lower bound on image_base from the maximum observed module
+// address.
+//
+// MODULES_END_TO_TEXT_OFFSET: upper-bound addend in module_text_bound.c:
+//   new_max = (vmod_lo + MODULES_END_TO_TEXT_OFFSET) & ~(virt_kaslr_align - 1)
+//   = MODULES_LEN + (_SEGMENT_SIZE − IMAGE_ALIGN) + IMAGE_BASE_OFFSET
+//   = 0x80000000 + 0xFC000 + 0x100000 = 0x801FC000
+//
+// Runtime-determined; use wide bounds for validation.
+// Where the module band is anchored: not decidable from this build. s390 has
+// carried two arrangements and they place the band at opposite ends of the
+// address space, so the answer is a property of the kernel that booted.
+//
+//   image-relative   the boot decompressor sets
+//                    MODULES_END = round_down(kernel_start, _SEGMENT_SIZE),
+//                    putting the band immediately below the image wherever
+//                    KASLR places it. arch/s390/boot/startup.c.
+//   address-space    MODULES_END is the top of the kernel address space, or
+//   top              the abs-lowcore mapping just under it -- MODULES_END =
+//                    vmax, = _REGION1_SIZE/_REGION2_SIZE, or =
+//                    round_down(__abs_lowcore, _SEGMENT_SIZE) across the
+//                    generations that carried it, each lowered further by the
+//                    ultravisor and KASAN adjustments beside them. The image is
+//                    identity-mapped down in RAM, nowhere near the band.
+//
+// The arrangement changed when the physical and virtual address spaces were
+// uncoupled; before that the kernel ran identity-mapped (__va(x) = x) and the
+// band had no image to be placed against. Deriving the band from the image on
+// an address-space-top kernel does not merely report a loose window -- it
+// reports one that excludes the true base by terabytes.
+//
+// enum s390_layout_generation below is how a rule establishes which one booted.
+#define MODULES_ANCHOR MOD_ANCHOR_RUNTIME
+#define MODULES_START 0ul
+#define MODULES_END 0x20000000000000ul
+
+// Usable as a BOUND, and for the reason the band is this wide rather than any
+// reason about where the band sits: MODULES_END here is the 4-level address
+// space limit, which every arrangement's MODULES_END is at or below, and a
+// floor of 0 cannot be too high whatever the layout. The window holds the true
+// base under both arrangements above WITHOUT either of them being established,
+// which is what a compile-time band has to do.
+#define MODULES_BAND_STRENGTH MOD_BAND_BOUNDS
+// Which end of the image the band tracks WHEN it tracks the image at all; read
+// only once the image-relative arrangement is established.
+#define MODULES_BELOW_TEXT_START 1
+#define MODULES_END_TO_TEXT_OFFSET                                             \
+  0x801FC000ul /* MODULES_LEN + (_SEGMENT_SIZE - IMAGE_ALIGN) +                \
+                * IMAGE_BASE_OFFSET                                            \
+                */
+
+/* Which generation of the s390 kernel memory layout the booted kernel built.
+ *
+ * One boot-time fact with several consequences, so it has one name rather than
+ * one per consumer. The physical and virtual kernel address spaces were
+ * uncoupled in a single upstream series, and before it:
+ *
+ *   - the kernel ran identity-mapped, __va(x) = x, with the image down in
+ *     physical RAM;
+ *   - the module band sat at the top of the address space rather than against
+ *     the image (see MODULES_ANCHOR);
+ *   - the boot code chose its paging level by a different formula, and under
+ *     KASAN by a separate one again that could land on either level.
+ *
+ * Every rule that needs any of those reads this one answer. Two of them would
+ * otherwise each restate the kernel's own condition, free to drift apart --
+ * the same reason s390_text_ceiling_from_va_bits reads the resolved paging
+ * level instead of re-deriving it.
+ *
+ * UNPROVEN is not a third generation: it is the honest answer wherever the
+ * evidence does not separate the two, and a rule whose derivation holds under
+ * only one of them must treat it as a refusal. */
+enum s390_layout_generation {
+  S390_LAYOUT_UNPROVEN = 0,
+  S390_LAYOUT_IDENTITY,
+  S390_LAYOUT_UNCOUPLED,
+};
+
+/* From the parsed kernel config, which answers it outright.
+ *
+ * CONFIG_KERNEL_IMAGE_BASE was added by the same series that uncoupled the
+ * address spaces, and the two cannot be separated: the knob's only consumers
+ * (__NO_KASLR_START_KERNEL / __NO_KASLR_END_KERNEL, asm/page.h) are read inside
+ * setup_kernel_memory_layout(), where one of them is assigned to kernel_start
+ * -- the variable the uncoupling introduced and the one MODULES_END is rounded
+ * down from. A tree carrying the knob without the image-relative band does not
+ * compile. The knob is also unconditional in arch/s390/Kconfig with a hex range
+ * floored at 0x100000, so a kernel that has it always reports a positive value
+ * and zero can only mean the config lacks the symbol.
+ *
+ * `present` distinguishes a config that was read and lacks the knob from no
+ * config at all, which is the whole content of the IDENTITY answer; a plain
+ * value cannot carry it. No version number is read or compared. */
+static inline enum s390_layout_generation
+s390_layout_from_config(int present, unsigned long selector) {
+  if (!present)
+    return S390_LAYOUT_UNPROVEN;
+  return selector ? S390_LAYOUT_UNCOUPLED : S390_LAYOUT_IDENTITY;
+}
+
+/* From an observed module address against the resolved image window, which
+ * answers it without a config at all -- the two arrangements put the band on
+ * opposite sides of the image, so one real module address decides between them.
+ *
+ * Image-relative: MODULES_END = round_down(kernel_start, _SEGMENT_SIZE) and
+ * kernel_start is IMAGE_BASE_OFFSET below the solved _text, so every module
+ * address is strictly below the image base. An address at or above the window's
+ * top is therefore at or above the true base and falsifies it.
+ *
+ * Identity-mapped: the band sits above the identity map by construction --
+ * the layout computation fits vmemmap, vmalloc and MODULES_LEN under vmax and
+ * puts the identity mapping below all of them -- and the image is inside that
+ * identity map. So every module address is above the image base, and one below
+ * the window's floor falsifies it.
+ *
+ * Both tests survive further narrowing: the window's floor only rises and its
+ * top only falls, so an answer proven on one pass cannot be withdrawn on the
+ * next. Neither test fires on a window that still spans the observation, which
+ * is the unresolved case and correctly says nothing. */
+static inline enum s390_layout_generation
+s390_layout_from_module_addr(unsigned long vmod, unsigned long vt_lo,
+                             unsigned long vt_hi) {
+  /* A window top of zero is no window: it is what a caller holds when the read
+   * that was meant to fill it did not. Taken at face value every module
+   * address is at or above it, so the test below would answer IDENTITY from the
+   * absence of a window rather than from evidence -- a failed read reported as
+   * a proof. No image-base window has a top of zero, so refusing one costs
+   * nothing and does not depend on how any caller initialises its locals. */
+  if (vmod == 0 || vt_hi == 0 || vt_hi < vt_lo)
+    return S390_LAYOUT_UNPROVEN;
+  if (vmod < vt_lo)
+    return S390_LAYOUT_UNCOUPLED;
+  if (vmod >= vt_hi)
+    return S390_LAYOUT_IDENTITY;
+  return S390_LAYOUT_UNPROVEN;
+}
+
+/* The answer two witnesses give together. Agreement answers; either one alone
+ * answers; disagreement does NOT pick a side.
+ *
+ * Disagreement means one witness is lying, and the likely liar is the config --
+ * a staged or stale /boot/config describing a kernel other than the running
+ * one. The module address is measured from the target and the image window it
+ * is judged against was narrowed by evidence, so a contradiction is the signal
+ * that the parsed layout cannot be trusted here. Refusing both is what keeps a
+ * mismatched config from flooring the text base at the top of the address
+ * space. */
+static inline enum s390_layout_generation
+s390_layout_proven(enum s390_layout_generation a,
+                   enum s390_layout_generation b) {
+  if (a == S390_LAYOUT_UNPROVEN)
+    return b;
+  if (b == S390_LAYOUT_UNPROVEN)
+    return a;
+  return a == b ? a : S390_LAYOUT_UNPROVEN;
+}
+
+// Virtual KASLR granularity: THREAD_SIZE (16 KiB on s390, PAGE_SIZE << 2).
+// Physical placement uses _SEGMENT_SIZE (1 MiB), but virtual text addresses
+// are only THREAD_SIZE-aligned. Confirmed on real hardware: _stext on a
+// v6.18 system was 0x4000-aligned but not 1 MiB aligned.
+#define IMAGE_ALIGN 0x4000ul
+
+// Physical KASLR uses _SEGMENT_SIZE (1 MiB) alignment (v6.10+).
+// Pre-v6.10 physical KASLR used THREAD_SIZE alignment.
+#define KASLR_PHYS_ALIGN 0x100000ul
+
+// IMAGE_BASE_OFFSET: .text begins 1 MiB (0x100000) into the kernel image.
+// Value is the kernel's TEXT_OFFSET (arch/s390/include/asm/page.h:
+// #define TEXT_OFFSET 0x100000).
+#define IMAGE_BASE_OFFSET 0x100000ul
+
+// Plausible physical address range for kernel image base (__kaslr_offset_phys).
+// Physical text address = __kaslr_offset_phys + IMAGE_BASE_OFFSET >=
+// IMAGE_BASE_OFFSET. PHYS_PLAUSIBLE_MAX is a RAM heuristic (a defeasible
+// ceiling), NOT an architectural limit. The honest top is PHYS_ADDR_TOP below.
+#define PHYS_PLAUSIBLE_MIN 0ul
+#define PHYS_PLAUSIBLE_MAX (64ul * GB)
+
+// Honest architectural phys top: 2^MAX_PHYSMEM_BITS. s390
+// CONFIG_MAX_PHYSMEM_BITS ranges 42..53 (default 46), so 53 bits (8 PiB) is the
+// widest realisable physical address. The engine narrows from here via RAM/DRAM
+// ceilings.
+#define PHYS_ADDR_TOP (1ul << 53)
+
+// Virtual KASLR randomization window (v6.10+ upstream defaults):
+// Image base picked from [CONFIG_KERNEL_IMAGE_BASE, vmax - image_size) where
+// vmax = asce_limit (paging-level-dependent):
+//   3-level: vmax = _REGION2_SIZE = 1 << 42 = 4 TiB
+//   4-level: vmax = _REGION1_SIZE = 1 << 53 = 8 PiB
+// The kernel is placed near the TOP of vmax rather than at a fixed address:
+// the identity mapping grows upward from 0 (covering all physical RAM), so
+// kernel text is anchored near vmax to stay clear of it. The minimum placement
+// is CONFIG_KERNEL_IMAGE_BASE (a compile-time floor near 4 TiB - 512 MiB);
+// the maximum is vmax - image_size (boot-time, tracks the ASCE limit).
+// On 4-level systems vmax = 8 PiB, so _stext can be anywhere from
+// CONFIG_KERNEL_IMAGE_BASE up to ~8 PiB — a much wider range than 3-level.
+#define VIRT_TEXT_MIN_DEFAULT_CONFIG (0x3FFE0000000ul + IMAGE_BASE_OFFSET)
+#define VIRT_TEXT_MAX_DEFAULT_CONFIG VIRT_TEXT_PLAUSIBLE_MAX
+
+/* Honest-top floor for Q_VIRT_IMAGE_BASE. VIRT_TEXT_MIN_DEFAULT_CONFIG is the
+ * modern (v6.10+ CONFIG_KERNEL_IMAGE_BASE) high-kernel KASLR floor (~4 TiB).
+ * Pre-v6.10 kernels run identity-mapped: kernel text lives near address 0
+ * (image base at the bottom of RAM, _stext at IMAGE_BASE_OFFSET = 0x100000).
+ * With no narrowing leak (the unprivileged/hardened case) flooring
+ * Q_VIRT_IMAGE_BASE at the modern VIRT_TEXT_MIN_DEFAULT_CONFIG would report a
+ * window EXCLUDING that low identity-mapped text base — unsound. Widen the
+ * floor to 0 so the honest window admits both the identity-mapped and the high
+ * relocated layouts.
+ *
+ * 0 is a conservative stand-in, deliberately, and the temptation is to replace
+ * it with a tighter value read off the old linker script — which opens at
+ * `. = 0x00000000;` and then sets `_text = 0x200;`. That 0x200 is not a layout
+ * fact and must not be used as one. The script gives its own reason: perf
+ * dislikes a symbol at address zero, so _text skips the initial PSW and channel
+ * program. The megabyte it sits in was cut off the image before loading, by an
+ * `.org 0x100000` in head64.S and a `tail -c` trim in the boot Makefile, both
+ * removed once the image was simply linked at 0x100000. So the symbol points at
+ * padding that was never loaded, the era offers no sound floor to read, and 0
+ * stands because nothing better can be derived — not because 0 is attainable.
+ *
+ * The validation range floors at 0 alongside it, since a text address the
+ * window admits must not be rejected as implausible. Widen-only — never
+ * narrows — so it cannot eliminate a true leak; a real text or module leak
+ * narrows Q_VIRT_IMAGE_BASE back up. The trade-off is a very loose unresolved
+ * window ([0, ASCE limit]); soundness across kernels without trusting version
+ * numbers takes priority over tightness. */
+#define VIRT_TEXT_MIN_ANY_CONFIG 0ul
+
+/* Honest-top floor for Q_PHYS_IMAGE_BASE. Without an explicit floor the generic
+ * chain sets KERNEL_PHYS_DEFAULT = PHYS_PLAUSIBLE_MIN + IMAGE_BASE_OFFSET =
+ * 0x100000 — that is the minimum physical _stext, but Q_PHYS_IMAGE_BASE solves
+ * the physical IMAGE base (_text = __kaslr_offset_phys), which sits
+ * IMAGE_BASE_OFFSET below _stext and can be as low as PHYS_PLAUSIBLE_MIN (0). A
+ * pre-v6.10 identity-mapped kernel loads the image at the bottom of RAM
+ * (physical _text near 0; a real 4.14 boot shows iomem "Kernel code" starting
+ * at 0x200), below 0x100000 — flooring Q_PHYS_IMAGE_BASE at 0x100000 reports a
+ * window EXCLUDING that base, and rejects the parsed low-base pin, unsound.
+ * Widen the floor to PHYS_PLAUSIBLE_MIN so the honest window admits the low
+ * identity-mapped image base. Widen-only — a real physical leak (iomem "Kernel
+ * code", firmware reservation) narrows Q_PHYS_IMAGE_BASE back up. Mirrors
+ * VIRT_TEXT_MIN_ANY_CONFIG on the virtual side. */
+#define PHYS_MIN_ANY_CONFIG PHYS_PLAUSIBLE_MIN
+
+// Default kernel text virtual address without KASLR.
+// CONFIG_KERNEL_IMAGE_BASE (introduced ~v6.10) default = 0x3FFE0000000
+// (+ IMAGE_BASE_OFFSET for _stext). Pre-v6.10 kernels used identity mapping
+// with _stext at IMAGE_BASE_OFFSET (0x100000). Distros may override. See
+// docs/kaslr.md "Default text base and KASLR alignment" for all architectures.
+// Kernel source: arch/s390/kernel/vmlinux.lds.S, arch/s390/boot/startup.c
+#define KERNEL_VIRT_TEXT_DEFAULT 0x3FFE0100000ul
+
+#define KASLR_SUPPORTED 1
+
+// Residue 0: the 1 MiB image offset is a whole number of 16 KiB granules, so
+// _text still lands on the grid.
+#define IMAGE_BASE_RESIDUE_FIXED 1
+
+/* s390 opts OUT of the generic compile-time-default disabled-pin: the no-KASLR
+ * image base is LAYOUT-DEPENDENT (modern high CONFIG_KERNEL_IMAGE_BASE vs
+ * pre-v6.10 low identity-mapped, ~4 TiB apart) and CONFIG_KERNEL_IMAGE_BASE is
+ * itself configurable, so the compile-time KERNEL_VIRT_TEXT_DEFAULT is not a
+ * sound pin — a wrong default still lies inside the historical-layout-spanning
+ * [low, ASCE] window, and the disabled-pin's window-containment backstop cannot
+ * reject a wrong-but-in-window value.
+ *
+ * Instead s390_image_base_from_config owns the no-KASLR base: with a readable
+ * config it resolves the layout (parsed, version-number-free) and PINS the
+ * modern base from the PARSED CONFIG_KERNEL_IMAGE_BASE on a positive
+ * SF_VIRT_KASLR_DISABLED — layout-correct where the compile-time default is
+ * not. With no config the layout is genuinely ambiguous, so it pins nothing and
+ * the sound wide window stands. (Mirrors riscv64, whose layout-dependent
+ * no-KASLR base is owned by riscv64_text_base.)
+ *
+ * KASLR-off signal sources: kdump (arch/s390/boot/startup.c forces
+ * __kaslr_enabled = 0 when oldmem_data.start is set, signalled by elfcorehdr=),
+ * nokaslr cmdline, RANDOMIZE_BASE=n.
+ *
+ * There is deliberately no arch_default_text_base() here. That hook returns a
+ * single compile-time constant, which is exactly the assumed default this arch
+ * declines to pin to. api.h's stub stands in and nothing calls it. */
+#define KASLR_DISABLED_PINS_VIRT_TEXT 0
+
+// The /boot artefact is a boot blob, not an ELF, so its on-disk size never
+// exceeds the in-memory footprint and can be read with stat() where the file
+// content is unreadable. See the axis contract in api.h.
+#define BOOT_IMAGE_SIZE_FLOORS_FOOTPRINT 1
+
+/* The ASCE limits are stated twice above -- once as addresses for the rules
+ * that compare against them, once as widths in VA_BITS_CANDIDATES -- because
+ * the two uses want different types. Tie them together so a later edit to one
+ * cannot leave the other behind: a rule comparing against a stale limit would
+ * pick the wrong paging level and say so with a parsed confidence.
+ * __extension__ silences -Wpedantic on -std=c99. */
+__extension__ _Static_assert(S390_ASCE_LIMIT_4LEVEL == KERNEL_VIRT_VAS_END,
+                             "s390 4-level ASCE limit must equal the kernel "
+                             "VAS end");
+__extension__ _Static_assert(S390_ASCE_LIMIT_3LEVEL < S390_ASCE_LIMIT_4LEVEL,
+                             "s390 ASCE limits must be ordered");
+
+#endif /* KASLD_S390_H */

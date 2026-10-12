@@ -1,0 +1,87 @@
+package org.pac4j.saml.metadata.mongo;
+
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
+import lombok.val;
+import net.shibboleth.shared.resolver.CriteriaSet;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.opensaml.core.criterion.EntityIdCriterion;
+import org.pac4j.saml.config.SAML2Configuration;
+import org.pac4j.saml.metadata.SAML2MetadataGenerator;
+import org.pac4j.saml.util.ConfigurationManager;
+import org.pac4j.saml.util.DefaultConfigurationManager;
+import org.pac4j.test.mongo.MongoServer;
+import org.pac4j.test.util.TestsConstants;
+import org.springframework.core.io.ClassPathResource;
+
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * This is {@link SAML2MongoMetadataGeneratorTests}.
+ *
+ * @author Misagh Moayyed
+ * @since 5.7.0
+ */
+public class SAML2MongoMetadataGeneratorTests implements TestsConstants {
+    private static final int PORT = 37018;
+    private static final String ENTITY_ID = "org:pac4j:example";
+
+    private final MongoServer mongoServer = new MongoServer();
+
+    private SAML2MetadataGenerator mongoMetadataGenerator;
+
+    @BeforeEach
+    public void setUp() {
+        mongoServer.start(PORT);
+
+        val mongo = MongoClients.create(String.format("mongodb://localhost:%d", PORT));
+        val db = mongo.getDatabase("saml2");
+        db.createCollection("metadata");
+
+        mongoMetadataGenerator = new SAML2MongoMetadataGenerator(getClient(), ENTITY_ID);
+    }
+
+    @AfterEach
+    public void tearDown() {
+        mongoServer.stop();
+    }
+
+    private static MongoClient getClient() {
+        return MongoClients.create(String.format("mongodb://localhost:%d", PORT));
+    }
+
+    @Test
+    public void testMetadata() throws Exception {
+        ConfigurationManager mgr = new DefaultConfigurationManager();
+        mgr.configure();
+
+        val configuration = new SAML2Configuration();
+        configuration.setForceKeystoreGeneration(true);
+        configuration.setKeystorePath("target/keystore.jks");
+        configuration.setKeystorePassword("pac4j");
+        configuration.setPrivateKeyPassword("pac4j");
+        configuration.setSignMetadata(true);
+        configuration.setServiceProviderEntityId(ENTITY_ID);
+        configuration.setMetadataGenerator(this.mongoMetadataGenerator);
+        configuration.getIdentityProviderMetadata().setResource(new ClassPathResource("idp-metadata.xml"));
+        configuration.init();
+
+        var metadataGenerator = configuration.toMetadataGenerator();
+        val entity = metadataGenerator.buildEntityDescriptor();
+        assertNotNull(entity);
+        val metadata = metadataGenerator.getMetadata(entity);
+        assertNotNull(metadata);
+
+        assertTrue(metadataGenerator.storeMetadata(metadata, true));
+        var resolver = metadataGenerator.buildMetadataResolver();
+        assertNotNull(resolver);
+        var entityDescriptor = resolver.resolveSingle(new CriteriaSet(new EntityIdCriterion(configuration.getServiceProviderEntityId())));
+        assertNotNull(entityDescriptor);
+
+        // now update
+        assertTrue(metadataGenerator.storeMetadata(metadata, true));
+    }
+}

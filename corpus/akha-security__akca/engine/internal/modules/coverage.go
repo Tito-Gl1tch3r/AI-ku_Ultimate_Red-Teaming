@@ -1,0 +1,224 @@
+package modules
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"github.com/akha-security/akca/engine/internal/config"
+	"github.com/akha-security/akca/engine/internal/httpclient"
+)
+
+type targetRun struct {
+	requests        atomic.Int64
+	responses       atomic.Int64
+	usableResponses atomic.Int64
+	failures        atomic.Int64
+	timeoutFailures atomic.Int64
+	transportErrors atomic.Int64
+	evidence        atomic.Bool
+	usableResponse  atomic.Bool
+	blockedResponse atomic.Bool
+	authBlocks      atomic.Int64
+	rateBlocks      atomic.Int64
+	gatewayBlocks   atomic.Int64
+	mu              sync.Mutex
+	skip            string
+	managed         bool
+	reserve         func() error
+	budgetExhausted atomic.Bool
+	interrupted     atomic.Bool
+	pendingTiming   atomic.Int64
+}
+type targetRunKey struct{}
+
+func withTargetRun(ctx context.Context, s *targetRun) context.Context {
+	ctx = context.WithValue(ctx, targetRunKey{}, s)
+	if s.reserve != nil {
+		ctx = httpclient.WithRequestBudget(ctx, func() error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			err := s.reserve()
+			if err != nil {
+				s.budgetExhausted.Store(true)
+				s.skipped(err.Error())
+			}
+			return err
+		})
+	}
+	return ctx
+}
+
+func managedTarget(ctx context.Context) bool {
+	s, _ := ctx.Value(targetRunKey{}).(*targetRun)
+	return s != nil && s.managed
+}
+
+func reserveClientBudget(ctx context.Context, client interface{}) error {
+	if s, ok := ctx.Value(targetRunKey{}).(*targetRun); ok && s.budgetExhausted.Load() {
+		return fmt.Errorf("request budget exhausted for target allocation")
+	}
+	if c, ok := client.(interface{ RequestBudgetAtTransport() bool }); ok && c.RequestBudgetAtTransport() {
+		return nil
+	}
+	return httpclient.ReserveRequestBudget(ctx)
+}
+
+func (s *targetRun) skipped(reason string) {
+	if s != nil {
+		s.mu.Lock()
+		s.skip = reason
+		s.mu.Unlock()
+	}
+}
+func noteExchange(ctx context.Context, err error) {
+	if s, ok := ctx.Value(targetRunKey{}).(*targetRun); ok {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			s.interrupted.Store(true)
+		}
+		if err != nil && strings.Contains(err.Error(), "request budget exhausted") {
+			s.budgetExhausted.Store(true)
+			s.skipped(err.Error())
+			return
+		}
+		s.requests.Add(1)
+		if err != nil {
+			s.failures.Add(1)
+			lower := strings.ToLower(err.Error())
+			if errors.Is(err, context.DeadlineExceeded) || strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline") {
+				s.timeoutFailures.Add(1)
+			} else {
+				s.transportErrors.Add(1)
+			}
+		} else {
+			s.evidence.Store(true)
+		}
+	}
+}
+func noteResponse(ctx context.Context, rr httpclient.RequestResponse) {
+	if s, ok := ctx.Value(targetRunKey{}).(*targetRun); ok {
+		s.responses.Add(1)
+		switch rr.Response.StatusCode {
+		case 401, 403:
+			s.blockedResponse.Store(true)
+			s.authBlocks.Add(1)
+		case 429:
+			s.blockedResponse.Store(true)
+			s.rateBlocks.Add(1)
+		case 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527:
+			s.blockedResponse.Store(true)
+			s.gatewayBlocks.Add(1)
+		default:
+			if rr.Response.StatusCode > 0 {
+				s.usableResponse.Store(true)
+				s.usableResponses.Add(1)
+			}
+		}
+	}
+}
+
+func noteCachedEvidence(ctx context.Context, rr httpclient.RequestResponse) {
+	noteResponse(ctx, rr)
+	if s, ok := ctx.Value(targetRunKey{}).(*targetRun); ok {
+		s.evidence.Store(true)
+	}
+}
+
+type observedHTTP struct{ HTTPDoer }
+
+func (c observedHTTP) IsLiveNetworkClient() bool {
+	live, ok := c.HTTPDoer.(interface{ IsLiveNetworkClient() bool })
+	return ok && live.IsLiveNetworkClient()
+}
+
+func (c observedHTTP) Do(ctx context.Context, m, u string, b []byte, h map[string]string) (httpclient.RequestResponse, error) {
+	if err := reserveClientBudget(ctx, c.HTTPDoer); err != nil {
+		noteExchange(ctx, err)
+		return httpclient.RequestResponse{}, err
+	}
+	rr, err := c.HTTPDoer.Do(ctx, m, u, b, h)
+	if err == nil {
+		noteResponse(ctx, rr)
+	}
+	if err == nil {
+		httpclient.StampExchange(&rr)
+	}
+	noteExchange(ctx, err)
+	return rr, err
+}
+func (c observedHTTP) ReserveExternal(ctx context.Context, rawURL, transport string) error {
+	if guard, ok := c.HTTPDoer.(interface {
+		ReserveExternal(context.Context, string, string) error
+	}); ok {
+		return guard.ReserveExternal(ctx, rawURL, transport)
+	}
+	return nil
+}
+
+type observedAnonymous struct{ base sessionlessHTTPDoer }
+
+func (c observedAnonymous) DoWithoutSession(ctx context.Context, m, u string, b []byte, h map[string]string) (httpclient.RequestResponse, error) {
+	if err := reserveClientBudget(ctx, c.base); err != nil {
+		noteExchange(ctx, err)
+		return httpclient.RequestResponse{}, err
+	}
+	rr, err := c.base.DoWithoutSession(ctx, m, u, b, h)
+	if err == nil {
+		noteResponse(ctx, rr)
+	}
+	if err == nil {
+		httpclient.StampExchange(&rr)
+	}
+	noteExchange(ctx, err)
+	return rr, err
+}
+
+type observedProfile struct{ base profiledHTTPDoer }
+
+func (c observedProfile) DoWithAuthProfile(ctx context.Context, m, u string, b []byte, h map[string]string, p config.AuthProfile) (httpclient.RequestResponse, error) {
+	if err := reserveClientBudget(ctx, c.base); err != nil {
+		noteExchange(ctx, err)
+		return httpclient.RequestResponse{}, err
+	}
+	rr, err := c.base.DoWithAuthProfile(ctx, m, u, b, h, p)
+	if err == nil {
+		noteResponse(ctx, rr)
+	}
+	if err == nil {
+		httpclient.StampExchange(&rr)
+	}
+	noteExchange(ctx, err)
+	return rr, err
+}
+
+// Preserve optional identity interfaces. Advertising unsupported capabilities
+// would change module preconditions and invalidate authorization controls.
+func observeHTTP(client HTTPDoer) HTTPDoer {
+	b := observedHTTP{client}
+	a, hasA := client.(sessionlessHTTPDoer)
+	p, hasP := client.(profiledHTTPDoer)
+	if hasA && hasP {
+		return struct {
+			observedHTTP
+			observedAnonymous
+			observedProfile
+		}{b, observedAnonymous{a}, observedProfile{p}}
+	}
+	if hasA {
+		return struct {
+			observedHTTP
+			observedAnonymous
+		}{b, observedAnonymous{a}}
+	}
+	if hasP {
+		return struct {
+			observedHTTP
+			observedProfile
+		}{b, observedProfile{p}}
+	}
+	return b
+}

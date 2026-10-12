@@ -1,0 +1,111 @@
+package cli
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/adithyan-ak/agenthound/server/internal/appdb"
+	"github.com/adithyan-ak/agenthound/server/internal/binding"
+	"github.com/adithyan-ak/agenthound/server/internal/graph"
+)
+
+func TestResolveStorageBindingMatrix(t *testing.T) {
+	expected, err := binding.NewMarker("7bc1f56e-c890-4de5-9cc5-921797176fa6")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPair, err := binding.NewMarker("ee2f3afe-209e-42fb-8685-af55caa7e58d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsupported := expected
+	unsupported.BindingVersion++
+
+	marker := func(value binding.Marker) *binding.Marker {
+		copy := value
+		return &copy
+	}
+	tests := []struct {
+		name       string
+		postgres   appdb.StorageInspection
+		neo4j      graph.StorageBindingInspection
+		wantMarker *binding.Marker
+		wantErr    bool
+		wantPhrase string
+	}{
+		{
+			name:     "fresh empty pair",
+			postgres: appdb.StorageInspection{ProductEmpty: true},
+			neo4j:    graph.StorageBindingInspection{ProductEmpty: true},
+		},
+		{
+			name:       "exact bound nonempty pair",
+			postgres:   appdb.StorageInspection{Marker: marker(expected)},
+			neo4j:      graph.StorageBindingInspection{Marker: marker(expected)},
+			wantMarker: marker(expected),
+		},
+		{
+			name:       "crash recovery PostgreSQL stamped first",
+			postgres:   appdb.StorageInspection{Marker: marker(expected), ProductEmpty: true},
+			neo4j:      graph.StorageBindingInspection{ProductEmpty: true},
+			wantMarker: marker(expected),
+		},
+		{
+			name:       "crash recovery Neo4j stamped first",
+			postgres:   appdb.StorageInspection{ProductEmpty: true},
+			neo4j:      graph.StorageBindingInspection{Marker: marker(expected), ProductEmpty: true},
+			wantMarker: marker(expected),
+		},
+		{
+			name:       "unbound PostgreSQL data",
+			postgres:   appdb.StorageInspection{ProductEmpty: false},
+			neo4j:      graph.StorageBindingInspection{ProductEmpty: true},
+			wantErr:    true,
+			wantPhrase: "not an ingest v1 database pair",
+		},
+		{
+			name:       "unbound Neo4j data",
+			postgres:   appdb.StorageInspection{ProductEmpty: true},
+			neo4j:      graph.StorageBindingInspection{ProductEmpty: false},
+			wantErr:    true,
+			wantPhrase: "not an ingest v1 database pair",
+		},
+		{
+			name:       "crossed storage pair",
+			postgres:   appdb.StorageInspection{Marker: marker(expected)},
+			neo4j:      graph.StorageBindingInspection{Marker: marker(otherPair)},
+			wantErr:    true,
+			wantPhrase: "different volume pairs",
+		},
+		{
+			name:       "matching unsupported bindings",
+			postgres:   appdb.StorageInspection{Marker: marker(unsupported)},
+			neo4j:      graph.StorageBindingInspection{Marker: marker(unsupported)},
+			wantErr:    true,
+			wantPhrase: "recreate both PostgreSQL and Neo4j volumes",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			resolved, err := resolveStorageBinding(test.postgres, test.neo4j)
+			if test.wantErr {
+				if err == nil || !strings.Contains(err.Error(), test.wantPhrase) {
+					t.Fatalf("error = %v, want phrase %q", err, test.wantPhrase)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if test.wantMarker != nil && !resolved.Equal(*test.wantMarker) {
+				t.Fatalf("marker = %+v, want %+v", resolved, *test.wantMarker)
+			}
+			if test.wantMarker == nil {
+				if err := resolved.Validate(); err != nil {
+					t.Fatalf("generated marker is invalid: %v", err)
+				}
+			}
+		})
+	}
+}

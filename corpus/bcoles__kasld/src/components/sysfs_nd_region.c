@@ -1,0 +1,204 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Read physical start addresses of NVDIMM/PMem regions from the Linux
+// libnvdimm sysfs interface.
+//
+// When a system has NVDIMM or Persistent Memory (PMem) hardware — such as
+// Intel Optane DCPMM (Data Center Persistent Memory) or JEDEC NVDIMM-P —
+// the libnvdimm driver registers nd_region devices under:
+//
+//   /sys/bus/nd/devices/ndregionN/
+//
+// Each nd_region's "resource" attribute exposes the physical start address
+// of that PMem region, and "size" its length:
+//
+//   /sys/bus/nd/devices/ndregionN/resource   (0400 — root only)
+//   /sys/bus/nd/devices/ndregionN/size       (0444 — world-readable)
+//
+// Format: resource "%#llx\n" (e.g. "0x2080000000\n"), size "%llu\n" decimal.
+//
+// "resource" is root-gated, and has been since it became
+// DEVICE_ATTR(resource, 0400, ...) — later spelled DEVICE_ATTR_ADMIN_RO. It
+// was world-readable when introduced, so this reads as an unprivileged leak
+// only on a kernel from that earlier era; everywhere else it needs root, and
+// the open simply fails. "size" carries no such gate, so the length is
+// available whenever the base is.
+//
+// The value is nd_region->ndr_start, the physical byte offset of the first
+// byte of this interleave set. On Intel Optane systems this is typically a
+// persistent-memory range beyond the regular DRAM ceiling (e.g. starting at
+// 0x40_0000_0000 / 256 GiB on a 256 GiB DRAM + 256 GiB PMem system).
+//
+// The attribute is hidden (mode 0) for degenerate regions with no interleave
+// mappings (ndr_mappings == 0); it is visible and world-readable for all
+// standard PMem regions.
+//
+// The resource attribute is only populated when the nd_region driver is
+// bound to the device; if no driver is bound, read() returns ENXIO.
+//
+// Leak primitive:
+//   Data leaked:      physical start address of NVDIMM/PMem interleave region
+//   Kernel subsystem: drivers/nvdimm —
+//                     /sys/bus/nd/devices/ndregionN/resource
+//   Data structure:   struct nd_region → ndr_start
+//   Address type:     physical (persistent memory / DRAM-like)
+//   Method:           parsed (sysfs text attribute)
+//   Status:           unfixed (information exposure by design)
+//   Access check:     CAP_SYS_ADMIN for "resource" (DEVICE_ATTR_ADMIN_RO,
+//                     0400); none for "size" (0444), which is useless alone
+//   Source:
+//   https://elixir.bootlin.com/linux/v6.12/source/drivers/nvdimm/region_devs.c
+//
+// Mitigations:
+//   CONFIG_LIBNVDIMM=n removes the nd bus and all nd_region sysfs entries.
+//   Requires physical NVDIMM/PMem hardware and the nd_region driver to be
+//   bound. On x86_64 with CONFIG_RANDOMIZE_MEMORY, physical addresses do not
+//   directly reveal the virtual text base. The physical address is emitted as
+//   a fact; where it lands in the linear map is the engine's to decide, from
+//   the base it resolved rather than from a compile-time constant.
+//
+// Requires:
+// - CONFIG_LIBNVDIMM
+// - NVDIMM / Persistent Memory hardware (Intel Optane DCPMM, JEDEC NVDIMM-P)
+// - nd_region driver bound to at least one ndregion device
+//
+// References:
+// https://elixir.bootlin.com/linux/v6.12/source/drivers/nvdimm/region_devs.c
+// https://www.kernel.org/doc/html/latest/driver-api/nvdimm/nvdimm.html
+// https://www.kernel.org/doc/Documentation/ABI/testing/sysfs-bus-nd
+// ---
+// <bcoles@gmail.com>
+
+#include "include/kasld/api.h"
+#include "include/kasld/cli.h"
+#include <dirent.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+KASLD_EXPLAIN(
+    "Reads physical start addresses of NVDIMM/PMem regions from the libnvdimm "
+    "sysfs interface (/sys/bus/nd/devices/ndregionN/resource). The 'resource' "
+    "attribute exposes nd_region->ndr_start - the physical byte address of the "
+    "first byte of that interleave set - and the world-readable 'size' gives "
+    "its length, so the pair bounds the region at both edges. 'resource' is "
+    "root-gated (0400) on current kernels, having been published 0444 for a "
+    "period after its introduction, so this reads unprivileged only there. "
+    "Only present on systems with NVDIMM or Persistent Memory hardware "
+    "(Intel Optane DCPMM, JEDEC NVDIMM-P) and the nd_region driver bound.");
+
+KASLD_META("method:parsed\n"
+           "phase:inference\n"
+           "discloses:physical\n"
+           "source:files\n"
+           "config:CONFIG_LIBNVDIMM\n");
+
+static const char *nd_base = "/sys/bus/nd/devices";
+
+int main(void) {
+  DIR *d;
+  struct dirent *ent;
+  char path[512];
+  char buf[64];
+  int count = 0;
+
+  kasld_info("trying %s/ndregionN/resource ...", nd_base);
+
+  d = kasld_opendir(nd_base);
+  if (!d) {
+    int saved_errno = errno;
+    if (saved_errno == ENOENT || saved_errno == ENODEV)
+      kasld_err("%s not present (CONFIG_LIBNVDIMM=n or no nd bus)", nd_base);
+    else
+      kasld_errno("opendir");
+    return (saved_errno == EACCES || saved_errno == EPERM)
+               ? KASLD_EXIT_NOPERM
+               : KASLD_EXIT_UNAVAILABLE;
+  }
+
+  while ((ent = readdir(d)) != NULL) {
+    /* Only process ndregionN devices (not namespace*, bregion*, dax*, etc.) */
+    if (strncmp(ent->d_name, "ndregion", 8) != 0)
+      continue;
+    /* Name must be "ndregion" followed by one or more digits */
+    const char *suffix = ent->d_name + 8;
+    int all_digits = (*suffix != '\0');
+    for (const char *p = suffix; *p; p++) {
+      if (*p < '0' || *p > '9') {
+        all_digits = 0;
+        break;
+      }
+    }
+    if (!all_digits)
+      continue;
+
+    snprintf(path, sizeof(path), "%s/%s/resource", nd_base, ent->d_name);
+
+    FILE *f = kasld_fopen(path, "r");
+    if (!f) {
+      /* ENXIO = driver not bound; ENOENT = attribute hidden (no mappings) */
+      if (errno != ENOENT && errno != ENXIO)
+        kasld_err("failed to open %s: %s", path, strerror(errno));
+      continue;
+    }
+
+    if (!fgets(buf, sizeof(buf), f)) {
+      fclose(f);
+      continue;
+    }
+    fclose(f);
+
+    /* Format is "0x%llx\n", so base 0 honours the prefix. A pmem region base
+     * can exceed the word on a 32-bit build; a refusal skips the region rather
+     * than reporting a truncated one. */
+    unsigned long addr;
+    if (!kasld_addr_parse(buf, 0, &addr, NULL) || addr == 0)
+      continue;
+
+    /* "size" is region_size(nd_region) in decimal, and carries no capability
+     * gate of its own, so wherever the base could be read the length can be
+     * too. Emitting the extent rather than the base alone lets the engine
+     * carve the whole forbidden band: persistent memory is not System RAM
+     * when the image is placed, so the image cannot overlap it. A missing or
+     * unparsable size falls back to the base as a bare sample rather than
+     * inventing an extent. */
+    unsigned long size = 0;
+    snprintf(path, sizeof(path), "%s/%s/size", nd_base, ent->d_name);
+    FILE *sf = kasld_fopen(path, "r");
+    if (sf) {
+      char sbuf[64];
+      if (fgets(sbuf, sizeof(sbuf), sf)) {
+        unsigned long v;
+        /* Decimal, and it must not run past the top of the address space. */
+        if (kasld_addr_parse(sbuf, 10, &v, NULL) && v > 0 &&
+            v - 1 <= ULONG_MAX - addr)
+          size = v;
+      }
+      fclose(sf);
+    }
+
+    if (size) {
+      kasld_info("%s resource: 0x%016lx size: %lu", ent->d_name, addr, size);
+      kasld_result_sized(KASLD_TYPE_PHYS, REGION_PMEM, addr, size, ent->d_name,
+                         CONF_PARSED);
+    } else {
+      kasld_info("%s resource: 0x%016lx (size unavailable)", ent->d_name, addr);
+      kasld_result_sample(KASLD_TYPE_PHYS, REGION_PMEM, addr, ent->d_name,
+                          CONF_PARSED);
+    }
+
+    count++;
+  }
+  closedir(d);
+
+  if (!count) {
+    kasld_err("no readable ndregion resource attributes found "
+              "(no NVDIMM hardware or driver not bound)");
+    return KASLD_EXIT_UNAVAILABLE;
+  }
+
+  return 0;
+}

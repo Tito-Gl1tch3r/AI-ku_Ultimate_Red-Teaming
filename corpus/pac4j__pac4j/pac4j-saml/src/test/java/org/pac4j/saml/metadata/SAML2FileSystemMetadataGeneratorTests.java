@@ -1,0 +1,45 @@
+package org.pac4j.saml.metadata;
+
+import lombok.val;
+import org.junit.jupiter.api.Test;
+import org.pac4j.saml.config.SAML2Configuration;
+import org.pac4j.saml.util.ConfigurationManager;
+import org.pac4j.saml.util.DefaultConfigurationManager;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.FileSystemResource;
+
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+
+/**
+ * This is {@link SAML2FileSystemMetadataGeneratorTests}.
+ *
+ * @author Misagh Moayyed
+ */
+public class SAML2FileSystemMetadataGeneratorTests {
+    @Test
+    public void verifyGeneration() throws Exception {
+        final ConfigurationManager mgr = new DefaultConfigurationManager();
+        mgr.configure();
+
+        val configuration = new SAML2Configuration();
+        configuration.setForceKeystoreGeneration(true);
+        configuration.setKeystorePath("target/keystore.jks");
+        configuration.setKeystorePassword("pac4j");
+        configuration.setPrivateKeyPassword("pac4j");
+        configuration.setSignMetadata(true);
+        configuration.getServiceProviderMetadata().setResource(new FileSystemResource("target/out.xml"));
+        configuration.getIdentityProviderMetadata().setResource(new ClassPathResource("idp-metadata.xml"));
+        configuration.init();
+
+        SAML2MetadataGenerator metadataGenerator =
+            new SAML2FileSystemMetadataGenerator(configuration.getServiceProviderMetadata().getResource());
+        val entity = metadataGenerator.buildEntityDescriptor();
+        assertNotNull(entity);
+        val metadata = metadataGenerator.getMetadata(entity);
+        assertNotNull(metadata);
+
+        metadataGenerator.storeMetadata(metadata, true);
+        assertNotNull(metadataGenerator.buildMetadataResolver());
+    }
+
+}

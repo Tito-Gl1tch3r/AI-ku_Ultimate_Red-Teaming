@@ -1,0 +1,586 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use k8s::{Client, ExecOutputObserver, ExecOutputStream, PodExecOutput};
+use tracing::{debug, warn};
+
+use crate::output::OutputSink;
+use crate::types::{ExecTtp, TtpExecuted};
+
+#[async_trait]
+pub(crate) trait PodExecClient: Send + Sync {
+    async fn exec_pod_command(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        command: &str,
+    ) -> anyhow::Result<PodExecOutput>;
+
+    async fn exec_pod_command_streaming(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        command: &str,
+        output: OutputSink,
+    ) -> anyhow::Result<PodExecOutput> {
+        let _ = output;
+        self.exec_pod_command(namespace, pod_name, command).await
+    }
+}
+
+#[async_trait]
+impl PodExecClient for Client {
+    async fn exec_pod_command(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        command: &str,
+    ) -> anyhow::Result<PodExecOutput> {
+        self.exec_pod_command(namespace, pod_name, command).await
+    }
+
+    async fn exec_pod_command_streaming(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        command: &str,
+        output: OutputSink,
+    ) -> anyhow::Result<PodExecOutput> {
+        let observer: ExecOutputObserver = Arc::new(move |stream, bytes| match stream {
+            ExecOutputStream::Stdout => output.stdout(bytes.to_vec()),
+            ExecOutputStream::Stderr => output.stderr(bytes.to_vec()),
+        });
+        self.exec_pod_command_streaming(namespace, pod_name, command, Some(observer))
+            .await
+    }
+}
+
+#[derive(Clone)]
+pub struct BuiltinC2 {
+    pod_exec_client: Arc<dyn PodExecClient>,
+}
+
+impl BuiltinC2 {
+    pub fn new(k8s: Client) -> Self {
+        Self {
+            pod_exec_client: Arc::new(k8s),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_pod_exec_client(client: Arc<dyn PodExecClient>) -> Self {
+        Self {
+            pod_exec_client: client,
+        }
+    }
+
+    pub async fn execute(&self, cmd: &ExecTtp) -> TtpExecuted {
+        self.execute_streaming(cmd, OutputSink::discard()).await
+    }
+
+    pub async fn execute_streaming(&self, cmd: &ExecTtp, output: OutputSink) -> TtpExecuted {
+        let Some(command) = cmd.operation.command() else {
+            return TtpExecuted {
+                id: cmd.id.clone(),
+                success: false,
+                results: Vec::new(),
+                exit_code: 1,
+                fail_reason: "builtin C2 received a non-shell execution operation".to_string(),
+                session_connected: None,
+            };
+        };
+        let routing_target = cmd.exec_entity();
+        if routing_target.starts_with("ns/?/pod/") {
+            let reason = format!(
+                "cannot exec pod target '{}': its Kubernetes namespace is unknown",
+                routing_target
+            );
+            warn!(cmd_id = %cmd.id, target_id = %cmd.target_id, routing_target, "{}", reason);
+            return TtpExecuted {
+                id: cmd.id.clone(),
+                success: false,
+                results: vec![reason.clone()],
+                exit_code: 1,
+                fail_reason: reason,
+                session_connected: None,
+            };
+        }
+        if let Some((namespace, pod_name)) = parse_pod_target_id(routing_target) {
+            debug!(
+                cmd_id = %cmd.id,
+                target_id = %cmd.target_id,
+                routing_target,
+                namespace,
+                pod_name,
+                "builtin c2 executing command through pod exec"
+            );
+
+            let timeout_seconds = cmd.execution_timeout_seconds.max(1);
+            let execution = self
+                .pod_exec_client
+                .exec_pod_command_streaming(namespace, pod_name, command, output);
+            match tokio::time::timeout(Duration::from_secs(timeout_seconds), execution).await {
+                Err(_) => {
+                    let reason = format!("pod exec command timed out after {timeout_seconds}s");
+                    warn!(cmd_id = %cmd.id, target_id = %cmd.target_id, %timeout_seconds, "{}", reason);
+                    return TtpExecuted {
+                        id: cmd.id.clone(),
+                        success: false,
+                        results: vec![reason.clone()],
+                        exit_code: 1,
+                        fail_reason: reason,
+                        session_connected: None,
+                    };
+                }
+                Ok(result) => match result {
+                    Ok(output) if output.exit_code == 0 => {
+                        let stdout = output.stdout.trim().to_string();
+                        let stderr = output.stderr.trim().to_string();
+
+                        // Keep stdout and stderr as separate entries so downstream
+                        // output parsers can consume clean stdout JSON/table data.
+                        // Preserve stdout at index 0 when stderr is present.
+                        let mut results = Vec::new();
+                        if !stdout.is_empty() {
+                            results.push(stdout);
+                        }
+                        if !stderr.is_empty() {
+                            if results.is_empty() {
+                                results.push(String::new());
+                            }
+                            results.push(stderr);
+                        }
+
+                        return TtpExecuted {
+                            id: cmd.id.clone(),
+                            success: true,
+                            results,
+                            exit_code: 0,
+                            fail_reason: String::new(),
+                            session_connected: None,
+                        };
+                    }
+                    Ok(output) => {
+                        let mut results = Vec::new();
+                        if !output.stdout.trim().is_empty() {
+                            results.push(output.stdout.trim().to_string());
+                        }
+                        if !output.stderr.trim().is_empty() {
+                            results.push(output.stderr.trim().to_string());
+                        }
+                        let fail_reason =
+                            derive_fail_reason(&output.stderr, &output.stdout, output.exit_code);
+                        warn!(
+                            cmd_id = %cmd.id,
+                            target_id = %cmd.target_id,
+                            exit_code = output.exit_code,
+                            stderr = %output.stderr.trim(),
+                            "builtin c2 pod exec command failed"
+                        );
+                        return TtpExecuted {
+                            id: cmd.id.clone(),
+                            success: false,
+                            results,
+                            exit_code: output.exit_code,
+                            fail_reason,
+                            session_connected: None,
+                        };
+                    }
+                    Err(err) => {
+                        // `anyhow::Error::to_string()` keeps only the outer
+                        // context. Preserve the source chain so Kubernetes API
+                        // status and exec-upgrade failures remain actionable.
+                        let reason = format!("{err:#}");
+                        warn!(
+                            cmd_id = %cmd.id,
+                            target_id = %cmd.target_id,
+                            error = %reason,
+                            "builtin c2 pod exec infrastructure failure"
+                        );
+                        return TtpExecuted {
+                            id: cmd.id.clone(),
+                            success: false,
+                            results: vec![reason.clone()],
+                            exit_code: 1,
+                            fail_reason: reason,
+                            session_connected: None,
+                        };
+                    }
+                },
+            }
+        }
+
+        if routing_target.starts_with("ns/") {
+            let reason = format!(
+                "invalid pod target id '{}': expected format ns/<namespace>/pod/<pod-name>",
+                routing_target
+            );
+            warn!(cmd_id = %cmd.id, target_id = %cmd.target_id, routing_target, "{}", reason);
+            return TtpExecuted {
+                id: cmd.id.clone(),
+                success: false,
+                results: vec![reason.clone()],
+                exit_code: 1,
+                fail_reason: reason,
+                session_connected: None,
+            };
+        }
+
+        let reason = format!(
+            "cannot execute command for non-pod target '{routing_target}': no local procedure or compatible C2 backend was selected"
+        );
+        warn!(
+            cmd_id = %cmd.id,
+            target_id = %cmd.target_id,
+            routing_target,
+            "builtin c2 rejected unroutable command"
+        );
+        TtpExecuted {
+            id: cmd.id.clone(),
+            success: false,
+            results: vec![reason.clone()],
+            exit_code: 1,
+            fail_reason: reason,
+            session_connected: None,
+        }
+    }
+}
+
+/// Lines that package managers and shells emit as routine progress - never a
+/// real failure reason, even when they land on stderr.
+fn is_benign_noise(line: &str) -> bool {
+    let l = line.trim();
+    if l.is_empty() {
+        return true;
+    }
+    const BENIGN_PREFIXES: &[&str] = &[
+        "Reading package lists",
+        "Reading state information",
+        "Building dependency tree",
+        "Get:",
+        "Hit:",
+        "Ign:",
+        "Fetched ",
+        "WARNING: apt does not have a stable CLI",
+        "debconf:",
+        "Selecting previously unselected",
+        "Preparing to unpack",
+        "Unpacking ",
+        "Setting up ",
+        "Processing triggers",
+    ];
+    BENIGN_PREFIXES.iter().any(|p| l.starts_with(p))
+}
+
+/// Pick a meaningful failure reason from a failed command's output.
+///
+/// Package managers write routine progress (e.g. "Reading state information…")
+/// to stderr even on success, so naively taking the first stderr line surfaces
+/// noise instead of the real error. Prefer the *last* non-benign stderr line,
+/// then the last non-benign stdout line, then a generic exit-code message.
+fn derive_fail_reason(stderr: &str, stdout: &str, exit_code: i32) -> String {
+    let meaningful_last = |text: &str| -> Option<String> {
+        text.lines()
+            .map(str::trim)
+            .rfind(|l| !is_benign_noise(l))
+            .map(ToString::to_string)
+    };
+
+    meaningful_last(stderr)
+        .or_else(|| meaningful_last(stdout))
+        .unwrap_or_else(|| format!("command exited with code {exit_code}"))
+}
+
+fn parse_pod_target_id(target_id: &str) -> Option<(&str, &str)> {
+    let mut parts = target_id.split('/');
+    let kind_a = parts.next()?;
+    let namespace = parts.next()?;
+    let kind_b = parts.next()?;
+    let pod_name = parts.next()?;
+
+    if parts.next().is_some() {
+        return None;
+    }
+
+    if kind_a != "ns"
+        || kind_b != "pod"
+        || namespace.is_empty()
+        || namespace == "?"
+        || pod_name.is_empty()
+    {
+        return None;
+    }
+
+    Some((namespace, pod_name))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use armory::{Procedure, Ttp};
+
+    use k8s::PodExecOutput;
+
+    use super::{derive_fail_reason, BuiltinC2, PodExecClient};
+    use crate::types::ExecTtp;
+    use crate::OutputSink;
+
+    #[test]
+    fn fail_reason_skips_benign_apt_noise() {
+        // apt writes progress to stderr even when the real failure is elsewhere;
+        // the reason should be the actual error, not "Reading state information".
+        let stderr = "Reading package lists...\nReading state information...\nE: Unable to locate package bogus-pkg";
+        assert_eq!(
+            derive_fail_reason(stderr, "", 100),
+            "E: Unable to locate package bogus-pkg"
+        );
+    }
+
+    #[test]
+    fn fail_reason_falls_back_to_stdout_then_exit_code() {
+        // Only benign stderr → use a meaningful stdout line.
+        assert_eq!(
+            derive_fail_reason("Reading state information...", "boom: it broke", 1),
+            "boom: it broke"
+        );
+        // Nothing meaningful anywhere → generic exit-code message.
+        assert_eq!(
+            derive_fail_reason("Reading state information...", "", 1),
+            "command exited with code 1"
+        );
+    }
+
+    struct FakePodExecClient {
+        calls: Mutex<Vec<(String, String, String)>>,
+        output: Mutex<PodExecOutput>,
+    }
+
+    impl Default for FakePodExecClient {
+        fn default() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                output: Mutex::new(PodExecOutput {
+                    stdout: "uid=0(root) gid=0(root)".to_string(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                }),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PodExecClient for FakePodExecClient {
+        async fn exec_pod_command(
+            &self,
+            namespace: &str,
+            pod_name: &str,
+            command: &str,
+        ) -> anyhow::Result<PodExecOutput> {
+            self.calls
+                .lock()
+                .expect("lock should not be poisoned")
+                .push((
+                    namespace.to_string(),
+                    pod_name.to_string(),
+                    command.to_string(),
+                ));
+            Ok(self
+                .output
+                .lock()
+                .expect("lock should not be poisoned")
+                .clone())
+        }
+
+        async fn exec_pod_command_streaming(
+            &self,
+            namespace: &str,
+            pod_name: &str,
+            command: &str,
+            output: OutputSink,
+        ) -> anyhow::Result<PodExecOutput> {
+            let result = self.exec_pod_command(namespace, pod_name, command).await?;
+            output.stdout(result.stdout.as_bytes().to_vec());
+            output.stderr(result.stderr.as_bytes().to_vec());
+            Ok(result)
+        }
+    }
+
+    struct FailingPodExecClient;
+
+    #[async_trait::async_trait]
+    impl PodExecClient for FailingPodExecClient {
+        async fn exec_pod_command(
+            &self,
+            _namespace: &str,
+            _pod_name: &str,
+            _command: &str,
+        ) -> anyhow::Result<PodExecOutput> {
+            Err(
+                anyhow::anyhow!("exec upgrade rejected: container not found")
+                    .context("failed to exec command in pod 'default/nginx'"),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn pod_target_executes_command_successfully() {
+        let fake = Arc::new(FakePodExecClient {
+            calls: Mutex::new(Vec::new()),
+            output: Mutex::new(PodExecOutput {
+                stdout: "uid=0(root) gid=0(root)".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
+            }),
+        });
+        let builtin = BuiltinC2::from_pod_exec_client(fake.clone());
+
+        let cmd = exec_cmd("ns/default/pod/nginx", "id", "");
+        let result = builtin.execute(&cmd).await;
+
+        assert!(result.success);
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.results, vec!["uid=0(root) gid=0(root)"]);
+
+        let calls = fake.calls.lock().expect("lock should not be poisoned");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "default");
+        assert_eq!(calls[0].1, "nginx");
+        assert_eq!(calls[0].2, "id");
+    }
+
+    #[tokio::test]
+    async fn pod_target_forwards_output_before_returning_final_result() {
+        let fake = Arc::new(FakePodExecClient::default());
+        let builtin = BuiltinC2::from_pod_exec_client(fake);
+        let cmd = exec_cmd("ns/default/pod/nginx", "id", "");
+        let (output, mut rx) = OutputSink::channel();
+
+        let result = builtin.execute_streaming(&cmd, output).await;
+
+        assert!(result.success);
+        let fragment = rx.try_recv().expect("stdout fragment");
+        assert_eq!(fragment.stream, crate::OutputStream::Stdout);
+        assert_eq!(
+            String::from_utf8(fragment.bytes).expect("utf8"),
+            "uid=0(root) gid=0(root)"
+        );
+    }
+
+    #[tokio::test]
+    async fn success_keeps_stdout_and_stderr_separate() {
+        let fake = Arc::new(FakePodExecClient {
+            calls: Mutex::new(Vec::new()),
+            output: Mutex::new(PodExecOutput {
+                stdout: "{\"status\":\"ok\"}".to_string(),
+                stderr: "curl: (0) progress output".to_string(),
+                exit_code: 0,
+            }),
+        });
+        let builtin = BuiltinC2::from_pod_exec_client(fake);
+
+        let cmd = exec_cmd("ns/default/pod/nginx", "curl ...", "");
+        let result = builtin.execute(&cmd).await;
+
+        assert!(result.success);
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.results.len(), 2);
+        assert_eq!(result.results[0], "{\"status\":\"ok\"}");
+        assert_eq!(result.results[1], "curl: (0) progress output");
+    }
+
+    #[tokio::test]
+    async fn pod_exec_failure_preserves_error_context_chain() {
+        let builtin = BuiltinC2::from_pod_exec_client(Arc::new(FailingPodExecClient));
+
+        let result = builtin
+            .execute(&exec_cmd("ns/default/pod/nginx", "id", ""))
+            .await;
+
+        assert!(!result.success);
+        assert!(result.fail_reason.contains("failed to exec command in pod"));
+        assert!(result
+            .fail_reason
+            .contains("exec upgrade rejected: container not found"));
+        assert_eq!(result.results, vec![result.fail_reason]);
+    }
+
+    #[tokio::test]
+    async fn malformed_pod_target_returns_failure() {
+        let fake = Arc::new(FakePodExecClient::default());
+        let builtin = BuiltinC2::from_pod_exec_client(fake.clone());
+
+        let cmd = exec_cmd("ns/default/pod", "id", "");
+        let result = builtin.execute(&cmd).await;
+
+        assert!(!result.success);
+        assert_eq!(result.exit_code, 1);
+        assert!(result.fail_reason.contains("invalid pod target id"));
+
+        let calls = fake.calls.lock().expect("lock should not be poisoned");
+        assert!(calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_namespace_pod_target_is_not_sent_to_kubernetes() {
+        let fake = Arc::new(FakePodExecClient::default());
+        let builtin = BuiltinC2::from_pod_exec_client(fake.clone());
+
+        let cmd = exec_cmd("ns/?/pod/netshoot", "id", "");
+        let result = builtin.execute(&cmd).await;
+
+        assert!(!result.success);
+        assert!(result.fail_reason.contains("namespace is unknown"));
+        assert!(fake
+            .calls
+            .lock()
+            .expect("lock should not be poisoned")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_pod_target_is_rejected_instead_of_returning_a_fake_success() {
+        let fake = Arc::new(FakePodExecClient::default());
+        let builtin = BuiltinC2::from_pod_exec_client(fake.clone());
+
+        let cmd = exec_cmd("svc/default/redis", "id", "");
+        let result = builtin.execute(&cmd).await;
+
+        assert!(!result.success);
+        assert_eq!(result.exit_code, 1);
+        assert!(result.fail_reason.contains("non-pod target"));
+        assert!(fake
+            .calls
+            .lock()
+            .expect("lock should not be poisoned")
+            .is_empty());
+    }
+
+    fn exec_cmd(target_id: &str, command: &str, exec_system_id: &str) -> ExecTtp {
+        ExecTtp {
+            id: "cmd-1".to_string(),
+            started_at_ms: 0,
+            execution_timeout_seconds: crate::DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+            ttp: Ttp {
+                description: "test".to_string(),
+                ..Ttp::new("T0001", "Test TTP", "Execution")
+            },
+            procedure: Procedure::new("proc-1", command),
+            operation: crate::ExecutionOperation::Shell {
+                command: command.to_string(),
+            },
+            args: HashMap::new(),
+            target_id: target_id.to_string(),
+            exec_chain: vec![target_id.to_string()],
+            exec_system_id: exec_system_id.to_string(),
+            execution_environment: None,
+            transport_environment: None,
+            auth_identity_id: None,
+            output_transform: None,
+            is_cleanup: false,
+            reasoning: String::new(),
+        }
+    }
+}

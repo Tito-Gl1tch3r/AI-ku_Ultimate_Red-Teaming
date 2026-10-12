@@ -1,0 +1,337 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Definitions for RISC-V 64-bit (riscv64)
+//
+// The riscv64 virtual address layout changed significantly in ~v5.10-v5.13:
+//
+// Legacy layout (pre-v5.10):
+//   - SV39 only, PAGE_OFFSET is compile-time (Kconfig)
+//   - KERNEL_LINK_ADDR = PAGE_OFFSET (text in linear mapping)
+//   - PAGE_OFFSET = 0xffffffe000000000 (MAXPHYSMEM_128GB)
+//   - phys_to_directmap_virt yields kernel text address (coupled)
+//   - No KASLR
+//
+// Modern layout (v5.10+):
+//   - SV39/SV48/SV57 with runtime detection (set_satp_mode)
+//   - KERNEL_LINK_ADDR = ADDRESS_SPACE_END - SZ_2G + 1 = 0xffffffff80000000
+//   - PAGE_OFFSET varies by mode (runtime):
+//       SV39: 0xffffffd600000000 (PAGE_OFFSET_L3, v6.12+)
+//             0xffffffd800000000 (PAGE_OFFSET_L3, v5.10 - v6.10)
+//       SV48: 0xffffaf8000000000 (PAGE_OFFSET_L4)
+//       SV57: 0xff60000000000000 (PAGE_OFFSET_L5)
+//   - Kernel text and linear map have separate VA-PA mappings (decoupled)
+//   - KASLR added in v6.6 (within 1 PUD / 1 GiB, at 2 MiB granularity)
+//
+// KASLR support added in commit f57805555834494e8cad729d01d86ba326d64959 in
+// kernel v6.6-rc1~10^2~5 on 2023-11-08.
+//
+// References:
+// https://github.com/torvalds/linux/commit/f57805555834494e8cad729d01d86ba326d64959
+// https://www.kernel.org/doc/html/next/riscv/vm-layout.html
+// https://www.kernel.org/doc/html/next/riscv/boot.html
+// ---
+// <bcoles@gmail.com>
+
+#ifndef KASLD_RISCV64_H
+#define KASLD_RISCV64_H
+
+// PAGE_OFFSET is runtime-determined on v5.10+. Use the SV57 value
+// (PAGE_OFFSET_L5, broadest), matching the approach used for x86_64 5-level
+// paging. CONFIG_PAGE_OFFSET Kconfig entry removed in v6.17; the value is
+// now hardcoded as PAGE_OFFSET_L5 in arch/riscv/include/asm/page.h.
+// https://elixir.bootlin.com/linux/v6.12/source/arch/riscv/include/asm/page.h
+#define PAGE_OFFSET 0xff60000000000000ul
+
+// Derived from the paging mode AND the kernel version, with no enumerable
+// set: SV57/SV48/SV39 each have a base, SV39 has had two across releases, the
+// pre-v5.10 layout adds another, and legacy MAXPHYSMEM_2GB puts PAGE_OFFSET at
+// 0xffffffff80000000 — above every other value. The bracket is therefore the
+// whole kernel VAS. Narrowing it to the values enumerated in the comment above
+// excludes that 2 GiB build, which is a guaranteed-window soundness bug, not a
+// precision gain. What the paging mode does prove is carried by Q_VA_BITS and
+// applied by the coupling rule.
+// Admissible kernel page sizes on this architecture. PAGE_SIZE_KNOWN_AT_BUILD
+// is derived from the pair in api.h and gates pfn_to_phys(); a page-frame
+// number may only be converted with a compile-time constant where the two
+// edges coincide. Where they differ the runtime SF_PAGE_SIZE observation is
+// the only sound multiplier.
+// riscv fixes the base page at 4 KiB under every Sv mode;
+// arch/riscv selects HAVE_PAGE_SIZE_4KB and offers no alternative.
+#define PAGE_SIZE_MIN 0x1000ul
+#define PAGE_SIZE_MAX 0x1000ul
+
+#define PAGE_OFFSET_MIN KERNEL_VIRT_VAS_START
+#define PAGE_OFFSET_MAX KERNEL_VIRT_VAS_END
+
+// Physical RAM base (platform-dependent; 0x80000000 for QEMU virt, SiFive,
+// etc.)
+#define PHYS_OFFSET 0x80000000ul
+
+// On v5.10+, PAGE_OFFSET (= kernel_map.virt_page_offset) and va_pa_offset are
+// runtime-resolved; kernel text lives at KERNEL_LINK_ADDR with its OWN
+// independent va_kernel_pa_offset. The compile-time formula is NOT a sound
+// runtime directmap projection; phys_to_directmap_virt() is therefore left
+// undefined (see gate at end of file). Text moves independently of the
+// linear map, so text does not track the directmap.
+//
+// On legacy kernels (pre-v5.10) text WAS in the linear map, but those
+// kernels had no KASLR so the lost coupled-derivation is acceptable.
+// LINEAR_MAP_ANCHOR: kernel_map.va_pa_offset = PAGE_OFFSET - phys_ram_base
+// with phys_ram_base = memblock_start_of_DRAM() & PMD_MASK, so the anchor
+// IS the base of DRAM (PMD-rounded; see riscv32.h). The paging mode moves
+// the VIRTUAL base, which Q_VA_BITS carries and this axis says nothing
+// about — the physical anchor tracks DRAM under every mode.
+// arch/riscv/mm/init.c setup_bootmem()
+#define LINEAR_MAP_ANCHOR LM_ANCHOR_DRAM_BASE
+#define DIRECTMAP_STATIC 0
+#define TEXT_TRACKS_DIRECTMAP 0
+
+/* Q_VA_BITS candidate set: SV39, SV48, SV57 (pgtable_l4_enabled /
+ * pgtable_l5_enabled at boot select one). proc_cpuinfo emits
+ * SF_VIRT_ADDR_BITS from /proc/cpuinfo "mmu" line; va_bits_from_scalar
+ * narrows Q_VA_BITS to the single selected value. */
+#define VA_BITS_CANDIDATES {39ul, 48ul, 57ul}
+
+// VAS start with SV57 (5-level page tables): ~0xff1bffff_fea00000
+// VAS start with SV48 (4-level page tables): ~0xffff8d7f_fea00000
+// VAS start with SV39 (3-level page tables): ~0xffffffc6_fea00000
+#define KERNEL_VIRT_VAS_START 0xff10000000000000ul
+#define KERNEL_VIRT_VAS_END 0xfffffffffffffffful
+
+// Kernel text region. Covers both modern and legacy layouts for validation:
+//   Legacy: _stext ≈ 0xffffffe000200000 (>= VIRT_TEXT_PLAUSIBLE_MIN)
+//   Modern: _stext ≈ 0xffffffff80002000 (>= VIRT_TEXT_PLAUSIBLE_MIN, <
+//   VIRT_TEXT_PLAUSIBLE_MAX)
+// KASLR (v6.6+) randomizes within 1 PUD (1 GiB) from KERNEL_LINK_ADDR.
+// https://elixir.bootlin.com/linux/v6.6/source/arch/riscv/include/asm/pgtable.h#L63
+#define VIRT_TEXT_PLAUSIBLE_MIN 0xffffffe000000000ul
+#define VIRT_TEXT_PLAUSIBLE_MAX 0xffffffffc0000000ul
+
+// TEXT_WINDOW_EXCLUSIVE is deliberately NOT declared here; the default 0 holds.
+//
+// vmalloc is not the problem — asm/pgtable.h puts it below the linear map
+// (VMALLOC_END == PAGE_OFFSET). The LINEAR MAP is. asm/page.h selects
+// PAGE_OFFSET at runtime from the VA mode in force:
+//
+//   PAGE_OFFSET_L5  0xff60000000000000   (sv57)  <- the value modelled below
+//   PAGE_OFFSET_L4  0xffffaf8000000000   (sv48)
+//   PAGE_OFFSET_L3  0xffffffd600000000   (sv39)
+//
+// On sv39 the linear map begins 40 GiB below VIRT_TEXT_PLAUSIBLE_MIN and grows
+// upward with installed memory, so a machine with more than that much RAM maps
+// RAM inside the text window. The api.h assertion cannot catch it: it compares
+// against the sv57 constant this header carries, which clears the window by a
+// wide margin while sv39 does not.
+
+// Modern (v5.10+): KERNEL_LINK_ADDR = 0xffffffff80000000;
+// module region = [PFN_ALIGN(&_end) - 2G, PFN_ALIGN(&_start)], always below
+// kernel text and shifting with KASLR.
+// https://elixir.bootlin.com/linux/v6.6/source/arch/riscv/include/asm/pgtable.h#L69
+//
+// Legacy: modules also below kernel, anchored to _end.
+// Use a wide range covering both layouts for validation.
+// Where the module band is anchored: placed relative to the kernel image, so it
+// slides with text KASLR.
+#define MODULES_ANCHOR MOD_ANCHOR_TEXT
+#define MODULES_START 0xffffffde00000000ul
+#define MODULES_END 0xffffffffc0000000ul
+
+// Usable as a BOUND: modules occupy [_end - 2 GiB, _start], so the lowest
+// possible base is (lowest text) - 2 GiB = 0xffffffdf80000000, ~6 GiB above
+// this floor, and the ceiling is exactly the highest _start the arch admits.
+#define MODULES_BAND_STRENGTH MOD_BAND_BOUNDS
+
+// Module region is anchored to kernel _end (shifts with KASLR)
+// MODULES_BELOW_TEXT_START selects which end of the image the band is
+// measured from, which decides what MODULES_END_TO_TEXT_OFFSET added to the
+// lowest module address yields. Both riscv64 and s390 place the band below
+// the image; they differ in what its low edge is pinned to:
+//
+//   s390 (1):     MODULES_END = round_down(_text), low edge = that - 2 GiB,
+//                 so lowest module + offset bounds the TEXT BASE directly.
+//   riscv64 (0):  MODULES_VADDR = _end - 2 GiB (MODULES_END = _start), so the
+//                 low edge tracks _end and lowest module + offset bounds _END;
+//                 module_text_bound then subtracts a minimum image size to
+//                 reach the text base.
+//
+// Explicit 0 rather than implicit-zero so -Wundef does not fire at the
+// `#if MODULES_BELOW_TEXT_START` sites in orchestrator.c +
+// rules/module_text_bound.c (those sites are gated on MODULES_MAY_TRACK_TEXT
+// so they're only reachable on riscv64 + s390). api.h also requires the macro
+// of every arch that predicate admits, so the explicit 0 is now the answer to
+// an #error as well as the thing that keeps -Wundef quiet.
+#define MODULES_BELOW_TEXT_START 0
+#define MODULES_END_TO_TEXT_OFFSET 0x80000000ul /* 2 GiB */
+
+// https://elixir.bootlin.com/linux/v6.6/source/arch/riscv/include/asm/efi.h#L41
+#define IMAGE_ALIGN (2 * MB)
+
+// The granularity is the architecture's, not a build's, and the two axes are
+// established separately because they are decoupled here. Virtual:
+// `kernel_map.virt_offset = (kaslr_seed % nr_pos) * PMD_SIZE`, with PMD_SHIFT
+// an unconditional 21. Physical: the boot contract requires the image be
+// "placed at a PMD boundary (2MB aligned for rv64)", which is what
+// kernel_map.phys_addr then takes from the loader.
+// https://elixir.bootlin.com/linux/latest/source/arch/riscv/mm/init.c
+// https://elixir.bootlin.com/linux/latest/source/Documentation/arch/riscv/boot.rst
+#define KASLR_ALIGN_FIXED 1
+
+// EFI_KIMG_ALIGN is the alignment the EFI stub uses when calling
+// AllocatePages() for the kernel image. On riscv64 this is PMD_SIZE
+// (2 MiB) — see arch/riscv/include/asm/efi.h. Used by efi_loader_kernel_pick
+// to filter multi-entry EFI_LOADER_CODE memmaps.
+#define EFI_KIMG_ALIGN (2 * MB)
+
+// OpenSBI loads the kernel at DRAM_BASE + 2MiB by default (PMD-aligned).
+// This is a PHYSICAL FIRMWARE-PLACEMENT offset (DRAM base -> phys image base),
+// NOT the image->_stext head (that is IMAGE_BASE_OFFSET, below). riscv64-only:
+// keep it out of generic code (a leak into cross-arch rules is the bug this
+// naming prevents). Used only by riscv64's KERNEL_PHYS_DEFAULT + riscv64 phys
+// rules.
+#define RISCV_PHYS_LOAD_OFFSET (2 * MB)
+
+// Plausible physical address range for kernel image. PHYS_PLAUSIBLE_MAX is a
+// RAM heuristic (a defeasible ceiling), NOT an architectural limit. The honest
+// top is PHYS_ADDR_TOP below.
+#define PHYS_PLAUSIBLE_MIN PHYS_OFFSET
+#define PHYS_PLAUSIBLE_MAX (PHYS_OFFSET + 4ul * GB)
+
+// Honest architectural phys top: 2^MAX_PHYSMEM_BITS. riscv64 caps the physical
+// address at 56 bits (Sv57) — the widest realisable physical address. The
+// engine narrows from here via RAM/DRAM ceilings.
+#define PHYS_ADDR_TOP (1ul << 56)
+
+// Modern (v5.10+) default: KERNEL_LINK_ADDR is the kernel image virtual base.
+// KASLR only exists on v6.6+ which always uses the modern layout.
+// On legacy kernels, default is PAGE_OFFSET (text in linear map, no KASLR).
+//
+// NOTE: RISCV_PHYS_LOAD_OFFSET (2 MiB) is the *physical* offset from DRAM base
+// where OpenSBI loads the kernel; it does NOT apply to the virtual address.
+// The kernel maps its image starting at KERNEL_LINK_ADDR (== _start), with
+// _stext at KERNEL_LINK_ADDR + IMAGE_BASE_OFFSET (the .head.text section). The
+// aligned image base (IMAGE_ALIGN = 2 MiB) is KERNEL_LINK_ADDR; _stext is
+// 0x2000 above.
+#define KERNEL_LINK_ADDR 0xffffffff80000000ul
+// Legacy/modern PAGE_OFFSET boundary, and the lowest legacy PAGE_OFFSET value.
+// Before v5.13 ("riscv: Move kernel mapping outside of linear mapping") kernel
+// text lived in the linear map at PAGE_OFFSET; arch/riscv/Kconfig set
+// CONFIG_PAGE_OFFSET to 0xffffffe000000000 (MAXPHYSMEM_128GB) or
+// 0xffffffff80000000 (MAXPHYSMEM_2GB). From v5.13 PAGE_OFFSET became a runtime
+// value strictly below this (PAGE_OFFSET_L3/L4/L5: 0xffffffd6.../0xffffaf8.../
+// 0xff60...) and text moved to KERNEL_LINK_ADDR. So a resolved Q_PAGE_OFFSET
+// >= this value is the version-free signal that text is in the linear map
+// (legacy); below it means modern. Consumed by rule_riscv64_text_base.
+#define RISCV_LEGACY_PAGE_OFFSET 0xffffffe000000000ul
+// IMAGE_BASE_OFFSET: the offset from the image base (_start) to _stext — the
+// arch's .head.text section length. This is the ONE offset that is the SAME in
+// virtual and physical space (it is an image-internal layout fact), so generic
+// code uses it on both axes. NOT the OpenSBI physical placement
+// (RISCV_PHYS_LOAD_OFFSET, above). Stable across v5.10+ kernels: the head holds
+// the EFI PE/COFF header + SBI entry stub + paging-mode handoff, sized to a
+// 0x2000 page boundary. arch/riscv/kernel/head.S + vmlinux.lds.S; see `_stext -
+// _start` in kallsyms.
+#define IMAGE_BASE_OFFSET 0x2000ul
+// See docs/kaslr.md "Default text base and KASLR alignment" for all
+// architectures. Kernel source: arch/riscv/kernel/vmlinux.lds.S,
+// arch/riscv/include/asm/pgtable.h
+//
+// KERNEL_VIRT_TEXT_DEFAULT names the default _stext virtual address (per the
+// api.h convention "Default _stext virtual address (no KASLR)"). On
+// riscv64 that is KERNEL_LINK_ADDR + the head-text offset — NOT
+// KERNEL_LINK_ADDR itself, which is _start (image base). Pinning to
+// KERNEL_LINK_ADDR alone is unsound: the engine's virt_/phys_kaslr_disabled_pin
+// rule would emit a value 0x2000 below the actual _stext, excluding
+// truth from the resolved window.
+#define KERNEL_VIRT_TEXT_DEFAULT (KERNEL_LINK_ADDR + IMAGE_BASE_OFFSET)
+
+// Phys default. riscv64 is decoupled, and OpenSBI places the image at
+// DRAM + RISCV_PHYS_LOAD_OFFSET. Defined explicitly because api.h would
+// otherwise auto-define KERNEL_PHYS_DEFAULT = PHYS_PLAUSIBLE_MIN +
+// IMAGE_BASE_OFFSET, which (post-rename) would use the head, not the firmware
+// placement. This preserves the prior value exactly (PHYS_PLAUSIBLE_MIN + 2
+// MiB). NOTE: this is the phys image base, not phys _stext (no
+// +IMAGE_BASE_OFFSET head) — a pre-existing asymmetry vs
+// KERNEL_VIRT_TEXT_DEFAULT, left as-is here; it is sound as a phys lower bound.
+// Revisit when the phys side is reviewed.
+#define KERNEL_PHYS_DEFAULT (PHYS_PLAUSIBLE_MIN + RISCV_PHYS_LOAD_OFFSET)
+
+/* Build-time check: KERNEL_VIRT_TEXT_DEFAULT must include the .head.text
+ * offset so it names _stext (per the api.h convention "Default _stext
+ * virtual address"), not _start. Defining KERNEL_VIRT_TEXT_DEFAULT as
+ * KERNEL_LINK_ADDR alone would pin Q_VIRT_IMAGE_BASE 0x2000 below the
+ * actual _stext via the engine's virt_/phys_kaslr_disabled_pin rule, excluding
+ * the true text base from the resolved window. __extension__ silences
+ * -Wpedantic on -std=c99. */
+__extension__ _Static_assert(
+    (KERNEL_VIRT_TEXT_DEFAULT - KERNEL_LINK_ADDR) == IMAGE_BASE_OFFSET,
+    "riscv64 KERNEL_VIRT_TEXT_DEFAULT must equal KERNEL_LINK_ADDR + "
+    "IMAGE_BASE_OFFSET (the default is _stext = _start + 0x2000 .head.text, "
+    "not _start itself)");
+
+/* KASLR-off text base is LAYOUT-DEPENDENT on riscv64, so the generic
+ * virt_kaslr_disabled_pin (which pins to a single compile-time default) is the
+ * wrong tool here and is opted OUT. rule_riscv64_text_base owns it instead:
+ *   - modern (v5.13+): text at KERNEL_LINK_ADDR (top 2 GiB, SATP-mode
+ *     independent) — pinned to KERNEL_VIRT_TEXT_DEFAULT.
+ *   - legacy (pre-v5.13, PAGE_OFFSET >= RISCV_LEGACY_PAGE_OFFSET): text in the
+ *     linear map at PAGE_OFFSET + load_offset — bounded, not pinned.
+ * The generic pin's window-containment backstop does NOT catch the legacy case:
+ * VIRT_TEXT_PLAUSIBLE_MIN/MAX intentionally spans both layouts, so the modern
+ * default sits inside the legacy window and would be pinned 128 GiB high. */
+#define KASLR_DISABLED_PINS_VIRT_TEXT 0
+#define KASLD_ARCH_DEFAULT_TEXT_BASE_DEFINED 1
+static inline unsigned long arch_default_text_base(void) {
+  return KERNEL_VIRT_TEXT_DEFAULT;
+}
+
+// KASLR randomization window. VIRT_TEXT_PLAUSIBLE_MIN is intentionally wide to
+// accept legacy (pre-v5.13) addresses for validation, but the actual KASLR
+// range (v6.6+) is [KERNEL_LINK_ADDR, KERNEL_LINK_ADDR + 1 PUD) = 1 GiB.
+#define VIRT_TEXT_MIN_DEFAULT_CONFIG KERNEL_LINK_ADDR
+
+// Honest-top floor for the Q_VIRT_IMAGE_BASE quantity. riscv64 has TWO text
+// layouts (see top of file): legacy text in the linear map at PAGE_OFFSET
+// (VIRT_TEXT_PLAUSIBLE_MIN) and modern text at KERNEL_LINK_ADDR. The quantity
+// top must span BOTH so the engine can resolve a legacy base — using the modern
+// VIRT_TEXT_MIN_DEFAULT_CONFIG as the floor would clamp away any legacy bound
+// (rule_riscv64_text_base). The layout is then narrowed from real evidence
+// (resolved PAGE_OFFSET → rule_riscv64_text_base).
+#define VIRT_TEXT_MIN_ANY_CONFIG VIRT_TEXT_PLAUSIBLE_MIN
+
+// No physical KASLR on RISC-V. The kernel always loads at a fixed offset
+// (IMAGE_BASE_OFFSET) from the DRAM base provided by firmware. Only the virtual
+// mapping is randomized (v6.6+).
+//
+// IMAGE_BASE_OFFSET = 2 MiB is the OpenSBI convention: OpenSBI occupies the
+// first 2 MiB of DRAM (trap vectors, fw_jump payload, etc.) and the kernel
+// image follows immediately. This gives a deterministic physical base on
+// non-EFI boots. On EFI-booted systems the EFI stub allocates memory from the
+// EFI memory map — anywhere in the physical address space — bypassing this
+// convention entirely. Additionally, the DRAM base itself varies by platform
+// (0x80000000 on QEMU virt/SiFive, 0x40000000 on StarFive VisionFive 2, etc.),
+// so the physical kernel base is not fixed across hardware. No ceiling narrower
+// than the heuristic PHYS_PLAUSIBLE_MAX can be stated for it.
+
+#define KASLR_SUPPORTED 1
+
+// OBSERVED, not constructed -- so 0.
+//
+// _text is not the load address here: the linker emits _start, then
+// HEAD_TEXT_SECTION, then ALIGN(PAGE_SIZE), then _text. The residue is
+// therefore roundup(sizeof .head.text, PAGE_SIZE), and that section is built
+// from #ifdef CONFIG_EFI / RISCV_M_MODE / MMU code whose size the kernel is
+// free to change. Three captures agree at 0x2000 (alpine 6.18, debian 6.12,
+// riscv32 mainline 6.15), which is evidence and not a guarantee.
+//
+// Snapping on a residue that is one page out raises a floor past the true
+// base, dropping the truth from the GUARANTEED window. Measured cost of
+// declining: nil -- image_base_grid_align emits no constraint on any fixture.
+// arch/riscv/kernel/vmlinux.lds.S, arch/riscv/kernel/head.S
+#define IMAGE_BASE_RESIDUE_FIXED 0
+
+// The /boot artefact is a boot blob, not an ELF, so its on-disk size never
+// exceeds the in-memory footprint and can be read with stat() where the file
+// content is unreadable. See the axis contract in api.h.
+#define BOOT_IMAGE_SIZE_FLOORS_FOOTPRINT 1
+
+#endif /* KASLD_RISCV64_H */

@@ -1,0 +1,715 @@
+"""Unit tests for apps/web_checker — collector response parsing, analyzer findings."""
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from apps.web_checker.collector import _parse_cookies, _extract_title, _parse_samesite, collect
+from apps.web_checker.analyzer import analyze
+from apps.web_checker.scanner import run_web_check
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_result(url_fk=None, port_fk=None, url="https://example.com",
+                 host="example.com", status_code=200,
+                 headers=None, cookies=None, body_snippet="",
+                 title="", cors_reflects_origin=False, error=None):
+    return {
+        "url": url, "url_fk": url_fk, "port_fk": port_fk,
+        "host": host, "status_code": status_code,
+        "headers": headers if headers is not None else {},
+        "cookies": cookies if cookies is not None else [],
+        "body_snippet": body_snippet, "title": title,
+        "cors_reflects_origin": cors_reflects_origin,
+        "error": error,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — no DB needed
+# ---------------------------------------------------------------------------
+
+class TestParseCookies:
+    def test_secure_and_httponly_detected(self):
+        resp = MagicMock()
+        resp.raw.headers.getlist.return_value = [
+            "session=abc123; Secure; HttpOnly; SameSite=Strict"
+        ]
+        resp.cookies = []
+        cookies = _parse_cookies(resp)
+        assert len(cookies) == 1
+        assert cookies[0]["name"] == "session"
+        assert cookies[0]["secure"] is True
+        assert cookies[0]["httponly"] is True
+        assert cookies[0]["samesite"] == "Strict"
+
+    def test_missing_flags(self):
+        resp = MagicMock()
+        resp.raw.headers.getlist.return_value = [
+            "token=xyz; Path=/"
+        ]
+        resp.cookies = []
+        cookies = _parse_cookies(resp)
+        assert cookies[0]["secure"] is False
+        assert cookies[0]["httponly"] is False
+        assert cookies[0]["samesite"] is None
+
+    def test_multiple_cookies(self):
+        resp = MagicMock()
+        resp.raw.headers.getlist.return_value = [
+            "a=1; Secure", "b=2; HttpOnly"
+        ]
+        resp.cookies = []
+        cookies = _parse_cookies(resp)
+        assert len(cookies) == 2
+
+
+class TestParseSamesite:
+    def test_lax(self):
+        assert _parse_samesite("; samesite=lax; path=/") == "Lax"
+
+    def test_strict(self):
+        assert _parse_samesite("; samesite=strict") == "Strict"
+
+    def test_none(self):
+        assert _parse_samesite("; samesite=none; secure") == "None"
+
+    def test_missing(self):
+        assert _parse_samesite("; path=/; httponly") is None
+
+
+class TestExtractTitle:
+    def test_simple_title(self):
+        assert _extract_title("<html><title>My Page</title></html>") == "My Page"
+
+    def test_index_of(self):
+        assert "Index of" in _extract_title("<title>Index of /uploads</title>")
+
+    def test_no_title(self):
+        assert _extract_title("<html><body>Hello</body></html>") == ""
+
+    def test_unclosed_title_tag(self):
+        # A truncated body snippet may cut off before </title>. The regex must
+        # not match a half-open tag (and must never raise).
+        assert _extract_title("<html><head><title>My Page without a close") == ""
+
+
+# ---------------------------------------------------------------------------
+# Analyzer — DB required
+# ---------------------------------------------------------------------------
+
+@pytest.mark.django_db
+class TestWebCheckerHeaders:
+    def _make_port(self):
+        from apps.core.engine.scans.models import ScanSession
+        from apps.core.data.assets.models import IPAddress, Port
+        sess = ScanSession.objects.create(domain="example.com", scan_type="full")
+        ip = IPAddress.objects.create(session=sess, address="1.2.3.4", version=4, source="dnsx")
+        p = Port.objects.create(session=sess, ip_address=ip, address="1.2.3.4",
+                                port=443, protocol="tcp", state="open", service="https", source="naabu")
+        return sess, p
+
+    def test_missing_csp_high(self):
+        sess, port_fk = self._make_port()
+        results = [_make_result(port_fk=port_fk, headers={})]
+        findings = analyze(sess, results)
+        f = next((f for f in findings if f.check_type == "missing_csp"), None)
+        assert f is not None and f.severity == "high"
+
+    def test_missing_xfo_medium(self):
+        sess, port_fk = self._make_port()
+        results = [_make_result(port_fk=port_fk, headers={})]
+        findings = analyze(sess, results)
+        f = next((f for f in findings if f.check_type == "missing_xfo"), None)
+        assert f is not None and f.severity == "medium"
+
+    def test_missing_xcto_medium(self):
+        sess, port_fk = self._make_port()
+        results = [_make_result(port_fk=port_fk, headers={})]
+        findings = analyze(sess, results)
+        f = next((f for f in findings if f.check_type == "missing_xcto"), None)
+        assert f is not None and f.severity == "medium"
+
+    def test_all_headers_present_no_finding(self):
+        sess, port_fk = self._make_port()
+        results = [_make_result(port_fk=port_fk, headers={
+            "Content-Security-Policy": "default-src 'self'",
+            "X-Frame-Options": "DENY",
+            "X-Content-Type-Options": "nosniff",
+            "Permissions-Policy": "camera=()",
+            "Referrer-Policy": "strict-origin-when-cross-origin",
+            "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+        })]
+        findings = analyze(sess, results)
+        header_types = {"missing_csp", "missing_xfo", "missing_xcto",
+                        "missing_permissions_policy", "missing_referrer_policy",
+                        "missing_hsts", "weak_hsts"}
+        assert not any(f.check_type in header_types for f in findings)
+
+    def test_error_result_skipped(self):
+        sess, port_fk = self._make_port()
+        results = [_make_result(port_fk=port_fk, error="Connection refused")]
+        findings = analyze(sess, results)
+        assert len(findings) == 0
+
+    def test_partial_result_dict_missing_optional_keys(self):
+        # A result dict carrying only the required keys (url/url_fk/port_fk/error)
+        # and no headers/cookies/title must still analyze cleanly via the .get
+        # defaults, producing the missing-header findings rather than a KeyError.
+        sess, port_fk = self._make_port()
+        partial = {
+            "url": "https://example.com",
+            "url_fk": None,
+            "port_fk": port_fk,
+            "error": None,
+        }
+        findings = analyze(sess, [partial])
+        check_types = {f.check_type for f in findings}
+        assert "missing_csp" in check_types
+        assert "missing_hsts" in check_types
+
+
+@pytest.mark.django_db
+class TestWebCheckerHSTS:
+    def _make_port(self):
+        from apps.core.engine.scans.models import ScanSession
+        from apps.core.data.assets.models import IPAddress, Port
+        sess = ScanSession.objects.create(domain="example.com", scan_type="full")
+        ip = IPAddress.objects.create(session=sess, address="1.2.3.4", version=4, source="dnsx")
+        p = Port.objects.create(session=sess, ip_address=ip, address="1.2.3.4",
+                                port=443, protocol="tcp", state="open", service="https", source="naabu")
+        return sess, p
+
+    def test_https_missing_hsts_medium(self):
+        sess, port_fk = self._make_port()
+        results = [_make_result(port_fk=port_fk, headers={})]
+        findings = analyze(sess, results)
+        f = next((f for f in findings if f.check_type == "missing_hsts"), None)
+        assert f is not None and f.severity == "medium"
+
+    def test_http_skips_hsts_check(self):
+        sess, port_fk = self._make_port()
+        results = [_make_result(port_fk=port_fk, url="http://example.com", headers={})]
+        findings = analyze(sess, results)
+        assert not any(f.check_type == "missing_hsts" for f in findings)
+
+    def test_hsts_max_age_less_than_six_months_low(self):
+        sess, port_fk = self._make_port()
+        results = [_make_result(port_fk=port_fk, headers={
+            "Strict-Transport-Security": "max-age=3600; includeSubDomains",
+        })]
+        findings = analyze(sess, results)
+        f = next((f for f in findings if f.check_type == "weak_hsts"), None)
+        assert f is not None and f.severity == "low"
+
+    def test_strong_hsts_no_finding(self):
+        sess, port_fk = self._make_port()
+        results = [_make_result(port_fk=port_fk, headers={
+            "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+        })]
+        findings = analyze(sess, results)
+        assert not any(f.check_type in {"missing_hsts", "weak_hsts"} for f in findings)
+
+
+@pytest.mark.django_db
+class TestWebCheckerCookies:
+    def _make_port(self):
+        from apps.core.engine.scans.models import ScanSession
+        from apps.core.data.assets.models import IPAddress, Port
+        sess = ScanSession.objects.create(domain="example.com", scan_type="full")
+        ip = IPAddress.objects.create(session=sess, address="1.2.3.4", version=4, source="dnsx")
+        p = Port.objects.create(session=sess, ip_address=ip, address="1.2.3.4",
+                                port=443, protocol="tcp", state="open", service="https", source="naabu")
+        return sess, p
+
+    def test_missing_secure_high(self):
+        sess, port_fk = self._make_port()
+        results = [_make_result(port_fk=port_fk,
+                                cookies=[{"name": "sid", "secure": False, "httponly": True, "samesite": "Lax"}])]
+        findings = analyze(sess, results)
+        f = next((f for f in findings if f.check_type == "cookie_missing_secure"), None)
+        assert f is not None and f.severity == "high"
+
+    def test_missing_httponly_medium(self):
+        sess, port_fk = self._make_port()
+        results = [_make_result(port_fk=port_fk,
+                                cookies=[{"name": "sid", "secure": True, "httponly": False, "samesite": "Lax"}])]
+        findings = analyze(sess, results)
+        f = next((f for f in findings if f.check_type == "cookie_missing_httponly"), None)
+        assert f is not None and f.severity == "medium"
+
+    def test_missing_samesite_medium(self):
+        sess, port_fk = self._make_port()
+        results = [_make_result(port_fk=port_fk,
+                                cookies=[{"name": "sid", "secure": True, "httponly": True, "samesite": None}])]
+        findings = analyze(sess, results)
+        f = next((f for f in findings if f.check_type == "cookie_missing_samesite"), None)
+        assert f is not None and f.severity == "medium"
+
+    def test_all_flags_no_finding(self):
+        sess, port_fk = self._make_port()
+        results = [_make_result(port_fk=port_fk,
+                                cookies=[{"name": "sid", "secure": True, "httponly": True, "samesite": "Strict"}])]
+        findings = analyze(sess, results)
+        cookie_types = {"cookie_missing_secure", "cookie_missing_httponly", "cookie_missing_samesite"}
+        assert not any(f.check_type in cookie_types for f in findings)
+
+    def test_http_no_secure_check(self):
+        """Secure flag check is skipped for HTTP-only URLs."""
+        sess, port_fk = self._make_port()
+        results = [_make_result(port_fk=port_fk, url="http://example.com",
+                                cookies=[{"name": "sid", "secure": False, "httponly": True, "samesite": "Lax"}])]
+        findings = analyze(sess, results)
+        assert not any(f.check_type == "cookie_missing_secure" for f in findings)
+
+
+@pytest.mark.django_db
+class TestWebCheckerCORS:
+    def _make_port(self):
+        from apps.core.engine.scans.models import ScanSession
+        from apps.core.data.assets.models import IPAddress, Port
+        sess = ScanSession.objects.create(domain="example.com", scan_type="full")
+        ip = IPAddress.objects.create(session=sess, address="1.2.3.4", version=4, source="dnsx")
+        p = Port.objects.create(session=sess, ip_address=ip, address="1.2.3.4",
+                                port=443, protocol="tcp", state="open", service="https", source="naabu")
+        return sess, p
+
+    def test_cors_wildcard_credentials_critical(self):
+        sess, port_fk = self._make_port()
+        results = [_make_result(port_fk=port_fk, headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Credentials": "true",
+        })]
+        findings = analyze(sess, results)
+        f = next((f for f in findings if f.check_type == "cors_wildcard_credentials"), None)
+        assert f is not None and f.severity == "critical"
+
+    def test_cors_origin_reflection_high(self):
+        sess, port_fk = self._make_port()
+        results = [_make_result(port_fk=port_fk,
+                                headers={"Access-Control-Allow-Origin": "https://evil.example.com"},
+                                cors_reflects_origin=True)]
+        findings = analyze(sess, results)
+        f = next((f for f in findings if f.check_type == "cors_origin_reflection"), None)
+        assert f is not None and f.severity == "high"
+
+    def test_cors_wildcard_medium(self):
+        sess, port_fk = self._make_port()
+        results = [_make_result(port_fk=port_fk,
+                                headers={"Access-Control-Allow-Origin": "*"})]
+        findings = analyze(sess, results)
+        f = next((f for f in findings if f.check_type == "cors_wildcard"), None)
+        assert f is not None and f.severity == "medium"
+
+    def test_no_cors_no_finding(self):
+        sess, port_fk = self._make_port()
+        results = [_make_result(port_fk=port_fk, headers={})]
+        findings = analyze(sess, results)
+        cors_types = {"cors_wildcard_credentials", "cors_origin_reflection", "cors_wildcard"}
+        assert not any(f.check_type in cors_types for f in findings)
+
+
+@pytest.mark.django_db
+class TestWebCheckerServerDisclosure:
+    def _make_port(self):
+        from apps.core.engine.scans.models import ScanSession
+        from apps.core.data.assets.models import IPAddress, Port
+        sess = ScanSession.objects.create(domain="example.com", scan_type="full")
+        ip = IPAddress.objects.create(session=sess, address="1.2.3.4", version=4, source="dnsx")
+        p = Port.objects.create(session=sess, ip_address=ip, address="1.2.3.4",
+                                port=443, protocol="tcp", state="open", service="https", source="naabu")
+        return sess, p
+
+    def test_server_version_low(self):
+        sess, port_fk = self._make_port()
+        results = [_make_result(port_fk=port_fk,
+                                headers={"Server": "Apache/2.4.51 (Ubuntu)"})]
+        findings = analyze(sess, results)
+        f = next((f for f in findings if f.check_type == "server_version_disclosure"), None)
+        assert f is not None and f.severity == "low"
+
+    def test_server_no_version_no_finding(self):
+        sess, port_fk = self._make_port()
+        results = [_make_result(port_fk=port_fk,
+                                headers={"Server": "nginx"})]
+        findings = analyze(sess, results)
+        assert not any(f.check_type == "server_version_disclosure" for f in findings)
+
+    def test_powered_by_low(self):
+        sess, port_fk = self._make_port()
+        results = [_make_result(port_fk=port_fk,
+                                headers={"X-Powered-By": "Express"})]
+        findings = analyze(sess, results)
+        f = next((f for f in findings if f.check_type == "server_poweredby_disclosure"), None)
+        assert f is not None and f.severity == "low"
+
+
+@pytest.mark.django_db
+class TestWebCheckerDirectoryListing:
+    def _make_port(self):
+        from apps.core.engine.scans.models import ScanSession
+        from apps.core.data.assets.models import IPAddress, Port
+        sess = ScanSession.objects.create(domain="example.com", scan_type="full")
+        ip = IPAddress.objects.create(session=sess, address="1.2.3.4", version=4, source="dnsx")
+        p = Port.objects.create(session=sess, ip_address=ip, address="1.2.3.4",
+                                port=443, protocol="tcp", state="open", service="https", source="naabu")
+        return sess, p
+
+    def test_directory_listing_medium(self):
+        sess, port_fk = self._make_port()
+        results = [_make_result(port_fk=port_fk, title="Index of /uploads")]
+        findings = analyze(sess, results)
+        f = next((f for f in findings if f.check_type == "directory_listing"), None)
+        assert f is not None and f.severity == "medium"
+
+    def test_normal_page_no_finding(self):
+        sess, port_fk = self._make_port()
+        results = [_make_result(port_fk=port_fk, title="Welcome to My Site")]
+        findings = analyze(sess, results)
+        assert not any(f.check_type == "directory_listing" for f in findings)
+
+
+# ---------------------------------------------------------------------------
+# Collector — mocked requests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.django_db
+class TestWebCheckerCollector:
+    def _make_session(self):
+        from apps.core.engine.scans.models import ScanSession
+        from apps.core.data.assets.models import Subdomain, IPAddress, Port
+        from apps.core.data.web_assets.models import URL
+        sess = ScanSession.objects.create(domain="example.com", scan_type="full")
+        ip = IPAddress.objects.create(session=sess, address="1.2.3.4", version=4, source="dnsx")
+        port = Port.objects.create(session=sess, ip_address=ip, address="1.2.3.4",
+                                   port=443, protocol="tcp", state="open", service="https", source="naabu")
+        sub = Subdomain.objects.create(session=sess, domain="example.com",
+                                       subdomain="www.example.com", source="subfinder")
+        URL.objects.create(session=sess, subdomain=sub, port=port,
+                           url="https://www.example.com:443",
+                           host="www.example.com", port_number=443, scheme="https", source="httpx")
+        return sess
+
+    def test_successful_fetch(self):
+        sess = self._make_session()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"Server": "nginx", "Content-Type": "text/html"}
+        mock_resp.text = "<html><title>Test</title></html>"
+        mock_resp.raw.headers.getlist.return_value = []
+        mock_resp.cookies = []
+
+        with patch("apps.web_checker.collector.requests.get", return_value=mock_resp):
+            results = collect(sess)
+
+        assert len(results) == 1
+        assert results[0]["status_code"] == 200
+        assert results[0]["title"] == "Test"
+        assert results[0]["error"] is None
+
+    def test_connection_error(self):
+        import requests as req
+        sess = self._make_session()
+
+        with patch("apps.web_checker.collector.requests.get",
+                   side_effect=req.ConnectionError("refused")):
+            results = collect(sess)
+
+        assert len(results) == 1
+        assert results[0]["error"] is not None
+
+    def test_empty_session(self):
+        from apps.core.engine.scans.models import ScanSession
+        sess = ScanSession.objects.create(domain="empty.com", scan_type="full")
+        results = collect(sess)
+        assert results == []
+
+    def test_deduplicates_same_host_across_sources(self):
+        """katana URLs on same host as httpx URL must not produce a second fetch."""
+        from apps.core.engine.scans.models import ScanSession
+        from apps.core.data.assets.models import Subdomain, IPAddress, Port
+        from apps.core.data.web_assets.models import URL
+
+        sess = ScanSession.objects.create(domain="example.com", scan_type="full")
+        ip = IPAddress.objects.create(session=sess, address="1.2.3.4", version=4, source="dnsx")
+        port = Port.objects.create(session=sess, ip_address=ip, address="1.2.3.4",
+                                   port=443, protocol="tcp", state="open", source="naabu")
+        sub = Subdomain.objects.create(session=sess, domain="example.com",
+                                       subdomain="www.example.com", source="subfinder")
+        URL.objects.create(session=sess, subdomain=sub, port=port,
+                           url="https://www.example.com", host="www.example.com",
+                           port_number=443, scheme="https", source="httpx")
+        # Katana adds multiple crawled paths on the same host
+        for path in ["/admin", "/login", "/api/docs"]:
+            URL.objects.create(session=sess, subdomain=sub, port=port,
+                               url=f"https://www.example.com{path}",
+                               host="www.example.com", port_number=443,
+                               scheme="https", source="katana")
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {}
+        mock_resp.text = ""
+        mock_resp.raw.headers.getlist.return_value = []
+        mock_resp.cookies = []
+
+        with patch("apps.web_checker.collector.requests.get", return_value=mock_resp) as mock_get:
+            results = collect(sess)
+
+        # Only 1 fetch for www.example.com:443 despite 4 URLs in the session
+        assert mock_get.call_count == 1
+        assert len(results) == 1
+
+    def test_deduplicates_trailing_slash_and_missing_port_number(self):
+        """A katana/gau URL with a trailing slash and no port_number must
+        collapse into the same probe as the canonical httpx URL for the same
+        host — not a second fetch (report EASD-005/006, 050/051)."""
+        from apps.core.engine.scans.models import ScanSession
+        from apps.core.data.assets.models import Subdomain, IPAddress, Port
+        from apps.core.data.web_assets.models import URL
+
+        sess = ScanSession.objects.create(domain="example.com", scan_type="full")
+        ip = IPAddress.objects.create(session=sess, address="1.2.3.4", version=4, source="dnsx")
+        port = Port.objects.create(session=sess, ip_address=ip, address="1.2.3.4",
+                                   port=443, protocol="tcp", state="open", source="naabu")
+        sub = Subdomain.objects.create(session=sess, domain="example.com",
+                                       subdomain="www.example.com", source="subfinder")
+        # httpx: canonical URL, port_number populated.
+        URL.objects.create(session=sess, subdomain=sub, port=port,
+                           url="https://www.example.com:443", host="www.example.com",
+                           port_number=443, scheme="https", source="httpx")
+        # katana: same endpoint, but trailing slash + no port_number.
+        URL.objects.create(session=sess, subdomain=sub, port=port,
+                           url="https://www.example.com:443/", host="www.example.com",
+                           port_number=None, scheme="https", source="katana")
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {}
+        mock_resp.text = ""
+        mock_resp.raw.headers.getlist.return_value = []
+        mock_resp.cookies = []
+
+        with patch("apps.web_checker.collector.requests.get", return_value=mock_resp) as mock_get:
+            results = collect(sess)
+
+        # Only 1 fetch — the two rows are the same effective endpoint.
+        assert mock_get.call_count == 1
+        assert len(results) == 1
+        # httpx-first ordering means the canonical httpx URL wins as the
+        # representative fetched.
+        assert results[0]["url"] == "https://www.example.com:443"
+
+    def test_different_hosts_each_get_fetched(self):
+        """Two different subdomains on the same port → two fetches."""
+        from apps.core.engine.scans.models import ScanSession
+        from apps.core.data.assets.models import Subdomain, IPAddress, Port
+        from apps.core.data.web_assets.models import URL
+
+        sess = ScanSession.objects.create(domain="example.com", scan_type="full")
+        ip = IPAddress.objects.create(session=sess, address="1.2.3.4", version=4, source="dnsx")
+        # Both subdomains share the same IP:port (common behind a CDN/load balancer)
+        port = Port.objects.create(session=sess, ip_address=ip, address="1.2.3.4",
+                                   port=443, protocol="tcp", state="open", source="naabu")
+        for host in ["www.example.com", "api.example.com"]:
+            sub = Subdomain.objects.create(session=sess, domain="example.com",
+                                           subdomain=host, source="subfinder")
+            URL.objects.create(session=sess, subdomain=sub, port=port,
+                               url=f"https://{host}", host=host,
+                               port_number=443, scheme="https", source="httpx")
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {}
+        mock_resp.text = ""
+        mock_resp.raw.headers.getlist.return_value = []
+        mock_resp.cookies = []
+
+        with patch("apps.web_checker.collector.requests.get", return_value=mock_resp) as mock_get:
+            results = collect(sess)
+
+        assert mock_get.call_count == 2
+        assert len(results) == 2
+
+
+# ---------------------------------------------------------------------------
+# Scanner orchestrator
+# ---------------------------------------------------------------------------
+
+@pytest.mark.django_db
+class TestWebCheckerScanner:
+    def test_scanner_creates_findings(self):
+        from apps.core.engine.scans.models import ScanSession
+        from apps.core.data.findings.models import Finding
+
+        sess = ScanSession.objects.create(domain="example.com", scan_type="full")
+        fake_results = [_make_result(headers={})]  # Missing all headers
+
+        with patch("apps.web_checker.scanner.collect", return_value=fake_results):
+            findings = run_web_check(sess)
+
+        assert len(findings) >= 5  # At least 5 missing header findings
+        assert Finding.objects.filter(session=sess, source="web_checker").count() == len(findings)
+
+    def test_scanner_empty_session(self):
+        from apps.core.engine.scans.models import ScanSession
+        sess = ScanSession.objects.create(domain="empty.com", scan_type="full")
+        with patch("apps.web_checker.scanner.collect", return_value=[]):
+            findings = run_web_check(sess)
+        assert findings == []
+
+
+# ---------------------------------------------------------------------------
+# Responsible disclosure — security.txt (RFC 9116)
+# ---------------------------------------------------------------------------
+
+class TestSecurityTxtHelpers:
+    def test_parse_expires_valid_z(self):
+        from apps.web_checker.analyzer import _parse_security_txt_expires
+        dt = _parse_security_txt_expires("Contact: mailto:s@x.com\nExpires: 2030-01-01T00:00:00Z\n")
+        assert dt is not None and dt.year == 2030 and dt.tzinfo is not None
+
+    def test_parse_expires_naive_assumed_utc(self):
+        import datetime
+        from apps.web_checker.analyzer import _parse_security_txt_expires
+        dt = _parse_security_txt_expires("Expires: 2030-01-01T00:00:00")
+        assert dt is not None and dt.tzinfo == datetime.timezone.utc
+
+    def test_parse_expires_absent_or_bad(self):
+        from apps.web_checker.analyzer import _parse_security_txt_expires
+        assert _parse_security_txt_expires("Contact: mailto:s@x.com") is None
+        assert _parse_security_txt_expires("Expires: not-a-date") is None
+
+    def test_looks_like_security_txt_accepts_contact(self):
+        from apps.web_checker.collector import _looks_like_security_txt
+        assert _looks_like_security_txt(200, "Contact: mailto:security@example.com\nExpires: 2030-01-01T00:00:00Z")
+
+    def test_looks_like_security_txt_rejects_html_spa(self):
+        from apps.web_checker.collector import _looks_like_security_txt
+        # SPA catch-all: 200 + HTML, no Contact line
+        assert not _looks_like_security_txt(200, "<!DOCTYPE html><html><head>Contact:</head></html>")
+
+    def test_looks_like_security_txt_rejects_non_200(self):
+        from apps.web_checker.collector import _looks_like_security_txt
+        assert not _looks_like_security_txt(404, "Contact: mailto:s@x.com")
+
+
+@pytest.mark.django_db
+class TestSecurityTxtFindings:
+    def _session(self):
+        from apps.core.engine.scans.models import ScanSession
+        return ScanSession.objects.create(domain="example.com", scan_type="full")
+
+    def test_none_result_no_finding(self):
+        from apps.web_checker.analyzer import security_txt_findings
+        assert security_txt_findings(None, self._session()) == []
+
+    def test_unreachable_no_finding(self):
+        # TLS/connection failure → we couldn't check → must NOT claim "missing".
+        from apps.web_checker.analyzer import security_txt_findings
+        out = security_txt_findings(
+            {"host": "example.com", "url_fk": None, "port_fk": None, "found": False,
+             "reachable": False, "location": None, "raw": "", "error": "SSLError"},
+            self._session())
+        assert out == []
+
+    def test_missing_is_info_finding(self):
+        from apps.web_checker.analyzer import security_txt_findings
+        sess = self._session()
+        out = security_txt_findings(
+            {"host": "example.com", "url_fk": None, "port_fk": None, "found": False,
+             "reachable": True, "location": None, "raw": "", "error": None}, sess)
+        assert len(out) == 1
+        assert out[0].check_type == "missing_security_txt"
+        assert out[0].severity == "info"
+
+    def test_valid_unexpired_no_finding(self):
+        from apps.web_checker.analyzer import security_txt_findings
+        sess = self._session()
+        out = security_txt_findings(
+            {"host": "example.com", "url_fk": None, "port_fk": None, "found": True,
+             "reachable": True, "location": "https://example.com/.well-known/security.txt",
+             "raw": "Contact: mailto:s@example.com\nExpires: 2999-01-01T00:00:00Z",
+             "error": None}, sess)
+        assert out == []
+
+    def test_expired_is_low_finding(self):
+        from apps.web_checker.analyzer import security_txt_findings
+        sess = self._session()
+        out = security_txt_findings(
+            {"host": "example.com", "url_fk": None, "port_fk": None, "found": True,
+             "reachable": True, "location": "https://example.com/.well-known/security.txt",
+             "raw": "Contact: mailto:s@example.com\nExpires: 2000-01-01T00:00:00Z",
+             "error": None}, sess)
+        assert len(out) == 1
+        assert out[0].check_type == "expired_security_txt"
+        assert out[0].severity == "low"
+
+
+@pytest.mark.django_db
+class TestCollectSecurityTxt:
+    def _session_with_apex(self, host="example.com", scheme="https"):
+        from apps.core.engine.scans.models import ScanSession
+        from apps.core.data.assets.models import Subdomain, IPAddress, Port
+        from apps.core.data.web_assets.models import URL
+        sess = ScanSession.objects.create(domain="example.com", scan_type="full")
+        ip = IPAddress.objects.create(session=sess, address="1.2.3.4", version=4, source="dnsx")
+        port = Port.objects.create(session=sess, ip_address=ip, address="1.2.3.4",
+                                   port=443, protocol="tcp", state="open", source="naabu")
+        sub = Subdomain.objects.create(session=sess, domain="example.com",
+                                       subdomain=host, source="subfinder")
+        URL.objects.create(session=sess, subdomain=sub, port=port,
+                           url=f"{scheme}://{host}", host=host, port_number=443,
+                           scheme=scheme, source="httpx")
+        return sess
+
+    def test_no_apex_url_returns_none(self):
+        # Only a subdomain URL, no apex/www — nothing to assert.
+        sess = self._session_with_apex(host="api.example.com")
+        from apps.web_checker.collector import collect_security_txt
+        assert collect_security_txt(sess) is None
+
+    def test_found_when_valid_body(self):
+        from apps.web_checker.collector import collect_security_txt
+        sess = self._session_with_apex()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = "Contact: mailto:security@example.com\nExpires: 2030-01-01T00:00:00Z"
+        with patch("apps.web_checker.collector.requests.get", return_value=mock_resp) as mget:
+            result = collect_security_txt(sess)
+        assert result["found"] is True
+        assert result["reachable"] is True
+        assert result["location"].endswith("/.well-known/security.txt")
+        assert mget.call_count == 1  # first path hit, no fallback needed
+
+    def test_not_found_tries_both_paths(self):
+        from apps.web_checker.collector import collect_security_txt
+        sess = self._session_with_apex()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_resp.text = "nope"
+        with patch("apps.web_checker.collector.requests.get", return_value=mock_resp) as mget:
+            result = collect_security_txt(sess)
+        assert result["found"] is False
+        assert result["reachable"] is True  # server answered (404) — definitively absent
+        assert mget.call_count == 2  # tried /.well-known/ then /security.txt
+
+    def test_fetch_error_is_graceful(self):
+        import requests as req
+        from apps.web_checker.collector import collect_security_txt
+        sess = self._session_with_apex()
+        with patch("apps.web_checker.collector.requests.get",
+                   side_effect=req.ConnectionError("refused")):
+            result = collect_security_txt(sess)
+        assert result["found"] is False
+        assert result["reachable"] is False  # couldn't reach → analyzer emits nothing
+        assert result["error"] is not None
+
+    def test_no_domain_returns_none(self):
+        from apps.core.engine.scans.models import ScanSession
+        from apps.web_checker.collector import collect_security_txt
+        sess = ScanSession.objects.create(domain="", scan_type="full")
+        assert collect_security_txt(sess) is None

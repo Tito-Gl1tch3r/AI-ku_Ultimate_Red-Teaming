@@ -1,0 +1,317 @@
+// Command reconner starts the self-hosted Reconner web application.
+//
+// Reconner is intentionally service-only: targets, scans, findings, reports,
+// and system settings are managed through the authenticated web interface.
+package main
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/recon-platform/internal/api"
+	"github.com/recon-platform/internal/config"
+	"github.com/recon-platform/internal/database"
+	"github.com/recon-platform/internal/scheduler"
+	"github.com/recon-platform/internal/secret"
+	"github.com/recon-platform/internal/websocket"
+	"github.com/recon-platform/pkg/logger"
+)
+
+const (
+	cReset  = "\033[0m"
+	cDim    = "\033[2m"
+	cYellow = "\033[33m"
+	cBlue   = "\033[36m"
+	cBold   = "\033[1m"
+)
+
+type application struct {
+	cfg       *config.Config
+	db        *database.DB
+	scheduler *scheduler.Scheduler
+	handler   *api.Handler
+	telegram  *api.TelegramBot
+}
+
+func main() {
+	if len(os.Args) != 1 {
+		fmt.Fprintln(os.Stderr, "Reconner no longer exposes command-line operations; start it without arguments and use the web interface.")
+		os.Exit(2)
+	}
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "reconner: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func boot() (*application, error) {
+	cfg, err := config.Load()
+	if err != nil {
+		return nil, fmt.Errorf("load config: %w", err)
+	}
+
+	log := logger.New("error")
+	db, err := database.New(cfg.DatabasePath)
+	if err != nil {
+		return nil, fmt.Errorf("open database: %w", err)
+	}
+	if err := database.RunMigrations(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate database: %w", err)
+	}
+	oldSecret, rotate, err := cfg.BeginLegacySecretRotation()
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("prepare deployment-secret rotation: %w", err)
+	}
+	if rotate {
+		if err := rotateStoredSecrets(db.DB, oldSecret, cfg.SessionSecret); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("rotate encrypted database values: %w", err)
+		}
+		if err := cfg.FinishLegacySecretRotation(); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("finalize deployment-secret rotation: %w", err)
+		}
+	}
+
+	hub := websocket.NewHub()
+	go hub.Run()
+	sched := scheduler.New(db, hub, cfg, log)
+	handler := api.NewHandler(db, hub, sched, cfg, log)
+	telegram := api.NewTelegramBot(handler)
+	handler.SetTelegramBot(telegram)
+	sched.SetNotifier(telegram)
+	telegram.Start()
+	sched.Start()
+
+	return &application{
+		cfg:       cfg,
+		db:        db,
+		scheduler: sched,
+		handler:   handler,
+		telegram:  telegram,
+	}, nil
+}
+
+func run() error {
+	app, err := boot()
+	if err != nil {
+		return err
+	}
+	defer app.db.Close()
+	defer app.telegram.Stop()
+	defer app.scheduler.Stop()
+
+	// Resume only work that was deliberately parked during a graceful service
+	// shutdown. The scheduler persists completed modules, so a restart repeats at
+	// most the module that was in flight.
+	if n := app.scheduler.ResumeInterrupted(); n > 0 {
+		fmt.Printf("%s  ↻ resumed %d scan(s) interrupted by the last shutdown%s\n", cDim, n, cReset)
+	}
+
+	// If no callback URL is configured, best-effort discovery makes the service
+	// itself the HTTP OOB listener. Failure leaves OOB disabled rather than
+	// guessing a callback address.
+	if app.cfg.BlindXSSCallbackURL == "" {
+		if base := detectPublicBaseURL(app.cfg.Port); base != "" {
+			app.cfg.BlindXSSCallbackURL = base
+			fmt.Printf("%s  OOB callback auto-set to %s (blind XSS/SSRF enabled)%s\n", cDim, base, cReset)
+		}
+	}
+
+	// Raw callbacks (notably JNDI/LDAP) use the same handler instance as the HTTP
+	// callback routes, keeping correlation and finding promotion on one runtime.
+	if app.cfg.BlindXSSCallbackURL != "" {
+		if closer, err := app.handler.StartLog4ShellListener(app.cfg.OOBRawPort); err != nil {
+			fmt.Printf("%s  Log4Shell OOB listener not started: %v%s\n", cDim, err, cReset)
+		} else {
+			defer closer.Close()
+			port := app.cfg.OOBRawPort
+			if port <= 0 {
+				port = 1389
+			}
+			fmt.Printf("%s  Log4Shell OOB listener on :%d (JNDI/LDAP callbacks)%s\n", cDim, port, cReset)
+		}
+	}
+
+	// Authoritative DNS OOB listener: catches DNS-only-egress blind callbacks
+	// (blind SSRF/SQLi/XXE that can resolve but not connect). Needs a zone
+	// delegated to this host; independent of the HTTP callback URL.
+	if app.cfg.OOBDNSZone != "" {
+		if closer, err := app.handler.StartOOBDNSListener(app.cfg.OOBDNSZone, app.cfg.OOBDNSPort); err != nil {
+			fmt.Printf("%s  DNS OOB listener not started: %v%s\n", cDim, err, cReset)
+		} else {
+			defer closer.Close()
+			port := app.cfg.OOBDNSPort
+			if port <= 0 {
+				port = 53
+			}
+			fmt.Printf("%s  DNS OOB listener on :%d (authoritative for %s)%s\n", cDim, port, app.cfg.OOBDNSZone, cReset)
+		}
+	}
+
+	srv := &http.Server{
+		Addr:         fmt.Sprintf("%s:%d", app.cfg.Host, app.cfg.Port),
+		Handler:      app.handler.Router(),
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 120 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("%s%s▶ Reconner web watchtower running%s — http://%s\n", cBold, cBlue, cReset, srv.Addr)
+	fmt.Printf("%s  login: %s / (see admin_password in the configured config.json)%s\n", cDim, app.cfg.AdminUsername, cReset)
+	switch {
+	case strings.HasPrefix(srv.Addr, "0.0.0.0:") || strings.HasPrefix(srv.Addr, ":"):
+		fmt.Printf("%s%s  ⚠ bound to all interfaces — the dashboard is reachable from the network.%s\n", cBold, cBlue, cReset)
+		fmt.Printf("%s    Only do this behind a firewall/VPN. For local-only access set \"host\": \"127.0.0.1\".%s\n", cDim, cReset)
+	case strings.HasPrefix(srv.Addr, "127.0.0.1:") || strings.HasPrefix(srv.Addr, "localhost:"):
+		fmt.Printf("%s  local-only. For remote access, prefer an SSH tunnel or explicitly configure a protected network bind.%s\n", cDim, cReset)
+	}
+
+	serverErr := make(chan error, 1)
+	go func() {
+		err := srv.ListenAndServe()
+		if err == http.ErrServerClosed {
+			err = nil
+		}
+		serverErr <- err
+	}()
+
+	var listenErr error
+	select {
+	case <-ctx.Done():
+		fmt.Printf("\n%sshutting down…%s\n", cYellow, cReset)
+	case listenErr = <-serverErr:
+		if listenErr != nil {
+			fmt.Printf("\n%sserver stopped unexpectedly: %v%s\n", cYellow, listenErr, cReset)
+		}
+	}
+
+	// Park active work before the scheduler and database are torn down. This is
+	// the only supported resume path now that Reconner has no maintenance CLI.
+	if n, parkErr := app.scheduler.SuspendActiveForShutdown(); parkErr != nil {
+		if listenErr == nil {
+			listenErr = fmt.Errorf("park active scans: %w", parkErr)
+		}
+	} else if n > 0 {
+		fmt.Printf("%s  ⏸ parked %d active scan(s) — they will resume on next start%s\n", cDim, n, cReset)
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil && listenErr == nil {
+		listenErr = fmt.Errorf("shutdown server: %w", err)
+	}
+	return listenErr
+}
+
+type encryptedColumn struct {
+	table, key, column string
+	// Optional, operator-replaceable integration credentials may be cleared when
+	// a historical config/database mismatch makes recovery cryptographically
+	// impossible. Scan identities and evidence always remain fail-closed.
+	resetIfUndecryptable bool
+}
+
+var encryptedDatabaseColumns = []encryptedColumn{
+	{table: "identities", key: "id", column: "headers_json"},
+	{table: "identities", key: "id", column: "storage_json"},
+	{table: "request_templates", key: "id", column: "encrypted_request"},
+	{table: "captured_responses", key: "id", column: "encrypted_response"},
+	{table: "guided_runs", key: "id", column: "encrypted_input"},
+	{table: "guided_runs", key: "id", column: "encrypted_report"},
+	{table: "telegram_config", key: "id", column: "encrypted_bot_token", resetIfUndecryptable: true},
+}
+
+func rotateStoredSecrets(db *sql.DB, oldSecret, newSecret string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, c := range encryptedDatabaseColumns {
+		query := fmt.Sprintf("SELECT %s,%s FROM %s WHERE %s<>''", c.key, c.column, c.table, c.column) // #nosec G201 -- identifiers are compile-time constants above
+		rows, err := tx.Query(query)
+		if err != nil {
+			return err
+		}
+		type update struct {
+			id    any
+			value string
+			reset bool
+		}
+		var updates []update
+		for rows.Next() {
+			var item update
+			if err := rows.Scan(&item.id, &item.value); err != nil {
+				rows.Close()
+				return err
+			}
+			rotated, err := secret.Reencrypt(item.value, oldSecret, newSecret)
+			if err != nil {
+				if !c.resetIfUndecryptable {
+					rows.Close()
+					return fmt.Errorf("%s.%s: %w", c.table, c.column, err)
+				}
+				rotated = ""
+				item.reset = true
+			}
+			item.value = rotated
+			updates = append(updates, item)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		statement := fmt.Sprintf("UPDATE %s SET %s=? WHERE %s=?", c.table, c.column, c.key) // #nosec G201 -- identifiers are compile-time constants above
+		for _, item := range updates {
+			if _, err := tx.Exec(statement, item.value, item.id); err != nil {
+				return err
+			}
+			if item.reset && c.table == "telegram_config" {
+				if _, err := tx.Exec(`UPDATE telegram_config SET enabled=0,
+					last_error='Stored BotFather token could not be decrypted after upgrade; enter it again.'
+					WHERE id=?`, item.id); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return tx.Commit()
+}
+
+// detectPublicBaseURL asks public address-discovery services for the host's
+// external IP. It returns empty when the host is offline or the result is not a
+// valid IP address.
+func detectPublicBaseURL(port int) string {
+	client := &http.Client{Timeout: 6 * time.Second}
+	for _, endpoint := range []string{"https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"} {
+		resp, err := client.Get(endpoint)
+		if err != nil {
+			continue
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64))
+		resp.Body.Close()
+		ip := strings.TrimSpace(string(body))
+		if net.ParseIP(ip) != nil {
+			return fmt.Sprintf("http://%s:%d", ip, port)
+		}
+	}
+	return ""
+}

@@ -1,0 +1,128 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Retrieve virtual address for loadable kernel modules from
+// /proc/modules.
+//
+// Kernel module addresses are masked (unless `kptr_restrict = 0`).
+//
+// Requires:
+// - kernel.kptr_restrict = 0 (Default on Debian <= 9 systems)
+//
+// Leak primitive:
+//   Data leaked:      kernel module virtual load addresses
+//   Kernel subsystem: kernel/module — /proc/modules
+//   Data structure:   struct module → module_core (base address)
+//   Address type:     virtual (kernel module text)
+//   Method:           parsed (proc file read)
+//   Status:           gated by design (kptr_restrict)
+//   Access check:     m_show() checks kptr_restrict via restricted_pointer();
+//                     requires CAP_SYSLOG
+//   Source:
+//   https://elixir.bootlin.com/linux/v6.12/source/kernel/module/procfs.c
+//
+// Mitigations:
+//   kernel.kptr_restrict >= 1 masks module addresses to 0x0.
+//   Bypass requires CAP_SYSLOG or CAP_SYS_ADMIN.
+// ---
+// <bcoles@gmail.com>
+
+#define _GNU_SOURCE
+#include "include/kasld/api.h"
+#include "include/kasld/cli.h"
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define module_range addr_range
+
+KASLD_EXPLAIN(
+    "Reads kernel module virtual load addresses from /proc/modules. "
+    "Each line reports the module name, size, and base address. When "
+    "kernel.kptr_restrict is 0 (or the reader has CAP_SYSLOG), raw "
+    "addresses are shown. Module addresses fall in the modules region, "
+    "which on some architectures is at a fixed offset from kernel "
+    "text.");
+
+KASLD_META("method:parsed\n"
+           "phase:inference\n"
+           "discloses:virtual\n"
+           "source:files\n"
+           "sysctl:kptr_restrict>=1\n"
+           "bypass:CAP_SYSLOG\n");
+
+static struct module_range get_addr_proc_modules(void) {
+  FILE *f;
+  char *line = 0;
+  char *addr_buf;
+  size_t size = 0;
+  const char *path = "/proc/modules";
+  unsigned long module_addr = 0;
+  struct module_range range = {0, 0, 0};
+
+  kasld_info("reading %s ...", path);
+
+  f = kasld_fopen(path, "r");
+
+  if (f == NULL) {
+    kasld_errno("fopen");
+    return range;
+  }
+
+  while ((getline(&line, &size, f)) != -1) {
+    addr_buf = strstr(line, " 0x");
+    if (addr_buf == NULL)
+      continue;
+
+    if (!kasld_addr_parse(addr_buf, 16, &module_addr, NULL) || !module_addr)
+      continue;
+
+    if (kasld_addr_is_module_band(module_addr)) {
+      if (!range.lo || module_addr < range.lo)
+        range.lo = module_addr;
+      if (module_addr > range.hi)
+        range.hi = module_addr;
+    }
+  }
+
+  free(line);
+  fclose(f);
+
+  return range;
+}
+
+int main(void) {
+  kasld_info("reading /proc/modules for loaded module base addresses ...");
+  /* Pre-check: is /proc/modules readable? */
+  if (kasld_access("/proc/modules", R_OK) != 0)
+    return (errno == EACCES || errno == EPERM) ? KASLD_EXIT_NOPERM
+                                               : KASLD_EXIT_UNAVAILABLE;
+
+  struct module_range range = get_addr_proc_modules();
+  if (!range.lo) {
+    kasld_err("no kernel address found in /proc/modules");
+    return 0;
+  }
+
+  /* /proc/modules lists loaded module base addresses.
+   * The component aggregates them into a min/max range — both endpoints
+   * are within the module region. (A future version could enumerate
+   * each module by name with kasld_result_sample().) */
+  /* REGION_MODULE, not REGION_MODULE_BAND: each address is a loaded
+   * module's own base, read from a per-module record — the region is known
+   * structurally, not inferred from the address falling in a band. That is
+   * what lets module_text_bracket consume it on arches whose band is a wide
+   * multi-layout union (see the provenance note in api.h). */
+  kasld_info("lowest leaked module address:  %lx", range.lo);
+  kasld_result_sample(KASLD_TYPE_VIRT, REGION_MODULE, range.lo, NULL,
+                      CONF_PARSED);
+
+  if (range.hi != range.lo) {
+    kasld_info("highest leaked module address: %lx", range.hi);
+    kasld_result_sample(KASLD_TYPE_VIRT, REGION_MODULE, range.hi, NULL,
+                        CONF_PARSED);
+  }
+
+  return 0;
+}

@@ -1,0 +1,78 @@
+// libFuzzer harness for orchestrator's capture_result() — the tagged-line
+// parser that consumes attacker-influenced bytes from component stdout.
+//
+// Wire format reference (see src/include/kasld/api.h):
+//   <P|V> <region>[:<name>] pos=<pos> conf=<conf> [lo=<hex>]
+//   [hi=<hex>|sz=<hex>]
+//     [sample=<hex>] [base_align=<hex>]
+//
+// Build with the make fuzz target:
+//   make fuzz FUZZ_CC=clang
+//
+// Run with the seed corpus:
+//   build/fuzz/fuzz_capture_result tests/fuzz/corpus/capture_result/ \
+//     -timeout=10 -max_len=4096
+
+#include "../../src/capture.c"
+#include "../../src/discard.c"
+#include "../../src/region_info.c"
+
+/* capture.c calls outward to five orchestrator-owned symbols: the discard
+ * origin-name lookup and the store lock. Stubbing them keeps this harness
+ * pointed at the parsers alone rather than compiling the orchestrator around
+ * them. Neither affects a parse decision: the name is for display, and the lock
+ * is uncontended in a single-threaded harness. The discard ledger is taken for
+ * real -- it is a leaf, so a rejected record still lands where it would in a
+ * live run. */
+const char *kasld_origin_name(int idx) {
+  (void)idx;
+  return "";
+}
+void kasld_result_lock(void) {}
+void kasld_result_unlock(void) {}
+
+/* The two output flags capture reads before reporting a rejection, and the
+ * reporter itself. A harness prints nothing, so these are inert -- but they are
+ * the parser's only remaining reach outside its own translation unit, and
+ * naming them here keeps that surface visible rather than implied. */
+int verbose = 0;
+int quiet = 1;
+__attribute__((format(printf, 1, 2))) void progress_note(const char *fmt, ...) {
+  (void)fmt;
+}
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  /* Bound the input shape to what the orchestrator's read loop would emit:
+   * LINE_LEN-sized line, single-line (capture_result expects pre-tokenised
+   * input — the read loop splits on '\n' before calling). */
+  if (size == 0 || size >= MAX_LINE_LEN)
+    return 0;
+
+  char *buf = malloc(size + 1);
+  if (!buf)
+    return 0;
+  memcpy(buf, data, size);
+  buf[size] = '\0';
+
+  /* Drop embedded newlines: the parser sees a single line at a time. */
+  for (size_t i = 0; i < size; i++)
+    if (buf[i] == '\n')
+      buf[i] = '\0';
+
+  /* Reset orchestrator state so results[] and scalar_facts[] do not grow
+   * unbounded across iterations, and clear the discard ledger with them: a
+   * single fuzz input should not carry state from the previous one, and a
+   * ledger left full would make every later iteration's caps look reached. */
+  num_results = 0;
+  num_scalar_facts = 0;
+  kasld_discard_reset();
+
+  capture_result(buf, "fuzz", 0);
+
+  free(buf);
+  return 0;
+}

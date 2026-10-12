@@ -1,0 +1,169 @@
+package modules
+
+import (
+	"context"
+	"encoding/json"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/akha-security/akca/engine/internal/httpclient"
+	modcve "github.com/akha-security/akca/engine/internal/modules/cve"
+)
+
+var componentPatterns = []struct {
+	vendor, product, source string
+	pattern                 *regexp.Regexp
+}{
+	{"apache", "http_server", "header", regexp.MustCompile(`(?i)apache[/ ]([0-9][\w.\-]+)`)},
+	{"nginx", "nginx", "header", regexp.MustCompile(`(?i)nginx[/ ]([0-9][\w.\-]+)`)},
+	{"php", "php", "header", regexp.MustCompile(`(?i)php[/ ]([0-9][\w.\-]+)`)},
+	{"php", "php-fpm", "header_or_body", regexp.MustCompile(`(?i)php-fpm[/ ]([0-9][\w.\-]+)`)},
+	{"apache", "log4j", "header_or_body", regexp.MustCompile(`(?i)log4j(?:-core)?[ /-]([0-9][\w.\-]+)`)},
+	{"apache", "struts2", "header_or_body", regexp.MustCompile(`(?i)(?:struts2|apache struts)[ /-]([0-9][\w.\-]+)`)},
+	{"openssl", "openssl", "header_or_body", regexp.MustCompile(`(?i)openssl[/ ]([0-9][\w.\-]+)`)},
+	{"nghttp2", "nghttp2", "header_or_body", regexp.MustCompile(`(?i)nghttp2[/ ]([0-9][\w.\-]+)`)},
+	{"vercel", "nextjs", "header_or_body", regexp.MustCompile(`(?i)(?:next(?:\.?js)?|x-powered-by\s*[:=]\s*next\.js)[ /@-]+v?([0-9]+\.[0-9]+\.[0-9]+(?:[-+][\w.-]+)?)`)},
+	{"facebook", "react-server-dom", "body", regexp.MustCompile(`(?i)react-server-dom-(?:webpack|turbopack|parcel)[ /@-]+v?([0-9]+\.[0-9]+\.[0-9]+(?:[-+][\w.-]+)?)`)},
+	{"apache", "tomcat", "header_or_body", regexp.MustCompile(`(?i)(?:apache[ /-]+)?tomcat[/ ]([0-9][\w.\-]+)`)},
+	{"microsoft", "iis", "header", regexp.MustCompile(`(?i)microsoft-iis[/ ]([0-9][\w.\-]+)`)},
+	{"eclipse", "jetty", "header", regexp.MustCompile(`(?i)jetty(?:\([^)]*\))?[/ ]([0-9][\w.\-]+)`)},
+	{"oracle", "weblogic", "header_or_body", regexp.MustCompile(`(?i)weblogic(?: server)?[/ ]([0-9][\w.\-]+)`)},
+	{"nodejs", "express", "header_or_body", regexp.MustCompile(`(?i)(?:express|x-powered-by\s*[:=]\s*express)[ /@-]+v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)`)},
+	{"djangoproject", "django", "header_or_body", regexp.MustCompile(`(?i)django[/ ]v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)`)},
+	{"palletsprojects", "flask", "header_or_body", regexp.MustCompile(`(?i)flask[/ ]v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)`)},
+	{"tiangolo", "fastapi", "header_or_body", regexp.MustCompile(`(?i)fastapi[/ ]v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)`)},
+	{"rubyonrails", "rails", "header_or_body", regexp.MustCompile(`(?i)(?:ruby on rails|rails)[/ ]v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)`)},
+	{"vmware", "spring_boot", "header_or_body", regexp.MustCompile(`(?i)spring[ -]?boot[/ ]v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)`)},
+	{"wordpress", "wordpress", "body", regexp.MustCompile(`(?i)(?:wordpress|generator)[ /"'=:-]+v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)`)},
+	{"drupal", "drupal", "body", regexp.MustCompile(`(?i)drupal[/ "'=:-]+v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)`)},
+	{"joomla", "joomla", "body", regexp.MustCompile(`(?i)joomla!?[/ "'=:-]+v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)`)},
+	{"jquery", "jquery", "asset", regexp.MustCompile(`(?i)jquery(?:[.@/-])v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)`)},
+	{"getbootstrap", "bootstrap", "asset", regexp.MustCompile(`(?i)bootstrap(?:[.@/-])v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)`)},
+	{"infomaniak", "site_creator", "asset", regexp.MustCompile(`(?i)website-builder/cdn/v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)`)},
+}
+
+type detectedComponent struct {
+	Vendor  string `json:"vendor"`
+	Product string `json:"product"`
+	Version string `json:"version"`
+	Source  string `json:"source"`
+}
+
+func (r *Runner) runVulnerableComponents(ctx context.Context, target ScanTarget) []ModuleFinding {
+	if ok, reason := r.shouldRunModule("vulnerable_components", target); !ok {
+		r.emitSkip("vulnerable_components", target, reason)
+		return nil
+	}
+	if !r.contentModuleOnce("vulnerable_components", target) {
+		return nil
+	}
+	rr, ok := observedResponse(ctx, target, false)
+	if !ok {
+		r.emitSkip("vulnerable_components", target, "no observed response was captured during discovery")
+		return nil
+	}
+	components := detectComponents(rr.Response.Headers, rr.Response.Body)
+	for _, component := range components {
+		r.persistComponentInventory(component)
+	}
+	// Component discovery is inventory, not vulnerability proof. CVE-backed
+	// findings are emitted once by known_cve to avoid duplicate reports.
+	return nil
+}
+
+func (r *Runner) runKnownCVE(ctx context.Context, target ScanTarget) []ModuleFinding {
+	if ok, reason := r.shouldRunModule("known_cve", target); !ok {
+		r.emitSkip("known_cve", target, reason)
+		return nil
+	}
+	if !r.contentModuleOnce("known_cve", target) {
+		return nil
+	}
+	rr, ok := observedResponse(ctx, target, false)
+	if !ok {
+		r.emitSkip("known_cve", target, "no observed response was captured during discovery")
+		return nil
+	}
+	if age := modcve.SnapshotAge(time.Now().UTC()); age > 45*24*time.Hour {
+		r.emitOnce("cve-catalog-stale", "coverage_gap", "Offline CVE catalog is older than 45 days; component vulnerability coverage may be incomplete", map[string]interface{}{
+			"module": "known_cve", "snapshot_version": modcve.EmbeddedSnapshotVersion,
+			"snapshot_date": modcve.EmbeddedSnapshotDate, "age_days": int(age.Hours() / 24),
+		})
+	}
+	components := detectComponents(rr.Response.Headers, rr.Response.Body)
+	return r.componentFindings(ctx, target, rr, components, "known_cve")
+}
+
+func (r *Runner) componentFindings(ctx context.Context, target ScanTarget, rr httpclient.RequestResponse, components []detectedComponent, module string) []ModuleFinding {
+	var out []ModuleFinding
+	baseline := httpclient.RequestResponse{
+		Response: httpclient.ResponseRecord{StatusCode: 200, Body: "{}", Headers: map[string]string{"Content-Type": "application/json"}},
+	}
+	seen := make(map[string]struct{})
+	for _, c := range components {
+		matches := modcve.MatchComponent(c.Vendor, c.Product, c.Version)
+		for _, m := range matches {
+			key := strings.ToLower(m.CVEID + "|" + c.Product + "|" + c.Version + "|" + target.EndpointURL)
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			p := defaultPayload(module, m.CVEID, c.Product+":"+c.Version, "cve_match")
+			f := r.verifyAndBuild(ctx, module, target, p, baseline, rr, m.CVEID, false, false, "", "")
+			if f != nil {
+				f.Description = m.CVEID + " affects " + c.Product + " " + c.Version
+				f.Severity = strings.ToLower(m.Severity)
+				r.recordFinding(ctx, &out, f, module, m.CVEID)
+				r.persistComponentMatch(c, m)
+			}
+		}
+	}
+	return out
+}
+
+func detectComponents(headers map[string]string, body string) []detectedComponent {
+	var out []detectedComponent
+	server := headerValue(headers, "Server")
+	xPowered := headerValue(headers, "X-Powered-By")
+	combined := server + " " + xPowered + " " + body
+	seen := make(map[string]struct{})
+	for _, fingerprint := range componentPatterns {
+		if m := fingerprint.pattern.FindStringSubmatch(combined); len(m) == 2 {
+			component := detectedComponent{Vendor: fingerprint.vendor, Product: fingerprint.product, Version: strings.TrimRight(m[1], ".,;:)"), Source: fingerprint.source}
+			key := component.Vendor + "|" + component.Product + "|" + component.Version
+			if _, exists := seen[key]; !exists {
+				seen[key] = struct{}{}
+				out = append(out, component)
+			}
+		}
+	}
+	return out
+}
+
+func (r *Runner) persistComponentInventory(component detectedComponent) {
+	if r.db == nil {
+		return
+	}
+	key := strings.ToLower(component.Vendor + "|" + component.Product + "|" + component.Version)
+	if !r.moduleWorkOnce("component_inventory", key) {
+		return
+	}
+	raw, _ := json.Marshal(component)
+	_, _ = r.db.SaveComponent(r.scanID, string(raw))
+}
+
+func (r *Runner) persistComponentMatch(c detectedComponent, match modcve.CatalogEntry) {
+	if r.db == nil {
+		return
+	}
+	raw, _ := json.Marshal(c)
+	id, err := r.db.SaveComponent(r.scanID, string(raw))
+	if err != nil {
+		return
+	}
+	matchRaw, _ := json.Marshal(match)
+	_ = r.db.SaveComponentCVEMatch(id, match.CVEID, string(matchRaw))
+	entries := []map[string]interface{}{{"cve_id": match.CVEID, "vendor": match.Vendor, "product": match.Product}}
+	_ = r.db.SeedCVECatalogIfEmpty(entries, modcve.EmbeddedSnapshotVersion)
+}

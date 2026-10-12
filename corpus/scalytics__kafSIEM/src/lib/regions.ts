@@ -1,0 +1,79 @@
+/*
+ * kafSIEM
+ * Portions derived from novatechflow/osint-siem and cyberdude88/osint-siem.
+ * See NOTICE for provenance and LICENSE for repository-local terms.
+ */
+
+import type { Alert } from "@/types/alert";
+
+type RegionBounds = {
+  latMin: number;
+  latMax: number;
+  lngMin: number;
+  lngMax: number;
+};
+
+export const CARIBBEAN_INTERACTION_BOUNDS: RegionBounds = {
+  latMin: 5,
+  latMax: 33,
+  lngMin: -118,
+  lngMax: -58,
+};
+
+function inBounds(lat: number, lng: number, bounds: RegionBounds): boolean {
+  return (
+    lat >= bounds.latMin &&
+    lat <= bounds.latMax &&
+    lng >= bounds.lngMin &&
+    lng <= bounds.lngMax
+  );
+}
+
+export function latLngToRegion(lat: number, lng: number): string | null {
+  // Caribbean interaction zone includes Mexico + Central America + island states.
+  if (inBounds(lat, lng, CARIBBEAN_INTERACTION_BOUNDS)) return "Caribbean";
+  // Continental regions — ordered narrow-to-wide to avoid swallowing smaller areas
+  if (lat >= 7 && lat <= 84 && lng >= -170 && lng <= -50) return "North America";
+  if (lat >= -57 && lat <= 15 && lng >= -82 && lng <= -33) return "South America";
+  // Europe: extend south to include Mediterranean, east to cover Turkey/Scandinavia
+  if (lat >= 34 && lat <= 72 && lng >= -12 && lng <= 45) return "Europe";
+  // Middle East: Arabian peninsula, Levant, Iran, Iraq — must precede Africa (overlapping lng)
+  if (lat >= 12 && lat <= 42 && lng >= 34 && lng <= 60) return "Middle East";
+  // Africa: full continent including Madagascar
+  if (lat >= -36 && lat <= 38 && lng >= -18 && lng <= 52) return "Africa";
+  // Asia-Pacific: main body + far-east dateline wrap + Oceania
+  if (lat >= -11 && lat <= 78 && lng >= 40 && lng <= 180) return "Asia-Pacific";
+  if (lat >= 30 && lat <= 78 && lng >= -180 && lng <= -168) return "Asia-Pacific";
+  if (lat >= -50 && lat <= 0 && lng >= 110 && lng <= 180) return "Asia-Pacific";
+  if (lat >= -50 && lat <= 15 && lng >= 95 && lng <= 180) return "Asia-Pacific";
+  return null;
+}
+
+export const MIDDLE_EAST_CODES = new Set([
+  "AE", "BH", "CY", "EG", "IL", "IQ", "IR", "JO", "KW", "LB",
+  "OM", "PS", "QA", "SA", "SY", "TR", "YE",
+]);
+
+// Region matching prefers where the event happened (event country, geocoded
+// coordinates) over where the publisher sits, so a UK feed reporting on an
+// Australian event lands in Asia-Pacific, not Europe.
+export function alertMatchesRegionFilter(alert: Alert, regionFilter: string): boolean {
+  if (regionFilter === "all") return true;
+  const countryCode = alert.event_country_code || alert.source.country_code;
+  if (regionFilter.startsWith("country:")) {
+    return countryCode === regionFilter.slice(8);
+  }
+  const geoRegion =
+    alert.lat === 0 && alert.lng === 0 ? null : latLngToRegion(alert.lat, alert.lng);
+  const region = geoRegion ?? alert.source.region;
+  if (regionFilter === "Caribbean") {
+    return region === "Caribbean" || inBounds(alert.lat, alert.lng, CARIBBEAN_INTERACTION_BOUNDS);
+  }
+  if (regionFilter === "Middle East") {
+    return region === "Middle East" || MIDDLE_EAST_CODES.has(countryCode);
+  }
+  if (regionFilter === "Asia-Pacific") {
+    return region === "Asia" || region === "Asia-Pacific" || region === "Oceania";
+  }
+  return region === regionFilter;
+}

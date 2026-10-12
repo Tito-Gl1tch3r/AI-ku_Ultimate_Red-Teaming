@@ -1,0 +1,2455 @@
+# coding: utf-8
+"""Server<->frontend<->backend integration tests. Boots the REAL server.py as a subprocess with a
+controlled config (known USERS credential, temp LOG_DIR with synthetic events) and exercises the
+actual HTTP contract the dashboard relies on: challenge-response login, /events with Range slicing,
+/counts, /check_ip, and malformed/edge inputs -- asserting the server answers correctly and never
+5xx/crashes. Raw-socket HTTP client -> no urllib py2/py3 differences. Skips cleanly if the server
+can't bind (e.g. sandbox)."""
+import datetime
+import gzip
+import json
+import io
+import os
+import re
+import sys
+import time
+import socket
+import hashlib
+import tempfile
+import subprocess
+import unittest
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)   # so `from core.log import safe_value` resolves (we also shell out to server.py)
+PW = "changeme!"
+STORED = hashlib.sha256(PW.encode()).hexdigest()   # what the config stores (sha256 of password)
+from core.httpd import LOGIN_FAILURE_THRESHOLD     # the brute-force refusal threshold under test
+from core.settings import UNAUTHORIZED_SLEEP_TIME  # the width of its window
+
+
+def _free_port():
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
+
+
+def _http(port, method, path, cookie=None, headers=None, body=None, timeout=10):
+    """Minimal HTTP/1.1 client for Connection: close responses. Returns (status, headers_text, body_bytes)."""
+    req = "%s %s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n" % (method, path)
+    if cookie:
+        req += "Cookie: %s\r\n" % cookie
+    for k, v in (headers or {}).items():
+        req += "%s: %s\r\n" % (k, v)
+    b = (body or "").encode("utf-8")
+    if body is not None:
+        req += "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: %d\r\n" % len(b)
+    req += "\r\n"
+    s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    s.sendall(req.encode("utf-8") + (b if body is not None else b""))
+    data = b""
+    try:
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        s.close()
+    head, _, payload = data.partition(b"\r\n\r\n")
+    head_t = head.decode("latin-1")
+    status = int(head_t.split(" ", 2)[1]) if head_t.startswith("HTTP/") else 0
+    return status, head_t, payload
+
+
+def _http_from(port, method, path, source, cookie=None, timeout=10):
+    """_http, but from a chosen local address - the only way to exercise the session's IP binding."""
+    req = "%s %s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n" % (method, path)
+    if cookie:
+        req += "Cookie: %s\r\n" % cookie
+    req += "\r\n"
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    s.bind((source, 0))
+    try:
+        s.connect(("127.0.0.1", port))
+        s.sendall(req.encode("utf-8"))
+        data = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        s.close()
+    head, _, payload = data.partition(b"\r\n\r\n")
+    head_t = head.decode("latin-1")
+    status = int(head_t.split(" ", 2)[1]) if head_t.startswith("HTTP/") else 0
+    return status, head_t, payload
+
+
+def _stop_server(proc):
+    """Stop a server subprocess without letting cleanup itself fail the test.
+
+    A bare `proc.wait(timeout=5)` raises TimeoutExpired, and raising inside a `finally` REPLACES
+    whatever the test was actually reporting - so a slow shutdown both fails a passing test and
+    hides the real error if there was one. That is exactly how this surfaced: green on three local
+    Python versions and in python:3.6-slim, red once on a contended CI runner, with the traceback
+    pointing at cleanup rather than at anything under test.
+
+    SIGTERM first so the server exits normally, then SIGKILL if it will not, and never propagate.
+    """
+
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=15)
+        return
+    except Exception:
+        pass
+    try:
+        proc.kill()
+        proc.wait(timeout=10)
+    except Exception:
+        pass
+
+
+class TestHttpd(unittest.TestCase):
+    proc = None
+    port = None
+    tmp = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="mt_httpd_")
+        logdir = cls.logdir = os.path.join(cls.tmp, "logs"); os.makedirs(logdir)
+        cls.date = time.strftime("%Y-%m-%d")
+        from core.log import safe_value                    # write lines EXACTLY as log_event does (quoted spaced fields)
+        def line(ts, *fields):
+            return " ".join(safe_value(f) for f in (ts,) + fields)
+        with open(os.path.join(logdir, cls.date + ".log"), "w") as f:
+            f.write(line("%s 10:00:00.000000" % cls.date, "sensor-a", "10.0.0.5", "4421", "8.8.8.8", "53", "UDP", "DNS", "evil.com", "malware (dummy)", "(static)") + "\n")
+            f.write(line("%s 10:00:01.000000" % cls.date, "sensor-b", "10.0.0.6", "5500", "66.66.66.66", "443", "TCP", "IP", "66.66.66.66", "badnet (dummy)", "(static)") + "\n")
+            # external-only event (no 10.x IP) -> a netfilter-restricted analyst must NOT see it
+            f.write(line("%s 10:00:02.000000" % cls.date, "sensor-a", "203.0.113.9", "5555", "198.51.100.5", "443", "TCP", "IP", "198.51.100.5", "extonly (dummy)", "(static)") + "\n")
+            # custom-trail event from an in-range host -> restricted analyst sees the event but the (custom) name masked
+            f.write(line("%s 10:00:03.000000" % cls.date, "sensor-a", "10.0.0.8", "6666", "5.5.5.5", "80", "TCP", "IP", "5.5.5.5", "supersecretname (custom)", "(custom)") + "\n")
+            # IP-based URL trail: trail string isn't a bare IP ("1.1.1.1/..."), but its host geolocates (AU) -> map it
+            f.write(line("%s 10:00:04.000000" % cls.date, "sensor-a", "10.0.0.9", "7777", "1.1.1.1", "80", "TCP", "URL", "1.1.1.1/malware.exe", "1312 (dummy)", "(static)") + "\n")
+        trails = os.path.join(cls.tmp, "trails.csv")
+        with open(trails, "w") as f:
+            f.write("evil.com,dummy,(static)\n")
+            f.write("1.2.3.4,badip (dummy),(static)\n")
+            f.write("badhost.example/gate.php,badurl (dummy),(static)\n")
+            f.write("internal-secret.corp,supersecretname (custom),(custom)\n")
+        # /check reads through the memory-mapped store, which the sensor normally builds; build it
+        # here so the endpoint has something to map. Both paths are passed explicitly: this test
+        # process has no configured TRAILS_FILE, and a silently skipped build would make the
+        # /check assertions pass vacuously against an absent store.
+        from core import common as _common
+        _common.build_trails_bin(trails, trails + ".bin")
+        assert os.path.isfile(trails + ".bin"), "the trail store must exist for the /check tests"
+        # seed a condensed observable store so /meta has something to look up (the server reads LOG_DIR/meta.sqlite)
+        from core import meta as _meta
+        _meta.configure(os.path.join(logdir, "meta.sqlite"), enabled=True, flush_period=99999)
+        _meta._agg = {}
+        _meta.observe_conn("10.0.0.5", "8.8.8.8", False, 1700000000)
+        _meta.observe_dns("evil.com", 1700000000)
+        _meta.flush()
+        _meta.configure(None, enabled=False); _meta._agg = {}   # reset the test process's module state
+        cls.port = _free_port()
+        cls.udp_port = _free_port()      # the sensor-facing event/heartbeat listener
+        cfg = os.path.join(cls.tmp, "srv.conf")
+        with open(cfg, "w") as f:
+            f.write("HTTP_ADDRESS 127.0.0.1\nHTTP_PORT %d\n" % cls.port)
+            f.write("UDP_ADDRESS 127.0.0.1\nUDP_PORT %d\n" % cls.udp_port)
+            f.write("USERS\n    admin:%s:0:\n    analyst:%s:1000:10.0.0.0/8\n    analyst2:%s:1001:10.0.5.0/16\n"
+                    "    analyst3:%s:1002:10.0.0.5\n    analyst4:%s:1003:10.0.0.6-10.0.0.9\n"
+                    "    ipv6user:%s:1004:::\n"   # netfilter "::" (IPv6 all) - the last field contains colons
+                    % (STORED, STORED, STORED, STORED, STORED, STORED))
+            f.write("ENABLE_MASK_CUSTOM true\n")
+            # deliberately carries every character that has to be escaped on the way into an HTML
+            # attribute - <, >, & and a double quote - so test_index_carries_the_severity_policy
+            # tests the escaping rather than assuming the shipped regex happens to be safe
+            f.write('REMOTE_SEVERITY_REGEX (?P<high>a&b"c)|(?P<low>zzz)\n')
+            f.write("FAIL2BAN_ALLOWLIST 127.0.0.1\nFAIL2BAN_REGEX dummy\n")   # allow localhost puller; match the synthetic events
+            # two distinct blacklists -> /blacklist (DNS events) vs /blacklist/foo (IP events); used to catch cross-name cache poisoning
+            f.write("BLACKLIST\n    type ~ DNS\n")
+            f.write("BLACKLIST_FOO\n    type ~ IP\n")
+            f.write("USE_SERVER_UPDATE_TRAILS false\nMONITOR_INTERFACE any\nCAPTURE_BUFFER 10MB\n")
+            f.write("LOG_DIR %s\nTRAILS_FILE %s\nUPDATE_PERIOD 86400\nSENSOR_NAME test\nDISABLE_CHECK_SUDO true\n" % (logdir, trails))
+        cls.proc = subprocess.Popen([sys.executable, "server.py", "-c", cfg], cwd=REPO,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        # readiness: poll the port
+        for _ in range(60):
+            if cls.proc.poll() is not None:
+                break
+            try:
+                socket.create_connection(("127.0.0.1", cls.port), timeout=0.5).close()
+                return
+            except (OSError, socket.error):
+                time.sleep(0.25)
+        # not ready
+        cls._skip = "server did not start (out: %s)" % (cls.proc.stdout.read()[:300] if cls.proc and cls.proc.stdout else "")
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.proc and cls.proc.poll() is None:
+            _stop_server(cls.proc)
+
+    def setUp(self):
+        if getattr(type(self), "_skip", None):
+            self.skipTest(self._skip)
+
+    def _login_body(self, username="admin"):
+        import binascii; nonce = binascii.hexlify(os.urandom(16)).decode()
+        h = hashlib.sha256((STORED + nonce).encode()).hexdigest()   # both test users share the same stored hash
+        return "username=%s&nonce=%s&hash=%s" % (username, nonce, h)
+
+    def _login(self, username="admin"):
+        st, head, _ = _http(self.port, "POST", "/login", body=self._login_body(username))
+        self.assertEqual(st, 200, "login should succeed")
+        m = [l for l in head.split("\r\n") if l.lower().startswith("set-cookie:")]
+        self.assertTrue(m, "login must set a session cookie")
+        return m[0].split(":", 1)[1].split(";", 1)[0].strip()
+
+    # --- the auth surfaces PLANS G4 named as untested ---
+
+    def test_a_nonce_is_single_use(self):
+        # replay protection: the same (nonce, hash) captured off the wire must not log anybody in a
+        # second time. DISPOSED_NONCES is what enforces it, and nothing exercised it.
+        body = self._login_body()
+        st, head, _ = _http(self.port, "POST", "/login", body=body)
+        self.assertEqual(st, 200, "the first use of a nonce must succeed")
+        st2, head2, _ = _http(self.port, "POST", "/login", body=body)
+        self.assertEqual(st2, 401, "replaying a spent nonce must fail")
+        self.assertNotIn("set-cookie", head2.lower(), "a replayed login must not be handed a session")
+
+    def test_the_session_cookie_carries_its_flags(self):
+        st, head, _ = _http(self.port, "POST", "/login", body=self._login_body())
+        self.assertEqual(st, 200)
+        cookie = [l for l in head.split("\r\n") if l.lower().startswith("set-cookie:")][0]
+        self.assertIn("HttpOnly", cookie, "the session cookie must be out of reach of document.cookie")
+        self.assertIn("SameSite=strict", cookie, "SESSION_COOKIE_FLAG_SAMESITE defaults on")
+        self.assertIn("path=/", cookie)
+        # Secure is conditional on USE_SSL and this server runs plain HTTP; asserting its ABSENCE
+        # here is what keeps the flag honest - set unconditionally, the cookie would be dropped by
+        # the browser on every plain-HTTP deployment and nobody could log in at all.
+        self.assertNotIn("Secure", cookie)
+
+    def test_a_session_is_bound_to_the_address_that_created_it(self):
+        # get_session() compares the session's stored client_ip with the peer address, so a stolen
+        # cookie replayed from elsewhere is not a session. Loopback gives us a second source address
+        # to prove it with: 127.0.0.2 is a different peer to the server, same machine to us.
+        cookie = self._login()
+        st, _, _ = _http(self.port, "GET", "/counts", cookie=cookie)
+        self.assertEqual(st, 200, "the cookie must work from the address that obtained it")
+
+        try:
+            probe = socket.socket()
+            probe.bind(("127.0.0.2", 0))
+            probe.close()
+        except (OSError, socket.error) as ex:
+            self.skipTest("no second loopback address to bind (%s)" % ex)
+
+        st2, _, body2 = _http_from(self.port, "GET", "/counts", cookie=cookie, source="127.0.0.2")
+        self.assertNotEqual(st2, 200, "the same cookie must not authenticate from another address")
+
+    # --- the contract ---
+    def test_index_served(self):
+        st, _, body = _http(self.port, "GET", "/")
+        self.assertEqual(st, 200)
+        self.assertIn(b"<table", body.lower() if False else body)  # dashboard HTML
+
+    def test_check_ip_reports_spamhaus_drop(self):
+        """DROP is a second, independent verdict beside worst_asns (#19598).
+
+        Its own field rather than folded into worst_asns: an address can be in a bad ASN, in a DROP
+        netblock, or both, and the dashboard draws a badge per verdict.
+        """
+        import ipaddress
+        sys.path.insert(0, REPO)
+        from core.settings import DROP_RANGES, read_drop
+        read_drop()
+        if not DROP_RANGES:
+            self.skipTest("no DROP netblocks loaded")
+        listed = str(ipaddress.ip_address(DROP_RANGES[0][0]))
+
+        cookie = self._login()
+        st, _, body = _http(self.port, "GET", "/check_ip?address=%s" % listed, cookie=cookie)
+        self.assertEqual(st, 200)
+        payload = json.loads(body.decode("utf8"))
+        self.assertEqual(payload.get("drop"), "true", "%s is a listed DROP netblock: %s" % (listed, payload))
+
+        st, _, body = _http(self.port, "GET", "/check_ip?address=8.8.8.8", cookie=cookie)
+        payload = json.loads(body.decode("utf8"))
+        self.assertEqual(payload.get("drop"), "false", "8.8.8.8 must not be reported as DROP")
+        # the older verdict has to keep working beside it
+        self.assertIn("worst_asns", payload)
+
+    def test_index_carries_the_severity_policy(self):
+        """The dashboard ranks with the server's REMOTE_SEVERITY_REGEX, not a copy of its own.
+
+        Severity is a policy an operator tunes, and it used to be implemented twice - once here,
+        once in main.js. They drifted twice, most visibly when "long domain (suspicious)" read LOW
+        on the dashboard and paged as MEDIUM. The page is served the regex so there is one
+        definition; if this token stops being substituted the dashboard silently falls back to the
+        shipped default and an operator's tuning stops reaching the screen.
+        """
+        st, _, body = _http(self.port, "GET", "/")
+        self.assertEqual(st, 200)
+        self.assertIn(b'name="mt-severity"', body,
+                      "the severity policy meta tag is gone from the served page")
+        self.assertNotIn(b"<!SEVERITY!>", body,
+                         "the <!SEVERITY!> token was served unsubstituted - it is missing from the "
+                         "allowlist in the token loop, or _severity() is gone")
+        # this server's regex, escaped for an attribute. Unescaped, the quote would end the
+        # attribute early and the rest of the regex would become stray markup.
+        self.assertIn(b'content="(?P&lt;high&gt;a&amp;b&quot;c)|(?P&lt;low&gt;zzz)"', body,
+                      "the configured regex did not reach the page correctly escaped")
+        self.assertNotIn(b'a&b"c', body,
+                         "the regex reached the attribute unescaped")
+
+    def test_auth_required(self):
+        for ep in ("/events?date=%s" % self.date, "/counts", "/check_ip?address=8.8.8.8"):
+            st, _, _ = _http(self.port, "GET", ep)
+            self.assertEqual(st, 401, "%s must require auth" % ep)
+
+    def test_check_finds_a_listed_trail(self):
+        st, _, body = _http(self.port, "GET", "/check?q=evil.com")
+        self.assertEqual(st, 200)
+        data = json.loads(body.decode())
+        self.assertTrue(data["found"], data)
+        self.assertEqual(data["trail"], "evil.com")
+        self.assertEqual(data["reference"], "(static)")
+
+    def test_check_walks_parent_domains(self):
+        # a subdomain of a listed domain is a hit, and reports WHICH key matched - the same
+        # parent walk _check_domain_member() does, so the answer matches what the sensor would do
+        st, _, body = _http(self.port, "GET", "/check?q=www.deep.evil.com")
+        data = json.loads(body.decode())
+        self.assertTrue(data["found"], data)
+        self.assertEqual(data["trail"], "evil.com")
+
+    def test_check_normalises_a_url(self):
+        st, _, body = _http(self.port, "GET", "/check?q=http%3A%2F%2Fbadhost.example%2Fgate.php")
+        data = json.loads(body.decode())
+        self.assertTrue(data["found"], data)
+        self.assertEqual(data["trail"], "badhost.example/gate.php")
+
+    def test_check_handles_an_ip(self):
+        st, _, body = _http(self.port, "GET", "/check?q=1.2.3.4")
+        self.assertTrue(json.loads(body.decode())["found"])
+
+    def test_check_does_not_disclose_custom_trails_unauthenticated(self):
+        # ENABLE_MASK_CUSTOM redacts custom trail names even from logged-in non-admin users, so an
+        # unauthenticated caller must not be able to confirm that one of the operator's OWN
+        # indicators exists. Reported as a miss: masking the name would still answer the question.
+        st, _, body = _http(self.port, "GET", "/check?q=internal-secret.corp")
+        self.assertEqual(st, 200)
+        data = json.loads(body.decode())
+        self.assertFalse(data["found"], data)
+        self.assertNotIn("supersecretname", body.decode())
+        self.assertNotIn("custom", body.decode())
+
+    def test_check_reveals_custom_trails_to_an_admin(self):
+        cookie = self._login()
+        st, _, body = _http(self.port, "GET", "/check?q=internal-secret.corp", cookie=cookie)
+        data = json.loads(body.decode())
+        self.assertTrue(data["found"], data)
+        self.assertEqual(data["reference"], "(custom)")
+        self.assertIn("supersecretname", data["info"])
+
+    def test_check_hides_custom_trails_from_a_masked_analyst(self):
+        # analyst has uid 1000, so mask_custom is on for that session - same rule as /events
+        cookie = self._login(username="analyst")
+        st, _, body = _http(self.port, "GET", "/check?q=internal-secret.corp", cookie=cookie)
+        data = json.loads(body.decode())
+        self.assertFalse(data["found"], data)
+        self.assertNotIn("supersecretname", body.decode())
+
+    def test_check_still_answers_for_public_trails(self):
+        # the restriction is scoped to custom trails; static/feed data stays answerable
+        st, _, body = _http(self.port, "GET", "/check?q=evil.com")
+        self.assertTrue(json.loads(body.decode())["found"])
+
+    def test_check_misses_are_not_errors(self):
+        st, _, body = _http(self.port, "GET", "/check?q=definitely-not-listed.example")
+        self.assertEqual(st, 200)
+        data = json.loads(body.decode())
+        self.assertFalse(data["found"])
+        self.assertNotIn("error", data)
+
+    def test_check_rejects_missing_and_oversized_queries(self):
+        for q in ("", "a" * 300):
+            st, _, body = _http(self.port, "GET", "/check?q=%s" % q)
+            self.assertEqual(st, 200, "must answer, not 500")
+            data = json.loads(body.decode())
+            self.assertFalse(data["found"])
+            self.assertIn("error", data)
+
+    def test_check_never_500s_on_hostile_input(self):
+        for q in ("%3Cscript%3E", "..%2F..%2Fetc%2Fpasswd", "%00", "*", "%25", "a%20b"):
+            st, _, body = _http(self.port, "GET", "/check?q=%s" % q)
+            self.assertEqual(st, 200, "q=%r produced %s" % (q, st))
+            json.loads(body.decode())          # must still be valid JSON
+
+    def test_login_and_events(self):
+        ck = self._login()
+        st, _, body = _http(self.port, "GET", "/events?date=%s" % self.date, cookie=ck)
+        self.assertEqual(st, 200)
+        self.assertIn(b"evil.com", body)                 # our synthetic event round-tripped
+        self.assertIn(b"sensor-a", body)                 # sensor name present in the stream
+
+    def test_events_range_slicing(self):
+        ck = self._login()
+        st_full, _, full = _http(self.port, "GET", "/events?date=%s" % self.date, cookie=ck)
+        st_r, _, part = _http(self.port, "GET", "/events?date=%s" % self.date, cookie=ck, headers={"Range": "bytes=0-9"})
+        self.assertIn(st_r, (200, 206))
+        self.assertLessEqual(len(part), len(full))       # a byte range returns a subset, no crash
+
+    def test_incremental_range_delta(self):
+        # the live view fetches ONLY appended bytes via Range: bytes=<prev_len>-<max>. The server's
+        # byte offsets must match the file exactly, or live shows duplicate/missing events.
+        ck = self._login()
+        _, _, full = _http(self.port, "GET", "/events?date=%s" % self.date, cookie=ck)
+        prev = len(full)
+        from core.log import safe_value
+        newline = " ".join(safe_value(f) for f in ("%s 11:11:11.000000" % self.date, "sensor-c",
+                  "10.0.0.7", "9999", "1.2.3.4", "80", "TCP", "PATH", "*", "potential web scanning", "(heuristic)")) + "\n"
+        logfile = os.path.join(self.tmp, "logs", self.date + ".log")
+        with open(logfile, "a") as f:
+            f.write(newline)
+        st, _, delta = _http(self.port, "GET", "/events?date=%s" % self.date, cookie=ck,
+                             headers={"Range": "bytes=%d-2147483647" % prev})
+        self.assertIn(st, (206, 200))
+        self.assertIn(b"sensor-c", delta)                # the appended event is in the delta
+        self.assertNotIn(b"sensor-a", delta)             # old events are NOT re-sent (no duplication)
+        if st == 206:
+            self.assertEqual(delta, newline.encode(), "Range delta must be exactly the appended bytes")
+
+    def test_netfilter_restricts_analyst(self):
+        # admin sees ALL events incl. the external-only one; a 10.0.0.0/8-restricted analyst must NOT
+        # see events lacking any in-range IP (data-restriction correctness — a leak if it fails).
+        _, _, admin_body = _http(self.port, "GET", "/events?date=%s" % self.date, cookie=self._login("admin"))
+        self.assertIn(b"198.51.100.5", admin_body, "admin should see the external-only event")
+        _, _, an_body = _http(self.port, "GET", "/events?date=%s" % self.date, cookie=self._login("analyst"))
+        self.assertNotIn(b"198.51.100.5", an_body, "analyst (10/8) must NOT see an external-only event (leak!)")
+        self.assertIn(b"10.0.0.5", an_body, "analyst SHOULD see in-range events")
+
+    def test_netfilter_non_aligned_cidr(self):
+        # analyst2 is restricted to 10.0.5.0/16 (NOT network-aligned; operators write CIDRs loosely).
+        # The subnet is 10.0.0.0/16, so in-range 10.0.0.x events MUST be visible. A prefix-not-masked
+        # comparison would never match its own subnet -> analyst sees nothing (events hidden).
+        _, _, body = _http(self.port, "GET", "/events?date=%s" % self.date, cookie=self._login("analyst2"))
+        self.assertIn(b"10.0.0.5", body, "non-aligned CIDR 10.0.5.0/16 must still match in-subnet 10.0.0.5")
+        self.assertNotIn(b"198.51.100.5", body, "out-of-subnet external event must stay hidden")
+
+    def test_login_user_with_colon_netfilter(self):
+        # A user whose netfilter is an IPv6 "::" (="all") puts colons in the LAST USERS field. A plain
+        # split(':') over-splits that entry into >4 parts -> ValueError while iterating USERS, which
+        # crashed EVERY login (not just this user's). Logging in as this user must succeed.
+        ck = self._login("ipv6user")
+        st, _, body = _http(self.port, "GET", "/events?date=%s" % self.date, cookie=ck)
+        self.assertEqual(st, 200, "'::'-netfilter user must be able to log in and query")
+        self.assertIn(b"10.0.0.5", body, "'::' means no restriction -> sees all events")
+
+    def test_netfilter_exact_ip(self):
+        # analyst3 restricted to a single exact IP (10.0.0.5): sees only lines containing it.
+        _, _, body = _http(self.port, "GET", "/events?date=%s" % self.date, cookie=self._login("analyst3"))
+        self.assertIn(b"10.0.0.5", body, "exact-IP filter must show its own IP's events")
+        self.assertNotIn(b"10.0.0.6", body, "exact-IP filter must NOT show other in-org IPs")
+        self.assertNotIn(b"198.51.100.5", body, "exact-IP filter must NOT show external events")
+
+    def test_netfilter_ip_range(self):
+        # analyst4 restricted to a dash range (10.0.0.6-10.0.0.9): sees 10.0.0.6 and 10.0.0.8, not 10.0.0.5.
+        _, _, body = _http(self.port, "GET", "/events?date=%s" % self.date, cookie=self._login("analyst4"))
+        self.assertIn(b"10.0.0.6", body, "range filter must show an in-range IP")
+        self.assertIn(b"10.0.0.8", body, "range filter must show another in-range IP")
+        self.assertNotIn(b"10.0.0.5", body, "range filter must NOT show a below-range IP")
+
+    def test_mask_custom_for_nonadmin(self):
+        # UID>=1000 with ENABLE_MASK_CUSTOM: (custom) trail NAMES are masked; admin sees the real name.
+        _, _, admin_body = _http(self.port, "GET", "/events?date=%s" % self.date, cookie=self._login("admin"))
+        self.assertIn(b"supersecretname", admin_body, "admin should see the real custom trail name")
+        _, _, an_body = _http(self.port, "GET", "/events?date=%s" % self.date, cookie=self._login("analyst"))
+        self.assertNotIn(b"supersecretname", an_body, "custom trail name must be masked for non-admin (leak!)")
+
+    def test_mask_custom_does_not_corrupt_an_info_that_merely_says_custom(self):
+        """The mask must key on the REFERENCE field, not on "(custom)" appearing anywhere.
+
+        The guard was `"(custom)" in line` with an unanchored global re.sub, so an event whose
+        `info` merely contained the literal - "note about (custom) lists" - had the token before
+        it replaced with "-" for any masked (uid >= 1000) session, on an event with no custom
+        trail at all. `logfmt.redact_json` already keyed on the reference field, so the text and
+        JSON paths disagreed about the same event. Own server: the shared fixture's event counts
+        are asserted by other tests in this file.
+        """
+        tmp = tempfile.mkdtemp(prefix="mt_mk_")
+        try:
+            logdir = os.path.join(tmp, "logs"); os.makedirs(logdir)
+            day = "2026-07-01"
+            with open(os.path.join(logdir, "%s.log" % day), "w") as f:
+                # a NON-custom event whose info happens to contain the literal
+                f.write('"%s 10:00:00.000000" box 10.0.0.5 4421 8.8.8.8 53 UDP DNS a.example '
+                        '"note about (custom) lists" (static)\n' % day)
+                # and a real custom-trail event, whose name must still be masked
+                f.write('"%s 10:00:01.000000" box 10.0.0.5 4422 8.8.8.8 53 UDP IP 8.8.8.8 '
+                        '"supersecretname (custom)" (custom)\n' % day)
+            trails = os.path.join(tmp, "t.csv")
+            with open(trails, "w") as f:
+                f.write("a.example,m (dummy),(static)\n")
+            port = _free_port()
+            cfg = os.path.join(tmp, "srv.conf")
+            with open(cfg, "w") as f:
+                f.write("HTTP_ADDRESS 127.0.0.1\nHTTP_PORT %d\nENABLE_MASK_CUSTOM true\n" % port)
+                f.write("USERS\n    admin:%s:0:\n    analyst:%s:1000:\n" % (STORED, STORED))
+                f.write("USE_SERVER_UPDATE_TRAILS false\nMONITOR_INTERFACE any\nCAPTURE_BUFFER 10MB\n")
+                f.write("LOG_DIR %s\nTRAILS_FILE %s\nUPDATE_PERIOD 86400\nSENSOR_NAME box\n"
+                        "DISABLE_CHECK_SUDO true\n" % (logdir, trails))
+            proc = subprocess.Popen([sys.executable, "server.py", "-c", cfg], cwd=REPO,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                for _ in range(60):
+                    try:
+                        socket.create_connection(("127.0.0.1", port), timeout=0.5).close(); break
+                    except OSError: time.sleep(0.25)
+
+                def login(user):
+                    import binascii as _b
+                    nonce = _b.hexlify(os.urandom(16)).decode()
+                    h = hashlib.sha256((STORED + nonce).encode()).hexdigest()
+                    _, hd, _b2 = _http(port, "POST", "/login",
+                                       body="username=%s&nonce=%s&hash=%s" % (user, nonce, h))
+                    for ln in hd.split("\r\n"):
+                        if ln.lower().startswith("set-cookie:"):
+                            return ln.split(":", 1)[1].split(";")[0].strip()
+                    return None
+
+                _, _, masked = _http(port, "GET", "/events?date=%s" % day, cookie=login("analyst"))
+
+                self.assertNotIn(b"supersecretname", masked,
+                                 "positive control: the custom trail NAME must still be masked")
+                self.assertIn(b"note about (custom) lists", masked,
+                              "a non-custom event's info was rewritten because it contained the "
+                              "literal '(custom)'; the mask must key on the reference field")
+            finally:
+                _stop_server(proc)
+        finally:
+            import shutil; shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_malformed_inputs_no_5xx(self):
+        ck = self._login()
+        cases = [
+            ("/events?date=%s" % self.date, {"Range": "bytes=abc-xyz"}),
+            ("/events?date=%s" % self.date, {"Range": "bytes=100-5"}),      # inverted
+            ("/events?date=%s" % self.date, {"Range": "bytes=-999999999"}),
+            ("/events?date=../../../etc/passwd", None),                     # traversal
+            ("/events?date=zzzz", None),                                    # junk date
+            ("/counts?date=zzzz", None),
+            ("/check_ip?address=%3Cscript%3E", None),                       # junk ip
+        ]
+        for path, hdr in cases:
+            st, _, _ = _http(self.port, "GET", path, cookie=ck, headers=hdr)
+            self.assertLess(st, 500, "5xx/crash on %s %s" % (path, hdr))
+            self.assertGreater(st, 0, "connection died on %s (server crash?)" % path)
+
+    def test_blacklist_cache_not_poisoned_across_names(self):
+        # /blacklist and /blacklist/foo select DIFFERENT BLACKLIST configs. The server caches the
+        # computed content in a single global with an 8s TTL; the cache key MUST include the blacklist
+        # name, or two requests in the same window return one blacklist's results for the other.
+        st1, _, def_bl = _http(self.port, "GET", "/blacklist")            # rule: type ~ DNS -> src_ip of DNS event
+        st2, _, foo_bl = _http(self.port, "GET", "/blacklist/foo")        # rule: type ~ IP  -> src_ips of IP events
+        self.assertEqual(st1, 200)
+        self.assertEqual(st2, 200)
+        # default blacklist = DNS event's source only
+        self.assertIn(b"10.0.0.5", def_bl, "default /blacklist (type~DNS) should list the DNS source")
+        self.assertNotIn(b"10.0.0.6", def_bl, "default /blacklist must NOT contain IP-event sources")
+        # foo blacklist = IP events' sources (poisoning would return the DNS set here instead)
+        self.assertIn(b"10.0.0.6", foo_bl, "/blacklist/foo (type~IP) should list IP-event sources (cache poisoning if missing)")
+        self.assertNotIn(b"10.0.0.5", foo_bl, "/blacklist/foo must NOT leak the default blacklist's DNS source")
+
+    def test_check_ip_returns_json(self):
+        import json as _json
+        ck = self._login()
+        st, _, body = _http(self.port, "GET", "/check_ip?address=8.8.8.8", cookie=ck)
+        self.assertEqual(st, 200)
+        obj = _json.loads(body.decode("utf-8"))
+        self.assertIn("ipcat", obj)
+        self.assertIn("worst_asns", obj)
+
+    def test_check_ip_jsonp_callback_validated(self):
+        ck = self._login()
+        # a valid identifier callback is honored (JSONP wrapping)
+        _, _, ok = _http(self.port, "GET", "/check_ip?address=8.8.8.8&callback=cb", cookie=ck)
+        self.assertTrue(ok.startswith(b"cb("), ok)
+        self.assertTrue(ok.rstrip().endswith(b")"), ok)
+        # a malicious callback must NOT be reflected (JSONP-XSS): server returns plain JSON instead
+        _, _, evil = _http(self.port, "GET", "/check_ip?address=8.8.8.8&callback=alert(1)//", cookie=ck)
+        self.assertNotIn(b"alert(1)", evil, "unsafe callback must not be reflected into a script body")
+        self.assertTrue(evil.lstrip().startswith(b"{"), "falls back to plain JSON")
+
+    def test_fail2ban_allowed_returns_attacker_ips(self):
+        # a puller on the FAIL2BAN_ALLOWLIST gets the src IPs of events matching FAIL2BAN_REGEX (for ipset/iptables)
+        st, _, body = _http(self.port, "GET", "/fail2ban")
+        self.assertEqual(st, 200, "allowlisted client must be served")
+        self.assertIn(b"10.0.0.5", body, "matching event's source IP must be listed")
+        self.assertNotIn(b"evil.com", body, "only IPs are emitted, not trail names")
+
+    def test_counts_returns_json(self):
+        import json as _json
+        ck = self._login()
+        st, _, body = _http(self.port, "GET", "/counts", cookie=ck)
+        self.assertEqual(st, 200)
+        obj = _json.loads(body.decode("utf-8"))            # per-day event density for the calendar heat: {"YYYY-MM-DD": count}
+        self.assertIsInstance(obj, dict)
+
+    def test_geo_returns_json(self):
+        # per-country attack-origin density for the world map: trail IPs geolocated, domains/private -> unmapped
+        import json as _json
+        ck = self._login()
+        st, _, body = _http(self.port, "GET", "/geo?date=%s" % self.date, cookie=ck)
+        self.assertEqual(st, 200)
+        obj = _json.loads(body.decode("utf-8"))
+        self.assertIsInstance(obj.get("counts"), dict)
+        self.assertIn("mapped", obj)
+        self.assertIn("unmapped", obj)
+        # the synthetic log has public-IP trails (geolocatable) and an 'evil.com' domain trail (unmapped)
+        self.assertGreaterEqual(obj["unmapped"], 1)
+        # IP-based URL trail ("1.1.1.1/malware.exe" -> AU) must geolocate its host, not fall to unmapped
+        self.assertIn("AU", obj["counts"], "IP-based URL trail must be placed on the map by its host IP")
+        self.assertEqual(obj["mapped"], sum(obj["counts"].values()))
+
+    def test_hunt_retro_search(self):
+        # retro-hunt: historical IOC sweep across daily logs -> per-day counts + capped samples, bounded + scoped
+        import json as _json
+        ck = self._login()
+        st, _, body = _http(self.port, "GET", "/hunt?q=evil.com", cookie=ck)
+        self.assertEqual(st, 200)
+        obj = _json.loads(body.decode("utf-8"))
+        self.assertIn("counts", obj)
+        self.assertIn("samples", obj)
+        self.assertIn("truncated", obj)
+        self.assertIn(self.date, obj["counts"])          # 'evil.com' is in today's synthetic log
+        # too-short queries are rejected (a 1-2 char substring would match ~everything -> self-DoS)
+        st, _, body = _http(self.port, "GET", "/hunt?q=x", cookie=ck)
+        self.assertIn("error", _json.loads(body.decode("utf-8")))
+        # a restricted analyst (netmask 10.0.0.0/8) must not see the external-only event
+        ck2 = self._login("analyst")
+        st, _, body = _http(self.port, "GET", "/hunt?q=extonly", cookie=ck2)
+        obj = _json.loads(body.decode("utf-8"))
+        self.assertEqual(obj["counts"], {}, "analyst must not hunt outside their netfilter scope")
+
+    def test_hunt_ip_prefilter_agrees_with_the_unfiltered_scan(self):
+        # The IP path gained a substring prefilter (10x on a 100 MB day). It is only allowed to skip a line
+        # that CANNOT match, so the property to hold is equivalence: for every query/line pair, the verdict
+        # with the prefilter must equal the verdict without it. Anything else is a silently missed hit.
+        import random
+        from core.httpd import _hunt_ip_query, _hunt_line_has_ip
+
+        random.seed(4242)
+        queries = ["10.0.0.5", "10.0.0.55", "8.8.8.8", "203.0.113.0/24", "203.0.113.128/25",
+                   "172.16.0.0/12", "10.0.0.0/8", "61.0.0.0/6", "0.0.0.0/0", "255.255.255.255"]
+        lines = [
+            '"2026-01-01 00:00:00" host 10.0.0.5 4421 8.8.8.8 53 UDP DNS evil.example "malware" (static)',
+            '"2026-01-01 00:00:01" host 10.0.0.55 4421 203.0.113.9 443 TCP IP 203.0.113.9 "malware" (static)',
+            '"2026-01-01 00:00:02" host 172.16.5.5 111 198.51.100.5 80 TCP URL 198.51.100.5/x "m" (static)',
+            '"2026-01-01 00:00:03" host 10.0.0.9 7777 1.1.1.1 80 TCP UA "curl/10.0.0.5" "m" (static)',
+            '"2026-01-01 00:00:04" host 255.255.255.255 1 0.0.0.0 1 UDP IP 0.0.0.0 "m" (static)',
+            'no addresses here at all',
+            '"2026-01-01 00:00:05" host 1203.0.113.55 1 999.999.999.999 1 UDP IP x "m" (static)',
+        ]
+        for _ in range(60):
+            octets = [random.choice([0, 1, 8, 10, 61, 172, 203, 254, 255]) for _ in range(4)]
+            lines.append('"2026-01-01 00:00:06" host %s 1 %d.%d.%d.%d 2 TCP IP y "m" (static)'
+                         % (".".join(str(_) for _ in octets), *[random.randint(0, 255) for _ in range(4)]))
+
+        checked = 0
+        for query in queries:
+            prefix, mask, needle = _hunt_ip_query(query)
+            self.assertIsNotNone(prefix, query)
+            for line in lines:
+                with_filter = _hunt_line_has_ip(line, prefix, mask, needle)
+                without = _hunt_line_has_ip(line, prefix, mask, None)   # the pre-change behaviour
+                self.assertEqual(with_filter, without, "%s vs %r" % (query, line))
+                checked += 1
+        self.assertGreater(checked, 600)                                # the loop actually ran
+
+    def test_hunt_ip_query_boundaries(self):
+        from core.httpd import _hunt_ip_query, _hunt_line_has_ip
+        # /32: an exact address, and NOT a longer one that merely starts with it
+        prefix, mask, needle = _hunt_ip_query("10.0.0.5")
+        self.assertTrue(_hunt_line_has_ip("x 10.0.0.5 y", prefix, mask, needle))
+        self.assertFalse(_hunt_line_has_ip("x 10.0.0.55 y", prefix, mask, needle))
+        self.assertFalse(_hunt_line_has_ip("x 110.0.0.5 y", prefix, mask, needle))
+        # /24: every address in the network, including the edges
+        prefix, mask, needle = _hunt_ip_query("203.0.113.0/24")
+        for ip in ("203.0.113.0", "203.0.113.1", "203.0.113.255"):
+            self.assertTrue(_hunt_line_has_ip("x %s y" % ip, prefix, mask, needle), ip)
+        self.assertFalse(_hunt_line_has_ip("x 203.0.114.1 y", prefix, mask, needle))
+        # below /8 there is no prefilter at all, and matching must still work
+        prefix, mask, needle = _hunt_ip_query("61.0.0.0/6")
+        self.assertIsNone(needle)
+        self.assertTrue(_hunt_line_has_ip("x 62.1.2.3 y", prefix, mask, needle))
+        self.assertFalse(_hunt_line_has_ip("x 128.1.2.3 y", prefix, mask, needle))
+        # a non-IP query is not an IP query
+        self.assertEqual(_hunt_ip_query("evil.example"), (None, None, None))
+        self.assertEqual(_hunt_ip_query("10.0.0.5/33"), (None, None, None))
+
+    def test_hunt_finds_an_ip_over_http(self):
+        # end to end, on the class fixture: the DNS event's dst is 8.8.8.8
+        import json as _json
+        ck = self._login()
+        st, _, body = _http(self.port, "GET", "/hunt?q=8.8.8.8", cookie=ck)
+        self.assertEqual(st, 200)
+        obj = _json.loads(body.decode("utf-8"))
+        self.assertEqual(sum(obj["counts"].values()), 1, obj)
+        st, _, body = _http(self.port, "GET", "/hunt?q=8.8.8.88", cookie=ck)
+        self.assertEqual(sum(_json.loads(body.decode("utf-8"))["counts"].values()), 0)
+        st, _, body = _http(self.port, "GET", "/hunt?q=10.0.0.0/8", cookie=ck)
+        self.assertGreater(sum(_json.loads(body.decode("utf-8"))["counts"].values()), 1)
+
+    def test_meta_lookup(self):
+        # condensed observable store: "have I ever seen this domain/ip, since when, how often" (O(1) PK lookup)
+        import json as _json
+        # requires auth
+        st, _, _ = _http(self.port, "GET", "/meta?observable=8.8.8.8")
+        self.assertEqual(st, 401, "/meta must require a session")
+        ck = self._login()
+        # a seeded IP observable -> full aggregate row
+        st, _, body = _http(self.port, "GET", "/meta?observable=8.8.8.8", cookie=ck)
+        self.assertEqual(st, 200)
+        obj = _json.loads(body.decode("utf-8"))
+        self.assertEqual(obj.get("kind"), "ip")
+        self.assertEqual(obj.get("scope"), "remote")
+        self.assertGreaterEqual(obj.get("count", 0), 1)
+        self.assertEqual(obj.get("first_seen"), 1700000000)
+        # a seeded domain observable
+        _, _, body = _http(self.port, "GET", "/meta?observable=evil.com", cookie=ck)
+        self.assertEqual(_json.loads(body.decode("utf-8")).get("kind"), "dns")
+        # never-seen observable -> empty object
+        _, _, body = _http(self.port, "GET", "/meta?observable=neverseen.invalid", cookie=ck)
+        self.assertEqual(_json.loads(body.decode("utf-8")), {})
+
+    def test_reference_endpoint(self):
+        # on-demand trail source citation: requires auth; unknown trail -> empty (valid JSON) not an error
+        import json as _json
+        st, _, _ = _http(self.port, "GET", "/reference?trail=x")
+        self.assertEqual(st, 401, "/reference must require a session")
+        ck = self._login()
+        st, _, body = _http(self.port, "GET", "/reference?trail=no-such-trail-xyz.invalid", cookie=ck)
+        self.assertEqual(st, 200)
+        obj = _json.loads(body.decode("utf-8"))
+        self.assertIsInstance(obj, dict)
+        self.assertEqual(obj.get("reference", ""), "")
+
+    def test_ping_healthcheck(self):
+        # unauthenticated liveness probe used by monitoring/LB health checks
+        st, _, body = _http(self.port, "GET", "/ping")
+        self.assertEqual(st, 200)
+        self.assertEqual(body.strip(), b"pong")
+
+    def test_sensors_endpoint(self):
+        import json as _json
+
+        # Sensor liveness (#19627): the server cannot tell a dead sensor from a quiet one by
+        # reading the event log, so this reports the heartbeats the UDP listener collects.
+        # Driven over the real socket into the real server process, because the receiving half
+        # and the reporting half live in different modules and nothing but this connects them.
+        st, _, _ = _http(self.port, "GET", "/sensors")
+        self.assertEqual(st, 401, "sensor inventory must not be readable without a session")
+
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        u.sendto(b"%d !HB httpd-probe 3.4 99" % int(time.time()), ("127.0.0.1", self.udp_port))
+        u.close()
+
+        ck = self._login()
+        row, obj = [], {}
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            st, _, body = _http(self.port, "GET", "/sensors", cookie=ck)
+            self.assertEqual(st, 200)
+            obj = _json.loads(body.decode("utf-8"))
+            row = [_ for _ in obj["sensors"] if _["sensor"] == "httpd-probe"]
+            if row:
+                break
+            time.sleep(0.1)
+
+        self.assertTrue(row, "a sensor that checked in was not listed")
+        self.assertEqual(row[0]["version"], "3.4")
+        self.assertEqual(row[0]["address"], "127.0.0.1")
+        self.assertEqual(row[0]["uptime"], 99)
+        # Served so the page can say "4 minutes ago" without trusting the workstation's clock.
+        self.assertAlmostEqual(obj["now"], int(time.time()), delta=60)
+
+        # Liveness is not a detection: in the day log it would reach /events, /counts and /fail2ban.
+        with open(os.path.join(self.logdir, self.date + ".log"), "rb") as f:
+            self.assertNotIn(b"!HB", f.read(), "a heartbeat was written into the event log")
+
+        # A network-restricted analyst is told which sensors are healthy - operational and useful -
+        # but not the addresses of collection infrastructure outside the scope they were given.
+        _, _, body = _http(self.port, "GET", "/sensors", cookie=self._login("analyst"))
+        scoped = [_ for _ in _json.loads(body.decode("utf-8"))["sensors"] if _["sensor"] == "httpd-probe"]
+        self.assertTrue(scoped, "a restricted analyst must still see whether sensors are alive")
+        self.assertEqual(scoped[0]["address"], "", "a restricted analyst was given a sensor's address")
+
+    def test_whoami_and_logout(self):
+        ck = self._login("admin")
+        _, _, who = _http(self.port, "GET", "/whoami", cookie=ck)
+        self.assertEqual(who.strip(), b"admin", "whoami returns the logged-in username")
+        _, _, anon = _http(self.port, "GET", "/whoami")
+        self.assertEqual(anon.strip(), b"", "no session -> empty username")
+        _http(self.port, "GET", "/logout", cookie=ck)                 # invalidates server-side session
+        _, _, after = _http(self.port, "GET", "/whoami", cookie=ck)
+        self.assertEqual(after.strip(), b"", "session must be invalid after logout")
+
+    def test_trails_endpoint_served(self):
+        # sensors pull the trail set from the server via /trails (UPDATE_SERVER). No auth (automation).
+        st, _, body = _http(self.port, "GET", "/trails")
+        self.assertEqual(st, 200)
+        self.assertIn(b"evil.com", body, "the public trail set must be served to an unauthenticated sensor")
+
+    def test_trails_endpoint_does_not_leak_custom_trails(self):
+        # update_trails() merges trails/custom into the SAME file as the public feeds, and /trails
+        # used to return that file verbatim to anyone who could reach the port - handing out the
+        # operator's private indicators (internal hostnames, an investigation's IOCs) that /check
+        # and /events go to real trouble to mask.
+        st, _, anon = _http(self.port, "GET", "/trails")
+        self.assertEqual(st, 200)
+        self.assertNotIn(b"internal-secret.corp", anon, "/trails must not disclose custom trails to an unauthenticated caller")
+        self.assertIn(b"evil.com", anon, "positive control: the public trails are still served")
+
+        # an admin is entitled to them, so a sensor pulling with a session still gets the full set
+        _, _, admin = _http(self.port, "GET", "/trails", cookie=self._login("admin"))
+        self.assertIn(b"internal-secret.corp", admin, "an admin session must still receive custom trails")
+
+        # ... and a mask_custom user (uid >= 1000) is not, exactly as /check treats them
+        _, _, analyst = _http(self.port, "GET", "/trails", cookie=self._login("analyst"))
+        self.assertNotIn(b"internal-secret.corp", analyst, "a mask_custom session must not receive custom trails")
+        self.assertIn(b"evil.com", analyst, "positive control: the public trails are still served")
+
+    @staticmethod
+    def _etag(headers_text):
+        for line in headers_text.split("\r\n"):
+            if line.lower().startswith("etag:"):
+                return line.split(":", 1)[1].strip()
+        return None
+
+    def test_trails_conditional_fetch_answers_304_without_a_body(self):
+        # The set is ~84 MB in a real deployment and a poll almost never finds it changed, so an
+        # UPDATE_SERVER used to re-send all of it to every sensor on every cycle.
+        st, head, body = _http(self.port, "GET", "/trails")
+        self.assertEqual(st, 200)
+        etag = self._etag(head)
+        self.assertIsNotNone(etag, "/trails must issue a validator or no sensor can ever skip a download")
+
+        st2, head2, body2 = _http(self.port, "GET", "/trails", headers={"If-None-Match": etag})
+        self.assertEqual(st2, 304, "an unchanged set must not be re-sent")
+        self.assertEqual(body2, b"", "a 304 carries no body")
+        self.assertEqual(self._etag(head2), etag, "the 304 must echo the validator it matched")
+        self.assertNotIn("content-length", head2.lower(), "a 304 must not frame a body it is not sending")
+        self.assertTrue(body, "positive control: the 200 did carry the set")
+
+    def test_trails_stale_validator_is_not_honoured(self):
+        # A validator that does not describe the current set must fall through to the full body,
+        # otherwise a sensor holding an old set is told it is current and stops updating forever.
+        st, _, body = _http(self.port, "GET", "/trails", headers={"If-None-Match": '"0-0-public"'})
+        self.assertEqual(st, 200)
+        self.assertIn(b"evil.com", body, "a non-matching validator must be served the whole set")
+
+    def test_trails_validator_does_not_cross_entitlement(self):
+        # /trails serves a DIFFERENT body to an entitled caller (custom trails included) than to a
+        # masked one. If the validator did not carry that, an admin's tag would match for an
+        # anonymous caller and answer 304 - telling it the stripped copy it holds is the current
+        # set. That is the masking hole this endpoint already exists to close, arriving as a cache
+        # hit instead of as a body.
+        _, admin_head, admin_body = _http(self.port, "GET", "/trails", cookie=self._login("admin"))
+        admin_etag = self._etag(admin_head)
+        self.assertIsNotNone(admin_etag)
+        self.assertIn(b"internal-secret.corp", admin_body, "positive control: the admin did get the full set")
+
+        st, _, body = _http(self.port, "GET", "/trails", headers={"If-None-Match": admin_etag})
+        self.assertEqual(st, 200, "an entitled caller's validator must not satisfy an unentitled one")
+        self.assertNotIn(b"internal-secret.corp", body, "and the fall-through body must still be masked")
+
+        # the reverse direction, so this is not passing by accident of which tag is 'bigger'
+        _, anon_head, _ = _http(self.port, "GET", "/trails")
+        anon_etag = self._etag(anon_head)
+        self.assertNotEqual(anon_etag, admin_etag, "one file on disk, two representations, two validators")
+
+        st2, _, admin_again = _http(self.port, "GET", "/trails", cookie=self._login("admin"),
+                                    headers={"If-None-Match": anon_etag})
+        self.assertEqual(st2, 200, "a masked caller's validator must not satisfy an entitled one")
+        self.assertIn(b"internal-secret.corp", admin_again)
+
+    def test_trails_masked_sessions_share_one_validator(self):
+        # An analyst (mask_custom) and an anonymous caller receive byte-identical bodies, so they
+        # must receive the same validator - otherwise every masked poll is a full download.
+        _, anon_head, _ = _http(self.port, "GET", "/trails")
+        _, analyst_head, _ = _http(self.port, "GET", "/trails", cookie=self._login("analyst"))
+        self.assertEqual(self._etag(anon_head), self._etag(analyst_head))
+
+    def test_a_date_range_selects_every_day_in_it(self):
+        # issue #4, open since 2015: /events has always understood START_END, but nothing else did
+        from core.httpd import _selected_days, MAX_RANGE_DAYS
+        self.assertEqual(_selected_days("2026-01-05"), ["2026-01-05"])
+        self.assertEqual(_selected_days("2026-01-01_2026-01-03"), ["2026-01-01", "2026-01-02", "2026-01-03"])
+        # written backwards is still a range - the picker can produce either order
+        self.assertEqual(_selected_days("2026-01-03_2026-01-01"), ["2026-01-01", "2026-01-02", "2026-01-03"])
+
+    def test_a_bogus_date_selects_nothing_rather_than_today(self):
+        from core.httpd import _selected_days
+        for bad in ("", "garbage", "2026-13-99", "2026-02-30", "2026-01-01_", "../../etc/passwd"):
+            self.assertEqual(_selected_days(bad), [], "%r must select no day" % bad)
+
+    def test_an_enormous_range_is_capped_not_walked(self):
+        # without a cap, ?date=1970-01-01_2038-01-19 asks the server to stat 25,000 files, which
+        # is a cheap way to occupy a worker
+        from core.httpd import _selected_days, MAX_RANGE_DAYS
+        days = _selected_days("1970-01-01_2038-01-19")
+        self.assertEqual(len(days), MAX_RANGE_DAYS)
+        self.assertEqual(days[-1], "2038-01-19", "the cap must keep the most RECENT window")
+
+    def test_geo_aggregates_a_range_instead_of_only_its_first_day(self):
+        # /geo used to re.search the first date out of the parameter, so a range mapped day one
+        # while the table beside it showed the whole span
+        cookie = self._login("admin")
+        one = json.loads(_http(self.port, "GET", "/geo?date=%s" % self.date, cookie=cookie)[2].decode())
+        self.assertGreater(one["mapped"] + one["unmapped"], 0, "fixture should geolocate something")
+
+        # a range whose extra day has no log must read exactly like the single day: a missing file
+        # is an ordinary gap in history, not an error
+        prev = (datetime.datetime.strptime(self.date, "%Y-%m-%d") - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        gap = json.loads(_http(self.port, "GET", "/geo?date=%s_%s" % (prev, self.date), cookie=cookie)[2].decode())
+        self.assertEqual(gap["counts"], one["counts"])
+
+        # now give that day its own log: the range must return the SUM, not either end of it
+        extra = os.path.join(self.logdir, "%s.log" % prev)
+        with open(extra, "w") as f:
+            f.write('"%s 09:00:00.000000" sensor-a 10.0.0.5 5000 66.66.66.66 443 TCP IP 66.66.66.66 "badnet (dummy)" (static)\n' % prev)
+        try:
+            both = json.loads(_http(self.port, "GET", "/geo?date=%s_%s" % (prev, self.date), cookie=cookie)[2].decode())
+            self.assertEqual(both["mapped"] + both["unmapped"], one["mapped"] + one["unmapped"] + 1,
+                             "the extra day's event was not aggregated")
+        finally:
+            os.remove(extra)
+
+    def _failed_login(self, username="admin"):
+        import binascii
+        nonce = binascii.hexlify(os.urandom(16)).decode()
+        h = hashlib.sha256(("0" * 64 + nonce).encode()).hexdigest()
+        return _http(self.port, "POST", "/login", body="username=%s&nonce=%s&hash=%s" % (username, nonce, h))
+
+    def test_failed_login_returns_promptly(self):
+        # The failure path used to time.sleep(UNAUTHORIZED_SLEEP_TIME) while holding a request
+        # thread, so the anti-brute-force measure was also the cheapest way to exhaust the server:
+        # 200 concurrent failed logins took it from 1 thread to 172. The delay is gone; the cost
+        # to an attacker is now a refusal threshold that holds no thread at all.
+        t0 = time.time()
+        st, _, _ = self._failed_login()
+        elapsed = time.time() - t0
+        self.assertEqual(st, 401)
+        self.assertLess(elapsed, 2.0, "a failed login must not park a request thread (was 5s)")
+
+    def test_one_mistyped_password_does_not_lock_out_the_address(self):
+        # The reporting interface is routinely reached through a single NAT address. Refusing on
+        # the FIRST failure - the obvious way to remove the sleep - would mean one fat-fingered
+        # password locks out everyone behind it, and an attacker could hold an office out of its
+        # own console by failing a login every few seconds. That is a worse bug than the one being
+        # fixed, so the refusal is a consecutive-failure threshold and this is its guard.
+        self._failed_login()
+        st, head, _ = _http(self.port, "POST", "/login", body=self._login_body("admin"))
+        self.assertEqual(st, 200, "a correct password right after one mistype must still work")
+        self.assertIn("sessid", head, "and must still establish a session")
+
+    def test_repeated_failures_are_refused_without_evaluation(self):
+        # Past the threshold the attempt is refused before the credentials are looked at, which is
+        # what bounds a brute-force run. Proven by submitting the CORRECT password and being
+        # refused anyway - if it were still being evaluated, this would succeed.
+        for _ in range(LOGIN_FAILURE_THRESHOLD + 1):
+            self._failed_login()
+        st, _, _ = _http(self.port, "POST", "/login", body=self._login_body("admin"))
+        self.assertEqual(st, 401, "past the threshold even a valid password must not be evaluated")
+        # ... and the streak expires, so the lockout is not permanent
+        time.sleep(UNAUTHORIZED_SLEEP_TIME + 0.5)
+        st, _, _ = _http(self.port, "POST", "/login", body=self._login_body("admin"))
+        self.assertEqual(st, 200, "the window must expire and let a legitimate user back in")
+
+    def test_csp_does_not_allow_eval(self):
+        # script-src carried 'unsafe-eval', which re-permits the whole class of injection CSP is
+        # there to stop - and nothing served needs it: no eval(), no Function("..."), no
+        # string-bodied setTimeout in main.js, worldmap.js, demo.js or the PapaParse bundle
+        # (tests/test_frontend.py asserts that side). Verified by loading the dashboard through
+        # this server in headless chromium under the tightened header: it renders with no CSP
+        # violation logged.
+        _, head, _ = _http(self.port, "GET", "/")
+        csp = [l for l in head.split("\r\n") if l.lower().startswith("content-security-policy:")]
+        self.assertTrue(csp, "the dashboard must be served with a CSP")
+        self.assertNotIn("unsafe-eval", csp[0], "script-src must not re-permit eval")
+        # The dashboard embeds nothing - no <iframe>, no window.frames, in any served script - so
+        # frame-src has no legitimate use and a wildcard there only widens what an injected tag
+        # could load. img-src deliberately stays open: HEADER_LOGO documents a remote <img>.
+        self.assertIn("frame-src 'none'", csp[0], "frame-src must not be a wildcard")
+        self.assertIn("default-src 'self'", csp[0], "positive control: the policy is still the real one")
+
+    def test_csp_script_src_allows_no_third_party_origin(self):
+        # script-src carried https://stat.ripe.net for as long as the frontend fetched RIPEstat with
+        # a JSONP <script> per IP: a third party allowed to execute code in the page that renders the
+        # operator's alerts, in exchange for a country flag and an ASN tooltip. That lookup is
+        # proxied through /ripe now, so the origin came back out. If some future enrichment needs a
+        # remote API, proxy it the same way instead of widening this - which is what this asserts.
+        _, head, _ = _http(self.port, "GET", "/")
+        csp = [l for l in head.split("\r\n") if l.lower().startswith("content-security-policy:")]
+        self.assertTrue(csp, "the dashboard must be served with a CSP")
+        script_src = [d.strip() for d in csp[0].split(';') if d.strip().startswith("script-src")]
+        self.assertEqual(script_src, ["script-src 'self'"],
+                         "script-src must be exactly 'self' (proxy remote APIs, do not allow their origin)")
+
+    def test_ripe_needs_a_session(self):
+        # /ripe makes the server talk to a third party on a caller's behalf, so it is gated like
+        # every other endpoint that does work for the dashboard.
+        st, _, _ = _http(self.port, "GET", "/ripe?kind=geo&address=8.8.8.8")
+        self.assertEqual(st, 401, "/ripe must not answer without a session")
+
+    def test_ripe_refuses_anything_that_is_not_a_public_address(self):
+        # The address is interpolated into a fixed RIPEstat URL, so this validation is the SSRF
+        # boundary: nothing that is not an address may reach it, and private/bogon space is not
+        # something RIPEstat has an answer for anyway. None of these may cause an outbound request,
+        # which is also why they are safe to assert in CI.
+        cookie = self._login()
+        for probe in ("kind=geo&address=127.0.0.1",
+                      "kind=geo&address=10.0.0.5",
+                      "kind=geo&address=0.0.0.0",
+                      "kind=geo&address=evil.example.com",
+                      "kind=geo&address=8.8.8.8%20evil",
+                      "kind=geo&address=8.8.8.8/../../etc/passwd",
+                      "kind=geo&address=",
+                      "kind=nonsense&address=8.8.8.8",
+                      "kind=geo&address=::1",            # is_local()/bogon_ip() are IPv4-only, so
+                      "kind=geo&address=fe80::1",        # the v6 non-global ranges are checked
+                      "kind=geo&address=fd00::1",        # separately - RIPEstat has nothing to say
+                      "kind=geo&address=ff02::1"):       # about any of them either
+
+            st, _, _ = _http(self.port, "GET", "/ripe?%s" % probe, cookie=cookie)
+            self.assertEqual(st, 400, "/ripe must refuse %r" % probe)
+        self.assertIsNone(type(self).proc.poll(), "server must stay alive")
+
+    def test_index_never_serves_the_demo_script(self):
+        """main.js turns DEMO on from the mere presence of demo.js.
+
+            var DEMO = (typeof window.getDemoCSV === "function");
+
+        So if the server's strip of that script tag ever misses, a real operator is shown
+        FABRICATED events - a normal-looking dashboard full of somebody else's fake traffic, with
+        nothing on screen saying so. It is the frontend's version of "looks fine, detects
+        nothing", and nothing tested it.
+
+        The strip used to require the exact shipped spelling of the tag, so re-quoting it or
+        adding an attribute in index.html would have been enough.
+        """
+
+        st, _, body = _http(self.port, "GET", "/")
+        self.assertEqual(st, 200)
+        self.assertNotIn(b"demo.js", body, "the served dashboard must never reference demo.js")
+        self.assertIn(b"js/main.js", body, "positive control: the real script is still served")
+
+    def test_events_supports_open_ended_and_suffix_ranges(self):
+        # The Range parser was `bytes=(\d+)-(\d+)`, so an end was mandatory. `bytes=N-` - the
+        # natural way to tail a growing log, and what any non-browser client writes - matched
+        # nothing, fell through, and got 200 with the WHOLE FILE. A client polling a large day log
+        # re-downloaded all of it every time and could not tell its range had been ignored;
+        # html/js/main.js only worked because it sends a huge explicit end as a documented
+        # workaround. RFC 7233 has three forms and all three now work.
+        ck = self._login("admin")
+        _, _, whole = _http(self.port, "GET", "/events?date=%s" % self.date, cookie=ck)
+        total = len(whole)
+        self.assertGreater(total, 20, "fixture log must be non-trivial")
+
+        st, head, body = _http(self.port, "GET", "/events?date=%s" % self.date, cookie=ck,
+                               headers={"Range": "bytes=%d-" % (total - 10)})
+        self.assertEqual(st, 206, "an open-ended range must be honoured, not answered with 200+everything")
+        self.assertEqual(body, whole[-10:])
+        self.assertIn("bytes %d-%d/%d" % (total - 10, total - 1, total), head)
+
+        st, _, body = _http(self.port, "GET", "/events?date=%s" % self.date, cookie=ck,
+                            headers={"Range": "bytes=-10"})
+        self.assertEqual(st, 206, "a suffix range must be honoured")
+        self.assertEqual(body, whole[-10:])
+
+        # explicit span still behaves exactly as before
+        st, _, body = _http(self.port, "GET", "/events?date=%s" % self.date, cookie=ck,
+                            headers={"Range": "bytes=0-9"})
+        self.assertEqual(st, 206)
+        self.assertEqual(body, whole[:10])
+
+        # a start at or past EOF is unsatisfiable, not a silent full-file 200
+        st, _, body = _http(self.port, "GET", "/events?date=%s" % self.date, cookie=ck,
+                            headers={"Range": "bytes=999999999-"})
+        self.assertEqual(st, 416, "an out-of-range start must not return the whole file")
+
+    def test_hunt_does_not_report_a_partial_day_as_complete(self):
+        # When the time budget expired inside a day, that day's running total was written into
+        # `counts` exactly like a finished day's. Measured on three 40k-line days with a small
+        # budget, the middle day came back as 16383 against a true 40000 - an undercount an
+        # analyst reads straight off the timeline as that day's answer. `truncated` was set, but
+        # it said only "something was cut", never which day. Undercounting a retro-hunt is the
+        # wrong direction to be wrong in.
+        #
+        # A second server with a deliberately tiny HUNT_TIME_BUDGET, so the cut is forced rather
+        # than raced: the shared fixture's budget is the real one.
+        import json as _json
+        tmp = tempfile.mkdtemp(prefix="mt_hunt_")
+        try:
+            logdir = os.path.join(tmp, "logs"); os.makedirs(logdir)
+            per, days = 20000, ["2026-07-01", "2026-07-02", "2026-07-03"]
+            for day in days:
+                with open(os.path.join(logdir, "%s.log" % day), "w") as f:
+                    for _ in range(per):
+                        f.write('"%s 10:00:00.000000" s 10.0.0.5 4421 8.8.8.8 53 UDP DNS '
+                                'huntme.example "malware (dummy)" (static)\n' % day)
+            trails = os.path.join(tmp, "t.csv")
+            with open(trails, "w") as f:
+                f.write("huntme.example,x (dummy),(static)\n")
+            port = _free_port()
+            cfg = os.path.join(tmp, "srv.conf")
+            with open(cfg, "w") as f:
+                f.write("HTTP_ADDRESS 127.0.0.1\nHTTP_PORT %d\nHUNT_TIME_BUDGET 0.02\n" % port)
+                f.write("USE_SERVER_UPDATE_TRAILS false\nMONITOR_INTERFACE any\nCAPTURE_BUFFER 10MB\n")
+                f.write("LOG_DIR %s\nTRAILS_FILE %s\nUPDATE_PERIOD 86400\nSENSOR_NAME t\nDISABLE_CHECK_SUDO true\n"
+                        % (logdir, trails))
+            proc = subprocess.Popen([sys.executable, "server.py", "-c", cfg], cwd=REPO,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                for _ in range(60):
+                    try:
+                        socket.create_connection(("127.0.0.1", port), timeout=0.5).close(); break
+                    except OSError: time.sleep(0.25)
+                st, _, body = _http(port, "GET", "/hunt?q=huntme.example", timeout=60)
+                self.assertEqual(st, 200)
+                o = _json.loads(body.decode("utf-8"))
+                self.assertTrue(o["truncated"], "a 0.02s budget over 60k lines must truncate")
+                # every day left in `counts` was read to the end, so its number is the real one
+                for day, hits in o["counts"].items():
+                    self.assertEqual(hits, per, "%s is in counts, so it must be a COMPLETE count" % day)
+                # and the day that was cut short is reported, separately and explicitly
+                if o.get("partial"):
+                    self.assertNotIn(o["partial"]["date"], o["counts"],
+                                     "a partially scanned day must not appear as a complete one")
+                    self.assertLess(o["partial"]["hits"], per, "a partial count is by definition short")
+                self.assertLessEqual(o["scanned"], o["selected"])
+                self.assertLess(o["scanned"], len(days), "scanned must count days READ, not days selected")
+            finally:
+                _stop_server(proc)
+        finally:
+            import shutil; shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_a_malformed_last_event_id_does_not_burn_a_stream_slot(self):
+        # /live claimed its budget slot BEFORE parsing Last-Event-ID, and the try/finally that
+        # returns the slot started after the parse. The parse was guarded by str.isdigit(), which
+        # is not a guard for int(): it is true for 128 characters int() refuses, including the
+        # latin-1 superscripts U+00B2/B3/B9 - single bytes, so they survive the latin-1 decoding
+        # http.server applies to header values. `Last-Event-ID: \xb2` therefore raised ValueError
+        # between the claim and the finally, leaking a slot per request. MAX_LIVE_STREAMS of them
+        # (30 by default) and /live answered 204 for everyone until the process restarted, with
+        # every dashboard silently falling back to Range polling.
+        tmp = tempfile.mkdtemp(prefix="mt_leid_")
+        try:
+            logdir = os.path.join(tmp, "logs"); os.makedirs(logdir)
+            day = "2026-07-01"
+            with open(os.path.join(logdir, "%s.log" % day), "w") as f:
+                f.write('"%s 10:00:00.000000" s 10.0.0.5 1 8.8.8.8 53 UDP DNS x.example "m (d)" (static)\n' % day)
+            trails = os.path.join(tmp, "t.csv")
+            with open(trails, "w") as f:
+                f.write("x.example,m (dummy),(static)\n")
+            port = _free_port()
+            cfg = os.path.join(tmp, "srv.conf")
+            with open(cfg, "w") as f:
+                f.write("HTTP_ADDRESS 127.0.0.1\nHTTP_PORT %d\nMAX_LIVE_STREAMS 3\n" % port)
+                f.write("USE_SERVER_UPDATE_TRAILS false\nMONITOR_INTERFACE any\nCAPTURE_BUFFER 10MB\n")
+                f.write("LOG_DIR %s\nTRAILS_FILE %s\nUPDATE_PERIOD 86400\nSENSOR_NAME t\nDISABLE_CHECK_SUDO true\n"
+                        % (logdir, trails))
+            proc = subprocess.Popen([sys.executable, "server.py", "-c", cfg], cwd=REPO,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                for _ in range(60):
+                    try:
+                        socket.create_connection(("127.0.0.1", port), timeout=0.5).close(); break
+                    except OSError: time.sleep(0.25)
+
+                def stream(last_event_id=None):
+                    """Open /live, read the status line, close. Returns the status line."""
+                    req = ("GET /live?date=%s HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                           "Connection: close\r\n" % day)
+                    if last_event_id is not None:
+                        req += "Last-Event-ID: %s\r\n" % last_event_id
+                    req += "\r\n"
+                    sk = socket.create_connection(("127.0.0.1", port), timeout=5)
+                    try:
+                        sk.sendall(req.encode("latin-1"))   # latin-1 IS the header wire encoding
+                        try:
+                            return sk.recv(64)
+                        except socket.timeout:
+                            return b""
+                    finally:
+                        sk.close()
+
+                # Positive control is an ORDINARY request: a closed SSE socket is not noticed by
+                # the server for up to 0.6s, so opening a real stream here would itself hold a
+                # slot and make the assertion below racy.
+                st, _, _ = _http(port, "GET", "/")
+                self.assertEqual(st, 200, "positive control: the server is up")
+
+                # Comfortably more malformed requests than the whole budget. A leak is permanent,
+                # so with the bug the budget is gone for good; with the fix they claim nothing.
+                for _ in range(8):
+                    stream(u"\xb2")
+
+                # A slot held by a stream whose socket just closed is returned once the server
+                # notices the disconnect (within a poll interval), so "busy" is expected briefly.
+                # A LEAKED slot is never returned - so poll, and the two cases separate cleanly.
+                for _ in range(40):
+                    if b" 204 " not in stream():
+                        break
+                    time.sleep(0.25)
+                else:
+                    self.fail("a malformed Last-Event-ID permanently leaked the /live budget: "
+                              "10s after 8 of them, a MAX_LIVE_STREAMS 3 server still refuses "
+                              "every stream, and only a restart would clear it")
+            finally:
+                _stop_server(proc)
+        finally:
+            import shutil; shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_live_streams_cannot_starve_ordinary_requests(self):
+        # A /live stream holds its request thread for the lifetime of the tab. Counted against the
+        # general thread cap it starves everything else: 120 open dashboards took all 100 slots and
+        # every ordinary request got a 503 - a cheaper denial of service than the cap was added to
+        # prevent, needing nothing but a browser. Streams get a smaller budget of their own, and a
+        # refused one is answered 204, which the frontend already falls back to polling on.
+        #
+        # Its own server with MAX_LIVE_STREAMS 3, so the assertion needs five held sockets rather
+        # than thirty-five. The first version of this test held 35 and passed standalone but blew
+        # through tests/run.sh's 1.2 GB address-space cap, taking the whole shared-server class
+        # down with it - a test heavy enough to break the runner is a test that does not run.
+        tmp = tempfile.mkdtemp(prefix="mt_sse_")
+        try:
+            logdir = os.path.join(tmp, "logs"); os.makedirs(logdir)
+            day = "2026-07-01"
+            with open(os.path.join(logdir, "%s.log" % day), "w") as f:
+                f.write('"%s 10:00:00.000000" s 10.0.0.5 1 8.8.8.8 53 UDP DNS x.example "m (d)" (static)\n' % day)
+            trails = os.path.join(tmp, "t.csv")
+            with open(trails, "w") as f:
+                f.write("x.example,m (dummy),(static)\n")
+            port = _free_port()
+            cfg = os.path.join(tmp, "srv.conf")
+            with open(cfg, "w") as f:
+                f.write("HTTP_ADDRESS 127.0.0.1\nHTTP_PORT %d\nMAX_LIVE_STREAMS 3\n" % port)
+                f.write("USE_SERVER_UPDATE_TRAILS false\nMONITOR_INTERFACE any\nCAPTURE_BUFFER 10MB\n")
+                f.write("LOG_DIR %s\nTRAILS_FILE %s\nUPDATE_PERIOD 86400\nSENSOR_NAME t\nDISABLE_CHECK_SUDO true\n"
+                        % (logdir, trails))
+            proc = subprocess.Popen([sys.executable, "server.py", "-c", cfg], cwd=REPO,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            held, refused = [], 0
+            try:
+                for _ in range(60):
+                    try:
+                        socket.create_connection(("127.0.0.1", port), timeout=0.5).close(); break
+                    except OSError: time.sleep(0.25)
+                for _ in range(5):
+                    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+                    s.sendall(("GET /live?date=%s HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n" % day).encode())
+                    if b" 204 " in s.recv(64):
+                        refused += 1; s.close()
+                    else:
+                        held.append(s)
+                self.assertEqual(len(held), 3, "the stream budget must be enforced exactly")
+                self.assertEqual(refused, 2, "streams past the budget must be refused, not accepted")
+                st, _, _ = _http(port, "GET", "/")
+                self.assertEqual(st, 200, "ordinary requests must survive a wall of open SSE streams")
+                # a closed stream returns its slot, so the budget is a ceiling and not a one-way latch
+                held.pop().close()
+                time.sleep(1.5)
+                s = socket.create_connection(("127.0.0.1", port), timeout=5)
+                s.sendall(("GET /live?date=%s HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n" % day).encode())
+                self.assertNotIn(b" 204 ", s.recv(64), "a released slot must be reusable")
+                s.close()
+            finally:
+                for s in held:
+                    try: s.close()
+                    except Exception: pass
+                _stop_server(proc)
+        finally:
+            import shutil; shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_counts_survives_a_wellformed_but_impossible_date(self):
+        # /counts read `from`/`to` with r"\d+-\d+-\d+", which matches "2026-13-45", and passed the
+        # match to strptime unguarded. The OK status line is written before that point, so the
+        # ValueError left the client with NO response at all - not a 400, not a 500, nothing.
+        # Every other strptime in core/httpd.py is guarded; these two were the exceptions.
+        import json as _json
+        ck = self._login("admin")
+        for value in ("2026-13-45", "9999-99-99", "2026-02-30", "0000-00-00"):
+            for key in ("from", "to"):
+                st, _, body = _http(self.port, "GET", "/counts?%s=%s" % (key, value), cookie=ck)
+                self.assertEqual(st, 200, "/counts?%s=%s got HTTP %s" % (key, value, st))
+                self.assertTrue(body, "/counts?%s=%s returned an empty body - the handler raised "
+                                      "after the status line was written" % (key, value))
+                _json.loads(body.decode("utf-8"))   # must still be JSON, not a truncated stream
+
+    def test_counts_still_honours_a_valid_range(self):
+        # positive control for the guard above: the bounds must still actually bound.
+        import json as _json
+        ck = self._login("admin")
+        _, _, all_days = _http(self.port, "GET", "/counts", cookie=ck)
+        _, _, none_days = _http(self.port, "GET", "/counts?from=1990-01-01&to=1990-01-02", cookie=ck)
+        self.assertTrue(_json.loads(all_days.decode("utf-8")), "unbounded /counts sees the log")
+        self.assertEqual(_json.loads(none_days.decode("utf-8")), {},
+                         "a range before any log must select nothing - the guard must not have "
+                         "turned every bound into the open end")
+
+    def test_counts_are_scoped_to_the_session_networks(self):
+        # /events has always honoured netfilters; /counts reported the GLOBAL daily totals to every
+        # authenticated user, so a restricted analyst could read the whole estate's volume off the
+        # calendar heat map. Five events are seeded, one of which has no 10.x address.
+        import json as _json
+        _, _, admin = _http(self.port, "GET", "/counts", cookie=self._login("admin"))
+        _, _, analyst = _http(self.port, "GET", "/counts", cookie=self._login("analyst"))
+        admin_counts = _json.loads(admin.decode("utf-8"))
+        analyst_counts = _json.loads(analyst.decode("utf-8"))
+        self.assertEqual(admin_counts.get(self.date), 5, "positive control: admin sees every event")
+        self.assertEqual(analyst_counts.get(self.date), 4, "the external-only event is outside 10.0.0.0/8")
+
+    def test_the_source_shortcut_never_decides_on_its_own(self):
+        """The scope shortcut may accept a line early; it must never reject one early.
+
+        _line_in_scope resolves most lines on the source field to avoid running a regex over every
+        line of the log. These are the lines where the source is NOT the answer, and each one has
+        to fall through to the full scan and return the same (visible, address) pair - the address
+        matters as well as the boolean, because _filter_events rewrites the line with it.
+        """
+        from core.httpd import _source_field
+
+        # not a source the shortcut may act on: it must decline rather than guess
+        for line, why in (
+            ('"t" box 203.0.113.9,10.0.0.8 1 8.8.8.8 53 UDP DNS a "m" (static)', "condensed multi-source"),
+            ('{"src_ip": "10.0.0.5"}', "a JSON event line"),
+            ('"t" box 2001:db8::1 1 8.8.8.8 53 UDP DNS a "m" (static)', "IPv6 source"),
+            ('"t" box', "truncated line"),
+        ):
+            self.assertIsNone(_source_field(line),
+                              "the shortcut claimed a source from %s; it must decline and let the "
+                              "full scan decide" % why)
+
+        # a source it may act on
+        self.assertEqual(
+            _source_field('"t" box 10.0.0.5 4421 8.8.8.8 53 UDP DNS a "m" (static)'), "10.0.0.5")
+
+    def test_scope_does_not_match_an_address_inside_a_domain_name(self):
+        """An address is a field, a comma-list element, or an IPORT host - not a domain label.
+
+        Scope matching used `\\b(\\d+\\.\\d+\\.\\d+\\.\\d+)\\b`, and `\\b` treats '.' as a boundary, so
+        10.0.0.5 was found inside the DOMAIN 10.0.0.5.evil.com. An analyst scoped to 10.0.0.0/8
+        was shown events whose src AND dst were both outside their networks, because an
+        attacker-chosen domain happened to contain an address in their scope. check_whitelisted()
+        documents fixing this exact shape on the whitelist side.
+        """
+        from core.httpd import _SCOPE_LINE_IP_REGEX as RX
+
+        # must still find a real address wherever one legitimately appears
+        for line, want in (
+            ('"t" box 10.0.0.5 4421 8.8.8.8 53 UDP DNS x "m" (s)', "10.0.0.5"),
+            ("10.0.0.5", "10.0.0.5"),
+            ("10.0.0.5:8080", "10.0.0.5"),          # IPORT trail
+            (" 203.0.113.9,10.0.0.8 ", "203.0.113.9"),   # condensed list
+            (",10.0.0.8 ", "10.0.0.8"),
+            ("10.0.0.100", "10.0.0.100"),
+        ):
+            match = RX.search(line)
+            self.assertIsNotNone(match, "scope must still see the address in %r" % line)
+            self.assertEqual(match.group(1), want, line)
+
+        # must NOT find one that is only a label inside a longer dotted name
+        for line in ("10.0.0.5.evil.com", "evil.10.0.0.9.com", "sub.1.2.3.4.example.org"):
+            self.assertIsNone(RX.search(line),
+                              "an address inside a domain name must not put the event in scope: "
+                              "%r" % line)
+
+        # and on a whole line the domain's labels must not appear among the addresses, while the
+        # line's REAL addresses still do
+        line = '"t" box 203.0.113.9 4421 8.8.8.8 53 UDP DNS 10.0.0.5.evil.com "m" (s)'
+        found = [m.group(1) for m in RX.finditer(line)]
+        self.assertEqual(found, ["203.0.113.9", "8.8.8.8"],
+                         "the real src/dst must be found and the domain's 10.0.0.5 must not: %s"
+                         % found)
+
+    def test_a_domain_trail_does_not_widen_a_restricted_session(self):
+        # The end-to-end half of the test above: both addresses out of scope, only the trail
+        # carries something that LOOKS like an in-scope address. Own server, because the shared
+        # fixture's event counts are asserted by other tests here.
+        tmp = tempfile.mkdtemp(prefix="mt_dom_")
+        try:
+            logdir = os.path.join(tmp, "logs"); os.makedirs(logdir)
+            day = "2026-07-01"
+            with open(os.path.join(logdir, "%s.log" % day), "w") as f:
+                f.write('"%s 10:00:00.000000" box 203.0.113.9 4421 8.8.8.8 53 UDP DNS '
+                        '10.0.0.5.evil.com "apt x (malware)" (static)\n' % day)
+                f.write('"%s 10:00:01.000000" box 10.0.0.7 4422 8.8.8.8 53 UDP DNS '
+                        'plain.example "apt x (malware)" (static)\n' % day)
+            trails = os.path.join(tmp, "t.csv")
+            with open(trails, "w") as f:
+                f.write("plain.example,m (dummy),(static)\n")
+            port = _free_port()
+            cfg = os.path.join(tmp, "srv.conf")
+            with open(cfg, "w") as f:
+                f.write("HTTP_ADDRESS 127.0.0.1\nHTTP_PORT %d\n" % port)
+                f.write("USERS\n    admin:%s:0:\n    analyst:%s:1000:10.0.0.0/8\n" % (STORED, STORED))
+                f.write("USE_SERVER_UPDATE_TRAILS false\nMONITOR_INTERFACE any\nCAPTURE_BUFFER 10MB\n")
+                f.write("LOG_DIR %s\nTRAILS_FILE %s\nUPDATE_PERIOD 86400\nSENSOR_NAME box\n"
+                        "DISABLE_CHECK_SUDO true\n" % (logdir, trails))
+            proc = subprocess.Popen([sys.executable, "server.py", "-c", cfg], cwd=REPO,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                for _ in range(60):
+                    try:
+                        socket.create_connection(("127.0.0.1", port), timeout=0.5).close(); break
+                    except OSError: time.sleep(0.25)
+
+                def login(user):
+                    import binascii as _b
+                    nonce = _b.hexlify(os.urandom(16)).decode()
+                    h = hashlib.sha256((STORED + nonce).encode()).hexdigest()
+                    _, hd, _x = _http(port, "POST", "/login",
+                                      body="username=%s&nonce=%s&hash=%s" % (user, nonce, h))
+                    for ln in hd.split("\r\n"):
+                        if ln.lower().startswith("set-cookie:"):
+                            return ln.split(":", 1)[1].split(";")[0].strip()
+                    return None
+
+                _, _, body = _http(port, "GET", "/events?date=%s" % day, cookie=login("analyst"))
+                self.assertIn(b"plain.example", body,
+                              "positive control: the genuinely in-scope event must be visible")
+                self.assertNotIn(b"10.0.0.5.evil.com", body,
+                                 "an event whose src and dst are BOTH outside the netfilter was "
+                                 "shown because the trail domain embedded an in-scope address")
+            finally:
+                _stop_server(proc)
+        finally:
+            import shutil; shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_counts_sees_an_event_reaching_the_scope_from_outside(self):
+        # The scope predicate is "any address on the line is inside my networks", not "the source
+        # is". An outside host talking TO the analyst's network is exactly the event they most need
+        # and the source field alone would hide it.
+        #
+        # This guards the shortcut that resolves most lines on their source: it may accept early,
+        # never reject early. Without the fall-through this line is silently uncounted.
+        import json as _json
+        from core.log import safe_value
+        line = " ".join(safe_value(_) for _ in (
+            '%s 11:00:00.000000' % self.date, "sensor-a", "198.51.100.7", "5555",
+            "10.0.0.42", "443", "TCP", "IP", "198.51.100.7", "inbound (dummy)", "(static)"))
+        path = os.path.join(self.logdir, "%s.log" % self.date)
+        with open(path, "r") as f:
+            original = f.read()
+        try:
+            with open(path, "a") as f:
+                f.write(line + "\n")
+            _, _, body = _http(self.port, "GET", "/counts", cookie=self._login("analyst"))
+            counts = _json.loads(body.decode("utf-8"))
+            self.assertEqual(counts.get(self.date), 5,
+                             "an event whose DESTINATION is in scope was not counted - the source "
+                             "field decided visibility on its own")
+        finally:
+            with open(path, "w") as f:
+                f.write(original)
+
+    def test_counts_cache_is_keyed_by_scope(self):
+        # The count cache is a module global shared by every request. Keyed on the log path alone,
+        # whichever user asked first would have their total served to the other - the same
+        # disclosure through the cache instead of the endpoint. Ask in both orders.
+        import json as _json
+        _, _, a1 = _http(self.port, "GET", "/counts", cookie=self._login("analyst"))
+        _, _, b1 = _http(self.port, "GET", "/counts", cookie=self._login("admin"))
+        _, _, a2 = _http(self.port, "GET", "/counts", cookie=self._login("analyst"))
+        self.assertEqual(_json.loads(a1.decode("utf-8")).get(self.date), 4)
+        self.assertEqual(_json.loads(b1.decode("utf-8")).get(self.date), 5)
+        self.assertEqual(_json.loads(a2.decode("utf-8")).get(self.date), 4, "the admin request must not have poisoned the analyst's entry")
+
+    def test_blacklist_is_scoped_to_the_session_networks(self):
+        # BLACKLIST_FOO selects the IP-type events, whose sources are 10.0.0.6, 10.0.0.8 and the
+        # out-of-scope 203.0.113.9. The response is a list of flagged SOURCE addresses, so an
+        # unscoped answer tells a restricted analyst which hosts outside their networks were hit.
+        _, _, admin = _http(self.port, "GET", "/blacklist/foo", cookie=self._login("admin"))
+        _, _, analyst = _http(self.port, "GET", "/blacklist/foo", cookie=self._login("analyst"))
+        self.assertIn(b"203.0.113.9", admin, "positive control: an unrestricted session still sees it")
+        self.assertNotIn(b"203.0.113.9", analyst, "/blacklist must not return sources outside the analyst's networks")
+        self.assertIn(b"10.0.0.6", analyst, "positive control: in-scope sources are still returned")
+
+    def test_geo_is_scoped_to_the_session_networks(self):
+        # The map is built from the same log lines. Unscoped, it drew a restricted analyst the
+        # whole estate's picture - coarser than /events, but still derived from events they may
+        # not read. The external-only event's destination (198.51.100.5) is the one that differs.
+        import json as _json
+        _, _, admin = _http(self.port, "GET", "/geo?date=%s" % self.date, cookie=self._login("admin"))
+        _, _, analyst = _http(self.port, "GET", "/geo?date=%s" % self.date, cookie=self._login("analyst"))
+        a = _json.loads(admin.decode("utf-8"))
+        b = _json.loads(analyst.decode("utf-8"))
+        self.assertGreater(a["mapped"] + a["unmapped"], b["mapped"] + b["unmapped"],
+                           "a restricted analyst must be placed on fewer events than an admin")
+
+    def test_meta_refused_for_scoped_sessions(self):
+        # The observables table is (observable, flags, first_seen, last_seen, count): no network
+        # dimension, so an answer is necessarily about the whole estate and cannot be filtered.
+        # Refused rather than answered with {}, which would read as "never observed".
+        st, _, _ = _http(self.port, "GET", "/meta?observable=8.8.8.8", cookie=self._login("analyst"))
+        self.assertEqual(st, 403, "/meta must not answer a network-restricted session")
+        st, _, _ = _http(self.port, "GET", "/meta?observable=8.8.8.8", cookie=self._login("admin"))
+        self.assertEqual(st, 200, "positive control: an unrestricted session is still answered")
+
+    def test_no_traceback_in_server_log(self):
+        # give the server a moment to flush, then check it never logged an unhandled traceback
+        self._login()
+        _http(self.port, "GET", "/events?date=%s" % self.date, cookie=self._login(), headers={"Range": "bytes=5-1"})
+        # (server stdout is captured; a traceback would mean an unhandled request exception)
+        # non-fatal: just assert the process is still alive after all the abuse
+        self.assertIsNone(type(self).proc.poll(), "server process died during tests")
+
+
+class TestTrailsEndpointMissingFile(unittest.TestCase):
+    """A fresh server (USE_SERVER_UPDATE_TRAILS off, or a first update that produced no trails) has no
+    TRAILS_FILE. GET /trails must NOT 500 (a bare open() would) -- it returns an empty body so a pulling
+    sensor keeps its current trails instead of erroring."""
+    proc = None
+    port = None
+    tmp = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="mt_notrails_")
+        logdir = os.path.join(cls.tmp, "logs"); os.makedirs(logdir)
+        missing_trails = os.path.join(cls.tmp, "does-not-exist.csv")   # deliberately absent
+        cls.port = _free_port()
+        cfg = os.path.join(cls.tmp, "srv.conf")
+        with open(cfg, "w") as f:
+            f.write("HTTP_ADDRESS 127.0.0.1\nHTTP_PORT %d\n" % cls.port)
+            f.write("USERS\n    admin:%s:0:\n" % STORED)
+            f.write("USE_SERVER_UPDATE_TRAILS false\nMONITOR_INTERFACE any\nCAPTURE_BUFFER 10MB\n")
+            f.write("LOG_DIR %s\nTRAILS_FILE %s\nUPDATE_PERIOD 86400\nSENSOR_NAME test\nDISABLE_CHECK_SUDO true\n" % (logdir, missing_trails))
+        cls.proc = subprocess.Popen([sys.executable, "server.py", "-c", cfg], cwd=REPO,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        for _ in range(60):
+            if cls.proc.poll() is not None:
+                break
+            try:
+                socket.create_connection(("127.0.0.1", cls.port), timeout=0.5).close()
+                return
+            except (OSError, socket.error):
+                time.sleep(0.25)
+        cls._skip = "server did not start (out: %s)" % (cls.proc.stdout.read()[:300] if cls.proc and cls.proc.stdout else "")
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.proc and cls.proc.poll() is None:
+            _stop_server(cls.proc)
+
+    def test_trails_missing_returns_empty_not_500(self):
+        if getattr(type(self), "_skip", None):
+            self.skipTest(self._skip)
+        st, _, body = _http(self.port, "GET", "/trails")
+        self.assertEqual(st, 200, "missing TRAILS_FILE must yield 200 empty, not 500")
+        self.assertEqual(body, b"", "no trails file -> empty body")
+        self.assertIsNone(type(self).proc.poll(), "server must stay alive")
+
+    def test_fail2ban_denied_secure_by_default(self):
+        # this server sets no FAIL2BAN_ALLOWLIST -> the endpoint must be closed (404), not leak attacker IPs
+        if getattr(type(self), "_skip", None):
+            self.skipTest(self._skip)
+        st, _, _ = _http(self.port, "GET", "/fail2ban")
+        self.assertEqual(st, 404, "/fail2ban must be closed by default (no allowlist configured)")
+
+
+class TestRipeLookupsDisabled(unittest.TestCase):
+    """`DISABLE_RIPE_LOOKUPS true` must make /ripe answer without touching the network.
+
+    Some installs are not allowed to make outbound requests at all, and before the lookup moved
+    server-side that was the browser's problem rather than the server's. The switch has to be a real
+    kill switch - 204 immediately, no connect attempt, no waiting out a timeout - and 204 is exactly
+    what the frontend's air-gap breaker reads as "no enrichment here", so the dashboard degrades to
+    the local RIR table via /check_ip instead of showing nothing.
+    """
+
+    proc = None
+    port = None
+    tmp = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="mt_noripe_")
+        logdir = os.path.join(cls.tmp, "logs"); os.makedirs(logdir)
+        cls.port = _free_port()
+        cfg = os.path.join(cls.tmp, "srv.conf")
+        with open(cfg, "w") as f:
+            f.write("HTTP_ADDRESS 127.0.0.1\nHTTP_PORT %d\n" % cls.port)
+            f.write("USERS\n    admin:%s:0:\n" % STORED)
+            f.write("DISABLE_RIPE_LOOKUPS true\n")
+            f.write("USE_SERVER_UPDATE_TRAILS false\nMONITOR_INTERFACE any\nCAPTURE_BUFFER 10MB\n")
+            f.write("LOG_DIR %s\nTRAILS_FILE %s\nUPDATE_PERIOD 86400\nSENSOR_NAME test\nDISABLE_CHECK_SUDO true\n"
+                    % (logdir, os.path.join(cls.tmp, "trails.csv")))
+        cls.proc = subprocess.Popen([sys.executable, "server.py", "-c", cfg], cwd=REPO,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        for _ in range(60):
+            if cls.proc.poll() is not None:
+                break
+            try:
+                socket.create_connection(("127.0.0.1", cls.port), timeout=0.5).close()
+                return
+            except (OSError, socket.error):
+                time.sleep(0.25)
+        cls._skip = "server did not start (out: %s)" % (cls.proc.stdout.read()[:300] if cls.proc and cls.proc.stdout else "")
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.proc and cls.proc.poll() is None:
+            _stop_server(cls.proc)
+
+    def test_a_valid_public_address_gets_204_without_delay(self):
+        if getattr(type(self), "_skip", None):
+            self.skipTest(self._skip)
+        import binascii
+        nonce = binascii.hexlify(os.urandom(16)).decode()
+        h = hashlib.sha256((STORED + nonce).encode()).hexdigest()
+        st, head, _ = _http(self.port, "POST", "/login", body="username=admin&nonce=%s&hash=%s" % (nonce, h))
+        self.assertEqual(st, 200, "login should succeed")
+        cookie = [l for l in head.split("\r\n") if l.lower().startswith("set-cookie:")][0].split(":", 1)[1].split(";")[0].strip()
+
+        started = time.time()
+        st, _, body = _http(self.port, "GET", "/ripe?kind=geo&address=8.8.8.8", cookie=cookie)
+        elapsed = time.time() - started
+        self.assertEqual(st, 204, "with lookups disabled /ripe must answer 204")
+        self.assertEqual(body, b"")
+        # A connect attempt to RIPEstat would cost seconds (RIPE_LOOKUP_TIMEOUT is 5) even when it
+        # fails, so this is the assertion that the switch short-circuits rather than merely failing.
+        self.assertLess(elapsed, 2.0, "the switch must skip the lookup, not wait for it to fail")
+        self.assertIsNone(type(self).proc.poll(), "server must stay alive")
+
+
+class TestReapSessions(unittest.TestCase):
+    """_reap_sessions drops expired sessions and closes any event-log handle they pinned (else sessions
+    created and never revisited leak memory + a file descriptor each). In-process unit test."""
+
+    def test_expired_dropped_live_kept_handle_closed(self):
+        import core.httpd as H
+        from core.attribdict import AttribDict
+        H.SESSIONS.clear()
+        closed = []
+
+        class _Handle(object):
+            def close(self):
+                closed.append(True)
+
+        H.SESSIONS["live"] = AttribDict({"expiration": time.time() + 3600})
+        H.SESSIONS["dead"] = AttribDict({"expiration": time.time() - 1, "range_handle": _Handle()})
+        H._sessions_reaped[0] = 0                    # bypass the time gate so the sweep runs now
+        H._reap_sessions()
+        self.assertIn("live", H.SESSIONS, "unexpired session must be kept")
+        self.assertNotIn("dead", H.SESSIONS, "expired session must be reaped (memory leak otherwise)")
+        self.assertEqual(closed, [True], "the expired session's pinned handle must be closed (fd leak otherwise)")
+        H.SESSIONS.clear()
+
+
+
+class TestGeoReadsEveryLineShape(unittest.TestCase):
+    """/geo draws the map. Every event must reach it, whatever the line looks like.
+
+    It located the fields by finding the end of the quoted timestamp (`line.find('" ')`) and
+    splitting the rest on spaces, which has two failure modes:
+
+      * a JSON line (LOCAL_LOG_FORMAT json) contains no '" ' at all, so `continue` skipped it and
+        a JSON LOG_DIR drew an EMPTY map - 0 of 5 events reached event_country();
+      * `safe_value()` QUOTES a sensor name containing a space, which shifts every field the
+        split indexes: for "my sensor" it read type=UDP, src=`sensor"`, dst=the source port and
+        trail=DNS, so the event was placed by garbage - or, as here, not placed at all.
+
+    The fast byte split is kept for the ordinary line, because a full-day scan runs it per line.
+    """
+
+    DAY = "2026-07-01"
+    # an IP trail resolves to a real country through the bundled table, so a field shift shows up
+    # as a WRONG answer rather than merely an absent one
+    EXPECT_CC = "AU"
+
+    def _fields(self, sensor):
+        return (self.DAY + " 10:00:00.000000", sensor, "10.0.0.5", "4421", "1.1.1.1", "53",
+                "UDP", "IP", "1.1.1.1", "apt x (malware)", "(static)")
+
+    def _text(self, sensor):
+        from core.log import safe_value
+        return " ".join(safe_value(_) for _ in self._fields(sensor)) + "\n"
+
+    def _json(self, sensor):
+        import json as _json
+        keys = ("time", "sensor", "src_ip", "src_port", "dst_ip", "dst_port", "proto", "type",
+                "trail", "info", "reference")
+        obj = dict(zip(keys, self._fields(sensor)))
+        obj["timestamp"] = 1767258000
+        obj["severity"] = "high"
+        return _json.dumps(obj) + "\n"
+
+    def _geo(self, log_line, copies=5):
+        tmp = tempfile.mkdtemp(prefix="mt_geo_")
+        try:
+            logdir = os.path.join(tmp, "logs"); os.makedirs(logdir)
+            with open(os.path.join(logdir, "%s.log" % self.DAY), "w") as f:
+                f.write(log_line * copies)
+            trails = os.path.join(tmp, "t.csv")
+            with open(trails, "w") as f:
+                f.write("1.1.1.1,m (dummy),(static)\n")
+            port = _free_port()
+            cfg = os.path.join(tmp, "srv.conf")
+            with open(cfg, "w") as f:
+                f.write("HTTP_ADDRESS 127.0.0.1\nHTTP_PORT %d\n" % port)
+                f.write("USERS\n    admin:%s:0:\n" % STORED)
+                f.write("USE_SERVER_UPDATE_TRAILS false\nMONITOR_INTERFACE any\nCAPTURE_BUFFER 10MB\n")
+                f.write("LOG_DIR %s\nTRAILS_FILE %s\nUPDATE_PERIOD 86400\nSENSOR_NAME s\n"
+                        "DISABLE_CHECK_SUDO true\n" % (logdir, trails))
+            proc = subprocess.Popen([sys.executable, "server.py", "-c", cfg], cwd=REPO,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                for _ in range(60):
+                    try:
+                        socket.create_connection(("127.0.0.1", port), timeout=0.5).close(); break
+                    except OSError: time.sleep(0.25)
+                import binascii as _b, json as _json
+                nonce = _b.hexlify(os.urandom(16)).decode()
+                h = hashlib.sha256((STORED + nonce).encode()).hexdigest()
+                _, hd, _x = _http(port, "POST", "/login",
+                                  body="username=admin&nonce=%s&hash=%s" % (nonce, h))
+                ck = None
+                for ln in hd.split("\r\n"):
+                    if ln.lower().startswith("set-cookie:"):
+                        ck = ln.split(":", 1)[1].split(";")[0].strip()
+                _, _, body = _http(port, "GET", "/geo?date=%s" % self.DAY, cookie=ck)
+                return _json.loads(body.decode("utf-8"))
+            finally:
+                _stop_server(proc)
+        finally:
+            import shutil; shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_a_plain_text_line_is_placed(self):
+        got = self._geo(self._text("box"))
+        self.assertEqual(got["counts"].get(self.EXPECT_CC), 5, got)   # positive control
+
+    def test_a_quoted_sensor_name_does_not_shift_the_fields(self):
+        for sensor in ("my sensor", "DMZ firewall 2"):
+            got = self._geo(self._text(sensor))
+            self.assertEqual(got["counts"].get(self.EXPECT_CC), 5,
+                             "SENSOR_NAME=%r shifted the fields /geo indexes, so the events were "
+                             "placed by garbage: %s" % (sensor, got))
+
+    def test_a_json_line_reaches_the_map(self):
+        got = self._geo(self._json("box"))
+        self.assertEqual(got["counts"].get(self.EXPECT_CC), 5,
+                         "a JSON log drew an empty map - the lines never reached "
+                         "event_country(): %s" % got)
+
+    def test_the_mapped_total_accounts_for_every_event(self):
+        for line in (self._text("box"), self._text("my sensor"), self._json("box")):
+            got = self._geo(line)
+            self.assertEqual(got["mapped"] + got["unmapped"], 5,
+                             "an event was dropped before it was even counted: %s" % got)
+
+
+class TestFail2banReadsTheFieldsCorrectly(unittest.TestCase):
+    """/fail2ban must publish the SOURCE address, whatever the line looks like.
+
+    It took the address from `line.split()[3]`, which assumes the quoted timestamp costs exactly
+    two whitespace tokens and the sensor name exactly one. `safe_value()` QUOTES any value
+    containing a space, so:
+
+      * `SENSOR_NAME DMZ firewall` shifted every field right and this endpoint published
+        `firewall` - and for `dmz 10.0.0.1`, the string `10.0.0.1"`, an internal address;
+      * a JSON line (LOCAL_LOG_FORMAT json) published `"2026-09-02`, a fragment of the timestamp.
+
+    fail2ban bans what it is given, so both mean the automated blocking quietly stops working
+    while looking healthy. The BLACKLIST reader next to it was converted to logfmt.fields() for
+    exactly this reason (see its comment); this endpoint was missed.
+    """
+
+    ATTACKER = "203.0.113.66"
+
+    def _serve(self, log_line):
+        tmp = tempfile.mkdtemp(prefix="mt_f2b_")
+        try:
+            logdir = os.path.join(tmp, "logs"); os.makedirs(logdir)
+            day = time.strftime("%Y-%m-%d")
+            with open(os.path.join(logdir, "%s.log" % day), "w") as f:
+                f.write(log_line)
+            trails = os.path.join(tmp, "t.csv")
+            with open(trails, "w") as f:
+                f.write("evil.example,m (dummy),(static)\n")
+            port = _free_port()
+            cfg = os.path.join(tmp, "srv.conf")
+            with open(cfg, "w") as f:
+                f.write("HTTP_ADDRESS 127.0.0.1\nHTTP_PORT %d\n" % port)
+                f.write("FAIL2BAN_ALLOWLIST 127.0.0.1\nFAIL2BAN_REGEX malware\n")
+                f.write("USE_SERVER_UPDATE_TRAILS false\nMONITOR_INTERFACE any\nCAPTURE_BUFFER 10MB\n")
+                f.write("LOG_DIR %s\nTRAILS_FILE %s\nUPDATE_PERIOD 86400\nSENSOR_NAME probe\n"
+                        "DISABLE_CHECK_SUDO true\n" % (logdir, trails))
+            proc = subprocess.Popen([sys.executable, "server.py", "-c", cfg], cwd=REPO,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                for _ in range(60):
+                    try:
+                        socket.create_connection(("127.0.0.1", port), timeout=0.5).close(); break
+                    except OSError: time.sleep(0.25)
+                _, _, body = _http(port, "GET", "/fail2ban")
+                return body.decode("utf-8", "replace").strip()
+            finally:
+                _stop_server(proc)
+        finally:
+            import shutil; shutil.rmtree(tmp, ignore_errors=True)
+
+    def _text_line(self, sensor):
+        from core.log import safe_value
+        day = time.strftime("%Y-%m-%d")
+        return " ".join(safe_value(_) for _ in (
+            day + " 10:00:00.000000", sensor, self.ATTACKER, "4421", "10.0.0.5", "53",
+            "UDP", "DNS", "evil.example", "attacker probe (malware)", "(static)")) + "\n"
+
+    def test_a_sensor_name_with_a_space_does_not_shift_the_fields(self):
+        for sensor in ("box", "edge-01", "my sensor", "DMZ firewall 2", "dmz 10.0.0.1"):
+            got = self._serve(self._text_line(sensor))
+            self.assertEqual(got, self.ATTACKER,
+                             "SENSOR_NAME=%r made /fail2ban publish %r instead of the attacker; "
+                             "fail2ban bans what it is given" % (sensor, got))
+
+    def test_it_reads_a_json_line(self):
+        import json as _json
+        day = time.strftime("%Y-%m-%d")
+        line = _json.dumps({"timestamp": 1767258000, "time": day + " 10:00:00.000000",
+                            "sensor": "box", "severity": "high", "src_ip": self.ATTACKER,
+                            "src_port": 4421, "dst_ip": "10.0.0.5", "dst_port": 53,
+                            "proto": "UDP", "type": "DNS", "trail": "evil.example",
+                            "info": "attacker probe (malware)", "reference": "(static)"}) + "\n"
+        got = self._serve(line)
+        self.assertEqual(got, self.ATTACKER,
+                         "a JSON log line made /fail2ban publish %r - LOCAL_LOG_FORMAT json broke "
+                         "the blocking feed entirely" % got)
+
+
+class TestShippedFail2banContract(unittest.TestCase):
+    """The regex in maltrail.conf is a firewall-rule generator, and no test had ever read it.
+
+    /fail2ban matches FAIL2BAN_REGEX against the WHOLE log line and returns the SOURCE
+    address of every matching event. For an inbound attack that is the attacker. For an OUTBOUND detection - one of our
+    hosts reaching a C2 - it is our own machine, so any alternative loose enough to hit a trail
+    NAME turns fail2ban against the network it protects.
+
+    The shipped regex used to contain the bare words `attacker`, `reputation` and `spammer`, and
+    39 trails in the published content carry one: attackerman.ddns.net, hightreputation.top,
+    spammer-apps471-info.bid. Reproduced against a live server before the fix, a single outbound
+    malware event to attackerman.ddns.net made /fail2ban return the internal host that resolved it.
+
+    Every existing test supplies `FAIL2BAN_REGEX dummy`, so none of them could see this."""
+
+    @classmethod
+    def setUpClass(cls):
+        import core.settings as settings
+        settings.read_config(os.path.join(REPO, "maltrail.conf"))
+        cls.regex = settings.config.FAIL2BAN_REGEX
+
+    def _line(self, trail, info):
+        from core.log import safe_value
+        return " ".join(safe_value(_) for _ in ("2026-08-28 10:00:00.000000", "sensor", "10.0.0.5",
+                                                "4421", "8.8.8.8", "53", "UDP", "DNS", trail, info, "(feed)"))
+
+    def _bans(self, trail, info):
+        return bool(re.search(self.regex, self._line(trail, info), re.I))
+
+    def test_the_shipped_regex_compiles(self):
+        self.assertTrue(self.regex, "FAIL2BAN_REGEX must stay set; unset makes /fail2ban answer 200 with prose")
+        re.compile(self.regex)
+
+    def test_it_bans_what_every_emitter_actually_writes(self):
+        # the sensor's heuristics, and the phrases feeds/*.py assign
+        for info in ("known attacker", "bad reputation", "bad reputation (suspicious)",
+                     "bad reputation (tor node)", "spammer", "mass scanner", "potential web scan",
+                     "potential directory traversal", "potential sql injection",
+                     "potential remote code execution", "potential iot-malware download"):
+            self.assertTrue(self._bans("1.2.3.4", info), "%r must be banned" % info)
+
+    def test_it_does_not_ban_an_outbound_detection(self):
+        # field 4 of these lines is OUR host; banning it firewalls the victim, not the attacker
+        for info in ("apt unclassified (malware)", "ransomware (malware)", "potential infection",
+                     "potential data leakage", "potential dns changer", "cobaltstrike (malware)"):
+            self.assertFalse(self._bans("1.2.3.4", info), "%r must NOT be banned" % info)
+
+    def test_a_trail_name_cannot_trigger_a_ban(self):
+        # the exact names that used to; the info on each is an outbound verdict
+        for trail in ("attackerman.ddns.net", "attacker-domain.com", "fromattacker.xyz",
+                      "hightreputation.top", "reputationb.com", "fixreputation.net",
+                      "spammer-apps471-info.bid", "hacker-spammer.no-ip.biz",
+                      "/wp_comment_spammer.py", "/simattacker.php", "/scar/attacker"):
+            self.assertFalse(self._bans(trail, "apt unclassified (malware)"),
+                             "the trail NAME %r must not put its source on the ban list" % trail)
+
+    def test_the_published_content_carries_no_name_that_would_ban(self):
+        static = os.environ.get("MALTRAIL_TRAILS_DIR") or os.path.join(os.path.dirname(REPO), "trails")
+        if not os.path.isdir(os.path.join(static, "malware")):
+            self.skipTest("no stamparm/trails checkout (gate.yml in that repository runs this content)")
+        import glob
+        rx = re.compile(self.regex, re.I)
+        offenders = []
+        for pile in ("malware", "malicious", "suspicious"):
+            for path in glob.glob(os.path.join(static, pile, "*.txt")):
+                for raw in io.open(path, encoding="utf8", errors="replace"):
+                    raw = raw.strip()
+                    if raw and not raw.startswith("#") and rx.search(raw):
+                        offenders.append((os.path.basename(path), raw))
+        self.assertEqual(offenders[:5], [], "%d published trail name(s) would put their own source on the ban list"
+                         % len(offenders))
+
+    def test_the_allowlist_still_lets_localhost_pull(self):
+        # the documented recipe is `curl -s http://127.0.0.1:8338/fail2ban`; an empty allowlist
+        # closes the endpoint entirely (secure by default), which would break every jail silently
+        import core.settings as settings
+        allow = str(settings.config.FAIL2BAN_ALLOWLIST or "")
+        self.assertIn("127.0.0.1", allow, "the shipped allowlist must keep the documented curl working")
+
+
+class TestDropSession(unittest.TestCase):
+    """Every way a session leaves SESSIONS must close the event-log handle it pinned.
+
+    /events hands a session an open file - or, for a multi-day range, an io.BufferedReader over several of them.
+    The reaper closed that handle. Logout and an expired cookie did not: they popped the session and left the
+    descriptors open, so an analyst who paged through a week of logs and then logged out leaked seven of them.
+    A long-lived server with people logging in and out walks towards "too many open files", which is the same
+    failure already fixed once inside /events when a fresh start=0 replaced a held handle.
+
+    Asserted per removal path, because they are three separate call sites and fixing one proves nothing about
+    the others."""
+
+    def setUp(self):
+        # imported here, like the neighbouring session test: core.httpd is not imported at module scope
+        import core.httpd
+        from core.attribdict import AttribDict
+        self.H = core.httpd
+        self.AttribDict = AttribDict
+        self.H.SESSIONS.clear()
+        self.H._sessions_reaped[0] = 0
+
+    def tearDown(self):
+        self.H.SESSIONS.clear()
+        self.H._sessions_reaped[0] = 0
+
+    class _Handle(object):
+        """Stands in for the open daily log, or the BufferedReader over several of them."""
+
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    def _session(self, name, expiration):
+        handle = self._Handle()
+        self.H.SESSIONS[name] = self.AttribDict({"expiration": expiration, "range_handle": handle})
+        return handle
+
+    def test_logout_closes_the_handle(self):
+        handle = self._session("out", time.time() + 3600)
+        self.H._drop_session("out")
+        self.assertNotIn("out", self.H.SESSIONS)
+        self.assertTrue(handle.closed, "logout left the event-log handle open")
+
+    def test_an_expired_session_closes_the_handle(self):
+        handle = self._session("stale", time.time() - 1)
+        self.H._drop_session("stale")
+        self.assertNotIn("stale", self.H.SESSIONS)
+        self.assertTrue(handle.closed, "an expired cookie left the event-log handle open")
+
+    def test_the_reaper_still_closes_the_handle(self):
+        # the one path that always did; it now shares the code with the two that did not
+        handle = self._session("dead", time.time() - 1)
+        live = self._session("live", time.time() + 3600)
+        self.H._reap_sessions()
+        self.assertNotIn("dead", self.H.SESSIONS)
+        self.assertIn("live", self.H.SESSIONS)
+        self.assertTrue(handle.closed)
+        self.assertFalse(live.closed, "an unexpired session must keep its handle")
+
+    def test_a_session_without_a_handle_is_dropped_cleanly(self):
+        self.H.SESSIONS["bare"] = self.AttribDict({"expiration": time.time() + 3600})
+        self.assertIsNotNone(self.H._drop_session("bare"))
+        self.assertNotIn("bare", self.H.SESSIONS)
+
+    def test_dropping_an_unknown_session_is_not_an_error(self):
+        # get_session() and delete_session() both act on an attacker-supplied cookie value
+        self.assertIsNone(self.H._drop_session("never-existed"))
+
+    def test_a_handle_that_refuses_to_close_still_drops_the_session(self):
+        # a closed-file or broken-handle error must not leave the session resident, which would turn a
+        # descriptor leak into a session leak
+        class Stubborn(object):
+            closed = False
+
+            def close(self):
+                raise IOError("nope")
+
+        self.H.SESSIONS["bad"] = self.AttribDict({"expiration": time.time() + 3600, "range_handle": Stubborn()})
+        self.H._drop_session("bad")
+        self.assertNotIn("bad", self.H.SESSIONS)
+
+
+class TestBlacklistAccessControl(unittest.TestCase):
+    """/blacklist returns the source IPs of flagged events, so it must not answer just anyone.
+
+    It is pulled by firewall automation rather than by the UI, so the control is the same
+    allowlist /fail2ban uses (an authenticated session also passes). This server sets NO
+    allowlist of either kind, so an unauthenticated caller must be refused -- and refused with
+    404, like the sibling endpoint, rather than advertising that the endpoint exists.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        logdir = os.path.join(cls.tmp, "logs")
+        os.makedirs(logdir)
+        cls.date = time.strftime("%Y-%m-%d")
+        with open(os.path.join(logdir, "%s.log" % cls.date), "w") as f:
+            f.write('"%s 09:14:22.117034" gw 10.13.13.2 57809 1.1.1.1 53 UDP DNS evil.com "asyncrat (malware)" (static)\n' % cls.date)
+        trails = os.path.join(cls.tmp, "trails.csv")
+        with open(trails, "w") as f:
+            f.write("evil.com,asyncrat (malware),(static)\n")
+
+        cls.port = _free_port()
+        cfg = os.path.join(cls.tmp, "srv.conf")
+        with open(cfg, "w") as f:
+            f.write("HTTP_ADDRESS 127.0.0.1\nHTTP_PORT %d\n" % cls.port)
+            f.write("USERS\n    admin:%s:0:\n" % STORED)
+            # deliberately NO FAIL2BAN_ALLOWLIST and NO BLACKLIST_ALLOWLIST
+            f.write("BLACKLIST\n    type ~ DNS\n")
+            f.write("USE_SERVER_UPDATE_TRAILS false\nMONITOR_INTERFACE any\nCAPTURE_BUFFER 10MB\n")
+            f.write("LOG_DIR %s\nTRAILS_FILE %s\nUPDATE_PERIOD 86400\nSENSOR_NAME test\nDISABLE_CHECK_SUDO true\n" % (logdir, trails))
+        cls.proc = subprocess.Popen([sys.executable, "server.py", "-c", cfg], cwd=REPO,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        for _ in range(60):
+            if cls.proc.poll() is not None:
+                break
+            try:
+                socket.create_connection(("127.0.0.1", cls.port), timeout=0.5).close()
+                break
+            except Exception:
+                time.sleep(0.25)
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.proc and cls.proc.poll() is None:
+            _stop_server(cls.proc)
+
+    def test_unauthenticated_pull_is_refused(self):
+        st, _, body = _http(self.port, "GET", "/blacklist")
+        self.assertEqual(st, 404, "/blacklist must be closed with no allowlist configured")
+        self.assertNotIn(b"10.13.13.2", body, "the flagged source IP must not be disclosed")
+
+    def test_subpaths_are_refused_too(self):
+        st, _, body = _http(self.port, "GET", "/blacklist/foo")
+        self.assertEqual(st, 404)
+        self.assertNotIn(b"10.13.13.2", body)
+
+    def test_an_authenticated_operator_still_gets_it(self):
+        import binascii
+        nonce = binascii.hexlify(os.urandom(16)).decode()
+        h = hashlib.sha256((STORED + nonce).encode()).hexdigest()
+        st, head, _ = _http(self.port, "POST", "/login", body="username=admin&nonce=%s&hash=%s" % (nonce, h))
+        self.assertEqual(st, 200, "login should succeed")
+        m = [l for l in head.split("\r\n") if l.lower().startswith("set-cookie:")]
+        self.assertTrue(m, "login must set a session cookie")
+        cookie = m[0].split(":", 1)[1].split(";", 1)[0].strip()
+        st, _, body = _http(self.port, "GET", "/blacklist", cookie=cookie)
+        self.assertEqual(st, 200, "an authenticated operator must still be able to pull it")
+        self.assertIn(b"10.13.13.2", body, "the blacklist content itself is unchanged")
+
+
+class TestClearedSources(unittest.TestCase):
+    """A remediated host can be taken off the derived lists without being whitelisted forever.
+
+    /blacklist and /fail2ban are derived from the current day's events, so a host flagged once
+    stays listed until midnight and the only escape was USER_WHITELIST - which also suppresses
+    every FUTURE detection for it (issue #19053). Clearing is time-bounded instead.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="mt_cleared_")
+        cls.logdir = os.path.join(cls.tmp, "logs"); os.makedirs(cls.logdir)
+        cls.date = time.strftime("%Y-%m-%d")
+        cls.log = os.path.join(cls.logdir, cls.date + ".log")
+        with open(cls.log, "w") as f:
+            f.write(cls._event("09:00:00", "10.13.13.37"))
+            f.write(cls._event("09:05:00", "10.13.13.99"))
+        trails = os.path.join(cls.tmp, "trails.csv")
+        with open(trails, "w") as f:
+            f.write("evil.com,dummy,(static)\n")
+
+        cls.port = _free_port()
+        cfg = os.path.join(cls.tmp, "srv.conf")
+        with open(cfg, "w") as f:
+            f.write("HTTP_ADDRESS 127.0.0.1\nHTTP_PORT %d\n" % cls.port)
+            f.write("FAIL2BAN_ALLOWLIST 127.0.0.1\nFAIL2BAN_REGEX malware\n")
+            f.write("BLACKLIST\n    src_ip ~ ^10\\.\n")
+            f.write("USE_SERVER_UPDATE_TRAILS false\nMONITOR_INTERFACE any\nCAPTURE_BUFFER 10MB\n")
+            f.write("LOG_DIR %s\nTRAILS_FILE %s\nUPDATE_PERIOD 86400\nSENSOR_NAME gw\nDISABLE_CHECK_SUDO true\n" % (cls.logdir, trails))
+        cls.proc = subprocess.Popen([sys.executable, "server.py", "-c", cfg], cwd=REPO,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        for _ in range(60):
+            if cls.proc.poll() is not None:
+                break
+            try:
+                socket.create_connection(("127.0.0.1", cls.port), timeout=0.5).close(); break
+            except Exception:
+                time.sleep(0.25)
+
+    @staticmethod
+    def _event(when, src):
+        return '"%s %s.000000" gw %s 4421 8.8.8.8 53 UDP DNS evil.com "malware (dummy)" (static)\n' % (
+            time.strftime("%Y-%m-%d"), when, src)
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.proc and cls.proc.poll() is None:
+            _stop_server(cls.proc)
+
+    def setUp(self):
+        # Each test owns the log and the cleared list: one of them APPENDS an event, and these
+        # run in alphabetical order, so without this the append leaks into its neighbours and
+        # they fail for a reason that has nothing to do with what they assert.
+        with open(self.log, "w") as f:
+            f.write(self._event("09:00:00", "10.13.13.37"))
+            f.write(self._event("09:05:00", "10.13.13.99"))
+        self._clear("")
+        time.sleep(9)      # both endpoints cache for 8s; start each test from a cold cache
+
+    def _listed(self, endpoint):
+        _, _, body = _http(self.port, "GET", endpoint)
+        return sorted(x for x in body.decode().split("\n") if x.strip())
+
+    def _clear(self, text):
+        with open(os.path.join(self.logdir, "cleared.txt"), "w") as f:
+            f.write(text)
+
+    def test_clearing_removes_only_that_host_and_only_the_earlier_events(self):
+        self.assertEqual(self._listed("/blacklist"), ["10.13.13.37", "10.13.13.99"])
+
+        self._clear("10.13.13.37 %s 09:30:00\n" % self.date)
+        self.assertEqual(self._listed("/blacklist"), ["10.13.13.99"], "the cleared host must drop off")
+        self.assertEqual(self._listed("/fail2ban"), ["10.13.13.99"], "and off /fail2ban too")
+
+    @staticmethod
+    def _json_event(when, src):
+        import json as _json
+        day = time.strftime("%Y-%m-%d")
+        return _json.dumps({"timestamp": int(time.time()), "time": "%s %s.000000" % (day, when),
+                            "sensor": "gw", "severity": "high", "src_ip": src, "src_port": 4421,
+                            "dst_ip": "8.8.8.8", "dst_port": 53, "proto": "UDP", "type": "DNS",
+                            "trail": "evil.com", "info": "malware (dummy)",
+                            "reference": "(static)"}) + "\n"
+
+    def test_clearing_works_on_a_json_log_too(self):
+        """LOCAL_LOG_FORMAT json makes a LOG_DIR mixed, and clearing has to work in both.
+
+        _event_precedes_clear matched `\\A"([^"]{19})` - the TEXT format's opening quoted
+        timestamp. A JSON line starts with '{', so the match failed and every event read as
+        "not cleared": cleared.txt silently did nothing on a JSON log, and a host the operator
+        had already dealt with stayed on /fail2ban, which bans what it is given.
+        """
+        with open(self.log, "w") as f:
+            f.write(self._json_event("09:00:00", "10.13.13.37"))
+            f.write(self._json_event("09:05:00", "10.13.13.99"))
+        time.sleep(9)      # both endpoints cache for 8s
+
+        self.assertEqual(self._listed("/fail2ban"), ["10.13.13.37", "10.13.13.99"],
+                         "positive control: a JSON log must feed /fail2ban at all")
+
+        self._clear("10.13.13.37 %s 09:30:00\n" % self.date)
+        time.sleep(9)
+        self.assertEqual(self._listed("/fail2ban"), ["10.13.13.99"],
+                         "cleared.txt was ignored on a JSON log: the remediated host is still "
+                         "being published for banning")
+        self.assertEqual(self._listed("/blacklist"), ["10.13.13.99"],
+                         "and the same on /blacklist")
+
+    def test_a_later_event_puts_a_cleared_host_straight_back(self):
+        # The whole point: clearing is not a whitelist. A NEW detection must re-list the host.
+        self._clear("10.13.13.37 %s 09:30:00\n" % self.date)
+        self.assertNotIn("10.13.13.37", self._listed("/blacklist"))
+        with open(self.log, "a") as f:
+            f.write(self._event("23:59:00", "10.13.13.37"))
+        time.sleep(9)                                     # the endpoints have always cached for 8s
+        self.assertIn("10.13.13.37", self._listed("/blacklist"), "a later event must re-list it")
+
+    def test_a_malformed_entry_does_not_clear_anything(self):
+        self._clear("not-an-ip\n@@@\n")
+        self.assertEqual(self._listed("/blacklist"), ["10.13.13.37", "10.13.13.99"])
+
+
+class TestAuthEventForwarding(unittest.TestCase):
+    """Login attempts must reach a remote collector, and must not be forgeable.
+
+    Brute force against the reporting interface is the one attack on Maltrail that Maltrail
+    could not see from outside the box (issue #19080).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="mt_auth_")
+        logdir = os.path.join(cls.tmp, "logs"); os.makedirs(logdir)
+        trails = os.path.join(cls.tmp, "trails.csv")
+        with open(trails, "w") as f:
+            f.write("evil.com,dummy,(static)\n")
+
+        cls.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        cls.sock.bind(("127.0.0.1", 0))
+        cls.sock.settimeout(15)
+        collector = cls.sock.getsockname()[1]
+
+        cls.port = _free_port()
+        cfg = os.path.join(cls.tmp, "srv.conf")
+        with open(cfg, "w") as f:
+            f.write("HTTP_ADDRESS 127.0.0.1\nHTTP_PORT %d\n" % cls.port)
+            f.write("USERS\n    admin:%s:0:\n" % STORED)
+            f.write("SYSLOG_SERVER 127.0.0.1:%d\n" % collector)
+            f.write("USE_SERVER_UPDATE_TRAILS false\nMONITOR_INTERFACE any\nCAPTURE_BUFFER 10MB\n")
+            f.write("LOG_DIR %s\nTRAILS_FILE %s\nUPDATE_PERIOD 86400\nSENSOR_NAME test\nDISABLE_CHECK_SUDO true\n" % (logdir, trails))
+        cls.proc = subprocess.Popen([sys.executable, "server.py", "-c", cfg], cwd=REPO,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        for _ in range(60):
+            if cls.proc.poll() is not None:
+                break
+            try:
+                socket.create_connection(("127.0.0.1", cls.port), timeout=0.5).close()
+                break
+            except Exception:
+                time.sleep(0.25)
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.proc and cls.proc.poll() is None:
+            _stop_server(cls.proc)
+        try:
+            cls.sock.close()
+        except Exception:
+            pass
+
+    def _attempt(self, username, good):
+        import binascii
+        nonce = binascii.hexlify(os.urandom(16)).decode()
+        secret = STORED if good else "0" * 64
+        h = hashlib.sha256((secret + nonce).encode()).hexdigest()
+        _http(self.port, "POST", "/login", body="username=%s&nonce=%s&hash=%s" % (username, nonce, h))
+        return self.sock.recv(65535).decode("utf8", "replace")
+
+    def test_a_failed_login_is_forwarded(self):
+        record = self._attempt("admin", False)
+        self.assertIn("CEF:0|Maltrail|server", record)
+        self.assertIn("login failure", record)
+        self.assertIn("duser=admin", record)
+        self.assertIn("src=127.0.0.1", record)
+
+    def test_a_successful_login_is_forwarded_and_distinguishable(self):
+        record = self._attempt("admin", True)
+        self.assertIn("login success", record)
+        self.assertNotIn("login failure", record)
+
+    def test_a_username_cannot_forge_a_log_line(self):
+        # An embedded newline would let an attacker append a convincing "Accepted password for
+        # root" to the audit trail meant to catch them.
+        record = self._attempt("evil%0AAccepted+password+for+root", False)
+        self.assertNotIn("\n", record.strip(), "the record must stay a single line")
+        self.assertIn("login failure", record)
+        self.assertNotIn("Accepted password", record.split("duser=")[0])
+
+
+class TestEventsAreCompressed(TestHttpd):
+    """A full day of events is the largest thing the dashboard ever fetches.
+
+    It is streamed straight to the socket so a 100MB day never has to fit in memory - which also
+    meant it skipped the gzip step every other response goes through, and went out uncompressed.
+    Event logs are extremely repetitive (a 24MB day is 6MB), and for any analyst who is not on
+    localhost that transfer IS the dashboard's load time.
+
+    The contract to protect: compress only when the client asked, and never change the bytes the
+    client ends up with.
+    """
+
+    def _events(self, cookie, gz):
+        headers = {"Accept-Encoding": "gzip"} if gz else None
+        return _http(self.port, "GET", "/events?date=%s" % self.date, cookie=cookie, headers=headers)
+
+    def test_a_client_that_asks_for_gzip_gets_it(self):
+        c = self._login()
+        st, head, payload = self._events(c, True)
+        self.assertEqual(st, 200)
+        self.assertIn("content-encoding: gzip", head.lower(),
+                      "a full-day /events response is no longer compressed; every remote analyst "
+                      "downloads the raw log again")
+        # it must really be gzip, not just a header
+        gzip.decompress(payload)
+
+    def test_the_bytes_the_client_ends_up_with_are_unchanged(self):
+        c = self._login()
+        _, headz, gzbody = self._events(c, True)
+        _, headp, plain = self._events(c, False)
+        self.assertIn("content-encoding: gzip", headz.lower())
+        self.assertNotIn("content-encoding", headp.lower(),
+                         "a client that did not advertise gzip must get exactly what it got before")
+        self.assertEqual(gzip.decompress(gzbody), plain,
+                         "compression changed the event stream's content")
+
+    def test_it_actually_makes_the_response_smaller(self):
+        c = self._login()
+        _, _, gzbody = self._events(c, True)
+        _, _, plain = self._events(c, False)
+        self.assertLess(len(gzbody), len(plain),
+                        "the compressed response is not smaller, so the CPU spent on it is wasted")
+
+    def test_a_restricted_session_is_still_filtered_when_compressed(self):
+        # The netfilter/mask path writes its lines through the same stream. If compression bypassed
+        # it, a restricted analyst would receive the whole unfiltered log - the exact failure the
+        # uncompressed branch carries a NOTE about.
+        c = self._login("analyst")
+        _, head, gzbody = self._events(c, True)
+        self.assertIn("content-encoding: gzip", head.lower())
+        body = gzip.decompress(gzbody).decode("utf8", "replace")
+        _, _, plain = self._events(c, False)
+        self.assertEqual(body, plain.decode("utf8", "replace"),
+                         "the compressed and uncompressed forms of a restricted session differ")
+        # the timestamp is quoted and contains a space, so the source address is field 3:
+        #   "2026-08-31 10:00:00.000000" sensor-a 10.0.0.5 4421 ...
+        for line in body.splitlines():
+            if line.strip():
+                self.assertTrue(line.split()[3].startswith("10."),
+                                "a netfiltered session received an event outside its allowed "
+                                "range: %s" % line[:90])
+
+class TestEventsConditionalRequests(TestHttpd):
+    """A past day's log can never change, but stepping to the previous day and back - or just
+    refreshing - re-downloaded the whole thing, which is the largest fetch the dashboard makes.
+
+    The risk this carries is not a slow response, it is a WRONG one: a validator issued for one
+    representation must never let a different one be served from cache. So a netfiltered or masked
+    session, which is served different bytes out of the same file, gets no tag at all, and today's
+    still-growing log must never be treated as fresh without asking.
+    """
+
+    def _get(self, cookie, path, inm=None):
+        headers = {"Accept-Encoding": "gzip"}
+        if inm:
+            headers["If-None-Match"] = inm
+        return _http(self.port, "GET", path, cookie=cookie, headers=headers)
+
+    def _etag(self, head):
+        for line in head.split("\r\n"):
+            if line.lower().startswith("etag:"):
+                return line.split(":", 1)[1].strip()
+        return None
+
+    def test_a_full_day_carries_a_validator(self):
+        c = self._login()
+        st, head, body = self._get(c, "/events?date=%s" % self.date)
+        self.assertEqual(st, 200)
+        self.assertIsNotNone(self._etag(head), "a full day of events carries no validator, so every "
+                                               "day switch and every refresh re-downloads it")
+        self.assertIn("no-cache", head.lower(),
+                      "without no-cache a heuristically-cached copy of TODAY's log - which is still "
+                      "being appended to - could be served as fresh")
+
+    def test_an_unchanged_day_answers_304(self):
+        c = self._login()
+        _, head, body = self._get(c, "/events?date=%s" % self.date)
+        tag = self._etag(head)
+        st2, head2, body2 = self._get(c, "/events?date=%s" % self.date, inm=tag)
+        self.assertEqual(st2, 304, "an unchanged day should revalidate, not re-send")
+        self.assertEqual(body2, b"", "a 304 must carry no body")
+
+    def test_a_mismatched_validator_resends(self):
+        c = self._login()
+        st, _, body = self._get(c, "/events?date=%s" % self.date, inm='"0-0"')
+        self.assertEqual(st, 200)
+        self.assertTrue(body, "a stale validator must get the content, not an empty 304")
+
+    def test_appending_to_the_day_changes_the_validator(self):
+        # This is what keeps a live day correct: the tag is derived from the file's size and mtime,
+        # so a log that grew cannot validate against the copy taken before it grew.
+        c = self._login()
+        _, head, _ = self._get(c, "/events?date=%s" % self.date)
+        tag = self._etag(head)
+        path = os.path.join(self.logdir, "%s.log" % self.date)
+        with open(path, "rb") as f:
+            original = f.read()
+        try:
+            with open(path, "ab") as f:
+                f.write(b'"%s 23:59:59.000000" s 10.0.0.9 1 9.9.9.9 53 UDP DNS grew.example "x (dummy)" (static)\n'
+                        % self.date.encode())
+            st, head2, body = self._get(c, "/events?date=%s" % self.date, inm=tag)
+            self.assertEqual(st, 200, "a day that grew must NOT be told its old copy is current")
+            self.assertNotEqual(self._etag(head2), tag, "the validator did not move when the log grew")
+        finally:
+            with open(path, "wb") as f:
+                f.write(original)
+
+    def test_a_restricted_session_gets_no_validator(self):
+        # analyst is netfiltered, so it is served a SUBSET of the same file. A tag here could let a
+        # restricted copy validate against the full one, or the reverse.
+        c = self._login("analyst")
+        st, head, _ = self._get(c, "/events?date=%s" % self.date)
+        self.assertEqual(st, 200)
+        self.assertIsNone(self._etag(head),
+                          "a netfiltered session was handed a validator; one representation's tag "
+                          "must never validate another's bytes")
+
+    def test_a_multi_day_range_gets_no_validator(self):
+        # the reader spans several files and one fd's stat does not describe the selection
+        c = self._login()
+        st, head, _ = self._get(c, "/events?date=%s_%s" % (self.date, self.date))
+        self.assertEqual(st, 200)
+        self.assertIsNone(self._etag(head), "a multi-day range must not carry a single file's tag")
+
+class TestScopeCallersFailClosed(unittest.TestCase):
+    """_build_netfilters returns None for netfilters that do not parse, and its docstring says
+    callers must fail closed on that. An empty scope is not "no results" - _filter_events with an
+    empty address set matches nothing and _hunt with one sweeps every log line, so the two ways of
+    getting this wrong point in opposite directions and only one of them is visible.
+
+    Unpacking the return value straight into three names skips the check. _hunt did exactly that
+    and crashed with a TypeError instead of refusing the request. Structural rather than
+    behavioural on purpose: it covers call sites that do not exist yet.
+    """
+
+    def test_no_caller_unpacks_the_return_value_without_checking_it(self):
+        import ast
+
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "core", "httpd.py")
+        with open(path, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+
+        def calls_it(node):
+            return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "_build_netfilters")
+
+        offenders, seen = [], 0
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign) or not calls_it(node.value):
+                continue
+            seen += 1
+            if any(isinstance(t, (ast.Tuple, ast.List)) for t in node.targets):
+                offenders.append(node.lineno)
+
+        self.assertTrue(seen, "no _build_netfilters call sites found - has it been renamed?")
+        self.assertEqual(offenders, [],
+                         "core/httpd.py:%s unpacks _build_netfilters() directly. It returns None "
+                         "for malformed netfilters; bind the result, check it for None, and fail "
+                         "closed before unpacking."
+                         % ", ".join(str(n) for n in offenders))
+
+
+if __name__ == "__main__":
+    unittest.main()
+

@@ -1,0 +1,50 @@
+﻿// The MIT License (MIT)
+// 
+// Copyright (c) 2015-2021 Rasmus Mikkelsen
+// Copyright (c) 2015-2021 eBay Software Foundation
+// https://github.com/eventflow/EventFlow
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a copy of
+// this software and associated documentation files (the "Software"), to deal in
+// the Software without restriction, including without limitation the rights to
+// use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+// the Software, and to permit persons to whom the Software is furnished to do so,
+// subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+// FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+// COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+// IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+// CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+using RCommon.Models.Commands;
+using RCommon.Models.ExecutionResults;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace RCommon.ApplicationServices.Commands
+{
+    /// <summary>
+    /// Defines the contract for a command bus that dispatches commands to their corresponding handlers.
+    /// </summary>
+    /// <remarks>
+    /// Commands represent intent to change state. The bus resolves the appropriate
+    /// <see cref="ICommandHandler{TResult, TCommand}"/> and returns an <see cref="IExecutionResult"/>.
+    /// </remarks>
+    public interface ICommandBus
+    {
+        /// <summary>
+        /// Dispatches a command to its registered handler and returns the execution result.
+        /// </summary>
+        /// <typeparam name="TResult">The type of execution result returned by the handler.</typeparam>
+        /// <param name="command">The command to dispatch.</param>
+        /// <param name="cancellationToken">Optional token to cancel the operation.</param>
+        /// <returns>The execution result produced by the command handler.</returns>
+        Task<TResult> DispatchCommandAsync<TResult>(ICommand<TResult> command, CancellationToken cancellationToken = default)
+            where TResult : IExecutionResult;
+    }
+}

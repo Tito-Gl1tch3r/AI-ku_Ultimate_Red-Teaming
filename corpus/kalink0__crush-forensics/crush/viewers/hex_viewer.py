@@ -1,0 +1,976 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 - now Marco Neumann (kalink0)
+"""Hex viewer — displays raw bytes as hex + ASCII, 16 bytes per row."""
+from __future__ import annotations
+
+from bisect import bisect_left
+
+from PySide6.QtCore import QPoint, QRegularExpression, Qt, Signal
+from PySide6.QtGui import (
+    QColor,
+    QContextMenuEvent,
+    QFont,
+    QPalette,
+    QRegularExpressionValidator,
+    QTextCharFormat,
+    QTextCursor,
+)
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPlainTextEdit,
+    QPushButton,
+    QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from crush.ui.busy_dialog import busy_call
+from crush.ui.wheel_scroll import install_horizontal_wheel_scroll
+from crush.ui.i18n import translate
+
+
+_BYTES_PER_ROW = 16
+_PAGE_BYTES = 1024 * 256  # 256 KB per page
+
+# Searching more data than this runs behind a wait dialog on a worker thread
+# so the window keeps repainting; a UX cut-off only, nothing is skipped.
+_BUSY_SCAN_BYTES = 8 * 1024 * 1024
+_SCAN_SLICE = 16 * 1024 * 1024
+
+# Search-mode combo: item text is display-only (translatable later); logic
+# always branches on this stable, never-translated data value instead.
+_SEARCH_MODE_ASCII = "ascii"
+_SEARCH_MODE_HEX = "hex"
+
+# Hex dump line layout (see _compute_layout / _load_page):
+# the offset field width is dynamic (8 hex digits, or enough decimal digits
+# to cover the file length) -- everything after it is anchored to that width:
+#   hex_start   = offset_width + 2   (two-space gutter)
+#   hex_end     = hex_start + 48     (hex_left<23> + "  " + hex_right<23>)
+#   ascii_start = hex_end + 2        (two-space gutter)
+_HEX_FIELD_LEN = 48
+_GUTTER_GAP = 2
+
+_COLOR_HIT = QColor(255, 230, 80)     # yellow — all matches
+_COLOR_CURRENT = QColor(255, 140, 0)  # orange — current match
+
+
+class _HexPlainTextEdit(QPlainTextEdit):
+    """QPlainTextEdit with a custom context menu for hex/ASCII copy actions."""
+
+    def __init__(self, viewer: "HexViewer") -> None:
+        super().__init__()
+        self._viewer = viewer
+
+    def contextMenuEvent(self, event: QContextMenuEvent) -> None:
+        menu = self.createStandardContextMenu()
+        cursor = self.textCursor()
+        if cursor.hasSelection():
+            menu.addSeparator()
+            menu.addAction(translate("_HexPlainTextEdit", "Copy Selected Hex")).triggered.connect(
+                self._viewer._copy_selected_hex
+            )
+            menu.addAction(translate("_HexPlainTextEdit", "Copy Selected ASCII")).triggered.connect(
+                self._viewer._copy_selected_ascii
+            )
+            menu.addSeparator()
+            menu.addAction(
+                translate("_HexPlainTextEdit", "Search Selected as ASCII")
+            ).triggered.connect(self._viewer._search_selected_as_ascii)
+            menu.addAction(
+                translate("_HexPlainTextEdit", "Search Selected as Hex")
+            ).triggered.connect(self._viewer._search_selected_as_hex)
+        menu.addSeparator()
+        menu.addAction(translate("_HexPlainTextEdit", "Copy All")).triggered.connect(
+            self._viewer._copy_all
+        )
+        menu.exec(event.globalPos())
+
+
+class HexViewer(QWidget):
+    """Simple hex + ASCII dump viewer with search, highlights, and result panel."""
+
+    byteOffsetFocused = Signal(int)
+
+    def __init__(self, data: bytes, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._data = data
+        self._page = 0
+        self._search_hits: list[int] = []   # byte offsets of all matches
+        self._current_hit: int = -1          # index into _search_hits
+        self._match_len: int = 0
+        self._focus_range: tuple[int, int] | None = None
+        self._focus_ranges: list[tuple[int, int]] = []
+        # Color index of each entry in _focus_ranges: the ranges of one
+        # group (e.g. every piece of a value spread over several pages)
+        # share one color.
+        self._focus_color_idx: list[int] = []
+        self._suppress_focus_signal = False
+        self._offset_mode = "hex"  # "hex" or "dec"
+        self._compute_layout()
+        self._build_ui()
+        self._load_page()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # Two rows instead of one -- crammed into a single QHBoxLayout, this
+        # toolbar's ~15 widgets forced a combined minimum width of ~1177px
+        # (the sum of every button's own minimum), which a QTabWidget then
+        # propagates as ITS minimum width even for tabs that never show this
+        # HexViewer at all (Qt sizes a tab widget from the largest page, not
+        # just the current one) -- most visible in the Realm viewer, which
+        # embeds a HexViewer in both its "Hex Preview" and "Freed Data" tabs
+        # alongside much narrower ones. Splitting into two rows roughly
+        # halves that floor.
+        toolbar = QVBoxLayout()
+        toolbar.setContentsMargins(6, 6, 6, 0)
+        toolbar.setSpacing(4)
+
+        search_row = QHBoxLayout()
+        search_row.setSpacing(8)
+
+        search_row.addWidget(QLabel(translate("HexViewer", "Search as:")))
+        self._search_mode = QComboBox()
+        self._search_mode.addItem(translate("HexViewer", "ASCII"), _SEARCH_MODE_ASCII)
+        self._search_mode.addItem(translate("HexViewer", "Hex"), _SEARCH_MODE_HEX)
+        self._search_mode.currentIndexChanged.connect(self._on_search_mode_changed)
+        search_row.addWidget(self._search_mode)
+
+        self._hex_validator = QRegularExpressionValidator(
+            QRegularExpression(r"[0-9a-fA-F\s:]*")
+        )
+        self._search_input = QLineEdit()
+        self._search_input.setPlaceholderText(translate("HexViewer", "Search text…"))
+        self._search_input.returnPressed.connect(self._do_search)
+        search_row.addWidget(self._search_input, stretch=1)
+
+        self._find_btn = QPushButton(translate("HexViewer", "Find"))
+        self._find_btn.clicked.connect(self._do_search)
+        search_row.addWidget(self._find_btn)
+
+        self._search_prev_btn = QToolButton()
+        self._search_prev_btn.setText("↑")
+        self._search_prev_btn.setToolTip(translate("HexViewer", "Previous match"))
+        self._search_prev_btn.clicked.connect(self._find_prev)
+        search_row.addWidget(self._search_prev_btn)
+
+        self._search_next_btn = QToolButton()
+        self._search_next_btn.setText("↓")
+        self._search_next_btn.setToolTip(translate("HexViewer", "Next match"))
+        self._search_next_btn.clicked.connect(self._find_next)
+        search_row.addWidget(self._search_next_btn)
+
+        self._count_label = QLabel("")
+        self._count_label.setMinimumWidth(90)
+        search_row.addWidget(self._count_label)
+
+        self._show_all_btn = QToolButton()
+        self._show_all_btn.setText(translate("HexViewer", "Show all"))
+        self._show_all_btn.setCheckable(True)
+        self._show_all_btn.toggled.connect(self._toggle_result_panel)
+        search_row.addWidget(self._show_all_btn)
+
+        self._status = QLabel("")
+        search_row.addWidget(self._status)
+        search_row.addStretch(1)
+        toolbar.addLayout(search_row)
+
+        nav_row = QHBoxLayout()
+        nav_row.setSpacing(8)
+
+        self._prev_btn = QPushButton(translate("HexViewer", "◀ Prev"))
+        self._prev_btn.clicked.connect(self._prev_page)
+        nav_row.addWidget(self._prev_btn)
+
+        self._page_label = QLabel("")
+        nav_row.addWidget(self._page_label)
+
+        self._next_btn = QPushButton(translate("HexViewer", "Next ▶"))
+        self._next_btn.clicked.connect(self._next_page)
+        nav_row.addWidget(self._next_btn)
+
+        nav_row.addSpacing(8)
+
+        self._copy_hex_btn = QPushButton(translate("HexViewer", "Copy Hex"))
+        self._copy_hex_btn.clicked.connect(self._copy_hex)
+        nav_row.addWidget(self._copy_hex_btn)
+
+        self._copy_ascii_btn = QPushButton(translate("HexViewer", "Copy ASCII"))
+        self._copy_ascii_btn.clicked.connect(self._copy_ascii)
+        nav_row.addWidget(self._copy_ascii_btn)
+
+        self._copy_all_btn = QPushButton(translate("HexViewer", "Copy All"))
+        self._copy_all_btn.clicked.connect(self._copy_all)
+        nav_row.addWidget(self._copy_all_btn)
+        nav_row.addStretch(1)
+        toolbar.addLayout(nav_row)
+
+        goto_row = QHBoxLayout()
+        goto_row.setSpacing(8)
+
+        self._offset_mode_btn = QToolButton()
+        self._offset_mode_btn.setText(translate("HexViewer", "Offset: Hex"))
+        self._offset_mode_btn.setToolTip(
+            translate("HexViewer", "Switch the offset gutter between hex and decimal")
+        )
+        self._offset_mode_btn.clicked.connect(self._toggle_offset_mode)
+        goto_row.addWidget(self._offset_mode_btn)
+
+        goto_row.addSpacing(8)
+        goto_row.addWidget(QLabel(translate("HexViewer", "Go to offset:")))
+        self._goto_offset_input = QLineEdit()
+        self._goto_offset_input.setPlaceholderText(translate("HexViewer", "offset (hex)"))
+        self._goto_offset_input.setMaximumWidth(120)
+        self._goto_offset_input.returnPressed.connect(self._do_goto)
+        goto_row.addWidget(self._goto_offset_input)
+
+        goto_row.addWidget(QLabel(translate("HexViewer", "Length:")))
+        self._goto_length_input = QLineEdit()
+        self._goto_length_input.setPlaceholderText(translate("HexViewer", "optional"))
+        self._goto_length_input.setMaximumWidth(80)
+        self._goto_length_input.returnPressed.connect(self._do_goto)
+        goto_row.addWidget(self._goto_length_input)
+
+        self._goto_btn = QPushButton(translate("HexViewer", "Go"))
+        self._goto_btn.clicked.connect(self._do_goto)
+        goto_row.addWidget(self._goto_btn)
+
+        self._goto_status = QLabel("")
+        goto_row.addWidget(self._goto_status)
+        goto_row.addStretch(1)
+        toolbar.addLayout(goto_row)
+
+        layout.addLayout(toolbar)
+
+        self._splitter = QSplitter(Qt.Orientation.Vertical)
+
+        self._text = _HexPlainTextEdit(self)
+        self._text.setReadOnly(True)
+        # setReadOnly() only grants mouse-based selection in Qt6 — keyboard
+        # cursor movement and Shift-selection need TextSelectableByKeyboard too.
+        self._text.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        self._text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        install_horizontal_wheel_scroll(self._text, smooth_item_scroll=False)
+
+        font = QFont("Courier New", 10)
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        self._text.setFont(font)
+        self._text.cursorPositionChanged.connect(self._emit_cursor_offset_changed)
+
+        self._splitter.addWidget(self._text)
+
+        # Result panel — hidden until user clicks "Show all"
+        self._result_panel = QWidget()
+        rp_layout = QVBoxLayout(self._result_panel)
+        rp_layout.setContentsMargins(0, 0, 0, 0)
+        rp_layout.setSpacing(0)
+        self._result_table = QTableWidget(0, 3)
+        self._result_table.setHorizontalHeaderLabels(
+            [
+                translate("HexViewer", "Offset"),
+                translate("HexViewer", "Hex"),
+                translate("HexViewer", "ASCII"),
+            ]
+        )
+        self._result_table.horizontalHeader().setStretchLastSection(True)
+        self._result_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self._result_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self._result_table.cellActivated.connect(self._jump_to_result_row)
+        self._result_table.cellDoubleClicked.connect(self._jump_to_result_row)
+        rp_layout.addWidget(self._result_table)
+        self._result_panel.setVisible(False)
+        self._splitter.addWidget(self._result_panel)
+
+        layout.addWidget(self._splitter)
+
+    # ------------------------------------------------------------------
+    # Page navigation
+    # ------------------------------------------------------------------
+
+    def _page_count(self) -> int:
+        return max(1, (len(self._data) + _PAGE_BYTES - 1) // _PAGE_BYTES)
+
+    def _page_data(self) -> bytes:
+        start = self._page * _PAGE_BYTES
+        return self._data[start : start + _PAGE_BYTES]
+
+    def _load_page(self) -> None:
+        page_data = self._page_data()
+        base_offset = self._page * _PAGE_BYTES
+        lines: list[str] = []
+
+        for i in range(0, len(page_data), _BYTES_PER_ROW):
+            chunk = page_data[i : i + _BYTES_PER_ROW]
+            off_str = self._format_offset(base_offset + i, prefixed=False)
+            hex_parts = [f"{b:02X}" for b in chunk]
+            hex_left  = " ".join(hex_parts[:8])
+            hex_right = " ".join(hex_parts[8:])
+            hex_str   = f"{hex_left:<23}  {hex_right:<23}"
+            ascii_str = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in chunk)
+            lines.append(f"{off_str}  {hex_str}  {ascii_str}")
+
+        self._text.setPlainText("\n".join(lines))
+        self._update_highlights()
+
+        pages = self._page_count()
+        self._page_label.setText(
+            translate("HexViewer", "Page {page} / {pages}").format(page=self._page + 1, pages=pages)
+        )
+        self._prev_btn.setEnabled(self._page > 0)
+        self._next_btn.setEnabled(self._page < pages - 1)
+        start = base_offset
+        end = base_offset + len(page_data)
+        self._status.setText(
+            translate("HexViewer", "{start}–{end}  ({total:,} B total)").format(
+                start=self._format_offset(start),
+                end=self._format_offset(end),
+                total=len(self._data),
+            )
+        )
+
+    def set_data(self, data: bytes) -> None:
+        """Replace the displayed bytes and reset to page 0."""
+        self._data = data
+        self._page = 0
+        self._search_hits = []
+        self._current_hit = -1
+        self._match_len = 0
+        self._focus_range = None
+        self._focus_ranges = []
+        self._focus_color_idx = []
+        self._count_label.setText("")
+        self._compute_layout()
+        self._load_page()
+
+    def highlight_byte_range(self, start: int, end: int, *, scroll: bool = True) -> None:
+        """Highlight a half-open byte range and optionally scroll it into view."""
+        self.highlight_byte_ranges([(start, end)], scroll=scroll)
+
+    def highlight_byte_ranges(
+        self,
+        ranges: list[tuple[int, int]],
+        *,
+        scroll: bool = True,
+    ) -> None:
+        """Highlight every half-open byte range in *ranges*, each in its own color."""
+        self.highlight_byte_range_groups([[rng] for rng in ranges], scroll=scroll)
+
+    def highlight_byte_range_groups(
+        self,
+        groups: list[list[tuple[int, int]]],
+        *,
+        scroll: bool = True,
+    ) -> None:
+        """Highlight every half-open byte range in *groups*, one color per
+        group: the pieces of one value share its color. Colors repeat
+        after the palette's last one; later groups paint over earlier ones."""
+        normalized: list[tuple[int, int]] = []
+        color_idx: list[int] = []
+        color = 0
+        for group in groups:
+            used = False
+            for start, end in group:
+                start = max(0, min(start, len(self._data)))
+                end = max(start, min(end, len(self._data)))
+                if end > start:
+                    normalized.append((start, end))
+                    color_idx.append(color)
+                    used = True
+            if used:
+                color += 1
+        self._focus_ranges = normalized
+        self._focus_color_idx = color_idx
+        self._focus_range = normalized[0] if normalized else None
+        if scroll and self._focus_range is not None and not self._focus_target_visible():
+            target_page = self._focus_range[0] // _PAGE_BYTES
+            if target_page != self._page:
+                self._page = target_page
+                self._load_page()
+            self._scroll_to_offset(self._focus_range[0] - self._page * _PAGE_BYTES)
+        self._update_highlights()
+
+    def clear_byte_range_highlight(self) -> None:
+        """Clear an externally selected byte-range highlight."""
+        self._focus_range = None
+        self._focus_ranges = []
+        self._focus_color_idx = []
+        self._update_highlights()
+
+    def _prev_page(self) -> None:
+        if self._page > 0:
+            self._page -= 1
+            self._load_page()
+
+    def _next_page(self) -> None:
+        if self._page < self._page_count() - 1:
+            self._page += 1
+            self._load_page()
+
+    def _scroll_to_offset(self, page_offset: int) -> None:
+        line = page_offset // _BYTES_PER_ROW
+        block = self._text.document().findBlockByNumber(line)
+        if not block.isValid():
+            return
+        cursor = self._text.textCursor()
+        self._suppress_focus_signal = True
+        cursor.setPosition(block.position())
+        self._text.setTextCursor(cursor)
+        self._suppress_focus_signal = False
+        self._text.centerCursor()
+
+    def _focus_target_visible(self) -> bool:
+        """Whether the scroll target (the first focus range's start byte) is
+        already in view -- not just any single byte of any focus range, which
+        would count a range as "visible" even when only one edge byte is
+        barely on-screen and the rest is scrolled out of view."""
+        if self._focus_range is None:
+            return False
+        first_cursor = self._text.cursorForPosition(QPoint(0, 0))
+        last_cursor = self._text.cursorForPosition(
+            QPoint(0, max(0, self._text.viewport().height() - 1))
+        )
+        first_line = first_cursor.blockNumber()
+        last_line = last_cursor.blockNumber()
+        if first_line < 0 or last_line < 0:
+            return False
+        page_start = self._page * _PAGE_BYTES
+        visible_start = page_start + first_line * _BYTES_PER_ROW
+        visible_end = page_start + (last_line + 1) * _BYTES_PER_ROW
+        target = self._focus_range[0]
+        return visible_start <= target < visible_end
+
+    # ------------------------------------------------------------------
+    # Offset mode (hex/decimal) & go to offset
+    # ------------------------------------------------------------------
+
+    def _compute_layout(self) -> None:
+        """(Re)derive the offset field width and the column positions that
+        depend on it, from the current offset mode and data length."""
+        if self._offset_mode == "hex":
+            self._offset_width = 8
+        else:
+            self._offset_width = max(1, len(str(len(self._data))))
+        self._hex_start = self._offset_width + _GUTTER_GAP
+        self._hex_end = self._hex_start + _HEX_FIELD_LEN
+        self._ascii_start = self._hex_end + _GUTTER_GAP
+
+    def _format_offset(self, value: int, *, prefixed: bool = True) -> str:
+        if self._offset_mode == "hex":
+            text = f"{value:0{self._offset_width}X}"
+            return f"0x{text}" if prefixed else text
+        return f"{value:0{self._offset_width}d}"
+
+    def _toggle_offset_mode(self) -> None:
+        self._set_offset_mode("dec" if self._offset_mode == "hex" else "hex")
+
+    def _set_offset_mode(self, mode: str) -> None:
+        if mode == self._offset_mode:
+            return
+        self._offset_mode = mode
+        self._offset_mode_btn.setText(
+            translate("HexViewer", "Offset: Hex")
+            if mode == "hex"
+            else translate("HexViewer", "Offset: Dec")
+        )
+        self._goto_offset_input.setPlaceholderText(
+            translate("HexViewer", "offset (hex)")
+            if mode == "hex"
+            else translate("HexViewer", "offset (dec)")
+        )
+        self._compute_layout()
+        self._load_page()
+
+    def _parse_offset_value(self, text: str) -> int | None:
+        text = text.strip()
+        if not text:
+            return None
+        try:
+            return int(text, 16 if self._offset_mode == "hex" else 10)
+        except ValueError:
+            return None
+
+    def _do_goto(self) -> None:
+        offset = self._parse_offset_value(self._goto_offset_input.text())
+        if offset is None or not (0 <= offset < max(1, len(self._data))):
+            self._goto_status.setText(translate("HexViewer", "Invalid offset"))
+            return
+        length_text = self._goto_length_input.text().strip()
+        length = self._parse_offset_value(length_text) if length_text else None
+        if length_text and (length is None or length <= 0):
+            self._goto_status.setText(translate("HexViewer", "Invalid length"))
+            return
+        self._goto_status.setText("")
+        if length:
+            self.highlight_byte_range(offset, offset + length)
+        else:
+            self.clear_byte_range_highlight()
+            target_page = offset // _PAGE_BYTES
+            if target_page != self._page:
+                self._page = target_page
+                self._load_page()
+            self._scroll_to_offset(offset - self._page * _PAGE_BYTES)
+
+    # ------------------------------------------------------------------
+    # Search — collect / navigate
+    # ------------------------------------------------------------------
+
+    def _set_search_mode(self, mode: str) -> None:
+        """Select a search mode by its stable data value (see _SEARCH_MODE_*),
+        never by the combo's displayed (and later translated) text."""
+        index = self._search_mode.findData(mode)
+        if index >= 0:
+            self._search_mode.setCurrentIndex(index)
+
+    def _on_search_mode_changed(self) -> None:
+        self._search_input.clear()
+        self._search_hits = []
+        self._current_hit = -1
+        self._count_label.setText("")
+        self._update_highlights()
+        if self._search_mode.currentData() == _SEARCH_MODE_HEX:
+            self._search_input.setPlaceholderText(
+                translate("HexViewer", "Hex pattern… (e.g. de ad be ef)")
+            )
+            self._search_input.setValidator(self._hex_validator)
+        else:
+            self._search_input.setPlaceholderText(translate("HexViewer", "Search text…"))
+            self._search_input.setValidator(None)
+
+    @staticmethod
+    def _scan_hits(data: bytes, pattern: bytes) -> list[int]:
+        # Scanned in slices so the interpreter can hand the GIL back to the UI
+        # thread between them (one find() over gigabytes would hold it for
+        # the whole scan). Each window reaches len(pattern)-1 bytes into the
+        # next slice, so matches straddling a boundary are found exactly once.
+        hits: list[int] = []
+        n, plen = len(data), len(pattern)
+        pos = 0
+        while pos <= n - plen:
+            end = min(n, pos + _SCAN_SLICE + plen - 1)
+            offset = pos
+            while (idx := data.find(pattern, offset, end)) >= 0:
+                hits.append(idx)
+                offset = idx + 1
+            pos += _SCAN_SLICE
+        return hits
+
+    def _collect_hits(self) -> bool:
+        """Find all matches for the current query. Returns True if any found."""
+        self._search_hits = []
+        self._match_len = 0
+        query = self._search_input.text().strip()
+        if not query:
+            self._count_label.setText("")
+            return False
+
+        if self._search_mode.currentData() == _SEARCH_MODE_HEX:
+            pattern = _parse_hex_query(query)
+            if pattern is None:
+                self._count_label.setText(translate("HexViewer", "Invalid hex"))
+                return False
+        else:
+            # Text search is byte-for-byte latin-1: a character above U+00FF
+            # cannot occur in the data, so such a query has no matches.
+            try:
+                pattern = query.encode("latin-1")
+            except UnicodeEncodeError:
+                return False
+        self._match_len = len(pattern)
+
+        data = self._data
+        if len(data) > _BUSY_SCAN_BYTES:
+            self._search_hits = busy_call(
+                self, translate("HexViewer", "Searching…"), lambda: self._scan_hits(data, pattern)
+            )
+        else:
+            self._search_hits = self._scan_hits(data, pattern)
+
+        return len(self._search_hits) > 0
+
+    def _do_search(self) -> None:
+        """Re-collect all hits for the current query and jump to the first."""
+        if not self._collect_hits():
+            self._count_label.setText(translate("HexViewer", "Not found"))
+            self._update_highlights()
+            self._update_result_panel()
+            return
+        self._current_hit = 0
+        self._jump_to_hit(0)
+        self._update_count_label()
+        self._update_highlights()
+        self._update_result_panel()
+        self._sync_result_selection()
+
+    def _find_next(self) -> None:
+        if not self._search_hits:
+            return
+        self._current_hit = (self._current_hit + 1) % len(self._search_hits)
+        self._jump_to_hit(self._current_hit)
+        self._update_count_label()
+        self._update_highlights()
+        self._sync_result_selection()
+
+    def _find_prev(self) -> None:
+        if not self._search_hits:
+            return
+        self._current_hit = (self._current_hit - 1) % len(self._search_hits)
+        self._jump_to_hit(self._current_hit)
+        self._update_count_label()
+        self._update_highlights()
+        self._sync_result_selection()
+
+    def _jump_to_hit(self, hit_idx: int) -> None:
+        byte_idx = self._search_hits[hit_idx]
+        target_page = byte_idx // _PAGE_BYTES
+        if target_page != self._page:
+            self._page = target_page
+            self._load_page()
+        page_offset = byte_idx - self._page * _PAGE_BYTES
+        self._scroll_to_offset(page_offset)
+        # _scroll_to_offset() suppresses byteOffsetFocused to avoid a loop
+        # when *it's* called from highlight_byte_ranges() re-centering on an
+        # externally driven selection -- but a search jump is never driven
+        # by such a selection, so there's no loop risk here, and consumers
+        # (e.g. the SQLite File Structure tree, or ByteMappedTreeHex for
+        # Realm/protobuf/ABX) should sync to a search hit like any other
+        # click.
+        self.byteOffsetFocused.emit(byte_idx)
+
+    def _update_count_label(self) -> None:
+        n = len(self._search_hits)
+        if n == 0:
+            self._count_label.setText(translate("HexViewer", "Not found"))
+        elif self._current_hit >= 0:
+            self._count_label.setText(f"{self._current_hit + 1} / {n}")  # i18n: keep -- numbers
+        else:
+            self._count_label.setText(translate("HexViewer", "{n} found").format(n=n))
+
+    # ------------------------------------------------------------------
+    # Highlights
+    # ------------------------------------------------------------------
+
+    def _update_highlights(self) -> None:
+        fmt_hit = QTextCharFormat()
+        fmt_hit.setBackground(_COLOR_HIT)
+        fmt_current = QTextCharFormat()
+        fmt_current.setBackground(_COLOR_CURRENT)
+
+        page_start = self._page * _PAGE_BYTES
+        page_end = page_start + len(self._page_data())
+
+        selections: list[QTextEdit.ExtraSelection] = []
+        focus_colors = _focus_range_colors(self.palette())
+        for (focus_start, focus_end), color in zip(self._focus_ranges, self._focus_color_idx):
+            if focus_end > page_start and focus_start < page_end:
+                fmt_range = QTextCharFormat()
+                fmt_range.setBackground(focus_colors[color % len(focus_colors)])
+                clip_start = max(focus_start, page_start) - page_start
+                clip_end = min(focus_end, page_end) - page_start
+                self._append_match_selections(selections, fmt_range, clip_start, clip_end)
+
+        # _search_hits is ascending, so only the hits overlapping this page
+        # are visited -- not all of them, which is millions for a common pattern.
+        first = bisect_left(self._search_hits, page_start - self._match_len + 1)
+        last = bisect_left(self._search_hits, page_end)
+        for i in range(first, last):
+            hit_offset = self._search_hits[i]
+            hit_end = hit_offset + self._match_len
+            fmt = fmt_current if i == self._current_hit else fmt_hit
+            clip_start = max(hit_offset, page_start) - page_start
+            clip_end = min(hit_end, page_end) - page_start
+            self._append_match_selections(selections, fmt, clip_start, clip_end)
+
+        self._text.setExtraSelections(selections)
+
+    def _append_match_selections(
+        self,
+        selections: list[QTextEdit.ExtraSelection],
+        fmt: QTextCharFormat,
+        byte_start: int,
+        byte_end: int,
+    ) -> None:
+        doc = self._text.document()
+        start_line = byte_start // _BYTES_PER_ROW
+        end_line = (byte_end - 1) // _BYTES_PER_ROW
+        for line_num in range(start_line, end_line + 1):
+            line_start_byte = line_num * _BYTES_PER_ROW
+            seg_start = max(byte_start, line_start_byte) - line_start_byte
+            seg_end = min(byte_end, line_start_byte + _BYTES_PER_ROW) - line_start_byte
+            block = doc.findBlockByNumber(line_num)
+            if not block.isValid():
+                continue
+            line_pos = block.position()
+            # ASCII column
+            sel = QTextEdit.ExtraSelection()
+            sel.format = fmt
+            c = QTextCursor(doc)
+            c.setPosition(line_pos + self._ascii_start + seg_start)
+            c.setPosition(line_pos + self._ascii_start + seg_end, QTextCursor.MoveMode.KeepAnchor)
+            sel.cursor = c
+            selections.append(sel)
+            # Hex column — each byte individually (gap between groups at cols 33–34)
+            for b in range(seg_start, seg_end):
+                hpos = (
+                    line_pos + self._hex_start + b * 3
+                    if b < 8
+                    else line_pos + self._hex_start + 25 + (b - 8) * 3
+                )
+                sel_h = QTextEdit.ExtraSelection()
+                sel_h.format = fmt
+                ch = QTextCursor(doc)
+                ch.setPosition(hpos)
+                ch.setPosition(hpos + 2, QTextCursor.MoveMode.KeepAnchor)
+                sel_h.cursor = ch
+                selections.append(sel_h)
+
+    def _emit_cursor_offset_changed(self) -> None:
+        if self._suppress_focus_signal:
+            return
+        offset = self._byte_offset_at_cursor()
+        if offset is not None:
+            self.byteOffsetFocused.emit(offset)
+
+    def _column_to_byte(self, col: int) -> int | None:
+        if col < self._hex_start:
+            return None
+        if col <= self._hex_start + 22:
+            return min((col - self._hex_start) // 3, 7)
+        if col <= self._hex_start + 24:
+            return 7
+        if col < self._hex_end:
+            return min(8 + (col - (self._hex_start + 25)) // 3, 15)
+        if col < self._ascii_start:
+            return 15
+        return min(col - self._ascii_start, 15)
+
+    def _byte_offset_at_cursor(self) -> int | None:
+        cursor = self._text.textCursor()
+        block = self._text.document().findBlock(cursor.position())
+        if not block.isValid():
+            return None
+        byte_in_line = self._column_to_byte(cursor.position() - block.position())
+        if byte_in_line is None:
+            return None
+        offset = self._page * _PAGE_BYTES + block.blockNumber() * _BYTES_PER_ROW + byte_in_line
+        if 0 <= offset < len(self._data):
+            return offset
+        return None
+
+    # ------------------------------------------------------------------
+    # Result panel
+    # ------------------------------------------------------------------
+
+    def _toggle_result_panel(self, checked: bool) -> None:
+        self._result_panel.setVisible(checked)
+        if checked:
+            self._update_result_panel()
+
+    def _update_result_panel(self) -> None:
+        if not self._result_panel.isVisible():
+            return
+        self._result_table.setRowCount(0)
+        for i, offset in enumerate(self._search_hits):
+            row = self._result_table.rowCount()
+            self._result_table.insertRow(row)
+            off_item = QTableWidgetItem(self._format_offset(offset))
+            off_item.setData(Qt.ItemDataRole.UserRole, i)
+            self._result_table.setItem(row, 0, off_item)
+            chunk = self._data[offset : offset + self._match_len]
+            self._result_table.setItem(
+                row, 1, QTableWidgetItem(" ".join(f"{b:02X}" for b in chunk))
+            )
+            self._result_table.setItem(
+                row, 2,
+                QTableWidgetItem(
+                    "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in chunk)
+                ),
+            )
+        self._sync_result_selection()
+
+    def _sync_result_selection(self) -> None:
+        if not self._result_panel.isVisible():
+            return
+        if 0 <= self._current_hit < self._result_table.rowCount():
+            self._result_table.selectRow(self._current_hit)
+            item = self._result_table.item(self._current_hit, 0)
+            if item is not None:
+                self._result_table.scrollToItem(item)
+
+    def _jump_to_result_row(self, row: int, _col: int = 0) -> None:
+        off_item = self._result_table.item(row, 0)
+        if off_item is None:
+            return
+        hit_idx = off_item.data(Qt.ItemDataRole.UserRole)
+        self._current_hit = hit_idx
+        self._jump_to_hit(hit_idx)
+        self._update_count_label()
+        self._update_highlights()
+
+    # ------------------------------------------------------------------
+    # Copy helpers
+    # ------------------------------------------------------------------
+
+    def _copy_hex(self) -> None:
+        QApplication.clipboard().setText(
+            " ".join(f"{b:02X}" for b in self._page_data())
+        )
+
+    def _copy_ascii(self) -> None:
+        QApplication.clipboard().setText(
+            "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in self._page_data())
+        )
+
+    def _copy_all(self) -> None:
+        QApplication.clipboard().setText(self._text.toPlainText())
+
+    def _selection_byte_range(self) -> tuple[int, int] | None:
+        cursor = self._text.textCursor()
+        if not cursor.hasSelection():
+            return None
+        doc = self._text.document()
+
+        def col_to_byte(col: int) -> int:
+            if col <= self._hex_start:
+                return 0
+            if col <= self._hex_start + 22:                 # hex left (bytes 0–7)
+                return min((col - self._hex_start) // 3, 7)
+            if col <= self._hex_start + 24:                 # gap between hex groups
+                return 7
+            if col < self._hex_end:                         # hex right (bytes 8–15)
+                return min(8 + (col - (self._hex_start + 25)) // 3, 15)
+            if col < self._ascii_start:                     # gap before ASCII
+                return 15
+            return min(col - self._ascii_start, 15)         # ASCII column
+
+        page_start = self._page * _PAGE_BYTES
+        s_block = doc.findBlock(cursor.selectionStart())
+        s_byte = s_block.blockNumber() * _BYTES_PER_ROW + col_to_byte(
+            cursor.selectionStart() - s_block.position()
+        )
+        e_block = doc.findBlock(cursor.selectionEnd())
+        e_byte = e_block.blockNumber() * _BYTES_PER_ROW + col_to_byte(
+            cursor.selectionEnd() - e_block.position()
+        )
+        return page_start + s_byte, page_start + e_byte
+
+    def _search_selected_as_ascii(self) -> None:
+        rng = self._selection_byte_range()
+        if rng is None:
+            return
+        chunk = self._data[rng[0] : rng[1] + 1]
+        query = chunk.decode("latin-1")
+        if query:
+            self._set_search_mode(_SEARCH_MODE_ASCII)
+            self._search_input.setText(query)
+            self._do_search()
+
+    def _search_selected_as_hex(self) -> None:
+        rng = self._selection_byte_range()
+        if rng is None:
+            return
+        chunk = self._data[rng[0] : rng[1] + 1]
+        if chunk:
+            self._set_search_mode(_SEARCH_MODE_HEX)
+            self._search_input.setText(" ".join(f"{b:02X}" for b in chunk))
+            self._do_search()
+
+    def _selection_start_column(self) -> int:
+        """Column (0-based) within its row that the selection's first
+        character sits at.
+
+        A multi-row selection's first row is a *partial* row whenever the
+        drag didn't start at column 0 (the normal case -- nobody drags from
+        exactly the left edge) -- Qt's selectedText() still hands back that
+        row's text starting from wherever the selection actually begins, not
+        from column 0. Slicing that fragment at the usual fixed column
+        offsets (self._hex_start, self._ascii_start, ...) would then cut from the
+        wrong place, or make it look like there was nothing to take from
+        that row at all. Every row after the first is unaffected (a
+        multi-row selection always starts each subsequent row at its true
+        column 0), and the last row is only ever truncated on the right,
+        which fixed-offset slicing already handles correctly on its own.
+        """
+        cursor = self._text.textCursor()
+        doc = self._text.document()
+        start_block = doc.findBlock(cursor.selectionStart())
+        return cursor.selectionStart() - start_block.position()
+
+    def _copy_selected_hex(self) -> None:
+        text = _selected_text(self._text)
+        if not text:
+            return
+        first_col = self._selection_start_column()
+        tokens: list[str] = []
+        for i, line in enumerate(text.split("\u2029")):
+            col_offset = first_col if i == 0 else 0
+            hex_section = line[max(self._hex_start - col_offset, 0):max(self._hex_end - col_offset, 0)]
+            for part in hex_section.split():
+                if len(part) == 2 and all(c in "0123456789ABCDEFabcdef" for c in part):
+                    tokens.append(part.upper())
+        QApplication.clipboard().setText(" ".join(tokens))
+
+    def _copy_selected_ascii(self) -> None:
+        text = _selected_text(self._text)
+        if not text:
+            return
+        first_col = self._selection_start_column()
+        parts: list[str] = []
+        for i, line in enumerate(text.split("\u2029")):
+            col_offset = first_col if i == 0 else 0
+            parts.append(line[max(self._ascii_start - col_offset, 0):])
+        QApplication.clipboard().setText("".join(parts))
+
+
+def _selected_text(widget: QPlainTextEdit) -> str:
+    """Return the selected text, using Qt's paragraph separator \\u2029."""
+    cursor = widget.textCursor()
+    return cursor.selectedText() if cursor.hasSelection() else ""
+
+
+def _focus_range_colors(palette: QPalette) -> list[QColor]:
+    base = palette.color(QPalette.ColorRole.Base)
+    dark = base.lightness() < 128
+    alpha = 92 if dark else 72
+    if dark:
+        return [
+            QColor(91, 160, 255, alpha),
+            QColor(92, 214, 164, alpha),
+            QColor(255, 194, 102, alpha),
+            QColor(207, 153, 255, alpha),
+            QColor(255, 139, 148, alpha),
+        ]
+    return [
+        QColor(28, 120, 220, alpha),
+        QColor(24, 150, 96, alpha),
+        QColor(210, 130, 24, alpha),
+        QColor(145, 84, 210, alpha),
+        QColor(210, 80, 90, alpha),
+    ]
+
+
+def _parse_hex_query(query: str) -> bytes | None:
+    cleaned = "".join(ch for ch in query if ch not in {" ", "\t", "\n", ":"})
+    if len(cleaned) % 2 != 0:
+        return None
+    try:
+        return bytes.fromhex(cleaned)
+    except ValueError:
+        return None

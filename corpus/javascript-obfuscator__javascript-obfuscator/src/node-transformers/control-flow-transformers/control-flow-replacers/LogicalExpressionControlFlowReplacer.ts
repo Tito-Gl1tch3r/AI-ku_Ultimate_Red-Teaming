@@ -1,0 +1,159 @@
+import { inject, injectable, injectFromBase } from 'inversify';
+import { ServiceIdentifiers } from '../../../container/ServiceIdentifiers';
+
+import * as ESTree from 'estree';
+import * as estraverse from '@javascript-obfuscator/estraverse';
+
+import { TControlFlowCustomNodeFactory } from '../../../types/container/custom-nodes/TControlFlowCustomNodeFactory';
+import { TIdentifierNamesGeneratorFactory } from '../../../types/container/generators/TIdentifierNamesGeneratorFactory';
+import { TInitialData } from '../../../types/TInitialData';
+
+import { IControlFlowStorage } from '../../../interfaces/storages/control-flow-transformers/IControlFlowStorage';
+import { ICustomNode } from '../../../interfaces/custom-nodes/ICustomNode';
+import { IOptions } from '../../../interfaces/options/IOptions';
+import { IRandomGenerator } from '../../../interfaces/utils/IRandomGenerator';
+
+import { ControlFlowCustomNode } from '../../../enums/custom-nodes/ControlFlowCustomNode';
+
+import { ExpressionWithOperatorControlFlowReplacer } from './ExpressionWithOperatorControlFlowReplacer';
+import { LogicalExpressionFunctionNode } from '../../../custom-nodes/control-flow-flattening-nodes/LogicalExpressionFunctionNode';
+import { NodeGuards } from '../../../node/NodeGuards';
+import { NodeUtils } from '../../../node/NodeUtils';
+
+@injectFromBase()
+@injectable()
+export class LogicalExpressionControlFlowReplacer extends ExpressionWithOperatorControlFlowReplacer {
+    /**
+     * @type {number}
+     */
+    private static readonly usingExistingIdentifierChance: number = 0.5;
+
+    /**
+     * @param {TControlFlowCustomNodeFactory} controlFlowCustomNodeFactory
+     * @param {TIdentifierNamesGeneratorFactory} identifierNamesGeneratorFactory
+     * @param {IRandomGenerator} randomGenerator
+     * @param {IOptions} options
+     */
+    public constructor(
+        @inject(ServiceIdentifiers.Factory__IControlFlowCustomNode)
+        controlFlowCustomNodeFactory: TControlFlowCustomNodeFactory,
+        @inject(ServiceIdentifiers.Factory__IIdentifierNamesGenerator)
+        identifierNamesGeneratorFactory: TIdentifierNamesGeneratorFactory,
+        @inject(ServiceIdentifiers.IRandomGenerator) randomGenerator: IRandomGenerator,
+        @inject(ServiceIdentifiers.IOptions) options: IOptions
+    ) {
+        super(controlFlowCustomNodeFactory, identifierNamesGeneratorFactory, randomGenerator, options);
+    }
+
+    /**
+     * @param {LogicalExpression} logicalExpressionNode
+     * @param {Node} parentNode
+     * @param {IControlFlowStorage} controlFlowStorage
+     * @returns {Node}
+     */
+    public replace(
+        logicalExpressionNode: ESTree.LogicalExpression,
+        parentNode: ESTree.Node,
+        controlFlowStorage: IControlFlowStorage
+    ): ESTree.Node {
+        if (this.checkForProhibitedExpressions(logicalExpressionNode.left, logicalExpressionNode.right)) {
+            return logicalExpressionNode;
+        }
+
+        const operator: ESTree.LogicalOperator = logicalExpressionNode.operator;
+        const logicalExpressionFunctionCustomNode: ICustomNode<TInitialData<LogicalExpressionFunctionNode>> =
+            this.controlFlowCustomNodeFactory(ControlFlowCustomNode.LogicalExpressionFunctionNode);
+
+        logicalExpressionFunctionCustomNode.initialize(operator);
+
+        const storageKey: string = this.insertCustomNodeToControlFlowStorage(
+            logicalExpressionFunctionCustomNode,
+            controlFlowStorage,
+            operator,
+            LogicalExpressionControlFlowReplacer.usingExistingIdentifierChance
+        );
+
+        return this.getControlFlowStorageCallNode(
+            controlFlowStorage.getStorageId(),
+            storageKey,
+            logicalExpressionNode.left,
+            logicalExpressionNode.right
+        );
+    }
+
+    /**
+     * @param {Expression} leftExpression
+     * @param {Expression} rightExpression
+     * @returns {boolean}
+     */
+    private checkForProhibitedExpressions(
+        leftExpression: ESTree.Expression,
+        rightExpression: ESTree.Expression
+    ): boolean {
+        if (
+            this.expressionContainsProhibitedNodes(rightExpression) ||
+            !this.isSafeToEvaluateEagerly(rightExpression)
+        ) {
+            return true;
+        }
+
+        return [leftExpression, rightExpression].some((expressionNode: ESTree.Node | ESTree.Expression): boolean => {
+            let nodeForCheck: ESTree.Node | ESTree.Expression;
+
+            if (!NodeGuards.isUnaryExpressionNode(expressionNode)) {
+                nodeForCheck = expressionNode;
+            } else {
+                nodeForCheck = NodeUtils.getUnaryExpressionArgumentNode(expressionNode);
+            }
+
+            return (
+                !NodeGuards.isLiteralNode(nodeForCheck) &&
+                !NodeGuards.isIdentifierNode(nodeForCheck) &&
+                !NodeGuards.isObjectExpressionNode(nodeForCheck) &&
+                !NodeGuards.isExpressionStatementNode(nodeForCheck)
+            );
+        });
+    }
+
+    /**
+     * The right operand becomes an argument of the control flow storage call and is always evaluated,
+     * so short-circuit evaluation is lost. Only literals are safe to evaluate eagerly: identifiers may throw
+     * (temporal dead zone, undeclared globals) and object expressions may throw or have side effects
+     *
+     * @param {Expression} expression
+     * @returns {boolean}
+     */
+    private isSafeToEvaluateEagerly(expression: ESTree.Expression): boolean {
+        const nodeForCheck: ESTree.Node = NodeGuards.isUnaryExpressionNode(expression)
+            ? NodeUtils.getUnaryExpressionArgumentNode(expression)
+            : expression;
+
+        return NodeGuards.isLiteralNode(nodeForCheck);
+    }
+
+    /**
+     * @param {Expression} expression
+     * @returns {boolean}
+     */
+    private expressionContainsProhibitedNodes(expression: ESTree.Expression): boolean {
+        let hasProhibitedNode = false;
+
+        estraverse.traverse(expression, {
+            enter: (node: ESTree.Node): estraverse.VisitorOption | void => {
+                if (NodeGuards.isMemberExpressionNode(node) && node.computed) {
+                    hasProhibitedNode = true;
+
+                    return estraverse.VisitorOption.Break;
+                }
+
+                if (NodeGuards.isCallExpressionNode(node)) {
+                    hasProhibitedNode = true;
+
+                    return estraverse.VisitorOption.Break;
+                }
+            }
+        });
+
+        return hasProhibitedNode;
+    }
+}

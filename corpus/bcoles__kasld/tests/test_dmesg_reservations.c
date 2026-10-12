@@ -1,0 +1,219 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Parser unit tests for the dmesg physical-reservation leak components. Each
+// component is #included with its main() renamed, then driven over a staged
+// KASLD_SYSROOT /var/log/dmesg fixture (mmap_syslog falls back to that file
+// under a sysroot). The fixtures reproduce the exact boot-message format the
+// kernel prints, and the tests assert the per-region forbidden-band wire
+// records the parsers emit — locking in the per-region sample->range emission
+// (collapsed interior points carried no [lo,hi] and never drove the engine's
+// phys_reservation_exclude; a per-region range does):
+//
+//   dmesg_reserved_mem    "OF: reserved mem: 0x..0x.."  -> one range per line
+//   dmesg_swiotlb         "software IO TLB: mapped [mem 0x..-0x..]" -> one
+//   range dmesg_crashkernel     high + low reservations -> TWO disjoint bands
+//   dmesg_cma_reserved    "created CMA ... at 0x.., size N MiB" -> per-pool
+//   range
+//
+// The fixture addresses are fixed literals parsed from text (not derived from
+// arch macros), so the parser logic is exercised identically regardless of the
+// host the suite is built for.
+// ---
+// <bcoles@gmail.com>
+#define _GNU_SOURCE
+
+/* Pull in the public API once, then neutralise the two ELF-section macros so
+ * the per-component KASLD_EXPLAIN/KASLD_META definitions do not collide when
+ * several components are included into this single translation unit (same
+ * approach as test_sysfs_parsers.c). */
+#include "../src/include/kasld/api.h"
+#undef KASLD_EXPLAIN
+#undef KASLD_META
+#define KASLD_CAT_(a, b) a##b
+#define KASLD_CAT(a, b) KASLD_CAT_(a, b)
+#define KASLD_EXPLAIN(t)                                                       \
+  extern char KASLD_CAT(kasld_explain_unused_, __COUNTER__)[]
+#define KASLD_META(t) extern char KASLD_CAT(kasld_meta_unused_, __COUNTER__)[]
+
+/* Forward declarations for the renamed component entry points (avoids
+ * -Wmissing-prototypes; the includes below define them). The parsers' static
+ * callbacks (on_match / on_mapped / on_reserved / on_reserved_pool / ...) are
+ * uniquely named across these four components, so they coexist in one TU. */
+int resmem_main(void);
+int swiotlb_main(void);
+int crashkernel_main(void);
+int cma_main(void);
+
+#define main resmem_main
+#include "../src/components/dmesg_reserved_mem.c"
+#undef main
+
+#define main swiotlb_main
+#include "../src/components/dmesg_swiotlb.c"
+#undef main
+
+#define main crashkernel_main
+#include "../src/components/dmesg_crashkernel.c"
+#undef main
+
+#define main cma_main
+#include "../src/components/dmesg_cma_reserved.c"
+#undef main
+
+#include "test_harness.h"
+#include "test_sysroot.h"
+
+#include <assert.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+/* Overwrite the sysroot's /var/log/dmesg with `text` (the dmesg components fall
+ * back to this file under KASLD_SYSROOT). */
+static void stage_dmesg(const char *text) {
+  th_sysroot_write("/var/log/dmesg", text);
+}
+
+/* Run a renamed component main(), capturing its stdout (the wire channel) into
+ * `cap`; stderr diagnostics are sent to /dev/null. */
+static char cap[16384];
+static void run_capture(int (*fn)(void)) {
+  fflush(stdout);
+  char tmpl[] = "/tmp/kasld_dmesg_capXXXXXX";
+  int fd = mkstemp(tmpl);
+  TH_CHECK(fd >= 0);
+  int saved = dup(1);
+  dup2(fd, 1);
+  fflush(stderr);
+  int saved_err = dup(2);
+  int devnull = open("/dev/null", O_WRONLY);
+  if (devnull >= 0)
+    dup2(devnull, 2);
+  fn();
+  fflush(stdout);
+  fflush(stderr);
+  dup2(saved, 1);
+  close(saved);
+  dup2(saved_err, 2);
+  close(saved_err);
+  if (devnull >= 0)
+    close(devnull);
+  lseek(fd, 0, SEEK_SET);
+  ssize_t n = read(fd, cap, sizeof(cap) - 1);
+  cap[n > 0 ? n : 0] = '\0';
+  close(fd);
+  unlink(tmpl);
+}
+
+/* --- dmesg_reserved_mem: one bounded range per "OF: reserved mem:" line.
+ * Each line is one contiguous reservation [start, inclusive-end]; the two
+ * sparse nodes must stay two ranges (the gap between them is usable RAM). ---
+ */
+static void test_reserved_mem_per_region(void) {
+  stage_dmesg("OF: reserved mem: 0x0000000080000000..0x00000000801fffff (2048 "
+              "KiB) nomap a@80000000\n"
+              "OF: reserved mem: 0x0000000088000000..0x000000008bffffff (65536 "
+              "KiB) map b@88000000\n");
+  run_capture(resmem_main);
+  /* dram_carveout: these lines come straight from the device-tree
+   * reserved-memory infrastructure, which prints a node with a fixed `reg`
+   * (a@80000000 here) exactly as it prints a dynamically sized one. A fixed
+   * reg is a plain memblock_reserve() that merges silently where it overlaps
+   * the loaded image, so the address bounds DRAM and establishes nothing
+   * about where the image is not. */
+  TH_CHECK(strstr(cap, "dram_carveout pos=base conf=parsed lo=0x80000000 "
+                       "hi=0x801fffff") != NULL);
+  TH_CHECK(strstr(cap, "dram_carveout pos=base conf=parsed lo=0x88000000 "
+                       "hi=0x8bffffff") != NULL);
+  TH_CHECK(strstr(cap, "reserved_mem") == NULL);
+}
+
+/* --- dmesg_swiotlb: the pool is a single contiguous reservation -> one range.
+ */
+static void test_swiotlb_single_range(void) {
+  stage_dmesg("software IO TLB: mapped [mem "
+              "0x00000000bbed0000-0x00000000bfed0000] (64MB)\n");
+  run_capture(swiotlb_main);
+  TH_CHECK(
+      strstr(cap, "swiotlb pos=base conf=parsed lo=0xbbed0000 hi=0xbfecffff") !=
+      NULL);
+}
+
+/* --- dmesg_crashkernel: the high and low reservations are TWO disjoint bands;
+ * they must NOT collapse into one [min,max] span (that would forbid the usable
+ * RAM in the gap between them). ---------------------------------------------
+ */
+static void test_crashkernel_two_disjoint_bands(void) {
+  stage_dmesg(
+      "crashkernel reserved: 0x0000000027e00000 - 0x000000003fe00000 (384 MB)\n"
+      "crashkernel low memory reserved: 0x0000000004000000 - "
+      "0x0000000008000000 "
+      "(64 MB)\n");
+  run_capture(crashkernel_main);
+  TH_CHECK(
+      strstr(cap,
+             "crashkernel pos=base conf=parsed lo=0x27e00000 hi=0x3fdfffff") !=
+      NULL);
+  TH_CHECK(
+      strstr(cap,
+             "crashkernel pos=base conf=parsed lo=0x4000000 hi=0x7ffffff") !=
+      NULL);
+  /* the collapsed span [low.lo, high.hi] must never be emitted */
+  TH_CHECK(strstr(cap, "lo=0x4000000 hi=0x3fdfffff") == NULL);
+}
+
+/* --- dmesg_cma_reserved: per-pool range computed from the MiB size (both the
+ * "created ... pool" and "cma: Reserved" formats). ------------------------- */
+static void test_cma_size_to_range(void) {
+  stage_dmesg(
+      "Reserved memory: created CMA memory pool at 0x000000007a000000, size 96 "
+      "MiB\n"
+      "cma: Reserved 256 MiB at 0x00000000f0000000 on node -1\n");
+  run_capture(cma_main);
+  /* The two message families carry different claims, so they carry different
+   * regions. "Reserved memory: created ... pool" is the /reserved-memory
+   * handler, which also runs for a fixed-`reg` node whose memblock_reserve()
+   * merges silently on overlap -> dram_carveout.
+   * 96 MiB:  0x7a000000 + 0x6000000  - 1 = 0x7fffffff */
+  TH_CHECK(strstr(cap, "dram_carveout pos=base conf=parsed lo=0x7a000000 "
+                       "hi=0x7fffffff") != NULL);
+  /* "cma: Reserved" is cma_declare_contiguous_nid(), whose fixed-base form
+   * fails with -EBUSY when the range is already reserved -- so a line that
+   * printed proves no overlap with the image -> reserved_mem.
+   * 256 MiB: 0xf0000000 + 0x10000000 - 1 = 0xffffffff */
+  TH_CHECK(
+      strstr(cap,
+             "reserved_mem pos=base conf=parsed lo=0xf0000000 hi=0xffffffff") !=
+      NULL);
+}
+
+/* --- dmesg_cma_reserved: with no parseable size, fall back to a base-only
+ * sample rather than fabricating a bounded range. -------------------------- */
+static void test_cma_size_absent_fallback(void) {
+  stage_dmesg(
+      "Reserved memory: created restricted DMA pool at 0x0000000060000000\n");
+  run_capture(cma_main);
+  /* The /reserved-memory family, so dram_carveout here too — the region
+   * follows the message, not whether a size was parseable. */
+  TH_CHECK(
+      strstr(cap, "dram_carveout pos=interior conf=parsed sample=0x60000000") !=
+      NULL);
+  /* no size => no [lo,hi] band may be invented */
+  TH_CHECK(strstr(cap, "lo=0x60000000 hi=") == NULL);
+}
+
+int main(void) {
+  th_sysroot_init("dmesg_reservations");
+
+  TEST_SUITE("test_dmesg_reservations");
+  BEGIN_CATEGORY("dmesg physical-reservation parsers");
+  RUN(test_reserved_mem_per_region);
+  RUN(test_swiotlb_single_range);
+  RUN(test_crashkernel_two_disjoint_bands);
+  RUN(test_cma_size_to_range);
+  RUN(test_cma_size_absent_fallback);
+  return TEST_DONE();
+}

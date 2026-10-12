@@ -1,0 +1,158 @@
+"""
+Looking up addresses for function names / symbols, and
+vice-versa.
+"""
+
+from __future__ import annotations
+
+from bisect import bisect_right
+from bisect import insort
+
+import pwndbg.aglib.memory
+import pwndbg.dbg_mod
+import pwndbg.dintegration
+import pwndbg.lib.cache
+from pwndbg.dbg_mod import EventHandlerPriority
+from pwndbg.dbg_mod import EventType
+from pwndbg.dbg_mod import SymbolLookupType
+
+
+def lookup_symbol_addr(
+    name: str,
+    *,
+    prefer_static: bool = False,
+    type: SymbolLookupType = SymbolLookupType.ANY,
+    objfile_endswith: str | None = None,
+) -> int | None:
+    addr = lookup_symbol(
+        name, type=type, prefer_static=prefer_static, objfile_endswith=objfile_endswith
+    )
+    if not addr:
+        return None
+    return int(addr)
+
+
+def lookup_symbol_value(
+    name: str,
+    *,
+    prefer_static: bool = False,
+    type: SymbolLookupType = SymbolLookupType.ANY,
+    objfile_endswith: str | None = None,
+) -> int | None:
+    addr = lookup_symbol(
+        name, type=type, prefer_static=prefer_static, objfile_endswith=objfile_endswith
+    )
+    if not addr or not pwndbg.aglib.memory.peek(int(addr)):
+        return None
+
+    value = addr.dereference()
+    if not value:
+        return None
+    return int(value)
+
+
+# TODO: cache here? can we cache obj 'Value'?
+def lookup_symbol(
+    name: str,
+    *,
+    prefer_static: bool = False,
+    type: SymbolLookupType = SymbolLookupType.ANY,
+    objfile_endswith: str | None = None,
+) -> pwndbg.dbg_mod.Value | None:
+    """
+    Returns the address of the given `symbol`, cast-ed to the appropriate symbol type.
+
+    This function searches for (SymbolLookupType.ANY):
+    - Function names
+    - Variable names
+    - (gdb only) Typedef names (if you need please use aglib.typeinfo.load)
+    - (gdb only) Enum values (if you need please use aglib.typeinfo.enum_member)
+
+    The lookup order is as follows (default):
+    1. Global scope within the current module
+    2. Global static scope within the current module
+    3. Global scope in other modules
+    4. Global static scope in other modules
+    """
+    return pwndbg.dbg.selected_inferior().lookup_symbol(
+        name, type=type, prefer_static=prefer_static, objfile_endswith=objfile_endswith
+    )
+
+
+# TODO: cache here? can we cache obj 'Value'?
+def lookup_frame_symbol(
+    name: str, *, type: SymbolLookupType = SymbolLookupType.ANY
+) -> pwndbg.dbg_mod.Value | None:
+    """
+    Returns the address of the given `symbol`, cast-ed to the appropriate symbol type.
+
+    This function searches for (SymbolLookupType.ANY):
+    - Function names
+    - Variable names
+    - (gdb only, please don't use) Typedef names
+    - (gdb only, please don't use) Enum values
+
+    The lookup order is as follows:
+    1. Local scope
+    2. Global scope within the current module
+    3. Global static scope within the current module
+    4. Global scope in other modules
+    5. Global static scope in other modules
+    """
+    return pwndbg.dbg.selected_frame().lookup_symbol(name, type=type)
+
+
+@pwndbg.lib.cache.cache_until("objfile")
+def resolve_addr(addr: int) -> str | None:
+    """
+    Resolves an address to its corresponding symbol name, if available.
+
+    Note:
+    - This function does not resolve TLS (Thread-Local Storage) addresses or addresses with local scope.
+
+    Resolution is performed in the following order:
+    - Global scope symbols.
+    """
+    assert addr >= 0, "address must be positive"
+
+    symbol_name = pwndbg.dbg.selected_inferior().symbol_name_at_address(addr)
+    if symbol_name:
+        return symbol_name
+
+    return pwndbg.dintegration.manager.symbol_at_address(addr)
+
+
+set_existing_ranges: list[tuple[int, int]] = []
+
+
+@pwndbg.dbg.event_handler(EventType.START, priority=EventHandlerPriority.CACHE_CLEAR)
+@pwndbg.dbg.event_handler(EventType.EXIT, priority=EventHandlerPriority.CACHE_CLEAR)
+def _clear_set_existing_ranges() -> None:
+    set_existing_ranges.clear()
+
+
+def resolve_function_boundaries(addr: int) -> tuple[int, int] | None:
+    """
+    Return the function start and end address for a function that
+    contains address `addr`.
+
+    Returns:
+    - tuple[int, int] | None: [start, end) of function block if found (end address is exclusive)
+    """
+    assert addr >= 0, "address must be positive"
+
+    # Binary search for the range which has the highest start which is <= addr,
+    # and out of those, we pick the one with the highest end.
+    # Does not find a match for some overlapping ranges (e.g. addr=150, set_existing_ranges=[(100,200), (148,149)])
+    # but this should almost never happen, and getting a cache miss is still fine correctness-wise.
+    i = bisect_right(set_existing_ranges, addr, key=lambda _range: _range[0]) - 1
+    if i >= 0 and addr < set_existing_ranges[i][1]:
+        return set_existing_ranges[i]
+
+    # Invokes GDBs `disass` which might be slow.
+    fn_range = pwndbg.dbg.selected_inferior().get_function_boundaries(addr)
+
+    if fn_range is not None:
+        insort(set_existing_ranges, fn_range)
+
+    return fn_range

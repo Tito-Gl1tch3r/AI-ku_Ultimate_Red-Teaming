@@ -1,0 +1,162 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Read kernel-image extents from /proc/iomem ("Kernel code/data/bss").
+//
+// Parsed physical kernel-image leak — emits the extents the kernel published.
+//   Purpose: x86 /proc/iomem nests three top-level "System RAM" sub-entries
+//   labeled "Kernel code", "Kernel data", and "Kernel bss". Each is the
+//   exact physical range the corresponding ELF section was loaded at.
+//   "Kernel code" starts at __pa_symbol(_text) (the image base), so it is
+//   emitted as PHYS REGION_KERNEL_IMAGE; "Kernel data"/"Kernel bss" as
+//   KERNEL_DATA / KERNEL_BSS. This gives the engine the tightest possible
+//   bound on Q_PHYS_IMAGE_BASE (pinned exactly by text_pin_from_observation
+//   when the KERNEL_IMAGE range arrives as a POS_BASE record; the upper edge
+//   of the image is absorbed by kernel_image_phys_bound's image-size
+//   constraints) — much tighter than the wide arch ceiling.
+//
+// Access: /proc/iomem is world-readable but the physical addresses are masked
+//   to 0 unless the caller has CAP_SYS_ADMIN (file_ns_capable(CAP_SYS_ADMIN) in
+//   the kernel's r_show()). This is independent of kptr_restrict — the
+//   addresses stay masked for an unprivileged reader even at kptr_restrict = 0.
+//   Detect masking (first valid line reads as 00000000-00000000) and emit
+//   nothing in that case — the alternative would be to emit a "phys text at 0"
+//   bound, which is harmful nonsense.
+//
+// Format (one line per range, indentation indicates nesting):
+//   80000000-bfffffff : System RAM
+//     1bc00000-1d336cef : Kernel code
+//     1e600000-1ead557f : Kernel data
+//     1f047000-1f5fffff : Kernel bss
+//
+// Scope: arches that publish kernel-image extents via the generic
+// iomem_resource path (x86 setup.c, s390 setup.c — confirmed). The
+// detection is label-driven (`Kernel code` etc.), so the component is
+// harmless on arches that don't emit these labels: the parser finds no
+// matching line and emits nothing.
+//
+// References:
+// arch/x86/kernel/setup.c reserve_real_mode() +
+// insert_resource(&iomem_resource, &code_resource);
+// ---
+// <bcoles@gmail.com>
+
+#include "include/kasld/api.h"
+#include "include/kasld/cli.h"
+#include "include/kasld/sysroot.h"
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+
+KASLD_EXPLAIN(
+    "Parses /proc/iomem for the kernel-image sub-entries (\"Kernel code\", "
+    "\"Kernel data\", \"Kernel bss\") and emits each as a PHYS extent on "
+    "REGION_KERNEL_IMAGE / KERNEL_DATA / KERNEL_BSS. These are the "
+    "authoritative physical placement of the running kernel image. x86 and "
+    "s390 emit these labels in their setup code; harmless on arches that "
+    "don't (no matching line -> no emission). /proc/iomem requires "
+    "CAP_SYS_ADMIN for unmasked addresses; emits nothing under masking.");
+
+KASLD_META("method:parsed\n"
+           "phase:inference\n"
+           "discloses:physical\n"
+           "source:files\n"
+           "bypass:CAP_SYS_ADMIN\n");
+
+/* Map one of the kernel-image iomem labels to its KASLD region.
+ *
+ * "Kernel code" starts at __pa_symbol(_text) — the IMAGE BASE (_text), not
+ * _stext (x86 setup.c, s390 setup.c, arm64 setup.c all set
+ * code_resource.start = __pa_symbol(_text)). So it must be REGION_KERNEL_IMAGE,
+ * which text_pin_from_observation pins as _text directly — NOT
+ * REGION_KERNEL_TEXT, which it treats as _stext and normalizes down by
+ * STEXT_OFFSET. On x86/s390 STEXT_OFFSET is 0 so the two are equivalent, but on
+ * arm64 it is 0x10000, and a KERNEL_TEXT tag would pin the phys base 64 KiB
+ * below the truth. */
+static int region_from_label(const char *label, enum kasld_region *r,
+                             const char **wire) {
+  if (strcmp(label, "Kernel code") == 0) {
+    *r = REGION_KERNEL_IMAGE;
+    *wire = "kernel_code";
+    return 1;
+  }
+  if (strcmp(label, "Kernel data") == 0) {
+    *r = REGION_KERNEL_DATA;
+    *wire = "kernel_data";
+    return 1;
+  }
+  if (strcmp(label, "Kernel bss") == 0) {
+    *r = REGION_KERNEL_BSS;
+    *wire = "kernel_bss";
+    return 1;
+  }
+  return 0;
+}
+
+int main(void) {
+  FILE *f = kasld_fopen("/proc/iomem", "r");
+  if (!f) {
+    kasld_err("/proc/iomem unavailable");
+    return (errno == EACCES || errno == EPERM) ? KASLD_EXIT_NOPERM
+                                               : KASLD_EXIT_UNAVAILABLE;
+  }
+
+  /* Detect CAP_SYS_ADMIN masking by scanning a few lines for a real address.
+   * If every line up to a small cap reads as 00000000-00000000, the file is
+   * masked and unusable. */
+  int saw_real_addr = 0;
+  char line[256];
+  long start_pos = ftell(f);
+  for (int i = 0; i < 32 && fgets(line, sizeof(line), f); i++) {
+    unsigned long lo = 0, hi = 0;
+    const char *p = line;
+    while (*p == ' ' || *p == '\t')
+      p++;
+    const char *e;
+    if (kasld_addr_parse(p, 16, &lo, &e) && *e == '-' &&
+        kasld_addr_parse(e + 1, 16, &hi, NULL) && (lo != 0 || hi != 0)) {
+      saw_real_addr = 1;
+      break;
+    }
+  }
+  if (!saw_real_addr) {
+    kasld_err("/proc/iomem appears masked (needs CAP_SYS_ADMIN); "
+              "addresses read as 0");
+    fclose(f);
+    /* Masking is an access restriction (CAP_SYS_ADMIN), not a missing source —
+     * report it as access-denied, mirroring proc_kallsyms's kptr_restrict
+     * all-zero path. */
+    return KASLD_EXIT_NOPERM;
+  }
+  fseek(f, start_pos, SEEK_SET);
+
+  int emitted = 0;
+  while (fgets(line, sizeof(line), f)) {
+    const char *p = line;
+    while (*p == ' ' || *p == '\t')
+      p++;
+    unsigned long lo = 0, hi = 0;
+    char label[128] = {0};
+    /* Both edges must be representable: a PAE map names physical addresses
+     * above the word on a 32-bit build, and half-parsing one would emit a
+     * region the kernel never reported. */
+    const char *e;
+    if (!kasld_addr_parse(p, 16, &lo, &e) || *e != '-' ||
+        !kasld_addr_parse(e + 1, 16, &hi, &e))
+      continue;
+    if (sscanf(e, " : %127[^\n]", label) != 1)
+      continue;
+    if (hi < lo)
+      continue;
+    enum kasld_region region;
+    const char *name_wire;
+    if (!region_from_label(label, &region, &name_wire))
+      continue;
+    kasld_info("iomem %s -> phys [%#lx, %#lx]", label, lo, hi);
+    kasld_result_range(KASLD_TYPE_PHYS, region, lo, hi, name_wire, CONF_PARSED);
+    emitted++;
+  }
+  fclose(f);
+  if (emitted == 0)
+    kasld_err("no Kernel code/data/bss entries found in /proc/iomem");
+  return 0;
+}

@@ -1,0 +1,362 @@
+/**
+ * Forensics++ (ForensicsPP.com)
+ * Local-first browser forensics workbench
+ *
+ * Copyright (c) 2026 DyNooob. All rights reserved.
+ * Author: DyNooob
+ * Website: https://www.forensicspp.com
+ * Platform: DigiForensics.cn
+ * Project: https://github.com/DyNooob/ForensicsPP
+ *
+ * Forensics++ is an open-source, browser-side toolkit for CTF/MISC,
+ * lightweight forensic triage, encoding/decoding, metadata inspection,
+ * hashes, archive parsing, and local analysis.
+ *
+ * Do not use this project for unauthorized access, intrusion,
+ * privacy infringement, or unlawful activity.
+ *
+ * Released under the MIT License.
+ * Full source code: https://github.com/DyNooob/ForensicsPP
+ */
+
+import React from "react";
+import { AButton, ALinearProgress, InfoTable, ToolPanelHeader } from "../components/ui";
+import { copy } from "../i18n";
+import type { YaraBatchRow, YaraRuleResult, YaraScanResult } from "../models";
+import { previewText } from "../utils/binary";
+import { downloadTextFile, formatBytes } from "../utils/files";
+import { useStoredState } from "../utils/storage";
+import { runWorkerTask } from "../utils/workerTask";
+
+type RuleTemplate = { id: string; label: string; rule: string };
+
+const MAX_YARA_RULE_BYTES = 2 * 1024 * 1024;
+const MAX_YARA_TEXT_SAMPLE_BYTES = 32 * 1024 * 1024;
+
+export type YaraToolServices = {
+  yaraRuleTemplates: RuleTemplate[];
+  defaultYaraSample: string;
+  yaraHitsToCsv: (results: YaraRuleResult[]) => string;
+  yaraBatchRowsToCsv: (rows: YaraBatchRow[]) => string;
+};
+
+export function YaraTool({ t, services, active = true }: { t: (typeof copy)["zh"]; services: YaraToolServices; active?: boolean }) {  const [rules, setRules] = useStoredState("yara.rules.v2", "");
+  const [sample, setSample] = useStoredState("yara.sample.v3", "");
+  const [sampleName, setSampleName] = React.useState("text sample");
+  const [sampleBytes, setSampleBytes] = React.useState<Uint8Array>(() => new TextEncoder().encode(sample));
+  const [result, setResult] = React.useState<YaraScanResult | null>(null);
+  const [batchRows, setBatchRows] = React.useState<YaraBatchRow[]>([]);
+  const [selectedRule, setSelectedRule] = React.useState("");
+  const [hitFilter, setHitFilter] = React.useState("");
+  const [dropActive, setDropActive] = React.useState(false);
+  const [scanning, setScanning] = React.useState(false);
+  const [error, setError] = React.useState("");
+  const inputRef = React.useRef<HTMLInputElement | null>(null);
+  const abortRef = React.useRef<AbortController | null>(null);
+  const selectedResult = selectedRule && result
+    ? result.results.find((item) => item.rule.name === selectedRule) ?? null
+    : null;
+  const matchedResults = result?.results.filter((item) => item.matched) ?? [];
+  const totalStringHits = matchedResults.reduce((sum, item) => sum + item.hits.reduce((inner, hit) => inner + hit.count, 0), 0);
+  const visibleHits = React.useMemo(() => {
+    if (!result) return [];
+    const query = hitFilter.trim().toLowerCase();
+    return result.results
+      .filter((item) => !selectedResult || item.rule.name === selectedResult.rule.name)
+      .flatMap((item) => item.hits.filter((hit) => hit.count > 0).map((hit) => ({ item, hit })))
+      .filter(({ item, hit }) => !query || [item.rule.name, hit.id, hit.pattern, hit.preview, hit.contexts.join(" ")].join(" ").toLowerCase().includes(query));
+  }, [hitFilter, result, selectedResult]);
+
+  const invalidate = () => {
+    setResult(null);
+    setBatchRows([]);
+    setSelectedRule("");
+    setHitFilter("");
+    setError("");
+  };
+
+  const scanSample = (bytes: Uint8Array, name: string, signal: AbortSignal) => {
+    const workerBytes = bytes.slice();
+    return runWorkerTask<{ ruleText: string; data: ArrayBuffer; name: string; timeoutMs: number }, YaraScanResult>({
+      createWorker: () => new Worker(new URL("../features/yara/yara.worker.ts", import.meta.url), { type: "module" }),
+      request: { ruleText: rules, data: workerBytes.buffer, name, timeoutMs: 10_000 },
+      transfer: [workerBytes.buffer],
+      signal,
+      timeoutMs: 20_000
+    });
+  };
+
+  const runTextScan = async () => {
+    if (!active) return;
+    if (new TextEncoder().encode(rules).byteLength > MAX_YARA_RULE_BYTES) {
+      setError(t.yara_rules_are_limited_to_2_mib );
+      return;
+    }
+    const bytes = sampleName === "text sample" ? new TextEncoder().encode(sample) : sampleBytes;
+    if (bytes.byteLength > MAX_YARA_TEXT_SAMPLE_BYTES) {
+      setError(t.text_samples_are_limited_to_32_mib );
+      return;
+    }
+    setSampleBytes(bytes);
+    const controller = new AbortController();
+    abortRef.current?.abort();
+    abortRef.current = controller;
+    setScanning(true);
+    setError("");
+    try {
+      const next = await scanSample(bytes, sampleName, controller.signal);
+      if (!active || controller.signal.aborted) return;
+      setResult(next);
+      setSelectedRule(next.results.find((item) => item.matched)?.rule.name ?? "");
+      setBatchRows([]);
+    } catch (caught) {
+      if (caught instanceof DOMException && caught.name === "AbortError") return;
+      if (active) setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      if (abortRef.current === controller) {
+        abortRef.current = null;
+        setScanning(false);
+      }
+    }
+  };
+
+  const handleFiles = async (files?: FileList | null) => {
+    if (!active || !files?.length) return;
+    if (new TextEncoder().encode(rules).byteLength > MAX_YARA_RULE_BYTES) {
+      setError(t.yara_rules_are_limited_to_2_mib );
+      return;
+    }
+    setScanning(true);
+    setDropActive(false);
+    setError("");
+    const rows: YaraBatchRow[] = [];
+    const controller = new AbortController();
+    abortRef.current?.abort();
+    abortRef.current = controller;
+    try {
+      const selectedFiles = Array.from(files).slice(0, 25);
+      let firstResult: YaraScanResult | null = null;
+      for (const [index, file] of selectedFiles.entries()) {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+        if (!active || controller.signal.aborted) break;
+        const bytes = new Uint8Array(await file.slice(0, 32 * 1024 * 1024).arrayBuffer());
+        if (!active || controller.signal.aborted) break;
+        const scan = await scanSample(bytes, file.name, controller.signal);
+        if (!active || controller.signal.aborted) break;
+        const matchedRules = scan.results.filter((item) => item.matched).map((item) => item.rule.name);
+        rows.push({
+          name: file.name,
+          size: file.size,
+          matchedRules,
+          matchCount: matchedRules.length,
+          stringHits: scan.results.reduce((sum, item) => sum + item.hits.reduce((inner, hit) => inner + hit.count, 0), 0),
+          warnings: [
+            ...(file.size > bytes.length ? [`Scanned first ${formatBytes(bytes.length)} of ${formatBytes(file.size)}`] : []),
+            ...scan.results.flatMap((item) => item.errors)
+          ]
+        });
+        if (index === 0) {
+          firstResult = scan;
+          setSampleName(file.name);
+          setSampleBytes(bytes);
+          setSample(previewText(bytes, Math.min(bytes.length, 20000)));
+        }
+      }
+      if (!active || controller.signal.aborted) return;
+      setBatchRows(rows);
+      setResult(firstResult);
+      setSelectedRule(firstResult?.results.find((item) => item.matched)?.rule.name ?? "");
+      if (files.length > selectedFiles.length) setError(t.only_the_first_25_files_were_scanned);
+    } catch (caught) {
+      if (caught instanceof DOMException && caught.name === "AbortError") return;
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      if (abortRef.current === controller) {
+        abortRef.current = null;
+        setScanning(false);
+      }
+    }
+  };
+
+  const cancel = () => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setScanning(false);
+  };
+
+  React.useEffect(() => {
+    if (active) return;
+    cancel();
+  }, [active]);
+
+  const loadDemo = () => {
+    setRules(services.yaraRuleTemplates[0]?.rule ?? "");
+    setSampleName("text sample");
+    setSample(services.defaultYaraSample);
+    setSampleBytes(new TextEncoder().encode(services.defaultYaraSample));
+    invalidate();
+  };
+
+  const clear = () => {
+    cancel();
+    setSample("");
+    setSampleName("text sample");
+    setSampleBytes(new Uint8Array());
+    invalidate();
+    if (inputRef.current) inputRef.current.value = "";
+  };
+
+  React.useEffect(() => () => abortRef.current?.abort(), []);
+
+  return (
+    <div className={`tool-grid yara-simple-workbench yara-workbench ${result ? "has-yara" : "empty-yara"}`}>
+      {scanning && <div className="wide-panel"><ALinearProgress /></div>}
+      {error && <pre className="result-box wide-panel">{error}</pre>}
+
+      <section className="tool-panel wide-panel yara-simple-input-panel">
+        <ToolPanelHeader
+          title={t.yara_scan}
+          actions={<AButton variant="text" disabled={!sample && !result} onClick={clear}>{t.clear}</AButton>}
+        />
+
+        <div className="yara-simple-section-heading">
+          <strong>{t.yaraRules}</strong>
+          <AButton variant="text" onClick={loadDemo}>{t.load_demo}</AButton>
+        </div>
+        <div className="button-row yara-simple-templates">
+          {services.yaraRuleTemplates.map((template) => (
+            <AButton key={template.id} variant="outlined" onClick={() => { setRules(template.rule); invalidate(); }}>{template.label}</AButton>
+          ))}
+        </div>
+        <textarea className="single-textarea yara-simple-editor" aria-label={t.yara_rules} value={rules} onChange={(event) => { const next = event.target.value; if (new TextEncoder().encode(next).byteLength > MAX_YARA_RULE_BYTES) { setError(t.yara_rules_are_limited_to_2_mib ); return; } setRules(next); invalidate(); }} placeholder={t.paste_one_or_more_yara_rules} />
+
+        <div className="yara-simple-divider" />
+        <div className="yara-simple-section-heading"><strong>{t.yaraSample}</strong></div>
+        <input ref={inputRef} type="file" multiple aria-hidden="true" tabIndex={-1} onChange={(event) => { void handleFiles(event.currentTarget.files); event.currentTarget.value = ""; }} />
+        <div
+          className={`desktop-drop-zone yara-drop-zone ${dropActive ? "active" : ""}`}
+          role="button"
+          tabIndex={0}
+          onClick={() => inputRef.current?.click()}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              inputRef.current?.click();
+            }
+          }}
+          onDragOver={(event) => { event.preventDefault(); setDropActive(true); }}
+          onDragLeave={() => setDropActive(false)}
+          onDrop={(event) => { event.preventDefault(); setDropActive(false); void handleFiles(event.dataTransfer.files); }}
+        >
+          <strong>{sampleName === "text sample" ? (t.text_sample) : sampleName}</strong>
+          <span>{sampleBytes.length ? formatBytes(sampleBytes.length) : (t.drop_up_to_25_files)}</span>
+        </div>
+        <textarea className="single-textarea yara-simple-sample" aria-label={t.yara_text_sample} value={sample} onChange={(event) => { const next = event.target.value; if (new TextEncoder().encode(next).byteLength > MAX_YARA_TEXT_SAMPLE_BYTES) { setError(t.text_samples_are_limited_to_32_mib ); return; } setSampleName("text sample"); setSample(next); invalidate(); }} placeholder={t.textPlaceholder} />
+        <div className="yara-simple-primary-action">
+          <AButton variant="filled" disabled={scanning || !rules.trim() || !sample.trim()} onClick={() => void runTextScan()}>{t.run}</AButton>
+          <AButton variant="outlined" disabled={scanning || !rules.trim()} onClick={() => inputRef.current?.click()}>{t.uploadSample}</AButton>
+          {scanning && <AButton variant="outlined" onClick={cancel}>{t.cancelEdit}</AButton>}
+        </div>
+      </section>
+
+      {result && (
+        <section className="tool-panel wide-panel yara-simple-results-panel">
+          <ToolPanelHeader
+            title={t.ruleMatches}
+            subtitle={sampleName === "text sample" ? (t.text_sample) : sampleName}
+            actions={<>
+              <AButton variant="outlined" disabled={!result.results.length} onClick={() => downloadTextFile(`yara-hits-${Date.now()}.csv`, services.yaraHitsToCsv(result.results), "text/csv;charset=utf-8")}>{t.hits_csv}</AButton>
+              <AButton variant="text" disabled={!batchRows.length} onClick={() => downloadTextFile(`yara-batch-${Date.now()}.csv`, services.yaraBatchRowsToCsv(batchRows), "text/csv;charset=utf-8")}>{t.batch_csv}</AButton>
+            </>}
+          />
+
+          <div className="yara-simple-summary">
+            <span><small>{t.yaraRules}</small><strong>{result.results.length}</strong></span>
+            <span><small>{t.matched}</small><strong>{matchedResults.length}</strong></span>
+            <span><small>{t.string_hits}</small><strong>{totalStringHits}</strong></span>
+            <span><small>{t.totalFiles}</small><strong>{batchRows.length || 1}</strong></span>
+          </div>
+
+          <div className="table-scroll yara-simple-rule-scroll">
+            <table className="data-table yara-simple-rule-table">
+              <thead><tr><th>{t.rule}</th><th>{t.matched}</th><th>{t.tags}</th><th>{t.strings_2}</th><th>{t.condition}</th><th>{t.errors}</th></tr></thead>
+              <tbody>
+                {result.results.map((item) => (
+                  <tr className={selectedResult?.rule.name === item.rule.name ? "selected-row" : ""} key={item.rule.name} onClick={() => setSelectedRule(item.rule.name)}>
+                    <td>{item.rule.name}</td>
+                    <td>{item.matched ? (t.yes) : (t.no)}</td>
+                    <td>{item.rule.tags.join(", ") || "--"}</td>
+                    <td>{item.hits.filter((hit) => hit.count).length}/{item.hits.length}</td>
+                    <td className="yara-simple-condition">{item.condition}</td>
+                    <td>{item.errors.join("; ") || "--"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
+
+      {result && (
+        <section className="tool-panel wide-panel yara-simple-hits-panel">
+          <ToolPanelHeader
+            title={t.stringMatches}
+            subtitle={selectedResult ? selectedResult.rule.name : (t.all_matched_rules)}
+          />
+          <input className="text-input yara-simple-hit-filter" aria-label={t.filter_yara_hits} value={hitFilter} onChange={(event) => setHitFilter(event.target.value)} placeholder={t.filter_id_pattern_or_context} />
+          {visibleHits.length ? (
+            <div className="table-scroll yara-simple-hit-scroll">
+              <table className="data-table yara-simple-hit-table">
+                <thead><tr><th>{t.rule}</th><th>ID</th><th>{t.pattern}</th><th>{t.iocCount}</th><th>{t.offsets}</th><th>{t.regexContext}</th></tr></thead>
+                <tbody>
+                  {visibleHits.map(({ item, hit }) => (
+                    <tr key={`${item.rule.name}-${hit.id}`}>
+                      <td>{item.rule.name}</td>
+                      <td>{hit.id}</td>
+                      <td className="mono-cell">{hit.pattern}</td>
+                      <td>{hit.count}</td>
+                      <td className="mono-cell">{hit.offsets.map((offset) => `0x${offset.toString(16).toUpperCase()}`).join(", ") || "--"}</td>
+                      <td className="yara-simple-context-cell">{hit.contexts.join("\n") || hit.preview || "--"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : <div className="empty-state">{t.no_string_hits}</div>}
+        </section>
+      )}
+
+      {selectedResult && (
+        <section className="tool-panel wide-panel yara-simple-detail-panel">
+          <ToolPanelHeader title={t.selected_rule} />
+          <InfoTable rows={[
+            [t.rule, selectedResult.rule.name],
+            [t.matched, selectedResult.matched ? (t.yes) : (t.no)],
+            [t.tags, selectedResult.rule.tags.join(", ") || "--"],
+            [t.condition, selectedResult.condition],
+            ["Meta", selectedResult.rule.meta.map(([key, value]) => `${key}=${value}`).join(", ") || "--"],
+            [t.errors, selectedResult.errors.join("; ") || "--"]
+          ]} />
+        </section>
+      )}
+
+      {batchRows.length > 1 && (
+        <section className="tool-panel wide-panel yara-simple-batch-panel">
+          <ToolPanelHeader title={t.yaraBatch} subtitle={`${batchRows.length} ${t.files}`} />
+          <div className="table-scroll yara-simple-batch-scroll">
+            <table className="data-table">
+              <thead><tr><th>{t.name}</th><th>{t.fileSize}</th><th>{t.matched}</th><th>{t.yaraRules}</th><th>{t.string_hits}</th><th>{t.entryRisk}</th></tr></thead>
+              <tbody>
+                {batchRows.map((row) => (
+                  <tr key={`${row.name}-${row.size}`}>
+                    <td>{row.name}</td><td>{formatBytes(row.size)}</td><td>{row.matchCount}</td><td>{row.matchedRules.join(", ") || "--"}</td><td>{row.stringHits}</td><td>{row.warnings.join("; ") || "--"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}

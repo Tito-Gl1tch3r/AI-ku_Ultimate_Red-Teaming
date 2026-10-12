@@ -1,0 +1,228 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Cilium
+
+package exporter
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/cilium/lumberjack/v2"
+	"google.golang.org/grpc/metadata"
+
+	"github.com/cilium/tetragon/pkg/server/eventlog"
+
+	"github.com/cilium/tetragon/pkg/option"
+
+	"github.com/cilium/tetragon/api/v1/tetragon"
+	"github.com/cilium/tetragon/pkg/logger"
+	"github.com/cilium/tetragon/pkg/logger/logfields"
+	"github.com/cilium/tetragon/pkg/ratelimit"
+	"github.com/cilium/tetragon/pkg/server"
+)
+
+type ExportEncoder interface {
+	Encode(v any) error
+}
+
+type Exporter struct {
+	ctx         context.Context
+	request     *tetragon.GetEventsRequest
+	server      *server.Server
+	encoder     ExportEncoder
+	closer      io.Closer
+	rateLimiter *ratelimit.RateLimiter
+	logFile     string
+	logsDir     string
+
+	// mu protects the rotation timer state for concurrent access.
+	mu                 sync.Mutex
+	rotateTimer        *time.Timer
+	rotationInterval   time.Duration
+	rotationGeneration uint64
+}
+
+func NewExporter(
+	ctx context.Context,
+	request *tetragon.GetEventsRequest,
+	server *server.Server,
+	encoder ExportEncoder,
+	closer io.Closer,
+	rateLimiter *ratelimit.RateLimiter,
+) (*Exporter, error) {
+	logFile := filepath.Base(option.Config.ExportFilename)
+	logsDir, err := filepath.Abs(filepath.Dir(filepath.Clean(option.Config.ExportFilename)))
+	if err != nil {
+		logger.GetLogger().Warn(fmt.Sprintf("Failed to get absolute path of exported JSON logs '%s'", option.Config.ExportFilename), logfields.Error, err)
+		// Do not fail; we let lumberjack handle this. We want to
+		// log the rotate logs operation.
+		logsDir = filepath.Dir(option.Config.ExportFilename)
+	}
+
+	if option.Config.ExportFileRotationInterval < 0 {
+		// Passed an invalid interval let's error out
+		return nil, fmt.Errorf("frequency '%s' at which to rotate JSON export files is negative", option.Config.ExportFileRotationInterval.String())
+	}
+
+	e := &Exporter{
+		ctx:              ctx,
+		request:          request,
+		server:           server,
+		encoder:          encoder,
+		closer:           closer,
+		rateLimiter:      rateLimiter,
+		logFile:          logFile,
+		logsDir:          logsDir,
+		rotationInterval: option.Config.ExportFileRotationInterval,
+	}
+	return e, nil
+}
+
+func (e *Exporter) Start() error {
+	// Start the rotation timer if needed. Hold mu to honor the invariant that
+	// rotateTimer and rotationInterval are only accessed while holding it.
+	e.mu.Lock()
+	if e.rotationInterval > 0 {
+		if _, ok := e.closer.(*lumberjack.Logger); !ok {
+			e.mu.Unlock()
+			return fmt.Errorf("writer must be of type lumberjack.Logger but got %T", e.closer)
+		}
+		e.scheduleRotateLocked()
+	}
+	e.mu.Unlock()
+
+	run, err := e.server.GetEventsListener(e.request, e, e.closer)
+	if err != nil {
+		return fmt.Errorf("error starting JSON exporter: %w", err)
+	}
+	go func() {
+		if err := run(); err != nil {
+			logger.GetLogger().Warn("JSON exporter terminated with error", logfields.Error, err)
+		}
+	}()
+
+	// Stop the self-rescheduling rotation timer once the exporter context is
+	// cancelled. Otherwise rotate() keeps rescheduling itself forever, leaking
+	// a timer (and, under virtual time, firing rotations unboundedly).
+	go func() {
+		<-e.ctx.Done()
+		e.stopRotateTimer()
+	}()
+	return nil
+}
+
+// scheduleRotateLocked schedules a rotation for the current configuration.
+// The caller must hold e.mu.
+func (e *Exporter) scheduleRotateLocked() {
+	generation := e.rotationGeneration
+	e.rotateTimer = time.AfterFunc(e.rotationInterval, func() {
+		e.rotate(generation)
+	})
+}
+
+func (e *Exporter) rotate(generation uint64) {
+	// Rotate is only called when writer is a lumberjack logger; no need to check.
+	writer := e.closer.(*lumberjack.Logger)
+	logger.GetLogger().Info("Rotating JSON logs export", "file", e.logFile, "directory", e.logsDir)
+	if rotationErr := writer.Rotate(); rotationErr != nil {
+		logger.GetLogger().Warn("Failed to rotate JSON export file", "file", option.Config.ExportFilename, logfields.Error, rotationErr)
+	}
+	// Do not reschedule once the context is cancelled or timed rotation is
+	// disabled.
+	e.mu.Lock()
+	if e.ctx.Err() == nil && e.rotationInterval > 0 && e.rotationGeneration == generation {
+		e.scheduleRotateLocked()
+	}
+	e.mu.Unlock()
+}
+
+// stopRotateTimer stops the self-rescheduling rotation timer, if any.
+func (e *Exporter) stopRotateTimer() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.rotationGeneration++
+	if e.rotateTimer != nil {
+		e.rotateTimer.Stop()
+		e.rotateTimer = nil
+	}
+}
+
+func (e *Exporter) Send(event *tetragon.GetEventsResponse) error {
+	if e.rateLimiter != nil && !e.rateLimiter.Allow() {
+		e.rateLimiter.Drop()
+		rateLimitDropped.Inc()
+		return nil
+	}
+
+	if err := e.encoder.Encode(event); err != nil {
+		logger.GetLogger().Warn("Failed to JSON encode", logfields.Error, err)
+		eventsExportFailedTotal.Inc()
+		return nil
+	}
+	eventsExportedTotal.Inc()
+	eventsExportTimestamp.Set(float64(event.GetTime().GetSeconds()))
+	return nil
+}
+
+func (e *Exporter) SetHeader(metadata.MD) error {
+	return nil
+}
+
+func (e *Exporter) SendHeader(metadata.MD) error {
+	return nil
+}
+
+func (e *Exporter) SetTrailer(metadata.MD) {
+}
+
+func (e *Exporter) Context() context.Context {
+	return e.ctx
+}
+
+func (e *Exporter) SendMsg(_ any) error {
+	return nil
+}
+
+func (e *Exporter) RecvMsg(_ any) error {
+	return nil
+}
+
+func (e *Exporter) SetLogParams(params eventlog.Params) error {
+	writer, ok := e.closer.(*lumberjack.Logger)
+	if !ok {
+		return errors.New("exporter does not support setting log params")
+	}
+
+	logger.GetLogger().Info("Updating exporter params", "params", params)
+
+	if params.MaxSize != nil {
+		writer.MaxSize = int(*params.MaxSize)
+	}
+
+	if params.MaxBackups != nil {
+		writer.MaxBackups = int(*params.MaxBackups)
+	}
+
+	if params.RotationInterval != nil {
+		e.mu.Lock()
+		e.rotationGeneration++
+		if e.rotateTimer != nil {
+			e.rotateTimer.Stop()
+			e.rotateTimer = nil
+		}
+		e.rotationInterval = *params.RotationInterval
+		// Do not install a new timer once the context is cancelled or timed
+		// rotation is disabled.
+		if e.ctx.Err() == nil && e.rotationInterval > 0 {
+			e.scheduleRotateLocked()
+		}
+		e.mu.Unlock()
+	}
+
+	return nil
+}

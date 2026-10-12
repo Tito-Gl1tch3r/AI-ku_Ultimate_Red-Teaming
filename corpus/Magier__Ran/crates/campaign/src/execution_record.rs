@@ -1,0 +1,193 @@
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use c2::{ExecTtp, TtpExecuted};
+use serde::{Deserialize, Serialize};
+
+use crate::ExecuteActionRequest;
+
+/// An entity fact produced as a direct or inferred consequence of an execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionEntity {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    /// Whether the execution revealed this entity, created it, or merely
+    /// refined one already known. Defaults to `Observed` for records written
+    /// before outcomes were tracked.
+    #[serde(default)]
+    pub outcome: crate::FactOutcome,
+    /// What sort of news this is, so a timeline rebuilt from history reads the
+    /// same as the live one instead of re-deriving the rule client-side.
+    #[serde(default)]
+    pub category: crate::FactCategory,
+}
+
+/// A relation fact produced as a direct or inferred consequence of an execution.
+///
+/// This intentionally omits execution envelopes and authentication material. The
+/// operation timeline needs to explain the newly learned path, not retain the
+/// command template used to traverse it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionRelation {
+    pub name: String,
+    pub source_id: String,
+    pub target_id: String,
+    pub is_exec_channel: bool,
+}
+
+impl From<&ExecutionRelation> for ran_domain::RelationSummary {
+    fn from(relation: &ExecutionRelation) -> Self {
+        Self {
+            name: relation.name.clone(),
+            source_id: relation.source_id.clone(),
+            target_id: relation.target_id.clone(),
+            is_exec_channel: relation.is_exec_channel,
+            envelope: None,
+            output_transform: None,
+            weight: 0.0,
+            session_id: None,
+            broken: false,
+        }
+    }
+}
+
+/// A single recorded execution - the grounded command, its arguments, and the
+/// raw results returned by the C2 backend.  This forms the append-only audit
+/// trail for a campaign session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_environment: Option<ran_domain::ExecutionEnvironment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_environment: Option<ran_domain::ExecutionEnvironment>,
+    /// Unique command identifier (same as `ExecTtp.id` / `TtpExecuted.id`).
+    pub id: String,
+    /// TTP identifier (e.g. `"k8s.exec-into-pod"`).
+    pub ttp_id: String,
+    /// Human-readable TTP name.
+    pub ttp_name: String,
+    /// MITRE tactic (e.g. `"Execution"`).
+    pub tactic: String,
+    /// ID of the entity that was targeted.
+    pub target_id: String,
+    /// ID of the entity the command physically executed on (pod, node, or C2 entity).
+    pub exec_system_id: String,
+    /// Kubernetes authentication identity selected for this action.
+    #[serde(default)]
+    pub auth_identity_id: Option<String>,
+    /// ID of the procedure variant that was selected.
+    pub procedure_id: String,
+    /// The fully-grounded command string that was sent to the C2 backend.
+    pub command: String,
+    /// Resolved arguments after default-filling and template substitution.
+    pub args: HashMap<String, String>,
+    /// Whether the command exited successfully (exit code 0).
+    pub success: bool,
+    /// Whether the action succeeded with a meaningful limitation. Old campaign
+    /// snapshots predate this field and deserialize as a full success.
+    #[serde(default)]
+    pub partial: bool,
+    /// Raw exit code returned by the process.
+    pub exit_code: i32,
+    /// Raw output lines from the C2 backend (stdout first, then stderr).
+    pub results: Vec<String>,
+    /// Human-readable reason for failure, if applicable.
+    pub fail_reason: String,
+    /// Unix timestamp (milliseconds) when the command was dispatched.
+    pub started_at_ms: u64,
+    /// Unix timestamp (milliseconds) when the result was received.
+    pub completed_at_ms: u64,
+    /// True when this record was produced by a cleanup procedure rather than
+    /// the primary attack step.
+    #[serde(default)]
+    pub is_cleanup: bool,
+    /// Free-text rationale supplied by the caller for why this action was run
+    /// (via `ExecuteActionRequest.reasoning`). Empty when none was given.
+    #[serde(default)]
+    pub reasoning: String,
+    /// Entity summaries produced by this execution, used to reconstruct the
+    /// operation timeline after a frontend reload.
+    #[serde(default)]
+    pub discovered_entities: Vec<ExecutionEntity>,
+    /// Relation summaries produced by this execution, used to reconstruct the
+    /// operation timeline after a frontend reload.
+    #[serde(default)]
+    pub discovered_relations: Vec<ExecutionRelation>,
+}
+
+impl ExecutionRecord {
+    /// Build an audit record for an action that failed before it could be
+    /// grounded or dispatched to a C2 backend.
+    pub fn from_preparation_failure(
+        cmd_id: String,
+        request: &ExecuteActionRequest,
+        ttp_name: String,
+        tactic: String,
+        reason: String,
+    ) -> Self {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        Self {
+            id: cmd_id,
+            ttp_id: request.action_id.clone(),
+            ttp_name,
+            tactic,
+            target_id: request.target_id.clone(),
+            exec_system_id: request.exec_system_id.clone().unwrap_or_default(),
+            execution_environment: None,
+            transport_environment: None,
+            auth_identity_id: request.auth_identity_id.clone(),
+            procedure_id: request.procedure_id.clone().unwrap_or_default(),
+            command: String::new(),
+            args: request.args.clone(),
+            success: false,
+            partial: false,
+            exit_code: -1,
+            results: vec![reason.clone()],
+            fail_reason: reason,
+            started_at_ms: now_ms,
+            completed_at_ms: now_ms,
+            is_cleanup: false,
+            reasoning: request.reasoning.clone().unwrap_or_default(),
+            discovered_entities: Vec::new(),
+            discovered_relations: Vec::new(),
+        }
+    }
+
+    pub fn from_execution(cmd: &ExecTtp, event: &TtpExecuted) -> Self {
+        let completed_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        Self {
+            id: cmd.id.clone(),
+            ttp_id: cmd.ttp.id.clone(),
+            ttp_name: cmd.ttp.name.clone(),
+            tactic: cmd.ttp.tactic.clone(),
+            target_id: cmd.target_id.clone(),
+            exec_system_id: cmd.exec_target().to_string(),
+            execution_environment: cmd.execution_environment.clone(),
+            transport_environment: cmd.transport_environment.clone(),
+            auth_identity_id: cmd.auth_identity_id.clone(),
+            procedure_id: cmd.procedure.id.clone(),
+            command: cmd.procedure.command.clone(),
+            args: cmd.args.clone(),
+            success: event.success,
+            partial: false,
+            exit_code: event.exit_code,
+            results: event.results.clone(),
+            fail_reason: event.fail_reason.clone(),
+            started_at_ms: cmd.started_at_ms,
+            completed_at_ms,
+            is_cleanup: cmd.is_cleanup,
+            reasoning: cmd.reasoning.clone(),
+            discovered_entities: Vec::new(),
+            discovered_relations: Vec::new(),
+        }
+    }
+}

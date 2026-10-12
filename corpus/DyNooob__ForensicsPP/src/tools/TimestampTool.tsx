@@ -1,0 +1,240 @@
+/**
+ * Forensics++ (ForensicsPP.com)
+ * Local-first browser forensics workbench
+ *
+ * Copyright (c) 2026 DyNooob. All rights reserved.
+ * Author: DyNooob
+ * Website: https://www.forensicspp.com
+ * Platform: DigiForensics.cn
+ * Project: https://github.com/DyNooob/ForensicsPP
+ *
+ * Forensics++ is an open-source, browser-side toolkit for CTF/MISC,
+ * lightweight forensic triage, encoding/decoding, metadata inspection,
+ * hashes, archive parsing, and local analysis.
+ *
+ * Do not use this project for unauthorized access, intrusion,
+ * privacy infringement, or unlawful activity.
+ *
+ * Released under the MIT License.
+ * Full source code: https://github.com/DyNooob/ForensicsPP
+ */
+
+import { copyText } from "../utils/clipboard";
+import React from "react";
+import { useHomeToolDraft } from "../app/useHomeToolDraft";
+import { AButton, ALinearProgress, ASelect, ASegmentedButton, ASegmentedGroup, ToolPanelHeader } from "../components/ui";
+import {
+  COCOA_EPOCH_MS,
+  dateRows,
+  DAY_MS,
+  DOTNET_EPOCH_OFFSET_MS,
+  generalizedTime,
+  GPS_EPOCH_MS,
+  HFS_EPOCH_OFFSET_MS,
+  MAX_TIMESTAMP_BATCH_CHARS,
+  parseTimestampRows,
+  timestampCandidateKey,
+  timestampCandidateRows,
+  timestampRowsToCsv,
+  timelineToCsv
+} from "../features/timestamp/analyzer";
+import { copy } from "../i18n";
+import { downloadTextFile } from "../utils/files";
+import { FILETIME_EPOCH_OFFSET_MS } from "../utils/forensics";
+import { useStoredState } from "../utils/storage";
+import { runWorkerTask } from "../utils/workerTask";
+import type { TimestampWorkerRequest, TimestampWorkerResult } from "../features/timestamp/timestamp.worker";
+
+type TimestampPage = "single" | "batch";
+
+function currentTimePresetRows(nowMs: number) {
+  const current = BigInt(nowMs);
+  return [
+    { id: "unix", label: "Unix seconds", value: Math.floor(nowMs / 1000).toString() },
+    { id: "unix-ms", label: "Unix milliseconds", value: nowMs.toString() },
+    { id: "filetime", label: "Windows FILETIME", value: ((current + FILETIME_EPOCH_OFFSET_MS) * 10000n).toString() },
+    { id: "chrome", label: "Chrome/WebKit", value: ((current + FILETIME_EPOCH_OFFSET_MS) * 1000n).toString() },
+    { id: "dotnet", label: ".NET ticks", value: ((current + DOTNET_EPOCH_OFFSET_MS) * 10000n).toString() },
+    { id: "ole", label: "OLE / Excel days", value: (nowMs / DAY_MS + 25569).toFixed(8).replace(/0+$/, "").replace(/\.$/, "") },
+    { id: "cocoa", label: "Cocoa / CoreData", value: ((nowMs - COCOA_EPOCH_MS) / 1000).toFixed(3).replace(/\.000$/, "") },
+    { id: "hfs", label: "HFS+ seconds", value: Math.floor((nowMs + HFS_EPOCH_OFFSET_MS) / 1000).toString() },
+    { id: "gps", label: "GPS seconds", value: Math.floor((nowMs - GPS_EPOCH_MS) / 1000).toString() },
+    { id: "ldap", label: "LDAP GeneralizedTime", value: generalizedTime(new Date(nowMs)) },
+    { id: "iso", label: "ISO 8601", value: new Date(nowMs).toISOString() }
+  ];
+}
+
+export function TimestampTool({ t, active = true }: { t: (typeof copy)["zh"]; active?: boolean }) {
+  const [input, setInput] = useStoredState("timestamp.input.v3", "");
+  const [batchInput, setBatchInput] = useStoredState("timestamp.batchInput.v3", "");
+  const [submittedInput, setSubmittedInput] = useStoredState("timestamp.submittedInput.v3", "");
+  const [submittedBatchInput, setSubmittedBatchInput] = useStoredState("timestamp.submittedBatchInput.v3", "");
+  const [page, setPage] = React.useState<TimestampPage>(() => input.trim() ? "single" : batchInput.trim() ? "batch" : "single");
+  useHomeToolDraft("timestamp", active, (draft) => {
+    setInput(draft);
+    setSubmittedInput("");
+    setPage("single");
+  });
+  const [selectedCandidateKey, setSelectedCandidateKey] = React.useState("");
+  const [batchFilter, setBatchFilter] = React.useState("");
+  const [batchFormat, setBatchFormat] = React.useState("");
+  const [batchEvents, setBatchEvents] = React.useState<TimestampWorkerResult["events"]>([]);
+  const [batchParsing, setBatchParsing] = React.useState(false);
+  const [batchError, setBatchError] = React.useState("");
+  const [outputScope, setOutputScope] = React.useState<"common" | "all">("common");
+  const english = t.waiting === "Waiting";
+  const hasInput = Boolean(submittedInput.trim());
+
+  const rows = React.useMemo<Array<[string, string]>>(() => {
+    if (!hasInput) return [];
+    try {
+      return parseTimestampRows(submittedInput);
+    } catch (error) {
+      return [[t.timestamp, error instanceof Error ? error.message : String(error)]];
+    }
+  }, [hasInput, submittedInput, t.timestamp]);
+  const candidates = React.useMemo(() => timestampCandidateRows(rows), [rows]);
+  const selectedCandidate = React.useMemo(() => {
+    if (!candidates.length) return null;
+    return candidates.find((candidate, index) => timestampCandidateKey(candidate, index) === selectedCandidateKey) ?? candidates[0];
+  }, [candidates, selectedCandidateKey]);
+  const conversions = React.useMemo(() => selectedCandidate ? dateRows(new Date(selectedCandidate[1])) : [], [selectedCandidate]);
+  const commonConversionLabels = React.useMemo(() => new Set(["ISO", "Local", "UTC", "Unix seconds", "Unix milliseconds", selectedCandidate?.[0] ?? ""]), [selectedCandidate]);
+  const visibleConversions = React.useMemo(() => outputScope === "all" ? conversions : conversions.filter(([label]) => commonConversionLabels.has(label)), [commonConversionLabels, conversions, outputScope]);
+  const conversionMap = React.useMemo(() => new Map(conversions), [conversions]);
+
+  const batchFormats = React.useMemo(() => Array.from(new Set(batchEvents.map((event) => event.format))).sort(), [batchEvents]);
+  const batchInputTooLarge = batchInput.length > MAX_TIMESTAMP_BATCH_CHARS;
+  const visibleBatchEvents = React.useMemo(() => {
+    const query = batchFilter.trim().toLowerCase();
+    return batchEvents.filter((event) => {
+      if (batchFormat && event.format !== batchFormat) return false;
+      return !query || [event.iso, event.local, event.raw, event.format, event.context].join(" ").toLowerCase().includes(query);
+    });
+  }, [batchEvents, batchFilter, batchFormat]);
+
+  React.useEffect(() => {
+    const controller = new AbortController();
+    if (!active) {
+      setBatchParsing(false);
+      return () => controller.abort();
+    }
+    if (!submittedBatchInput.trim()) {
+      setBatchEvents([]);
+      setBatchParsing(false);
+      setBatchError("");
+      return () => controller.abort();
+    }
+    setBatchParsing(true);
+    setBatchError("");
+    void runWorkerTask<TimestampWorkerRequest, TimestampWorkerResult>({
+      createWorker: () => new Worker(new URL("../features/timestamp/timestamp.worker.ts", import.meta.url), { type: "module" }),
+      request: { source: submittedBatchInput, name: "timestamp batch" },
+      signal: controller.signal,
+      timeoutMs: 120_000
+    }).then((result) => {
+      if (!controller.signal.aborted) setBatchEvents(result.events);
+    }).catch((caught) => {
+      if (!controller.signal.aborted) {
+        setBatchEvents([]);
+        setBatchError(caught instanceof RangeError && caught.message.startsWith("TIMESTAMP_BATCH_TOO_LARGE:")
+          ? (t.the_batch_input_exceeds_the_32_mib_limit)
+          : caught instanceof Error ? caught.message : String(caught));
+      }
+    }).finally(() => {
+      if (!controller.signal.aborted) setBatchParsing(false);
+    });
+    return () => controller.abort();
+  }, [active, submittedBatchInput]);
+
+  const setSingleValue = (value: string) => {
+    setInput(value);
+    setSubmittedInput(value);
+    setSelectedCandidateKey("");
+    setPage("single");
+  };
+  const currentTimePresets = React.useMemo(() => currentTimePresetRows(Date.now()), []);
+  const [preset, setPreset] = React.useState("unix");
+  const applyPreset = () => {
+    const freshPresets = currentTimePresetRows(Date.now());
+    const item = freshPresets.find((candidate) => candidate.id === preset) ?? freshPresets[0];
+    setSingleValue(item.value);
+  };
+  const clearSingle = () => {
+    setInput("");
+    setSubmittedInput("");
+    setSelectedCandidateKey("");
+  };
+
+  return (
+    <div className={`tool-grid timestamp-workbench timestamp-simple-workbench ${hasInput || submittedBatchInput.trim() ? "has-timestamp" : "empty-timestamp"}`}>
+      <ASegmentedGroup className="timestamp-page-tabs wide-panel" value={page} selects="single" aria-label={t.timestamp_workspace}>
+        <ASegmentedButton value="single" onClick={() => setPage("single")}>{t.single_value}</ASegmentedButton>
+        <ASegmentedButton value="batch" onClick={() => setPage("batch")}>{t.batch_extract}{batchEvents.length ? ` (${batchEvents.length})` : ""}</ASegmentedButton>
+      </ASegmentedGroup>
+
+      {page === "single" && <>
+        <div className="tool-panel wide-panel timestamp-simple-input-panel">
+          <ToolPanelHeader title={t.timestamp_input} actions={<AButton variant="text" disabled={!hasInput} onClick={clearSingle}>{t.clear}</AButton>} />
+          <input className="text-input full-input" aria-label={t.timestamp_value} value={input} onChange={(event) => { setInput(event.currentTarget.value); setSubmittedInput(""); setSelectedCandidateKey(""); }} placeholder="1719705600 / 133638048000000000 / 20260706083045Z" />
+          <div className="timestamp-preset-row">
+            <ASelect aria-label={t.timestamp_format} value={preset} onChange={(value) => setPreset(String(value))} options={currentTimePresets.map((item) => ({ value: item.id, label: item.label }))} />
+            <AButton variant="outlined" onClick={applyPreset}>{t.use_current_time}</AButton>
+            <AButton variant="filled" disabled={!input.trim()} onClick={() => { setSubmittedInput(input); setSelectedCandidateKey(""); }}>{t.convert}</AButton>
+          </div>
+        </div>
+
+        {hasInput && <div className="tool-panel wide-panel timestamp-simple-result-panel">
+          <ToolPanelHeader
+            title={t.conversion_result}
+            subtitle={selectedCandidate?.[0] ?? (t.no_supported_format)}
+            actions={<>
+              <ASegmentedGroup value={outputScope} selects="single" aria-label={t.conversion_output_scope}>
+                <ASegmentedButton value="common" onClick={() => setOutputScope("common")}>{t.common}</ASegmentedButton>
+                <ASegmentedButton value="all" onClick={() => setOutputScope("all")}>{t.all}</ASegmentedButton>
+              </ASegmentedGroup>
+              <AButton variant="outlined" disabled={!selectedCandidate} onClick={() => selectedCandidate && void copyText(selectedCandidate[1])}>{t.copy_iso}</AButton>
+              <AButton variant="outlined" disabled={!conversionMap.get("Unix milliseconds")} onClick={() => void copyText(conversionMap.get("Unix milliseconds") ?? "")}>{t.copy_unix_ms}</AButton>
+              <AButton variant="text" disabled={!selectedCandidate} onClick={() => downloadTextFile(`timestamp-${Date.now()}.csv`, timestampRowsToCsv(rows, candidates), "text/csv;charset=utf-8")}>{t.exportTimestampCsv}</AButton>
+            </>}
+          />
+          {selectedCandidate ? <div className="table-scroll compact-scroll"><table className="data-table timestamp-conversion-table"><thead><tr><th>{t.format}</th><th>{t.httpHeaderValue}</th><th>{t.copy}</th></tr></thead><tbody>
+            {visibleConversions.map(([label, value]) => <tr key={`${label}-${value}`}><td>{label}</td><td className="mono-cell">{value}</td><td><AButton variant="text" disabled={!value || value === "--"} onClick={() => void copyText(value)}>{t.copy}</AButton></td></tr>)}
+          </tbody></table></div> : <div className="empty-state error-state">{rows[0]?.[1] || (t.unsupported_timestamp)}</div>}
+        </div>}
+
+        {candidates.length > 1 && <details className="tool-panel wide-panel timestamp-simple-candidates-panel">
+          <summary><span>{t.timestampCandidates}</span><small>{english ? `${candidates.length} possible interpretations` : `${candidates.length} 个可能解释`}</small></summary>
+          <div className="table-scroll compact-scroll"><table className="data-table"><thead><tr><th>{t.format}</th><th>ISO</th><th>{t.copy}</th></tr></thead><tbody>{candidates.map((candidate, index) => {
+            const key = timestampCandidateKey(candidate, index);
+            const active = selectedCandidate?.[0] === candidate[0] && selectedCandidate?.[1] === candidate[1];
+            return <tr className={active ? "selected-row" : ""} key={key} onClick={() => setSelectedCandidateKey(key)}><td>{candidate[0]}</td><td>{candidate[1]}</td><td><AButton variant="text" onClick={(event) => { event.stopPropagation(); void copyText(candidate[1]); }}>{t.copy}</AButton></td></tr>;
+          })}</tbody></table></div>
+        </details>}
+      </>}
+
+      {page === "batch" && <div className="tool-panel wide-panel timestamp-simple-batch-panel">
+        <ToolPanelHeader
+          title={t.extract_timestamps_from_text}
+          subtitle={`${visibleBatchEvents.length}/${batchEvents.length}`}
+          actions={<>
+            <AButton variant="outlined" disabled={!batchEvents.length} onClick={() => downloadTextFile(`timestamp-batch-${Date.now()}.csv`, timelineToCsv(visibleBatchEvents.length ? visibleBatchEvents : batchEvents), "text/csv;charset=utf-8")}>{t.exportCsv}</AButton>
+              <AButton variant="filled" disabled={!batchInput.trim() || batchInputTooLarge} onClick={() => { setSubmittedBatchInput(batchInput); setBatchFilter(""); setBatchFormat(""); }}>{t.extract}</AButton>
+              <AButton variant="text" disabled={!batchInput && !submittedBatchInput} onClick={() => { setBatchInput(""); setSubmittedBatchInput(""); setBatchFilter(""); setBatchFormat(""); }}>{t.clear}</AButton>
+          </>}
+        />
+        <textarea className="single-textarea timestamp-simple-batch-input" value={batchInput} onChange={(event) => { setBatchInput(event.currentTarget.value); setSubmittedBatchInput(""); setBatchFilter(""); setBatchFormat(""); }} placeholder={t.textPlaceholder} />
+        {batchInputTooLarge && <div className="empty-state error-state">{t.the_batch_input_exceeds_the_32_mib_limit}</div>}
+        <div className="timestamp-simple-batch-filter">
+          <input className="text-input" aria-label={t.filter_extracted_timestamps} value={batchFilter} onChange={(event) => setBatchFilter(event.currentTarget.value)} placeholder={t.filter_raw_value_iso_or_context} />
+          <ASelect aria-label={t.batch_result_format} value={batchFormat} onChange={(value) => setBatchFormat(String(value))} options={[{ value: "", label: t.all_formats }, ...batchFormats.map((format) => ({ value: format, label: format }))]} />
+        </div>
+        {batchParsing && <ALinearProgress />}
+        {batchError && <div className="empty-state error-state">{batchError}</div>}
+        <div className="table-scroll timestamp-simple-batch-scroll">
+          {visibleBatchEvents.length ? <table className="data-table timestamp-simple-batch-table"><thead><tr><th>ISO</th><th>{t.localTime}</th><th>{t.format}</th><th>{t.raw}</th><th>{t.iocLine}</th><th>{t.regexContext}</th></tr></thead><tbody>{visibleBatchEvents.map((event) => <tr key={event.id}><td>{event.iso}</td><td>{event.local}</td><td>{event.format}</td><td>{event.raw}</td><td>{event.line}</td><td>{event.context}</td></tr>)}</tbody></table> : <div className="empty-state">{submittedBatchInput ? (t.no_timestamp_found) : t.waiting}</div>}
+        </div>
+      </div>}
+    </div>
+  );
+}

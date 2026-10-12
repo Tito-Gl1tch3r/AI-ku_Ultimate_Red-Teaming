@@ -1,0 +1,376 @@
+package org.pac4j.openid4vp.request;
+
+import com.nimbusds.jose.util.JSONObjectUtils;
+import com.nimbusds.jose.JWSAlgorithm;
+import com.nimbusds.jose.jwk.ECKey;
+import com.nimbusds.jwt.SignedJWT;
+import lombok.val;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.pac4j.core.config.properties.JwksProperties;
+
+import org.pac4j.core.context.CallContext;
+import org.pac4j.core.exception.http.FoundAction;
+import com.nimbusds.jose.crypto.ECDSAVerifier;
+import org.pac4j.openid4vp.client.OpenId4VpClient;
+import org.pac4j.openid4vp.config.ClientIdPrefix;
+import org.pac4j.openid4vp.config.CredentialFormat;
+import org.pac4j.openid4vp.exceptions.OpenId4VpException;
+import org.pac4j.openid4vp.verifier.CredentialVerifier;
+import org.pac4j.openid4vp.verifier.SdJwtVcVerifier;
+import org.pac4j.openid4vp.verifier.VerifiedCredential;
+import org.pac4j.openid4vp.wallet.WalletSimulator;
+import org.pac4j.openid4vp.dcql.DcqlQuery;
+import org.pac4j.openid4vp.dcql.CredentialQuery;
+import org.pac4j.openid4vp.dcql.CredentialSetQuery;
+import org.pac4j.openid4vp.config.VerifierAttestation;
+import org.pac4j.openid4vp.config.OpenId4VpConfiguration;
+import org.pac4j.openid4vp.transaction.VpTransaction;
+import org.pac4j.test.context.MockWebContext;
+import org.pac4j.test.context.session.MockSessionStore;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.pac4j.openid4vp.util.OpenId4VpConstants.*;
+
+/**
+ * Tests the request object actually handed over to a wallet, built when the wallet asks for it.
+ *
+ * @author Jerome LELEU
+ * @since 6.6.0
+ */
+class OpenId4VpRequestObjectBuilderTests {
+
+    private static final String CALLBACK_URL = "https://app.example.org/callback";
+    private static final String CLIENT = "https://app.example.org/callback";
+    private static final String DCQL = "{\"credentials\":[{\"id\":\"pid\",\"format\":\"dc+sd-jwt\","
+        + "\"meta\":{\"vct_values\":[\"urn:eudi:pid:1\"]}}]}";
+
+    @TempDir
+    private java.nio.file.Path directory;
+
+    private OpenId4VpClient client;
+    private OpenId4VpConfiguration configuration;
+
+    @BeforeEach
+    void setUp() throws Exception {
+        configuration = new OpenId4VpConfiguration();
+        configuration.setJwks(new JwksProperties(directory.resolve("keys.jwks").toString()).setKid("key-1"));
+        configuration.setClientId(CLIENT);
+        configuration.setClientIdPrefix(ClientIdPrefix.DECENTRALIZED_IDENTIFIER);
+        configuration.setDcqlQuery(DCQL);
+
+        client = new OpenId4VpClient(configuration);
+        client.setName("EudiWallet");
+        client.setCallbackUrl(CALLBACK_URL);
+    }
+
+    /** Open a transaction, then build its request object as the wallet fetching it would. */
+    private SignedJWT requestObjectOf(final VpTransaction transaction) throws Exception {
+        return SignedJWT.parse(client.getRequestObjectBuilder()
+            .build(new CallContext(MockWebContext.create(), new MockSessionStore()), transaction));
+    }
+
+    private VpTransaction openTransaction() {
+        val ctx = new CallContext(MockWebContext.create(), new MockSessionStore());
+        val action = assertInstanceOf(FoundAction.class, client.getRedirectionAction(ctx).get());
+        // the wallet is invoked with the custom scheme, carrying the verifier and where to fetch the request
+        assertTrue(action.getLocation().startsWith("openid4vp://"));
+        assertTrue(action.getLocation().contains(CLIENT_ID + "="));
+        assertTrue(action.getLocation().contains(REQUEST_URI + "="));
+
+        val transactionId = ctx.sessionStore().get(ctx.webContext(), SESSION_TRANSACTION_ID).get().toString();
+        return configuration.getTransactionStore().get(transactionId).get();
+    }
+
+    @Test
+    void testTheRequestObjectIsSignedAndTyped() throws Exception {
+        val requestObject = requestObjectOf(openTransaction());
+
+        assertEquals(REQUEST_OBJECT_TYPE, requestObject.getHeader().getType().toString());
+        assertEquals(JWSAlgorithm.ES256, requestObject.getHeader().getAlgorithm());
+        assertTrue(requestObject.verify(
+            new ECDSAVerifier(((ECKey) configuration.getRequestObjectSigningKey()).toPublicJWK())));
+    }
+
+    @Test
+    void testTheRequestObjectClaims() throws Exception {
+        val transaction = openTransaction();
+        val claims = requestObjectOf(transaction).getJWTClaimsSet();
+
+        assertEquals(ClientIdPrefix.DECENTRALIZED_IDENTIFIER.getValue() + ":" + CLIENT, claims.getStringClaim(CLIENT_ID));
+        // no issuer by default: redundant with client_id, and a wallet must ignore it anyway
+        assertNull(claims.getIssuer());
+        assertEquals(RESPONSE_TYPE_VP_TOKEN, claims.getStringClaim(RESPONSE_TYPE));
+        assertEquals("direct_post.jwt", claims.getStringClaim(RESPONSE_MODE));
+        assertEquals(transaction.getNonce(), claims.getStringClaim(NONCE));
+        assertNotNull(claims.getExpirationTime());
+        // no wallet is discovered beforehand: the symbolic audience of the static discovery case
+        assertEquals(List.of(REQUEST_OBJECT_AUDIENCE), claims.getAudience());
+
+        // the response comes back on the very endpoint the request object was fetched from
+        assertTrue(claims.getStringClaim(RESPONSE_URI).contains(VP_TRANSACTION_ID + "=" + transaction.getId()));
+
+        // the required credential type is sent in meta
+        assertEquals(List.of(Map.of("id", "pid", "format", "dc+sd-jwt", "meta", Map.of("vct_values", List.of("urn:eudi:pid:1")))),
+            claims.getJSONObjectClaim(DCQL_QUERY).get("credentials"));
+    }
+
+    @Test
+    void testTheIssuerIsSentAsConfigured() throws Exception {
+        // a wallet which still reads the iss claim gets exactly what was configured for it, here the bare DID
+        configuration.setRequestObjectIssuer(CLIENT);
+        val claims = requestObjectOf(openTransaction()).getJWTClaimsSet();
+        assertEquals(CLIENT, claims.getIssuer());
+    }
+
+    @Test
+    void testAScopeStandsForTheDcqlQuery() throws Exception {
+        configuration.setScope("com.example.pid_presentation");
+        val transaction = openTransaction();
+        val claims = requestObjectOf(transaction).getJWTClaimsSet();
+
+        // "Either a dcql_query or a scope parameter representing a DCQL Query MUST be present [...], but not both"
+        assertEquals("com.example.pid_presentation", claims.getStringClaim(SCOPE));
+        assertNull(claims.getClaim(DCQL_QUERY));
+        assertNotNull(transaction.getDcqlQuery());
+        assertEquals(configuration.getDcqlQuery().toJsonString(), transaction.getDcqlQuery());
+        assertEquals("pid", DcqlQuery.parse(transaction.getDcqlQuery()).getCredentials().get(0).getId());
+    }
+
+    @Test
+    void testTheSavedQueryDoesNotChangeWithTheConfiguration() throws Exception {
+        val transaction = openTransaction();
+        transaction.setState("state");
+        val claims = requestObjectOf(transaction).getJWTClaimsSet();
+        configuration.getDcqlQuery().getCredentials().get(0).setId("changed");
+        val saved = JSONObjectUtils.parse(transaction.getRequestParameters());
+        assertEquals(claims.getClaim(DCQL_QUERY), saved.get(DCQL_QUERY));
+        assertEquals(claims.getClaim(CLIENT_METADATA), saved.get(CLIENT_METADATA));
+        assertEquals("state", saved.get(STATE));
+        assertEquals("pid", DcqlQuery.parse(transaction.getDcqlQuery()).getCredentials().get(0).getId());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void testTheVerifierAttestationsAreSentAsIs() throws Exception {
+        configuration.getVerifierInfo().add(new VerifierAttestation("jwt", "eyJhbGciOiJFUzI1NiJ9.registration.certificate")
+            .setCredentialIds(List.of("pid")));
+        configuration.getVerifierInfo().add(new VerifierAttestation("example+json", Map.of("purpose", "age verification")));
+        val claims = requestObjectOf(openTransaction()).getJWTClaimsSet();
+
+        val verifierInfo = (List<Map<String, Object>>) claims.getClaim(VERIFIER_INFO);
+        assertEquals(2, verifierInfo.size());
+        assertEquals(Map.of(FORMAT, "jwt", DATA, "eyJhbGciOiJFUzI1NiJ9.registration.certificate", CREDENTIAL_IDS, List.of("pid")),
+            verifierInfo.get(0));
+        // relevant to every requested credential: no credential_ids
+        assertEquals(Map.of(FORMAT, "example+json", DATA, Map.of("purpose", "age verification")), verifierInfo.get(1));
+    }
+
+    @Test
+    void testNoVerifierInfoParameterWithoutAttestations() throws Exception {
+        val claims = requestObjectOf(openTransaction()).getJWTClaimsSet();
+        assertNull(claims.getClaim(VERIFIER_INFO));
+    }
+
+    @Test
+    void testSdJwtVcAlgorithmsAreAdvertised() throws Exception {
+        configuration.addCredentialVerifier(new SdJwtVcVerifier()
+            .setIssuerAlgorithms(Set.of(JWSAlgorithm.ES384, JWSAlgorithm.ES256)));
+        val metadata = requestObjectOf(openTransaction()).getJWTClaimsSet().getJSONObjectClaim(CLIENT_METADATA);
+        val formats = (Map<String, Object>) metadata.get(VP_FORMATS_SUPPORTED);
+        assertEquals(Map.of("sd-jwt_alg_values", List.of("ES256", "ES384"), "kb-jwt_alg_values", List.of("ES256")),
+            formats.get("dc+sd-jwt"));
+    }
+
+    @Test
+    void testMdocAlgorithmsAreAdvertised() throws Exception {
+        val metadata = requestObjectOf(openTransaction()).getJWTClaimsSet().getJSONObjectClaim(CLIENT_METADATA);
+        val formats = (Map<String, Object>) metadata.get(VP_FORMATS_SUPPORTED);
+        assertEquals(Map.of("issuerauth_alg_values", List.of(-7L), "deviceauth_alg_values", List.of(-7L)),
+            formats.get("mso_mdoc"));
+    }
+
+    /** A second registered format, so that the narrowing down to what the wallet declares is visible. */
+    private void registerAnMdocVerifier() {
+        configuration.addCredentialVerifier(new CredentialVerifier() {
+            @Override
+            public CredentialFormat getFormat() {
+                return CredentialFormat.MSO_MDOC;
+            }
+
+            @Override
+            public VerifiedCredential verify(final String rawCredential, final VpTransaction transaction,
+                                             final OpenId4VpConfiguration configuration) {
+                throw new UnsupportedOperationException();
+            }
+        });
+    }
+
+    @Test
+    void testABlankScopeIsNoScope() throws Exception {
+        // what a properties file binding hands over for an absent scope: accepted at initialization, so the
+        // DCQL query must go out, not an empty scope
+        configuration.setScope("  ");
+        val transaction = openTransaction();
+        val claims = requestObjectOf(transaction).getJWTClaimsSet();
+
+        assertNull(claims.getClaim(SCOPE));
+        assertNotNull(claims.getJSONObjectClaim(DCQL_QUERY));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void testTheFormatsAreNarrowedDownToWhatTheWalletDeclares() throws Exception {
+        registerAnMdocVerifier();
+        val transaction = openTransaction();
+        // fetched with a GET, the wallet said nothing: every verified format is published
+        var formats = (Map<String, Object>) requestObjectOf(transaction).getJWTClaimsSet()
+            .getJSONObjectClaim(CLIENT_METADATA).get(VP_FORMATS_SUPPORTED);
+        assertEquals(List.of("dc+sd-jwt", "mso_mdoc"), List.copyOf(formats.keySet()));
+
+        // posted with its metadata, the wallet only presents SD-JWT VCs: the mobile documents are left out
+        transaction.setWalletMetadata(WalletSimulator.WALLET_METADATA_JSON);
+        formats = (Map<String, Object>) requestObjectOf(transaction).getJWTClaimsSet()
+            .getJSONObjectClaim(CLIENT_METADATA).get(VP_FORMATS_SUPPORTED);
+        assertEquals(List.of("dc+sd-jwt"), List.copyOf(formats.keySet()));
+    }
+
+    @Test
+    void testAWalletPresentingNoneOfTheVerifiedFormatsIsRefused() {
+        configuration.getCredentialVerifiers().remove(CredentialFormat.MSO_MDOC);
+        val transaction = openTransaction()
+            .setWalletMetadata("{\"vp_formats_supported\":{\"mso_mdoc\":{}}}");
+
+        val e = assertThrows(OpenId4VpException.class, () -> requestObjectOf(transaction));
+        assertEquals("the wallet presents none of the credential formats this verifier verifies [dc+sd-jwt], "
+            + "but [mso_mdoc]: " + transaction.getId(), e.getMessage());
+    }
+
+    @Test
+    void testAnUnrequestedCommonFormatDoesNotAllowTheRequest() {
+        configuration.setProfileIdResolver(credentials -> "user");
+        configuration.setDcqlQuery(new DcqlQuery().addCredential(mdocQuery()));
+        assertUnsupportedSelection();
+    }
+
+    @Test
+    void testAllCredentialsAreRequiredWithoutCredentialSets() {
+        configuration.getDcqlQuery().addCredential(mdocQuery());
+        assertUnsupportedSelection();
+    }
+
+    @Test
+    void testAScopeAlsoChecksTheRequiredFormats() {
+        configuration.setProfileIdResolver(credentials -> "user");
+        configuration.setScope("com.example.mdl_presentation");
+        configuration.setDcqlQuery(new DcqlQuery().addCredential(mdocQuery()));
+        assertUnsupportedSelection();
+    }
+
+    @Test
+    void testAPartiallySupportedOptionIsRefused() {
+        configuration.getDcqlQuery().addCredential(mdocQuery())
+            .addCredentialSet(new CredentialSetQuery().addOption("pid", "mdl"));
+        assertUnsupportedSelection();
+    }
+
+    @Test
+    void testEveryRequiredCredentialSetMustBeSupported() {
+        configuration.getDcqlQuery().addCredential(mdocQuery())
+            .addCredentialSet(new CredentialSetQuery().addOption("pid"))
+            .addCredentialSet(new CredentialSetQuery().addOption("mdl").setRequired(true));
+        assertUnsupportedSelection();
+    }
+
+    @Test
+    void testASupportedAlternativeAllowsTheRequest() throws Exception {
+        configuration.getDcqlQuery().addCredential(mdocQuery())
+            .addCredentialSet(new CredentialSetQuery().addOption("mdl").addOption("pid"));
+        val transaction = openTransaction().setWalletMetadata(WalletSimulator.WALLET_METADATA_JSON);
+
+        val claims = requestObjectOf(transaction).getJWTClaimsSet();
+        assertEquals(configuration.getDcqlQuery().toJson(), claims.getJSONObjectClaim(DCQL_QUERY));
+        // only the format the wallet declared, with the default algorithms of the SD-JWT VC verifier
+        assertEquals(Map.of("dc+sd-jwt", Map.of("sd-jwt_alg_values", List.of("ES256"), "kb-jwt_alg_values", List.of("ES256"))),
+            claims.getJSONObjectClaim(CLIENT_METADATA).get(VP_FORMATS_SUPPORTED));
+    }
+
+    @Test
+    void testAnUnsupportedOptionalCredentialSetAllowsTheRequest() throws Exception {
+        configuration.getDcqlQuery().addCredential(mdocQuery())
+            .addCredentialSet(new CredentialSetQuery().addOption("pid"))
+            .addCredentialSet(new CredentialSetQuery().addOption("mdl").setRequired(false));
+        val transaction = openTransaction().setWalletMetadata(WalletSimulator.WALLET_METADATA_JSON);
+
+        assertEquals(configuration.getDcqlQuery().toJson(), requestObjectOf(transaction).getJWTClaimsSet()
+            .getJSONObjectClaim(DCQL_QUERY));
+    }
+
+    @Test
+    void testAbsentWalletFormatsDoNotPreventAnMdocRequest() throws Exception {
+        configuration.setProfileIdResolver(credentials -> "user");
+        configuration.setDcqlQuery(new DcqlQuery().addCredential(mdocQuery()));
+        val transaction = openTransaction();
+        assertNotNull(requestObjectOf(transaction));
+        transaction.setWalletMetadata("{}");
+        assertNotNull(requestObjectOf(transaction));
+    }
+
+    private CredentialQuery mdocQuery() {
+        return new CredentialQuery("mdl", CredentialFormat.MSO_MDOC).setDoctypeValue("org.iso.18013.5.1.mDL");
+    }
+
+    private void assertUnsupportedSelection() {
+        val transaction = openTransaction().setWalletMetadata(WalletSimulator.WALLET_METADATA_JSON);
+        val e = assertThrows(OpenId4VpException.class, () -> requestObjectOf(transaction));
+        assertEquals("the wallet's supported credential formats [dc+sd-jwt] cannot satisfy the required DCQL "
+            + "credential selections: " + transaction.getId(), e.getMessage());
+        assertNull(transaction.getRequestParameters());
+    }
+
+    @Test
+    void testTheEncryptionIsNarrowedDownToWhatTheWalletDeclares() throws Exception {
+        val transaction = openTransaction()
+            .setWalletMetadata("{\"vp_formats_supported\":{\"dc+sd-jwt\":{}},"
+                + "\"authorization_encryption_enc_values_supported\":[\"A256GCM\",\"A128CBC-HS256\"]}");
+
+        val metadata = requestObjectOf(transaction).getJWTClaimsSet().getJSONObjectClaim(CLIENT_METADATA);
+        assertEquals(List.of("A256GCM"), metadata.get(ENCRYPTED_RESPONSE_ENC_VALUES_SUPPORTED));
+    }
+
+    @Test
+    void testAWalletEncryptingWithNoneOfTheAcceptedAlgorithmsIsRefused() {
+        val transaction = openTransaction()
+            .setWalletMetadata("{\"vp_formats_supported\":{\"dc+sd-jwt\":{}},"
+                + "\"authorization_encryption_enc_values_supported\":[\"A128CBC-HS256\"]}");
+
+        val e = assertThrows(OpenId4VpException.class, () -> requestObjectOf(transaction));
+        assertEquals("the wallet encrypts its response with none of the accepted content encryption algorithms "
+            + "[A128GCM, A256GCM], but with [A128CBC-HS256]: " + transaction.getId(), e.getMessage());
+    }
+
+    @Test
+    void testThePublishedEncryptionKeyIsPublicOnly() throws Exception {
+        val transaction = openTransaction();
+        val claims = requestObjectOf(transaction).getJWTClaimsSet();
+
+        // the private part is kept in the transaction, only the public one reaches the wallet
+        assertTrue(ECKey.parse(transaction.getEncryptionKey()).isPrivate());
+
+        val jwks = (Map<String, Object>) claims.getJSONObjectClaim(CLIENT_METADATA).get(JWKS);
+        val keys = (List<Map<String, Object>>) jwks.get(KEYS);
+        assertEquals(1, keys.size());
+        assertFalse(ECKey.parse(keys.get(0)).isPrivate());
+        // ECDH-ES on P-256, and both content encryptions the high assurance profile requires a verifier to list
+        assertEquals("ECDH-ES", keys.get(0).get("alg"));
+        assertEquals("P-256", keys.get(0).get("crv"));
+        assertEquals(List.of("A128GCM", "A256GCM"),
+            claims.getJSONObjectClaim(CLIENT_METADATA).get(ENCRYPTED_RESPONSE_ENC_VALUES_SUPPORTED));
+    }
+
+}

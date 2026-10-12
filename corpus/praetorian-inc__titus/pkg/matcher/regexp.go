@@ -1,0 +1,195 @@
+//go:build wasm
+
+package matcher
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/dlclark/regexp2"
+	"github.com/praetorian-inc/titus/pkg/types"
+)
+
+// RegexpMatcher implements Matcher using regexp2 for Perl-style regex support.
+// Used for WASM builds where Hyperscan (CGO) is unavailable.
+// Unlike HyperscanMatcher which uses a two-stage pipeline, RegexpMatcher
+// performs pattern matching and capture extraction in a single pass.
+type RegexpMatcher struct {
+	rules        []*types.Rule
+	regexCache   map[string]*regexp2.Regexp
+	contextLines int
+	warnf        func(string, ...any)
+	matchTimeout time.Duration
+}
+
+// NewRegexp creates a new regexp-based matcher with the default 5s timeout.
+func NewRegexp(rules []*types.Rule, contextLines int, warnf func(string, ...any)) (*RegexpMatcher, error) {
+	return NewRegexpWithTimeout(rules, contextLines, warnf, 5*time.Second)
+}
+
+// NewRegexpWithTimeout creates a new regexp-based matcher with a configurable
+// per-match timeout. Production callers should use NewRegexp, which applies
+// the default 5s timeout.
+func NewRegexpWithTimeout(rules []*types.Rule, contextLines int, warnf func(string, ...any), matchTimeout time.Duration) (*RegexpMatcher, error) {
+	if len(rules) == 0 {
+		return nil, fmt.Errorf("no rules provided")
+	}
+	if matchTimeout <= 0 {
+		matchTimeout = 5 * time.Second
+	}
+
+	m := &RegexpMatcher{
+		rules:        rules,
+		regexCache:   make(map[string]*regexp2.Regexp),
+		contextLines: contextLines,
+		warnf:        warnf,
+		matchTimeout: matchTimeout,
+	}
+
+	// Pre-compile all patterns to catch errors early
+	for _, rule := range rules {
+		// Try RE2 mode first (safer, no backtracking)
+		re, err := regexp2.Compile(rule.Pattern, regexp2.RE2|regexp2.Multiline)
+		if err != nil {
+			// Fallback to default Perl-compatible mode if RE2 fails (for advanced features like (?x))
+			re, err = regexp2.Compile(rule.Pattern, regexp2.None)
+			if err != nil {
+				return nil, fmt.Errorf("failed to compile pattern %q for rule %s: %w", rule.Pattern, rule.ID, err)
+			}
+		}
+		// Set timeout to prevent catastrophic backtracking
+		re.MatchTimeout = matchTimeout
+		m.regexCache[rule.Pattern] = re
+	}
+
+	return m, nil
+}
+
+// Match scans content against all loaded rules.
+func (m *RegexpMatcher) Match(content []byte) ([]*types.Match, error) {
+	blobID := types.ComputeBlobID(content)
+	return m.MatchWithBlobID(content, blobID)
+}
+
+// MatchWithBlobID scans content with a known BlobID.
+func (m *RegexpMatcher) MatchWithBlobID(content []byte, blobID types.BlobID) ([]*types.Match, error) {
+	var matches []*types.Match
+	dedup := NewDeduplicator()
+	contentStr := string(content)
+
+	for _, rule := range m.rules {
+		re := m.regexCache[rule.Pattern]
+		if re == nil {
+			continue
+		}
+
+		// Find first match
+		match, err := re.FindStringMatch(contentStr)
+		if err != nil {
+			if m.warnf != nil {
+				if strings.Contains(err.Error(), "match timeout") {
+					m.warnf("[warn] rule %s regex timeout on blob %s (skipping rule for this blob)\n", rule.ID, blobID.Hex())
+				} else {
+					m.warnf("[warn] rule %s regex error on blob %s (skipping rule for this blob): %v\n", rule.ID, blobID.Hex(), err)
+				}
+			}
+			continue
+		}
+
+		// Loop through all matches
+		for match != nil {
+			// regexp2's Match.Index and Match.Length are rune-based, not byte-based
+			matchedText := []byte(match.String())
+			start, end := runeSpanToByteSpan(content, match.Index, match.Length)
+
+			// Extract capture groups (positional, for backwards compatibility)
+			var groups [][]byte
+			matchGroups := match.Groups()
+			for i := 1; i < len(matchGroups); i++ {
+				group := matchGroups[i]
+				if len(group.Captures) > 0 {
+					capture := group.Captures[0]
+					groups = append(groups, []byte(capture.String()))
+				}
+			}
+
+			// Extract named capture groups
+			namedGroups := make(map[string][]byte)
+			groupNames := re.GetGroupNames()
+			for _, name := range groupNames {
+				// Skip numbered groups (they show up as "0", "1", etc.)
+				if name == "" || (len(name) > 0 && name[0] >= '0' && name[0] <= '9') {
+					continue
+				}
+				group := match.GroupByName(name)
+				if group != nil && len(group.Captures) > 0 {
+					namedGroups[name] = []byte(group.Captures[0].String())
+				}
+			}
+
+			// Extract context using corrected positions
+			var before, after []byte
+			if m.contextLines > 0 {
+				before, after = ExtractContext(content, start, end, m.contextLines)
+			}
+
+			result := &types.Match{
+				BlobID:   blobID,
+				RuleID:   rule.ID,
+				RuleName: rule.Name,
+				Location: types.Location{
+					Offset: types.OffsetSpan{
+						Start: int64(start),
+						End:   int64(end),
+					},
+				},
+				Groups:      groups,
+				NamedGroups: namedGroups,
+				Snippet: types.Snippet{
+					Before:   before,
+					Matching: matchedText,
+					After:    after,
+				},
+			}
+
+			// Compute structural ID for deduplication
+			result.StructuralID = result.ComputeStructuralID(rule.StructuralID)
+
+			// Compute finding ID for content-based deduplication (NoseyParker-compatible)
+			result.FindingID = types.ComputeFindingID(rule.StructuralID, groups)
+
+			// Deduplicate
+			if !dedup.IsDuplicate(result) {
+				dedup.Add(result)
+				matches = append(matches, result)
+			}
+
+			// Find next match
+			match, err = re.FindNextMatch(match)
+			if err != nil {
+				if m.warnf != nil {
+					if strings.Contains(err.Error(), "match timeout") {
+						m.warnf("[warn] rule %s regex timeout on blob %s (skipping rule for this blob)\n", rule.ID, blobID.Hex())
+					} else {
+						m.warnf("[warn] rule %s regex error on blob %s (skipping rule for this blob): %v\n", rule.ID, blobID.Hex(), err)
+					}
+				}
+				break
+			}
+		}
+	}
+
+	return matches, nil
+}
+
+// DrainTimedOut is a no-op for the WASM RegexpMatcher: WASM runs single-threaded
+// so there is no CPU-contention starvation and timeouts are genuine backtracking.
+func (m *RegexpMatcher) DrainTimedOut() ([]*types.Match, error) {
+	return nil, nil
+}
+
+// Close releases resources (no-op for regexp).
+func (m *RegexpMatcher) Close() error {
+	return nil
+}

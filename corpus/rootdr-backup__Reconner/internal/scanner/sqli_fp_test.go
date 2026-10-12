@@ -1,0 +1,165 @@
+package scanner
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+)
+
+// The data-flow bug: headerChecks tested X-Forwarded-For and Referer, but
+// fetchWithHeader only ever set Cookie/User-Agent, so those headers were never
+// actually injected. This asserts the injection now reaches each header.
+func TestSQLiFetchWithHeaderSetsAllHeaders(t *testing.T) {
+	withLoopbackAllowed(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Echo the header under test so the caller can confirm the injection landed.
+		w.Write([]byte("XFF=" + r.Header.Get("X-Forwarded-For") +
+			"|REF=" + r.Header.Get("Referer") +
+			"|UA=" + r.Header.Get("User-Agent") +
+			"|CK=" + r.Header.Get("Cookie") +
+			"|XC=" + r.Header.Get("X-Custom")))
+	}))
+	defer srv.Close()
+	s := &SQLiScanner{}
+	ctx := context.Background()
+
+	if b := s.fetchWithHeader(ctx, srv.URL, "X-Forwarded-For", "INJ123"); !strings.Contains(b, "XFF=127.0.0.1,INJ123") {
+		t.Fatalf("X-Forwarded-For injection not sent: %q", b)
+	}
+	if b := s.fetchWithHeader(ctx, srv.URL, "Referer", "INJ123"); !strings.Contains(b, "REF=https://INJ123/") {
+		t.Fatalf("Referer injection not sent: %q", b)
+	}
+	if b := s.fetchWithHeader(ctx, srv.URL, "X-Custom", "INJ123"); !strings.Contains(b, "XC=INJ123") {
+		t.Fatalf("custom header injection not sent: %q", b)
+	}
+	if b := s.fetchWithHeader(ctx, srv.URL, "Cookie", "INJ123"); !strings.Contains(b, "CK=id=INJ123") {
+		t.Fatalf("Cookie injection not sent: %q", b)
+	}
+}
+
+// hasQuote reports whether the injected id value carries a quote (the error probe).
+func hasQuote(v string) bool { return strings.ContainsAny(v, "'\"`") }
+
+// Error-based must REPRODUCE: a DB error that flashes only once (transient 500)
+// must NOT be reported. A consistent DB error MUST be reported.
+func TestSQLiErrorBasedRequiresReproduction(t *testing.T) {
+	withLoopbackAllowed(t)
+	ctx := context.Background()
+	dbErr := "<html>You have an error in your SQL syntax; check the manual near '1' at line 1</html>"
+	normal := "<html>ok ok ok normal page stable content here</html>"
+
+	// Transient: emit the DB error on the FIRST quote request only.
+	var firstQuote int32
+	transient := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hasQuote(r.URL.Query().Get("id")) && atomic.AddInt32(&firstQuote, 1) == 1 {
+			w.Write([]byte(dbErr))
+			return
+		}
+		w.Write([]byte(normal))
+	}))
+	defer transient.Close()
+	ip := insertionPoint{URL: transient.URL + "/?id=1", Param: "id", Method: "GET"}
+	if kind, _, _ := (&SQLiScanner{}).quickProbe(ctx, ip, nil); kind == "error_based" {
+		t.Fatal("a one-shot (transient) DB error must NOT be reported as error-based SQLi")
+	}
+
+	// Consistent: emit the DB error on EVERY quote request.
+	consistent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hasQuote(r.URL.Query().Get("id")) {
+			w.Write([]byte(dbErr))
+			return
+		}
+		w.Write([]byte(normal))
+	}))
+	defer consistent.Close()
+	ip2 := insertionPoint{URL: consistent.URL + "/?id=1", Param: "id", Method: "GET"}
+	if kind, _, _ := (&SQLiScanner{}).quickProbe(ctx, ip2, nil); kind != "error_based" {
+		t.Fatalf("a reproducible DB error must be reported as error-based SQLi, got %q", kind)
+	}
+}
+
+// A host whose adaptive throttle is already severely ramped (repeated
+// 429/503/timeout, observed by ANY module) must have quickProbe's expensive
+// ladders (error-forced extraction, boolean pairs, OR-based extraction —
+// together dozens of requests per candidate) skipped entirely: continuing to
+// grind through them is what turns one struggling host into many extra
+// minutes on a large scan, per the sqlSpeed fix. This counts real requests to
+// prove it, rather than trusting the code path by inspection.
+func TestSQLiSkipsExpensiveLaddersOnSeverelyThrottledHost(t *testing.T) {
+	withLoopbackAllowed(t)
+	var reqCount int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reqCount, 1)
+		w.Write([]byte("<html>ok normal stable page content here</html>"))
+	}))
+	defer srv.Close()
+
+	ip := insertionPoint{URL: srv.URL + "/?id=1", Param: "id", Method: "GET"}
+	host := hostOfURL(ip.URL)
+	hostThrottles.Delete(host)
+
+	// Baseline: healthy host runs the full ladder (error-suffix probe +
+	// error-forced extraction + boolean pairs + OR-based extraction).
+	atomic.StoreInt32(&reqCount, 0)
+	(&SQLiScanner{}).quickProbe(context.Background(), ip, nil)
+	healthyRequests := atomic.LoadInt32(&reqCount)
+	if healthyRequests < 20 {
+		t.Fatalf("expected the full ladder to make a substantial number of requests on a healthy host, got %d", healthyRequests)
+	}
+
+	// Ramp the host's throttle to its ceiling, as repeated 429/503 would.
+	for i := 0; i < 10; i++ {
+		hostThrottleObserve(host, 503, false)
+	}
+	if !hostThrottleSevere(host) {
+		t.Fatal("expected the host to be reported severely throttled after ramping")
+	}
+
+	atomic.StoreInt32(&reqCount, 0)
+	(&SQLiScanner{}).quickProbe(context.Background(), ip, nil)
+	severeRequests := atomic.LoadInt32(&reqCount)
+	// The cheap stage alone (base + 6 error suffixes) is 7 requests; allow a
+	// little headroom without allowing the expensive ladders back in.
+	if severeRequests > 10 {
+		t.Fatalf("expected a severely throttled host to skip the expensive ladders (few requests), got %d (healthy case was %d)", severeRequests, healthyRequests)
+	}
+	hostThrottles.Delete(host)
+}
+
+func TestSQLiFullEngineInjectsHeaderAndAuthenticatedCookie(t *testing.T) {
+	withLoopbackAllowed(t)
+	dbErr := "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hasQuote(r.Header.Get("X-Forwarded-For")) || hasQuote(cookieValue(r.Header.Get("Cookie"), "cart")) {
+			w.Write([]byte(dbErr))
+			return
+		}
+		w.Write([]byte("stable normal response"))
+	}))
+	defer srv.Close()
+	s := &SQLiScanner{}
+	auth := map[string]string{"Cookie": "session=secret; cart=7"}
+
+	headerIP := insertionPoint{URL: srv.URL, Param: "X-Forwarded-For", Value: "127.0.0.1", Method: "GET", Location: "header"}
+	if kind, payload, _ := s.quickProbe(context.Background(), headerIP, auth); kind != "error_based" {
+		t.Fatalf("full SQLi engine did not reach header sink: %q", kind)
+	} else if payload == "" {
+		t.Fatal("header SQLi must carry the reproduction payload")
+	}
+	cookieIP := insertionPoint{URL: srv.URL, Param: "cart", Value: "7", Method: "GET", Location: "cookie"}
+	if kind, payload, _ := s.quickProbe(context.Background(), cookieIP, auth); kind != "error_based" {
+		t.Fatalf("full SQLi engine did not reach authenticated cookie sink: %q", kind)
+	} else if payload == "" {
+		t.Fatal("cookie SQLi must carry the reproduction payload")
+	}
+	req, err := buildInjectedRequest(context.Background(), cookieIP, "7'", auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cookieValue(req.Header.Get("Cookie"), "session") != "secret" {
+		t.Fatalf("injecting cart cookie dropped auth session: %q", req.Header.Get("Cookie"))
+	}
+}

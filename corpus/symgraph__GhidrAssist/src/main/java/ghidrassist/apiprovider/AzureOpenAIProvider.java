@@ -1,0 +1,885 @@
+package ghidrassist.apiprovider;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import com.google.gson.JsonSyntaxException;
+
+import ghidrassist.LlmApi;
+import ghidrassist.apiprovider.exceptions.*;
+import ghidrassist.apiprovider.capabilities.FunctionCallingProvider;
+import ghidrassist.apiprovider.capabilities.ModelListProvider;
+import ghidrassist.apiprovider.capabilities.EmbeddingProvider;
+import okhttp3.*;
+import okio.BufferedSource;
+import javax.net.ssl.*;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+public class AzureOpenAIProvider extends APIProvider
+        implements FunctionCallingProvider, ModelListProvider, EmbeddingProvider {
+    private static final Gson gson = new Gson();
+    private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
+    private static final String AZURE_API_VERSION = "2025-01-01-preview";
+    private static final String AZURE_EMBEDDING_MODEL = "text-embedding-ada-002";
+
+    // Retry settings for streaming calls
+    private static final int MAX_STREAMING_RETRIES = 10;
+    private static final int MIN_RETRY_BACKOFF_MS = 10000;  // 10 seconds
+    private static final int MAX_RETRY_BACKOFF_MS = 30000;  // 30 seconds
+
+    private volatile boolean isCancelled = false;
+
+    // Azure OpenAI requires a deployment name
+    private String deploymentName;
+
+    public AzureOpenAIProvider(String name, String model, Integer maxTokens, String url, String key,
+            boolean disableTlsVerification, boolean bypassProxy, Integer timeout) {
+        super(name, ProviderType.AZURE_OPENAI, model, maxTokens, url, key, disableTlsVerification, bypassProxy, timeout);
+
+        // Extract deployment name from model if it contains a deployment name
+        // Format: deploymentName or deploymentName:modelName
+        if (model != null && model.contains(":")) {
+            String[] parts = model.split(":", 2);
+            this.deploymentName = parts[0];
+            this.model = parts[1]; // Use the actual model name
+        } else {
+            this.deploymentName = model; // Use model as deployment name
+        }
+    }
+
+    public static AzureOpenAIProvider fromConfig(APIProviderConfig config) {
+        return new AzureOpenAIProvider(
+                config.getName(),
+                config.getModel(),
+                config.getMaxTokens(),
+                config.getUrl(),
+                config.getKey(),
+                config.isDisableTlsVerification(),
+                config.isBypassProxy(),
+                config.getTimeout());
+    }
+
+    @Override
+    protected OkHttpClient buildClient() {
+        try {
+            OkHttpClient.Builder builder = configureClientBuilder(new OkHttpClient.Builder())
+                    .connectTimeout(super.timeout)
+                    .readTimeout(super.timeout)
+                    .writeTimeout(super.timeout)
+                    .retryOnConnectionFailure(true)
+                    .addInterceptor(chain -> {
+                        Request originalRequest = chain.request();
+
+                        // Add Azure OpenAI specific headers
+                        Request.Builder requestBuilder = originalRequest.newBuilder()
+                                .header("api-key", super.key)
+                                .header("Content-Type", "application/json");
+
+                        return chain.proceed(requestBuilder.build());
+                    });
+
+            if (disableTlsVerification) {
+                // Create a trust manager that does not validate certificate chains
+                final TrustManager[] trustAllCerts = new TrustManager[] {
+                        new X509TrustManager() {
+                            @Override
+                            public void checkClientTrusted(java.security.cert.X509Certificate[] chain,
+                                    String authType) {
+                            }
+
+                            @Override
+                            public void checkServerTrusted(java.security.cert.X509Certificate[] chain,
+                                    String authType) {
+                            }
+
+                            @Override
+                            public java.security.cert.X509Certificate[] getAcceptedIssuers() {
+                                return new java.security.cert.X509Certificate[] {};
+                            }
+                        }
+                };
+
+                // Install the all-trusting trust manager
+                final SSLContext sslContext = SSLContext.getInstance("SSL");
+                sslContext.init(null, trustAllCerts, new java.security.SecureRandom());
+                final SSLSocketFactory sslSocketFactory = sslContext.getSocketFactory();
+
+                builder.sslSocketFactory(sslSocketFactory, (X509TrustManager) trustAllCerts[0]);
+                builder.hostnameVerifier((hostname, session) -> true);
+            }
+
+            return builder.build();
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to build Azure OpenAI HTTP client: " + e.getMessage(), e);
+        }
+    }
+
+    @Override
+    public String createChatCompletion(List<ChatMessage> messages) throws APIProviderException {
+        JsonObject payload = buildChatCompletionPayload(messages, false);
+
+        String endpoint = buildChatCompletionUrl();
+        Request request = new Request.Builder()
+                .url(endpoint)
+                .post(RequestBody.create(gson.toJson(payload), JSON))
+                .build();
+
+        try (Response response = executeWithRetry(request, "createChatCompletion")) {
+            String responseBody = response.body().string();
+            try {
+                JsonObject responseObj = gson.fromJson(responseBody, JsonObject.class);
+                return extractContentFromResponse(responseObj);
+            } catch (JsonSyntaxException e) {
+                throw new ResponseException(name, "createChatCompletion",
+                        ResponseException.ResponseErrorType.MALFORMED_JSON, e);
+            }
+        } catch (IOException e) {
+            throw handleNetworkError(e, "createChatCompletion");
+        }
+    }
+
+    @Override
+    public void streamChatCompletion(List<ChatMessage> messages, LlmApi.LlmResponseHandler handler)
+            throws APIProviderException {
+        JsonObject payload = buildChatCompletionPayload(messages, true);
+        executeStreamingWithRetry(payload, handler, "stream_chat_completion", 0);
+    }
+
+    /**
+     * Execute streaming request with retry logic for rate limits and transient errors.
+     */
+    private void executeStreamingWithRetry(JsonObject payload, LlmApi.LlmResponseHandler handler,
+                                           String operation, int attemptNumber) {
+        if (isCancelled) {
+            handler.onError(new StreamCancelledException(name, operation,
+                StreamCancelledException.CancellationReason.USER_REQUESTED));
+            return;
+        }
+
+        String endpoint = buildChatCompletionUrl();
+        Request request = new Request.Builder()
+                .url(endpoint)
+                .post(RequestBody.create(gson.toJson(payload), JSON))
+                .build();
+
+        client.newCall(request).enqueue(new Callback() {
+            private boolean isFirst = true;
+
+            @Override
+            public void onFailure(Call call, IOException e) {
+                if (call.isCanceled()) {
+                    handler.onError(new StreamCancelledException(name, operation,
+                        StreamCancelledException.CancellationReason.USER_REQUESTED, e));
+                    return;
+                }
+
+                APIProviderException error = handleNetworkError(e, operation);
+                if (shouldRetryStreaming(error, attemptNumber)) {
+                    retryStreamingAfterDelay(payload, handler, operation, attemptNumber, error);
+                } else {
+                    handler.onError(error);
+                }
+            }
+
+            @Override
+            public void onResponse(Call call, Response response) throws IOException {
+                if (!response.isSuccessful()) {
+                    APIProviderException error = handleHttpError(response, operation);
+                    if (shouldRetryStreaming(error, attemptNumber)) {
+                        retryStreamingAfterDelay(payload, handler, operation, attemptNumber, error);
+                    } else {
+                        handler.onError(error);
+                    }
+                    return;
+                }
+
+                try (BufferedSource source = response.body().source()) {
+                    StringBuilder contentBuilder = new StringBuilder();
+
+                    while (!source.exhausted() && !isCancelled && handler.shouldContinue()) {
+                        String line = source.readUtf8Line();
+                        if (line == null || line.isEmpty())
+                            continue;
+
+                        if (line.startsWith("data: ")) {
+                            String data = line.substring(6).trim();
+                            if (data.equals("[DONE]")) {
+                                handler.onComplete(contentBuilder.toString());
+                                return;
+                            }
+
+                            try {
+                                JsonObject chunk = gson.fromJson(data, JsonObject.class);
+                                String content = extractDeltaContent(chunk);
+                                if (content != null) {
+                                    if (isFirst) {
+                                        handler.onStart();
+                                        isFirst = false;
+                                    }
+                                    contentBuilder.append(content);
+                                    handler.onUpdate(content);
+                                }
+                            } catch (JsonSyntaxException e) {
+                                handler.onError(new ResponseException(name, operation,
+                                        ResponseException.ResponseErrorType.MALFORMED_JSON, e));
+                                return;
+                            }
+                        }
+                    }
+
+                    if (isCancelled) {
+                        handler.onError(new StreamCancelledException(name, operation,
+                                StreamCancelledException.CancellationReason.USER_REQUESTED));
+                    } else if (!handler.shouldContinue()) {
+                        handler.onError(new StreamCancelledException(name, operation,
+                                StreamCancelledException.CancellationReason.USER_REQUESTED));
+                    } else {
+                        handler.onComplete(contentBuilder.toString());
+                    }
+                } catch (IOException e) {
+                    if (!isCancelled) {
+                        handler.onError(handleNetworkError(e, operation));
+                    }
+                }
+            }
+        });
+    }
+
+    /**
+     * Check if a streaming error should be retried.
+     */
+    private boolean shouldRetryStreaming(APIProviderException error, int attemptNumber) {
+        if (attemptNumber >= MAX_STREAMING_RETRIES) {
+            return false;
+        }
+        switch (error.getCategory()) {
+            case RATE_LIMIT:
+            case NETWORK:
+            case TIMEOUT:
+            case SERVICE_ERROR:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Retry streaming request after appropriate delay.
+     */
+    private void retryStreamingAfterDelay(JsonObject payload, LlmApi.LlmResponseHandler handler,
+                                          String operation, int attemptNumber, APIProviderException error) {
+        int nextAttempt = attemptNumber + 1;
+        int waitTimeMs = calculateStreamingRetryWait(error);
+
+        ghidra.util.Msg.warn(this, String.format("Streaming retry %d/%d for %s: %s. Waiting %d seconds...",
+            nextAttempt, MAX_STREAMING_RETRIES, operation,
+            error.getCategory().getDisplayName(), waitTimeMs / 1000));
+
+        new Thread(() -> {
+            try {
+                Thread.sleep(waitTimeMs);
+                if (!isCancelled) {
+                    executeStreamingWithRetry(payload, handler, operation, nextAttempt);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                handler.onError(new StreamCancelledException(name, operation,
+                    StreamCancelledException.CancellationReason.USER_REQUESTED));
+            }
+        }, "AzureOpenAIProvider-StreamRetry").start();
+    }
+
+    /**
+     * Calculate wait time for streaming retry with jitter.
+     */
+    private int calculateStreamingRetryWait(APIProviderException error) {
+        if (error.getCategory() == APIProviderException.ErrorCategory.RATE_LIMIT) {
+            Integer retryAfter = error.getRetryAfterSeconds();
+            if (retryAfter != null && retryAfter > 0) {
+                return retryAfter * 1000;
+            }
+        }
+        return MIN_RETRY_BACKOFF_MS + (int) (Math.random() * (MAX_RETRY_BACKOFF_MS - MIN_RETRY_BACKOFF_MS));
+    }
+
+    @Override
+    public String createChatCompletionWithFunctionsFullResponse(List<ChatMessage> messages,
+            List<Map<String, Object>> functions) throws APIProviderException {
+        return createChatCompletionWithFunctionsFullResponse(messages, functions, ToolChoiceMode.AUTO);
+    }
+
+    @Override
+    public String createChatCompletionWithFunctionsFullResponse(List<ChatMessage> messages,
+            List<Map<String, Object>> functions, ToolChoiceMode toolChoiceMode) throws APIProviderException {
+        JsonObject payload = buildChatCompletionPayload(messages, false);
+
+        // Add tools (functions) to the payload
+        payload.add("tools", gson.toJsonTree(functions));
+        payload.addProperty("tool_choice",
+                (toolChoiceMode != null ? toolChoiceMode : ToolChoiceMode.AUTO).toOpenAIToolChoice(messages));
+
+        String endpoint = buildChatCompletionUrl();
+        Request request = new Request.Builder()
+                .url(endpoint)
+                .post(RequestBody.create(gson.toJson(payload), JSON))
+                .build();
+
+        try (Response response = executeWithRetry(request, "createChatCompletionWithFunctionsFullResponse")) {
+            String responseBody = response.body().string();
+
+            // Return the full response body as-is, including finish_reason
+            return responseBody;
+
+        } catch (IOException e) {
+            throw new NetworkException(name, "createChatCompletionWithFunctionsFullResponse",
+                    NetworkException.NetworkErrorType.CONNECTION_FAILED);
+        }
+    }
+
+    @Override
+    public String createChatCompletionWithFunctions(List<ChatMessage> messages, List<Map<String, Object>> functions)
+            throws APIProviderException {
+        return createChatCompletionWithFunctions(messages, functions, ToolChoiceMode.AUTO);
+    }
+
+    @Override
+    public String createChatCompletionWithFunctions(List<ChatMessage> messages, List<Map<String, Object>> functions,
+            ToolChoiceMode toolChoiceMode) throws APIProviderException {
+        JsonObject payload = buildChatCompletionPayload(messages, false);
+
+        // Add tools (functions) to the payload
+        payload.add("tools", gson.toJsonTree(functions));
+        payload.addProperty("tool_choice",
+                (toolChoiceMode != null ? toolChoiceMode : ToolChoiceMode.AUTO).toOpenAIToolChoice(messages));
+
+        String endpoint = buildChatCompletionUrl();
+        Request request = new Request.Builder()
+                .url(endpoint)
+                .post(RequestBody.create(gson.toJson(payload), JSON))
+                .build();
+
+        try (Response response = executeWithRetry(request, "createChatCompletionWithFunctions")) {
+            String responseBody = response.body().string();
+
+            try {
+                JsonObject responseObj = gson.fromJson(responseBody, JsonObject.class);
+
+                // Extract message from response (Azure OpenAI follows standard format)
+                JsonObject message = responseObj.getAsJsonArray("choices")
+                        .get(0).getAsJsonObject()
+                        .getAsJsonObject("message");
+
+                // Check if tool_calls exists directly
+                if (message.has("tool_calls") && !message.get("tool_calls").isJsonNull()) {
+                    return "{\"tool_calls\":" + message.get("tool_calls").toString() + "}";
+                }
+
+                // If no tool_calls, check if content contains a JSON object (fallback for edge
+                // cases)
+                if (message.has("content") && !message.get("content").isJsonNull()) {
+                    String content = message.get("content").getAsString().trim();
+
+                    // Try to parse content as JSON if it looks like JSON
+                    if (content.startsWith("{") || content.startsWith("[")) {
+                        try {
+                            JsonElement contentJson = JsonParser.parseString(content);
+
+                            // Case 1: Content is already a tool_calls object
+                            if (contentJson.isJsonObject() && contentJson.getAsJsonObject().has("tool_calls")) {
+                                return content;
+                            }
+
+                            // Case 2: Content is a single function call
+                            if (contentJson.isJsonObject()) {
+                                JsonObject funcObj = contentJson.getAsJsonObject();
+                                if (funcObj.has("name") && funcObj.has("arguments")) {
+                                    JsonArray toolCalls = new JsonArray();
+                                    JsonObject toolCall = new JsonObject();
+                                    toolCall.addProperty("id", "call_" + System.currentTimeMillis());
+                                    toolCall.addProperty("type", "function");
+
+                                    JsonObject function = new JsonObject();
+                                    function.add("name", funcObj.get("name"));
+                                    function.add("arguments", funcObj.get("arguments"));
+                                    toolCall.add("function", function);
+                                    toolCalls.add(toolCall);
+
+                                    return "{\"tool_calls\":" + toolCalls.toString() + "}";
+                                }
+                            }
+                        } catch (JsonSyntaxException e) {
+                            // Content is not valid JSON, fall through
+                        }
+                    }
+                }
+
+                // No valid tool calls found
+                return "{\"tool_calls\":[]}";
+
+            } catch (JsonSyntaxException e) {
+                throw new ResponseException(name, "createChatCompletionWithFunctions",
+                        ResponseException.ResponseErrorType.MALFORMED_JSON, e);
+            }
+        } catch (IOException e) {
+            throw handleNetworkError(e, "createChatCompletionWithFunctions");
+        }
+    }
+
+    @Override
+    public List<String> getAvailableModels() throws APIProviderException {
+        String endpoint = buildModelsUrl();
+        Request request = new Request.Builder()
+                .url(endpoint)
+                .build();
+
+        try (Response response = executeWithRetry(request, "getAvailableModels")) {
+            String responseBody = response.body().string();
+            try {
+                JsonObject responseObj = gson.fromJson(responseBody, JsonObject.class);
+                JsonArray modelsArray = responseObj.getAsJsonArray("data");
+
+                List<String> models = new ArrayList<>();
+                for (JsonElement element : modelsArray) {
+                    JsonObject modelObj = element.getAsJsonObject();
+                    models.add(modelObj.get("id").getAsString());
+                }
+                return models;
+            } catch (JsonSyntaxException e) {
+                throw new ResponseException(name, "getAvailableModels",
+                        ResponseException.ResponseErrorType.MALFORMED_JSON, e);
+            }
+        } catch (IOException e) {
+            throw handleNetworkError(e, "getAvailableModels");
+        }
+    }
+
+    @Override
+    public void getEmbeddingsAsync(String text, EmbeddingCallback callback) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("input", text);
+        executeEmbeddingsWithRetry(payload, callback, "get_embeddings", 0);
+    }
+
+    /**
+     * Execute embeddings request with retry logic for rate limits and transient errors.
+     */
+    private void executeEmbeddingsWithRetry(JsonObject payload, EmbeddingCallback callback,
+                                            String operation, int attemptNumber) {
+        if (isCancelled) {
+            callback.onError(new StreamCancelledException(name, operation,
+                StreamCancelledException.CancellationReason.USER_REQUESTED));
+            return;
+        }
+
+        String endpoint = buildEmbeddingsUrl();
+        Request request = new Request.Builder()
+                .url(endpoint)
+                .post(RequestBody.create(gson.toJson(payload), JSON))
+                .build();
+
+        client.newCall(request).enqueue(new Callback() {
+            @Override
+            public void onFailure(Call call, IOException e) {
+                if (call.isCanceled()) {
+                    callback.onError(new StreamCancelledException(name, operation,
+                        StreamCancelledException.CancellationReason.USER_REQUESTED, e));
+                    return;
+                }
+
+                APIProviderException error = handleNetworkError(e, operation);
+                if (shouldRetryStreaming(error, attemptNumber)) {
+                    retryEmbeddingsAfterDelay(payload, callback, operation, attemptNumber, error);
+                } else {
+                    callback.onError(error);
+                }
+            }
+
+            @Override
+            public void onResponse(Call call, Response response) throws IOException {
+                if (!response.isSuccessful()) {
+                    APIProviderException error = handleHttpError(response, operation);
+                    if (shouldRetryStreaming(error, attemptNumber)) {
+                        retryEmbeddingsAfterDelay(payload, callback, operation, attemptNumber, error);
+                    } else {
+                        callback.onError(error);
+                    }
+                    return;
+                }
+
+                try {
+                    String responseBody = response.body().string();
+                    JsonObject responseObj = gson.fromJson(responseBody, JsonObject.class);
+                    JsonArray dataArray = responseObj.getAsJsonArray("data");
+
+                    if (dataArray.size() > 0) {
+                        JsonArray embeddingArray = dataArray.get(0).getAsJsonObject().getAsJsonArray("embedding");
+                        double[] embedding = new double[embeddingArray.size()];
+
+                        for (int i = 0; i < embeddingArray.size(); i++) {
+                            embedding[i] = embeddingArray.get(i).getAsDouble();
+                        }
+
+                        callback.onSuccess(embedding);
+                    } else {
+                        callback.onError(new ResponseException(name, operation,
+                                ResponseException.ResponseErrorType.EMPTY_RESPONSE));
+                    }
+                } catch (JsonSyntaxException e) {
+                    callback.onError(new ResponseException(name, operation,
+                            ResponseException.ResponseErrorType.MALFORMED_JSON, e));
+                }
+            }
+        });
+    }
+
+    /**
+     * Retry embeddings request after appropriate delay.
+     */
+    private void retryEmbeddingsAfterDelay(JsonObject payload, EmbeddingCallback callback,
+                                           String operation, int attemptNumber, APIProviderException error) {
+        int nextAttempt = attemptNumber + 1;
+        int waitTimeMs = calculateStreamingRetryWait(error);
+
+        ghidra.util.Msg.warn(this, String.format("Embeddings retry %d/%d for %s: %s. Waiting %d seconds...",
+            nextAttempt, MAX_STREAMING_RETRIES, operation,
+            error.getCategory().getDisplayName(), waitTimeMs / 1000));
+
+        new Thread(() -> {
+            try {
+                Thread.sleep(waitTimeMs);
+                if (!isCancelled) {
+                    executeEmbeddingsWithRetry(payload, callback, operation, nextAttempt);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                callback.onError(new StreamCancelledException(name, operation,
+                    StreamCancelledException.CancellationReason.USER_REQUESTED));
+            }
+        }, "AzureOpenAIProvider-EmbeddingsRetry").start();
+    }
+
+    private String buildChatCompletionUrl() {
+        return String.format("%sopenai/deployments/%s/chat/completions?api-version=%s",
+                url, deploymentName, AZURE_API_VERSION);
+    }
+
+    private String buildModelsUrl() {
+        return String.format("%sopenai/models?api-version=%s", url, AZURE_API_VERSION);
+    }
+
+    private String buildEmbeddingsUrl() {
+        return String.format("%sopenai/deployments/%s/embeddings?api-version=%s",
+                url, AZURE_EMBEDDING_MODEL, AZURE_API_VERSION);
+    }
+
+    private JsonObject buildChatCompletionPayload(List<ChatMessage> messages, boolean stream) {
+        JsonObject payload = new JsonObject();
+
+        // Handle different token field names based on model
+        String modelName = super.getModel();
+        if (modelName != null
+                && (modelName.startsWith("o1-") || modelName.startsWith("o3-") || modelName.startsWith("o4-") || modelName.startsWith("gpt-5"))) {
+            payload.addProperty("max_completion_tokens", super.getMaxTokens());
+        } else {
+            payload.addProperty("max_tokens", super.getMaxTokens());
+        }
+
+        payload.addProperty("stream", stream);
+
+        // Add reasoning_effort if configured
+        ReasoningConfig reasoning = getReasoningConfig();
+        if (reasoning != null && reasoning.isEnabled()) {
+            payload.addProperty("reasoning_effort", reasoning.getEffortString());
+        }
+
+        JsonArray messagesArray = new JsonArray();
+        for (ChatMessage message : messages) {
+            JsonObject messageObj = new JsonObject();
+            messageObj.addProperty("role", message.getRole());
+
+            // Handle content - tool messages MUST always have content (even empty string)
+            if (message.getContent() != null) {
+                messageObj.addProperty("content", message.getContent());
+            } else if ("tool".equals(message.getRole())) {
+                // OpenAI requires content field for tool messages, even if empty
+                messageObj.addProperty("content", "");
+            }
+
+            // Handle tool calls for assistant messages
+            if (message.getToolCalls() != null) {
+                messageObj.add("tool_calls", gson.toJsonTree(message.getToolCalls()));
+            }
+
+            // Handle tool call ID for tool response messages
+            if (message.getToolCallId() != null) {
+                messageObj.addProperty("tool_call_id", message.getToolCallId());
+            }
+
+            messagesArray.add(messageObj);
+        }
+        // Last-line-of-defense: validate tool_call/result pairing in the payload
+        sanitizeToolCallsInPayload(messagesArray);
+
+        payload.add("messages", messagesArray);
+
+        return payload;
+    }
+
+    /**
+     * Sanitize the messages array to prevent orphaned tool_calls from reaching the API.
+     * For each assistant message with tool_calls, verifies matching tool result messages exist.
+     * If not, removes the tool_calls or inserts placeholder tool results.
+     */
+    private void sanitizeToolCallsInPayload(JsonArray messagesArray) {
+        for (int i = 0; i < messagesArray.size(); i++) {
+            JsonObject msg = messagesArray.get(i).getAsJsonObject();
+            if (!"assistant".equals(getStringField(msg, "role"))) continue;
+            if (!msg.has("tool_calls") || msg.get("tool_calls").isJsonNull()) continue;
+
+            JsonArray toolCalls;
+            try {
+                toolCalls = msg.getAsJsonArray("tool_calls");
+            } catch (Exception e) {
+                continue;
+            }
+            if (toolCalls.size() == 0) continue;
+
+            // Collect expected tool_call IDs
+            java.util.List<String> expectedIds = new java.util.ArrayList<>();
+            for (int tc = 0; tc < toolCalls.size(); tc++) {
+                JsonObject tcObj = toolCalls.get(tc).getAsJsonObject();
+                String id = getStringField(tcObj, "id");
+                if (id != null && !id.isEmpty()) {
+                    expectedIds.add(id);
+                }
+            }
+
+            if (expectedIds.isEmpty()) {
+                msg.remove("tool_calls");
+                ghidra.util.Msg.warn(this, "Payload sanitization: removed tool_calls with null/empty IDs at message " + i);
+                continue;
+            }
+
+            // Check for matching tool result messages
+            java.util.Set<String> foundIds = new java.util.HashSet<>();
+            for (int j = i + 1; j < messagesArray.size(); j++) {
+                JsonObject resultMsg = messagesArray.get(j).getAsJsonObject();
+                String role = getStringField(resultMsg, "role");
+                if ("tool".equals(role)) {
+                    String tcId = getStringField(resultMsg, "tool_call_id");
+                    if (tcId != null) foundIds.add(tcId);
+                } else if ("assistant".equals(role) || "user".equals(role)) {
+                    break;
+                }
+            }
+
+            java.util.List<String> missingIds = new java.util.ArrayList<>();
+            for (String id : expectedIds) {
+                if (!foundIds.contains(id)) {
+                    missingIds.add(id);
+                }
+            }
+
+            if (missingIds.isEmpty()) continue;
+
+            if (missingIds.size() == expectedIds.size()) {
+                msg.remove("tool_calls");
+                ghidra.util.Msg.warn(this, "Payload sanitization: removed orphaned tool_calls at message " + i +
+                    " (no matching results for " + expectedIds.size() + " tool calls)");
+            } else {
+                // Insert placeholder results for missing IDs
+                for (String missingId : missingIds) {
+                    JsonObject placeholder = new JsonObject();
+                    placeholder.addProperty("role", "tool");
+                    placeholder.addProperty("tool_call_id", missingId);
+                    placeholder.addProperty("content", "Error: Tool execution result was lost.");
+                    messagesArray.add(placeholder);
+                    ghidra.util.Msg.warn(this, "Payload sanitization: inserted placeholder for tool_call_id=" + missingId);
+                }
+                reorderToolResults(messagesArray);
+            }
+        }
+    }
+
+    /**
+     * Reorder messages so tool results immediately follow their assistant message.
+     */
+    private void reorderToolResults(JsonArray messagesArray) {
+        java.util.List<JsonObject> ordered = new java.util.ArrayList<>();
+        for (int i = 0; i < messagesArray.size(); i++) {
+            ordered.add(messagesArray.get(i).getAsJsonObject());
+        }
+
+        java.util.List<JsonObject> result = new java.util.ArrayList<>();
+        java.util.Set<Integer> processed = new java.util.HashSet<>();
+
+        for (int i = 0; i < ordered.size(); i++) {
+            if (processed.contains(i)) continue;
+            JsonObject msg = ordered.get(i);
+            result.add(msg);
+            processed.add(i);
+
+            if ("assistant".equals(getStringField(msg, "role")) &&
+                msg.has("tool_calls") && !msg.get("tool_calls").isJsonNull()) {
+
+                JsonArray toolCalls;
+                try {
+                    toolCalls = msg.getAsJsonArray("tool_calls");
+                } catch (Exception e) {
+                    continue;
+                }
+                java.util.Set<String> tcIds = new java.util.HashSet<>();
+                for (int tc = 0; tc < toolCalls.size(); tc++) {
+                    String id = getStringField(toolCalls.get(tc).getAsJsonObject(), "id");
+                    if (id != null) tcIds.add(id);
+                }
+
+                for (int j = 0; j < ordered.size(); j++) {
+                    if (processed.contains(j)) continue;
+                    JsonObject candidate = ordered.get(j);
+                    if ("tool".equals(getStringField(candidate, "role"))) {
+                        String candidateId = getStringField(candidate, "tool_call_id");
+                        if (candidateId != null && tcIds.contains(candidateId)) {
+                            result.add(candidate);
+                            processed.add(j);
+                        }
+                    }
+                }
+            }
+        }
+
+        while (messagesArray.size() > 0) {
+            messagesArray.remove(0);
+        }
+        for (JsonObject msg : result) {
+            messagesArray.add(msg);
+        }
+    }
+
+    /**
+     * Safely extract a string field from a JsonObject.
+     */
+    private String getStringField(JsonObject obj, String field) {
+        if (obj.has(field)) {
+            JsonElement el = obj.get(field);
+            if (el != null && !el.isJsonNull() && el.isJsonPrimitive()) {
+                return el.getAsString();
+            }
+        }
+        return null;
+    }
+
+    private String extractContentFromResponse(JsonObject responseObj) {
+        JsonObject message = responseObj.getAsJsonArray("choices")
+                .get(0).getAsJsonObject()
+                .getAsJsonObject("message");
+
+        // Check if content exists and is not null
+        if (message.has("content") && !message.get("content").isJsonNull()) {
+            return message.get("content").getAsString();
+        }
+
+        // If no content, this might be a tool call response
+        // Return empty string or handle tool calls appropriately
+        return "";
+    }
+
+    private String extractDeltaContent(JsonObject chunk) {
+        try {
+            JsonObject delta = chunk.getAsJsonArray("choices")
+                    .get(0).getAsJsonObject()
+                    .getAsJsonObject("delta");
+
+            if (delta.has("content") && !delta.get("content").isJsonNull()) {
+                return delta.get("content").getAsString();
+            }
+        } catch (Exception e) {
+            // Handle any JSON parsing errors silently and return null
+        }
+        return null;
+    }
+
+    public void cancelRequest() {
+        isCancelled = true;
+    }
+
+    @Override
+    protected String extractApiErrorCode(String responseBody) {
+        if (responseBody == null || responseBody.isEmpty()) {
+            return null;
+        }
+
+        try {
+            JsonObject errorObj = gson.fromJson(responseBody, JsonObject.class);
+            if (errorObj.has("error")) {
+                JsonObject error = errorObj.getAsJsonObject("error");
+                if (error.has("code")) {
+                    JsonElement codeElement = error.get("code");
+                    if (codeElement != null && !codeElement.isJsonNull()) {
+                        return codeElement.getAsString();
+                    }
+                }
+            }
+        } catch (JsonSyntaxException e) {
+            // Ignore parsing errors
+        }
+
+        return null;
+    }
+
+    @Override
+    protected String extractErrorMessage(String responseBody, int statusCode) {
+        if (responseBody == null || responseBody.isEmpty()) {
+            return null;
+        }
+
+        try {
+            JsonObject errorObj = gson.fromJson(responseBody, JsonObject.class);
+            if (errorObj.has("error")) {
+                JsonObject error = errorObj.getAsJsonObject("error");
+                if (error.has("message")) {
+                    JsonElement messageElement = error.get("message");
+                    if (messageElement != null && !messageElement.isJsonNull()) {
+                        return messageElement.getAsString();
+                    }
+                }
+            }
+        } catch (JsonSyntaxException e) {
+            // Ignore parsing errors and fall back to parent implementation
+        }
+
+        // Fallback to parent implementation
+        return super.extractErrorMessage(responseBody, statusCode);
+    }
+
+    @Override
+    protected Integer extractRetryAfter(Response response, String responseBody) {
+        // First check the parent implementation for standard headers
+        Integer retryAfter = super.extractRetryAfter(response, responseBody);
+        if (retryAfter != null) {
+            return retryAfter;
+        }
+
+        // Check Azure OpenAI-specific retry information in response body
+        if (responseBody != null) {
+            try {
+                JsonObject errorObj = gson.fromJson(responseBody, JsonObject.class);
+                if (errorObj.has("error")) {
+                    JsonObject error = errorObj.getAsJsonObject("error");
+                    if (error.has("retry_after")) {
+                        return error.get("retry_after").getAsInt();
+                    }
+                }
+            } catch (Exception e) {
+                // Ignore parsing errors
+            }
+        }
+
+        return null;
+    }
+}

@@ -1,0 +1,538 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// The engine's complete rule registry — the single source of truth for which
+// constraint rules and curation (verdict) rules run, shared by the orchestrator
+// (engine_resolve) and the integration tests so the two cannot drift.
+//
+// Each rule's prototype is also declared here so the rule .c file can include
+// this header at its definition site and satisfy -Wmissing-prototypes; the
+// registry in engine_rules.c then references the same names. Adding a new
+// rule means: prototype here + entry in engine_rules.c's k_rules / k_vrules.
+// ---
+// <bcoles@gmail.com>
+
+#ifndef KASLD_ENGINE_RULES_H
+#define KASLD_ENGINE_RULES_H
+
+#include "engine.h"
+
+#include <stdio.h>
+#include <string.h>
+
+/* Constraint rules, in registry order. *n is set to the count. */
+const rule_fn *engine_rules(int *n);
+
+/* Curation (verdict) rules, in registry order. *n is set to the count. */
+const verdict_fn *engine_verdict_rules(int *n);
+
+/* Confidence propagation for cross-quantity derived constraints. A bound
+ * derived from another quantity's resolved edge is no more trustworthy than
+ * that edge: a rule caps its emitted conf at kasld_conf_min(own_grade,
+ * edge_conf). kasld_edge_conf normalizes a zero-initialized estimate (lo_conf/
+ * hi_conf == CONF_UNKNOWN, e.g. a hand-built test estimate) to the axiom
+ * default CONF_PARSED, matching the honest top set by init_top. */
+static inline enum kasld_confidence kasld_conf_min(enum kasld_confidence a,
+                                                   enum kasld_confidence b) {
+  return (int)a < (int)b ? a : b;
+}
+static inline enum kasld_confidence
+kasld_edge_conf(enum kasld_confidence edge) {
+  return edge == CONF_UNKNOWN ? CONF_PARSED : edge;
+}
+
+/* Shared skeleton for the per-arch `*_coupling_validate` verdict rules. Each
+ * such rule emits V_INVALID for every VIRT address observation whose anchor
+ * falls outside its region's fixed VA band — the band layout is the only
+ * arch-specific part, supplied as `is_bad(region, anchor)`. This folds the
+ * identical scan + verdict-emission boilerplate the four rules used to repeat.
+ * An anchor of 0 (no usable address) is never flagged. */
+typedef int (*kasld_va_band_check)(enum kasld_region region,
+                                   unsigned long anchor);
+
+static inline int kasld_emit_va_band_verdicts(const struct evidence_set *ev,
+                                              struct verdict *out, int out_max,
+                                              kasld_va_band_check is_bad,
+                                              const char *origin) {
+  int n = 0;
+  for (int i = 0; i < ev->n_obs && n < out_max; i++) {
+    const struct observation *o = &ev->obs[i];
+    if (!o->valid || o->value_kind != OBS_ADDRESS ||
+        o->eff_type != KASLD_TYPE_VIRT)
+      continue;
+    unsigned long a = obs_anchor(o);
+    if (a == 0)
+      continue;
+    if (!is_bad(o->eff_region, a))
+      continue;
+    struct verdict *v = &out[n++];
+    memset(v, 0, sizeof(*v));
+    v->observation_id = o->id;
+    v->kind = V_INVALID;
+    snprintf(v->origin, ORIGIN_LEN, "%s", origin);
+  }
+  return n;
+}
+
+/* First non-zero OBS_SCALAR value for `fact`, or 0. Reports its confidence and
+ * source id via the out-params when found. */
+static inline unsigned long
+kasld_scalar_fact_value(const struct evidence_set *ev,
+                        enum kasld_scalar_fact fact,
+                        enum kasld_confidence *conf, uint32_t *src) {
+  for (int i = 0; i < ev->n_obs; i++) {
+    const struct observation *o = &ev->obs[i];
+    if (o->valid && o->value_kind == OBS_SCALAR && o->scalar_fact == fact &&
+        o->scalar_value != 0) {
+      if (conf)
+        *conf = o->conf;
+      if (src)
+        *src = o->id;
+      return o->scalar_value;
+    }
+  }
+  return 0;
+}
+
+/* A scalar fact's value together with whether it was present at all.
+ *
+ * kasld_scalar_fact_value() above skips a zero-valued observation, so it cannot
+ * tell "no such fact" from "the fact says zero". For most facts those mean the
+ * same thing. For a fact whose zero is itself an answer they do not, and a
+ * consumer that cannot distinguish them silently loses half the fact.
+ *
+ * Returns 1 when the fact was observed, writing its value, confidence and
+ * source id; 0 when it was absent, leaving all three cleared so a caller that
+ * ignores the return cannot pick up a stale lineage id. */
+static inline int kasld_scalar_fact_present(const struct evidence_set *ev,
+                                            enum kasld_scalar_fact fact,
+                                            unsigned long *value,
+                                            enum kasld_confidence *conf,
+                                            uint32_t *src) {
+  if (value)
+    *value = 0;
+  if (conf)
+    *conf = CONF_UNKNOWN;
+  if (src)
+    *src = 0;
+  for (int i = 0; i < ev->n_obs; i++) {
+    const struct observation *o = &ev->obs[i];
+    if (!o->valid || o->value_kind != OBS_SCALAR || o->scalar_fact != fact)
+      continue;
+    if (value)
+      *value = o->scalar_value;
+    if (conf)
+      *conf = o->conf;
+    if (src)
+      *src = o->id;
+    return 1;
+  }
+  return 0;
+}
+
+#if MODULES_ANCHOR_IS_RUNTIME
+/* Which module-band arrangement the evidence proves, on an architecture whose
+ * anchor is a property of the kernel that booted rather than of this build.
+ *
+ * One answer for every consumer: two rules derive from the arrangement and the
+ * layout renderer draws the band from it, and three sites each deciding it
+ * would be three places for the decision to drift -- and the renderer drawing
+ * one arrangement while the engine bounded the other is the drift that shows.
+ * The arch supplies the tests; this gathers what they need and combines them.
+ *
+ * The module scan takes REGION_MODULE only, never REGION_MODULE_BAND, and must
+ * keep doing so: a band-classified address is one that merely FELL INSIDE the
+ * compile-time band, which on these arches spans the whole kernel address
+ * space, so a kernel .data address would read as a module and answer the
+ * arrangement question backwards. module_text_bound applies the same filter for
+ * the same reason, at greater length, and the two have to agree.
+ *
+ * The highest such address is the one to test, since the question is whether
+ * ANY module sits at or above the image.
+ *
+ * The image window is taken as two values rather than as the estimate array on
+ * purpose. A rule that bounds Q_VIRT_IMAGE_BASE and consults this is a
+ * self-edge, and check-self-edges finds those by reading the rule for an
+ * est[Q] read beside a write of the same Q -- so the read stays at the call
+ * site, where the guard can see it and the reviewed-allowlist entry stays
+ * honest. Hidden in here it would be a self-edge the guard cannot report. */
+static inline enum s390_layout_generation
+kasld_module_anchor_proven(const struct evidence_set *ev, unsigned long vt_lo,
+                           unsigned long vt_hi) {
+#if defined(__s390x__) || defined(__zarch__)
+  unsigned long sel = 0;
+  const int have_sel = kasld_scalar_fact_present(ev, SF_VIRT_KERNEL_IMAGE_BASE,
+                                                 &sel, NULL, NULL);
+  unsigned long vmod_hi = 0;
+  for (int i = 0; i < ev->n_obs; i++) {
+    const struct observation *o = &ev->obs[i];
+    if (!o->valid || o->value_kind != OBS_ADDRESS ||
+        o->eff_type != KASLD_TYPE_VIRT || o->eff_region != REGION_MODULE)
+      continue;
+    unsigned long a = obs_anchor(o);
+    if (a > vmod_hi)
+      vmod_hi = a;
+  }
+
+  enum s390_layout_generation from_addr = S390_LAYOUT_UNPROVEN;
+  if (vmod_hi != 0)
+    from_addr = s390_layout_from_module_addr(vmod_hi, vt_lo, vt_hi);
+
+  return s390_layout_proven(s390_layout_from_config(have_sel, sel), from_addr);
+#else
+  (void)vt_lo;
+  (void)vt_hi;
+#error                                                                         \
+    "MOD_ANCHOR_RUNTIME on an arch with no arrangement witness here: supply the tests that establish which arrangement booted, or a band derived from the image can exclude the true base"
+#endif
+}
+#endif /* MODULES_ANCHOR_IS_RUNTIME */
+
+/* The observed kernel page size, or 0 when none is trustworthy.
+ *
+ * One answer to "is there a page size I may use", so consumers do not each
+ * invent a bracket. SF_PAGE_SIZE crosses the tagged-line protocol, so it is a
+ * parse and is checked like one: a value the architecture does not admit, or
+ * one that is not a power of two, is an artefact rather than a measurement.
+ * The bracket is the arch's own PAGE_SIZE_MIN / PAGE_SIZE_MAX axis rather than
+ * a round number, so it tightens wherever an arch states a narrower range.
+ *
+ * Returning 0 means "unknown", never "assume the usual": a rule that converts
+ * a page-frame number with a guessed size understates a physical address by up
+ * to 64x on the architectures that admit several, and a bound derived from an
+ * understated span lands past the truth it should contain. Where the
+ * architecture admits exactly one size, PAGE_SIZE_MIN is that size and needs
+ * no observation. */
+static inline unsigned long
+kasld_page_size_observed(const struct evidence_set *ev,
+                         enum kasld_confidence *conf, uint32_t *src) {
+  unsigned long ps = kasld_scalar_fact_value(ev, SF_PAGE_SIZE, conf, src);
+
+  if (ps && (ps & (ps - 1)) == 0 && ps >= (unsigned long)PAGE_SIZE_MIN &&
+      ps <= (unsigned long)PAGE_SIZE_MAX)
+    return ps;
+
+  /* Reject cleanly: a caller that ignores the return must not find a
+   * confidence or a lineage id left behind from a value that was refused. */
+  if (conf)
+    *conf = CONF_UNKNOWN;
+  if (src)
+    *src = 0;
+  return 0;
+}
+
+/* Shared skeleton for the virt/phys KASLR-disabled text pins. On a positive
+ * `signal` scalar, pin quantity `q` to the KASLR-off base — but the VALUE and
+ * its confidence differ by whether the base is a fact or a guess:
+ *   - `learned_base` != 0 is the EXACT no-KASLR base, pinned at
+ * `learned_ceiling`
+ *     (<= CONF_INFERRED) — reaches the guaranteed window, correct for default
+ * AND non-default builds. The caller must pass the exact value: on x86 the base
+ *     is __START_KERNEL_map + LOAD_PHYSICAL_ADDR, and LOAD_PHYSICAL_ADDR =
+ *     ALIGN(CONFIG_PHYSICAL_START, CONFIG_PHYSICAL_ALIGN) — so the caller
+ * aligns the parsed CONFIG_PHYSICAL_START and passes 0 (falling back to `dflt`)
+ * when the alignment is unknown, since the un-aligned value is a floor, not the
+ *     base. `learned_src`/`learned_src2` are the parsed value's source ids for
+ *     lineage (0 = none), added only on the learned path.
+ *   - otherwise the compile-time `dflt` is an ASSUMED standard-config value (a
+ *     guess): pinned at CONF_HEURISTIC (likely window only), so a non-default
+ *     CONFIG_PHYSICAL_START build's true base is never excluded from the
+ *     guaranteed window. (Previously the default reached CONF_INFERRED; the
+ *     window-containment check below only catches a default ABOVE a narrowed
+ *     window, not a below-default build — hence the demotion.)
+ * The value must lie inside `q`'s current honest window (so a leak that already
+ * narrowed past it wins). Mirrors s390_image_base_from_config, which pins its
+ * learned config base. Returns 1 if a pin was emitted, 0 otherwise. */
+static inline int kasld_emit_kaslr_disabled_pin(
+    const struct evidence_set *ev, const struct estimate *est,
+    struct constraint *out, int out_max, enum kasld_scalar_fact signal,
+    enum kasld_quantity q, unsigned long learned_base,
+    enum kasld_confidence learned_ceiling, uint32_t learned_src,
+    uint32_t learned_src2, unsigned long dflt, const char *origin) {
+  if (out_max < 1)
+    return 0;
+
+  uint32_t sig_id = 0;
+  enum kasld_confidence sig_conf = CONF_UNKNOWN;
+  for (int i = 0; i < ev->n_obs; i++) {
+    const struct observation *o = &ev->obs[i];
+    if (!o->valid || o->value_kind != OBS_SCALAR)
+      continue;
+    if (o->scalar_fact == signal && o->scalar_value != 0) {
+      sig_id = o->id;
+      sig_conf = o->conf;
+      break;
+    }
+  }
+  if (sig_id == 0)
+    return 0;
+
+  unsigned long value;
+  enum kasld_confidence ceiling;
+  uint32_t extra_src, extra_src2;
+  if (learned_base != 0) {
+    value = learned_base;
+    ceiling = learned_ceiling;
+    extra_src = learned_src;
+    extra_src2 = learned_src2;
+  } else {
+    value = dflt;
+    ceiling = CONF_HEURISTIC;
+    extra_src = 0;
+    extra_src2 = 0;
+  }
+
+  const struct estimate *e = &est[q];
+  if (value == 0 || value < e->lo || value > e->hi)
+    return 0;
+
+  struct constraint *c = &out[0];
+  memset(c, 0, sizeof(*c));
+  c->q = q;
+  c->op = C_EQUALS;
+  c->value = value;
+  c->conf = kasld_conf_min(sig_conf, ceiling);
+  c->derived_from[0] = sig_id;
+  c->lineage_count = 1;
+  if (extra_src)
+    c->derived_from[c->lineage_count++] = extra_src;
+  if (extra_src2 && c->lineage_count < MAX_LINEAGE)
+    c->derived_from[c->lineage_count++] = extra_src2;
+  snprintf(c->origin, ORIGIN_LEN, "%s", origin);
+  return 1;
+}
+
+/* Shared skeleton for the per-arch virt↔phys text-residue coupling rules
+ * (arm64 and s390, each direction). On an arch where the kernel-image
+ * virt→phys offset is `modulus`-aligned, virt_text and phys_text share their
+ * low log2(modulus) bits, so a kernel-image *base* observation of one side
+ * pins the other side's residue class mod `modulus`. `want_type` selects which
+ * address-type's base to read (the source); `q` is the coupled quantity being
+ * pinned (the target).
+ *
+ * Soundness (the reason all four rules share one body rather than repeat it):
+ *   * Only a POS_BASE kernel-image / kernel-text observation is used — a
+ *     residue is well defined only for the image base; an interior sample sits
+ *     at an unknown offset from _text, so its residue would be wrong.
+ *   * The anchor is normalised to _text with kasld_image_base_from (a
+ *     KERNEL_TEXT witness is _stext = _text + STEXT_OFFSET).
+ *   * A real _text is IMAGE_ALIGN-aligned, so its residue is too; a residue off
+ *     the IMAGE_ALIGN grid signals a bad anchor and is skipped rather than
+ *     emitted (an unaligned residue would leave no IMAGE_ALIGN-aligned base in
+ *     the class and force bottom).
+ * Emits one C_STRIDE at the source observation's confidence. Returns 1 if a
+ * stride was emitted, 0 otherwise. */
+static inline int kasld_emit_text_residue(const struct evidence_set *ev,
+                                          struct constraint *out, int out_max,
+                                          enum kasld_addr_type want_type,
+                                          enum kasld_quantity q,
+                                          unsigned long modulus,
+                                          const char *origin) {
+  if (out_max < 1)
+    return 0;
+
+  unsigned long img_base = 0;
+  enum kasld_confidence conf = CONF_UNKNOWN;
+  uint32_t src = 0;
+  int found = 0;
+  for (int i = 0; i < ev->n_obs; i++) {
+    const struct observation *o = &ev->obs[i];
+    if (!o->valid || o->value_kind != OBS_ADDRESS || o->eff_type != want_type)
+      continue;
+    if (o->eff_region != REGION_KERNEL_IMAGE &&
+        o->eff_region != REGION_KERNEL_TEXT)
+      continue;
+    if (o->pos != POS_BASE || !HAS_LO(o))
+      continue;
+    /* An _stext witness is normalised to the image base by subtracting the head
+     * gap. Where that gap is a range rather than a single value the subtraction
+     * is only approximate, and the error does not vanish under the modulus: the
+     * residue class it produces need not contain the truth. A residue is an
+     * equality on the low bits, so there is no weaker form to fall back to --
+     * skip the witness. An image-base witness carries no gap and is unaffected.
+     */
+    if (o->eff_region == REGION_KERNEL_TEXT && !STEXT_GAP_EXACT)
+      continue;
+    unsigned long base = obs_anchor(o);
+    if (base == 0)
+      continue;
+    unsigned long img =
+        kasld_image_base_from(base, o->eff_region == REGION_KERNEL_TEXT);
+    if (!found || img < img_base) {
+      img_base = img;
+      conf = o->conf;
+      src = o->id;
+      found = 1;
+    }
+  }
+  if (!found)
+    return 0;
+
+  unsigned long residue = img_base % modulus;
+  if (residue & ((unsigned long)IMAGE_ALIGN - 1))
+    return 0; /* not on the image-alignment grid: bad anchor, skip */
+
+  struct constraint *c = &out[0];
+  memset(c, 0, sizeof(*c));
+  c->q = q;
+  c->op = C_STRIDE;
+  c->value = residue;
+  c->value2 = modulus;
+  c->conf = conf;
+  c->derived_from[0] = src;
+  c->lineage_count = 1;
+  snprintf(c->origin, ORIGIN_LEN, "%s", origin);
+  return 1;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Rule prototypes — grouped by family to mirror the registry layout in
+ * engine_rules.c. The R(...) / V(...) macros expand to the long
+ * rule_fn / verdict_fn signatures from engine.h.
+ * ─────────────────────────────────────────────────────────────────── */
+
+#define R(name)                                                                \
+  int rule_##name(const struct evidence_set *, const struct estimate *,        \
+                  struct constraint *, int)
+#define V(name)                                                                \
+  int rule_##name(const struct evidence_set *, struct verdict *, int)
+
+/* Image-size ceilings (CONFIG_KERNEL_IMAGE_SIZE / SF_IMAGE_SIZE_MIN etc.) */
+R(ceiling_from_image_size);
+R(phys_ceiling_from_memtotal);
+R(virt_ceiling_from_memtotal);
+R(phys_bits_ceiling);
+R(image_size_text_data_gap);
+R(min_offset_from_image_size);
+R(image_floor_from_init_size);
+R(vmsplit_text_base);
+R(range_from_interior);
+R(image_base_grid_align);
+R(image_base_resolved_grid_align);
+
+/* DRAM bounds (MMIO ceilings, holes, kernel-image phys gap, firmware) */
+R(dram_floor_bound);
+R(page_offset_text_floor);
+R(dram_ceiling);
+R(mmio_floor_phys_ceiling);
+R(phys_hole_filter);
+R(kernel_image_phys_bound);
+R(highmem_32bit_bound);
+
+/* virt_page_offset rules */
+R(page_offset_from_landmark);
+R(va_bits_from_scalar);
+R(page_offset_invariant_pin);
+R(page_offset_from_config);
+R(page_offset_from_leak);
+R(directmap_page_offset_bounds);
+R(randomize_memory_page_offset);
+
+/* Cmdline rules (mem= / memmap= / initrd / efi-seed) */
+R(initrd_phys_exclude);
+R(phys_reservation_exclude);
+R(ram_map_phys_exclude);
+R(initrd_above_kernel);
+R(cmdline_phys_exclude);
+R(cmdline_mem_phys_ceiling);
+R(cmdline_mem_virt_ceiling);
+R(cmdline_memmap_phys_exclude);
+R(cmdline_memmap_too_large_phys_pin);
+R(x86_64_efi_phys_seed_zero);
+
+/* KASLR alignment */
+R(kaslr_align_arch_default);
+R(boot_params_kaslr_align);
+R(kaslr_align_from_phys_base);
+R(s390_thread_size_align);
+R(arm64_efi_kimg_align);
+R(base_align_cross_validate);
+
+/* KASLR-off pin + learned floor */
+R(virt_kaslr_disabled_pin);
+R(directmap_kaslr_disabled_pin);
+R(phys_kaslr_disabled_pin);
+R(physical_start_lower_bound);
+
+/* Module-relative text bounds */
+R(module_text_bound);
+R(module_text_bracket);
+R(module_base_bounds);
+R(module_base_execmem_window);
+R(module_base_no_kaslr_ceiling);
+R(module_base_from_text);
+R(module_base_from_text_bracket);
+R(loongarch64_module_base);
+R(module_base_ppc64_vmalloc);
+
+/* Multi-entry EFI_LOADER_CODE → Q_PHYS_IMAGE_BASE pin (arm64/riscv64/x86_64) */
+R(efi_loader_kernel_pick);
+
+/* Text-base pin from POS_BASE kernel-image observation */
+R(text_pin_from_observation);
+R(constraint_passthrough);
+
+/* Symmetric phys↔virt text-base coupling synthesizer */
+R(text_base_coupling_synth);
+
+/* phys_virt_synth */
+R(phys_virt_synth);
+
+/* arm64-specific rules */
+R(arm64_text_base);
+R(arm64_memstart_align);
+R(arm64_va_bits_from_directmap);
+R(arm64_va_bits_from_vmemmap);
+R(arm64_va47_modern_floor);
+R(arm64_va_bits_from_vmalloc);
+R(arm64_va_bits_from_user_width);
+R(riscv64_va_bits_from_vmalloc);
+R(x86_64_va_bits_from_vmalloc);
+R(arm64_page_offset_from_va_bits);
+R(arm64_text_phys_residue);
+R(arm64_phys_text_residue);
+
+/* riscv64-specific rules */
+R(riscv64_text_base);
+R(riscv64_text_floor_from_va_bits);
+R(riscv64_non_efi_phys_base);
+R(riscv64_page_offset_from_vmalloc_vmemmap);
+
+/* s390-specific rules */
+R(s390_va_bits_from_config);
+R(s390_module_ceiling_from_va_bits);
+R(s390_text_ceiling_from_va_bits);
+R(s390_text_from_belows);
+R(s390_text_segment_mod);
+R(s390_phys_segment_mod);
+R(s390_text_no_random);
+R(s390_image_base_from_config);
+
+/* ppc-specific rules */
+R(ppc32_phys_ceiling);
+R(ppc64_firmware_ceiling);
+
+/* x86_32-specific rules */
+R(x86_32_vmsplit_ceiling);
+
+/* x86_64-specific rules */
+R(x86_64_vmalloc_base_bound);
+R(x86_64_vmemmap_base_bound);
+R(x86_64_la57_from_directmap);
+R(x86_64_page_offset_from_vmalloc_vmemmap);
+R(x86_64_randomize_memory_budget);
+R(x86_64_page_offset_floor_from_va_bits);
+
+/* Verdict rules */
+V(coupling_validate);
+V(text_cluster_filter);
+V(firmware_memmap_holes);
+V(ram_map_nonram_conflict);
+V(x86_64_vmalloc_vmemmap_invariant);
+V(arm64_coupling_validate);
+V(riscv64_coupling_validate);
+V(loongarch64_coupling_validate);
+
+#undef R
+#undef V
+
+#endif /* KASLD_ENGINE_RULES_H */

@@ -1,0 +1,499 @@
+package ghidrassist.chat.persistence;
+
+import ghidra.util.Msg;
+import ghidrassist.chat.PersistedChatMessage;
+import ghidrassist.chat.message.MessageRepository;
+import ghidrassist.chat.session.ChatSession;
+import ghidrassist.chat.session.ChatSessionRepository;
+
+import java.sql.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+
+/**
+ * Unified DAO for all chat history database operations.
+ * Implements both MessageRepository and ChatSessionRepository interfaces.
+ * Uses TransactionManager for atomic multi-statement operations.
+ */
+public class ChatHistoryDAO implements MessageRepository, ChatSessionRepository {
+
+    public static class DocumentChatMetadata {
+        private boolean documentChat;
+        private String documentIdentityId;
+        private Integer documentVersion;
+        private String docType;
+        private Long lastSyncedAt;
+        private String sourceSha256;
+
+        public boolean isDocumentChat() { return documentChat; }
+        public void setDocumentChat(boolean documentChat) { this.documentChat = documentChat; }
+        public String getDocumentIdentityId() { return documentIdentityId; }
+        public void setDocumentIdentityId(String documentIdentityId) { this.documentIdentityId = documentIdentityId; }
+        public Integer getDocumentVersion() { return documentVersion; }
+        public void setDocumentVersion(Integer documentVersion) { this.documentVersion = documentVersion; }
+        public String getDocType() { return docType; }
+        public void setDocType(String docType) { this.docType = docType; }
+        public Long getLastSyncedAt() { return lastSyncedAt; }
+        public void setLastSyncedAt(Long lastSyncedAt) { this.lastSyncedAt = lastSyncedAt; }
+        public String getSourceSha256() { return sourceSha256; }
+        public void setSourceSha256(String sourceSha256) { this.sourceSha256 = sourceSha256; }
+    }
+
+    private final TransactionManager transactionManager;
+
+    public ChatHistoryDAO(TransactionManager transactionManager) {
+        this.transactionManager = transactionManager;
+    }
+
+    // ==================== ChatSessionRepository Implementation ====================
+
+    @Override
+    public int createSession(String programHash, String description) {
+        String sql = "INSERT INTO GHChatHistory (program_hash, description, conversation) VALUES (?, ?, '')";
+
+        try (PreparedStatement pstmt = transactionManager.getConnection()
+                .prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+            pstmt.setString(1, programHash);
+            pstmt.setString(2, description);
+            pstmt.executeUpdate();
+
+            ResultSet rs = pstmt.getGeneratedKeys();
+            if (rs.next()) {
+                return rs.getInt(1);
+            }
+        } catch (SQLException e) {
+            Msg.error(this, "Failed to create chat session: " + e.getMessage());
+        }
+        return -1;
+    }
+
+    @Override
+    public List<ChatSession> getSessionsForProgram(String programHash) {
+        List<ChatSession> sessions = new ArrayList<>();
+        String sql = "SELECT id, description, last_update FROM GHChatHistory " +
+                     "WHERE program_hash = ? ORDER BY last_update DESC";
+
+        try (PreparedStatement pstmt = transactionManager.getConnection().prepareStatement(sql)) {
+            pstmt.setString(1, programHash);
+            ResultSet rs = pstmt.executeQuery();
+
+            while (rs.next()) {
+                sessions.add(new ChatSession.Builder()
+                        .id(rs.getInt("id"))
+                        .programHash(programHash)
+                        .description(rs.getString("description"))
+                        .lastUpdate(rs.getTimestamp("last_update"))
+                        .build());
+            }
+        } catch (SQLException e) {
+            Msg.error(this, "Failed to get chat sessions: " + e.getMessage());
+        }
+        return sessions;
+    }
+
+    @Override
+    public Optional<ChatSession> getSession(int sessionId) {
+        String sql = "SELECT id, program_hash, description, last_update FROM GHChatHistory WHERE id = ?";
+
+        try (PreparedStatement pstmt = transactionManager.getConnection().prepareStatement(sql)) {
+            pstmt.setInt(1, sessionId);
+            ResultSet rs = pstmt.executeQuery();
+
+            if (rs.next()) {
+                return Optional.of(new ChatSession.Builder()
+                        .id(rs.getInt("id"))
+                        .programHash(rs.getString("program_hash"))
+                        .description(rs.getString("description"))
+                        .lastUpdate(rs.getTimestamp("last_update"))
+                        .isReActSession(isReActSession(sessionId))
+                        .build());
+            }
+        } catch (SQLException e) {
+            Msg.error(this, "Failed to get session: " + e.getMessage());
+        }
+        return Optional.empty();
+    }
+
+    @Override
+    public boolean updateDescription(int sessionId, String description) {
+        String sql = "UPDATE GHChatHistory SET description = ? WHERE id = ?";
+
+        try (PreparedStatement pstmt = transactionManager.getConnection().prepareStatement(sql)) {
+            pstmt.setString(1, description);
+            pstmt.setInt(2, sessionId);
+            return pstmt.executeUpdate() > 0;
+        } catch (SQLException e) {
+            Msg.error(this, "Failed to update description: " + e.getMessage());
+            return false;
+        }
+    }
+
+    @Override
+    public boolean touchSession(int sessionId) {
+        String sql = "UPDATE GHChatHistory SET last_update = CURRENT_TIMESTAMP WHERE id = ?";
+
+        try (PreparedStatement pstmt = transactionManager.getConnection().prepareStatement(sql)) {
+            pstmt.setInt(1, sessionId);
+            return pstmt.executeUpdate() > 0;
+        } catch (SQLException e) {
+            Msg.error(this, "Failed to touch session: " + e.getMessage());
+            return false;
+        }
+    }
+
+    @Override
+    public boolean deleteSession(int sessionId) {
+        // Messages will cascade delete via FK
+        String sql = "DELETE FROM GHChatHistory WHERE id = ?";
+
+        try (PreparedStatement pstmt = transactionManager.getConnection().prepareStatement(sql)) {
+            pstmt.setInt(1, sessionId);
+            return pstmt.executeUpdate() > 0;
+        } catch (SQLException e) {
+            Msg.error(this, "Failed to delete session: " + e.getMessage());
+            return false;
+        }
+    }
+
+    @Override
+    public boolean sessionExists(int sessionId) {
+        String sql = "SELECT 1 FROM GHChatHistory WHERE id = ?";
+
+        try (PreparedStatement pstmt = transactionManager.getConnection().prepareStatement(sql)) {
+            pstmt.setInt(1, sessionId);
+            return pstmt.executeQuery().next();
+        } catch (SQLException e) {
+            return false;
+        }
+    }
+
+    @Override
+    public boolean isReActSession(int sessionId) {
+        String sql = "SELECT 1 FROM GHReActMessages WHERE session_id = ? LIMIT 1";
+
+        try (PreparedStatement pstmt = transactionManager.getConnection().prepareStatement(sql)) {
+            pstmt.setInt(1, sessionId);
+            return pstmt.executeQuery().next();
+        } catch (SQLException e) {
+            return false;
+        }
+    }
+
+    @Override
+    public int getNextSessionNumber(String programHash) {
+        String sql = "SELECT COUNT(*) FROM GHChatHistory WHERE program_hash = ?";
+
+        try (PreparedStatement pstmt = transactionManager.getConnection().prepareStatement(sql)) {
+            pstmt.setString(1, programHash);
+            ResultSet rs = pstmt.executeQuery();
+            if (rs.next()) {
+                return rs.getInt(1) + 1;
+            }
+        } catch (SQLException e) {
+            Msg.warn(this, "Failed to get session count: " + e.getMessage());
+        }
+        return 1;
+    }
+
+    // ==================== MessageRepository Implementation ====================
+
+    @Override
+    public int saveMessage(String programHash, int sessionId, PersistedChatMessage message) {
+        // Check if message already exists at this order
+        Integer existingId = findExistingMessageId(programHash, sessionId, message.getOrder());
+
+        if (existingId != null) {
+            // Update existing message
+            return updateExistingMessage(existingId, message) ? existingId : -1;
+        } else {
+            // Insert new message
+            return insertMessage(programHash, sessionId, message);
+        }
+    }
+
+    @Override
+    public boolean replaceAllMessages(String programHash, int sessionId, List<PersistedChatMessage> messages) {
+        return transactionManager.executeInTransaction(conn -> {
+            try {
+                // Delete all existing messages
+                deleteAllMessages(programHash, sessionId);
+
+                // Insert all new messages
+                for (int i = 0; i < messages.size(); i++) {
+                    PersistedChatMessage msg = messages.get(i);
+                    // Ensure order is correct
+                    if (msg.getOrder() != i) {
+                        msg.setOrder(i);
+                    }
+                    insertMessage(programHash, sessionId, msg);
+                }
+                return true;
+            } catch (Exception e) {
+                Msg.error(this, "Failed to replace messages: " + e.getMessage());
+                throw new RuntimeException(e);
+            }
+        });
+    }
+
+    @Override
+    public List<PersistedChatMessage> loadMessages(String programHash, int sessionId) {
+        List<PersistedChatMessage> messages = new ArrayList<>();
+        String sql = "SELECT id, role, content_text, message_order, created_at, " +
+                     "provider_type, native_message_data, message_type " +
+                     "FROM GHChatMessages WHERE program_hash = ? AND chat_id = ? " +
+                     "ORDER BY message_order ASC";
+
+        try (PreparedStatement pstmt = transactionManager.getConnection().prepareStatement(sql)) {
+            pstmt.setString(1, programHash);
+            pstmt.setInt(2, sessionId);
+
+            ResultSet rs = pstmt.executeQuery();
+            while (rs.next()) {
+                PersistedChatMessage msg = new PersistedChatMessage(
+                        rs.getInt("id"),
+                        rs.getString("role"),
+                        rs.getString("content_text"),
+                        rs.getTimestamp("created_at"),
+                        rs.getInt("message_order")
+                );
+                msg.setProviderType(rs.getString("provider_type"));
+                msg.setNativeMessageData(rs.getString("native_message_data"));
+                msg.setMessageType(rs.getString("message_type"));
+                messages.add(msg);
+            }
+        } catch (SQLException e) {
+            Msg.error(this, "Failed to load messages: " + e.getMessage());
+        }
+        return messages;
+    }
+
+    @Override
+    public int deleteAllMessages(String programHash, int sessionId) {
+        String sql = "DELETE FROM GHChatMessages WHERE program_hash = ? AND chat_id = ?";
+
+        try (PreparedStatement pstmt = transactionManager.getConnection().prepareStatement(sql)) {
+            pstmt.setString(1, programHash);
+            pstmt.setInt(2, sessionId);
+            return pstmt.executeUpdate();
+        } catch (SQLException e) {
+            Msg.error(this, "Failed to delete messages: " + e.getMessage());
+            return 0;
+        }
+    }
+
+    @Override
+    public boolean hasMessages(String programHash, int sessionId) {
+        return getMessageCount(programHash, sessionId) > 0;
+    }
+
+    @Override
+    public int getMessageCount(String programHash, int sessionId) {
+        String sql = "SELECT COUNT(*) FROM GHChatMessages WHERE program_hash = ? AND chat_id = ?";
+
+        try (PreparedStatement pstmt = transactionManager.getConnection().prepareStatement(sql)) {
+            pstmt.setString(1, programHash);
+            pstmt.setInt(2, sessionId);
+            ResultSet rs = pstmt.executeQuery();
+            if (rs.next()) {
+                return rs.getInt(1);
+            }
+        } catch (SQLException e) {
+            Msg.warn(this, "Failed to get message count: " + e.getMessage());
+        }
+        return 0;
+    }
+
+    @Override
+    public boolean updateMessageContent(int messageId, String newContent, String newMessageType) {
+        String sql = "UPDATE GHChatMessages SET content_text = ?, message_type = ?, " +
+                     "updated_at = CURRENT_TIMESTAMP WHERE id = ?";
+
+        try (PreparedStatement pstmt = transactionManager.getConnection().prepareStatement(sql)) {
+            pstmt.setString(1, newContent);
+            pstmt.setString(2, newMessageType != null ? newMessageType : "edited");
+            pstmt.setInt(3, messageId);
+            return pstmt.executeUpdate() > 0;
+        } catch (SQLException e) {
+            Msg.error(this, "Failed to update message content: " + e.getMessage());
+            return false;
+        }
+    }
+
+    @Override
+    public boolean deleteMessage(int messageId) {
+        String sql = "DELETE FROM GHChatMessages WHERE id = ?";
+
+        try (PreparedStatement pstmt = transactionManager.getConnection().prepareStatement(sql)) {
+            pstmt.setInt(1, messageId);
+            return pstmt.executeUpdate() > 0;
+        } catch (SQLException e) {
+            Msg.error(this, "Failed to delete message: " + e.getMessage());
+            return false;
+        }
+    }
+
+    public DocumentChatMetadata getDocumentChatMetadata(int sessionId) {
+        String sql = "SELECT is_document_chat, symgraph_document_identity_id, symgraph_document_version, "
+                + "symgraph_doc_type, symgraph_last_synced_at, symgraph_source_sha256 "
+                + "FROM GHDocumentChatMetadata WHERE session_id = ?";
+
+        try (PreparedStatement pstmt = transactionManager.getConnection().prepareStatement(sql)) {
+            pstmt.setInt(1, sessionId);
+            ResultSet rs = pstmt.executeQuery();
+            if (rs.next()) {
+                DocumentChatMetadata metadata = new DocumentChatMetadata();
+                metadata.setDocumentChat(rs.getInt("is_document_chat") != 0);
+                metadata.setDocumentIdentityId(rs.getString("symgraph_document_identity_id"));
+                int version = rs.getInt("symgraph_document_version");
+                metadata.setDocumentVersion(rs.wasNull() ? null : version);
+                metadata.setDocType(rs.getString("symgraph_doc_type"));
+                long syncedAt = rs.getLong("symgraph_last_synced_at");
+                metadata.setLastSyncedAt(rs.wasNull() ? null : syncedAt);
+                metadata.setSourceSha256(rs.getString("symgraph_source_sha256"));
+                return metadata;
+            }
+        } catch (SQLException e) {
+            Msg.error(this, "Failed to get document chat metadata: " + e.getMessage());
+        }
+        return new DocumentChatMetadata();
+    }
+
+    public boolean upsertDocumentChatMetadata(int sessionId, DocumentChatMetadata metadata) {
+        String sql = "INSERT INTO GHDocumentChatMetadata ("
+                + "session_id, is_document_chat, symgraph_document_identity_id, symgraph_document_version, "
+                + "symgraph_doc_type, symgraph_last_synced_at, symgraph_source_sha256"
+                + ") VALUES (?, ?, ?, ?, ?, ?, ?) "
+                + "ON CONFLICT(session_id) DO UPDATE SET "
+                + "is_document_chat = excluded.is_document_chat, "
+                + "symgraph_document_identity_id = excluded.symgraph_document_identity_id, "
+                + "symgraph_document_version = excluded.symgraph_document_version, "
+                + "symgraph_doc_type = excluded.symgraph_doc_type, "
+                + "symgraph_last_synced_at = excluded.symgraph_last_synced_at, "
+                + "symgraph_source_sha256 = excluded.symgraph_source_sha256";
+
+        try (PreparedStatement pstmt = transactionManager.getConnection().prepareStatement(sql)) {
+            pstmt.setInt(1, sessionId);
+            pstmt.setInt(2, metadata != null && metadata.isDocumentChat() ? 1 : 0);
+            if (metadata != null && metadata.getDocumentIdentityId() != null) {
+                pstmt.setString(3, metadata.getDocumentIdentityId());
+            } else {
+                pstmt.setNull(3, Types.VARCHAR);
+            }
+            if (metadata != null && metadata.getDocumentVersion() != null) {
+                pstmt.setInt(4, metadata.getDocumentVersion());
+            } else {
+                pstmt.setNull(4, Types.INTEGER);
+            }
+            if (metadata != null && metadata.getDocType() != null) {
+                pstmt.setString(5, metadata.getDocType());
+            } else {
+                pstmt.setNull(5, Types.VARCHAR);
+            }
+            if (metadata != null && metadata.getLastSyncedAt() != null) {
+                pstmt.setLong(6, metadata.getLastSyncedAt());
+            } else {
+                pstmt.setNull(6, Types.INTEGER);
+            }
+            if (metadata != null && metadata.getSourceSha256() != null) {
+                pstmt.setString(7, metadata.getSourceSha256());
+            } else {
+                pstmt.setNull(7, Types.VARCHAR);
+            }
+            return pstmt.executeUpdate() > 0;
+        } catch (SQLException e) {
+            Msg.error(this, "Failed to save document chat metadata: " + e.getMessage());
+            return false;
+        }
+    }
+
+    public Integer findSessionIdByDocumentIdentity(String programHash, String documentIdentityId) {
+        String sql = "SELECT h.id FROM GHChatHistory h "
+                + "JOIN GHDocumentChatMetadata m ON h.id = m.session_id "
+                + "WHERE h.program_hash = ? AND m.symgraph_document_identity_id = ? "
+                + "ORDER BY h.last_update DESC LIMIT 1";
+
+        try (PreparedStatement pstmt = transactionManager.getConnection().prepareStatement(sql)) {
+            pstmt.setString(1, programHash);
+            pstmt.setString(2, documentIdentityId);
+            ResultSet rs = pstmt.executeQuery();
+            if (rs.next()) {
+                return rs.getInt("id");
+            }
+        } catch (SQLException e) {
+            Msg.error(this, "Failed to find document chat session: " + e.getMessage());
+        }
+        return null;
+    }
+
+    // ==================== Private Helper Methods ====================
+
+    private Integer findExistingMessageId(String programHash, int sessionId, int order) {
+        String sql = "SELECT id FROM GHChatMessages WHERE program_hash = ? AND chat_id = ? AND message_order = ?";
+
+        try (PreparedStatement pstmt = transactionManager.getConnection().prepareStatement(sql)) {
+            pstmt.setString(1, programHash);
+            pstmt.setInt(2, sessionId);
+            pstmt.setInt(3, order);
+            ResultSet rs = pstmt.executeQuery();
+            if (rs.next()) {
+                return rs.getInt("id");
+            }
+        } catch (SQLException e) {
+            Msg.error(this, "Failed to find message: " + e.getMessage());
+        }
+        return null;
+    }
+
+    private boolean updateExistingMessage(int messageId, PersistedChatMessage message) {
+        String sql = "UPDATE GHChatMessages SET provider_type = ?, native_message_data = ?, " +
+                     "role = ?, content_text = ?, message_type = ?, updated_at = CURRENT_TIMESTAMP " +
+                     "WHERE id = ?";
+
+        try (PreparedStatement pstmt = transactionManager.getConnection().prepareStatement(sql)) {
+            pstmt.setString(1, message.getProviderType());
+            pstmt.setString(2, message.getNativeMessageData() != null ? message.getNativeMessageData() : "{}");
+            pstmt.setString(3, message.getRole());
+            pstmt.setString(4, message.getContent());
+            pstmt.setString(5, message.getMessageType() != null ? message.getMessageType() : "standard");
+            pstmt.setInt(6, messageId);
+            return pstmt.executeUpdate() > 0;
+        } catch (SQLException e) {
+            Msg.error(this, "Failed to update message: " + e.getMessage());
+            return false;
+        }
+    }
+
+    private int insertMessage(String programHash, int sessionId, PersistedChatMessage message) {
+        // Include session_id and sequence_number for backward compatibility with databases
+        // that may have NOT NULL constraints on these legacy columns
+        String sql = "INSERT INTO GHChatMessages " +
+                     "(program_hash, chat_id, session_id, message_order, sequence_number, " +
+                     "provider_type, native_message_data, role, content_text, message_type, " +
+                     "created_at, updated_at) " +
+                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)";
+
+        try (PreparedStatement pstmt = transactionManager.getConnection()
+                .prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+            pstmt.setString(1, programHash);
+            pstmt.setInt(2, sessionId);
+            pstmt.setInt(3, sessionId);  // session_id = chat_id for compatibility
+            pstmt.setInt(4, message.getOrder());
+            pstmt.setInt(5, message.getOrder());  // sequence_number = message_order for compatibility
+            pstmt.setString(6, message.getProviderType() != null ? message.getProviderType() : "unknown");
+            pstmt.setString(7, message.getNativeMessageData() != null ? message.getNativeMessageData() : "{}");
+            pstmt.setString(8, message.getRole());
+            pstmt.setString(9, message.getContent());
+            pstmt.setString(10, message.getMessageType() != null ? message.getMessageType() : "standard");
+            pstmt.executeUpdate();
+
+            ResultSet rs = pstmt.getGeneratedKeys();
+            if (rs.next()) {
+                return rs.getInt(1);
+            }
+        } catch (SQLException e) {
+            Msg.error(this, "Failed to insert message: " + e.getMessage());
+        }
+        return -1;
+    }
+}

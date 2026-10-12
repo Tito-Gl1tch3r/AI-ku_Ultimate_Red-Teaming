@@ -1,0 +1,202 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Rule: s390 image-base window from the parsed kernel config layout selector.
+//
+// s390 has two kernel-text layouts that place the image ~4 TiB apart, so with
+// no address leak the honest Q_VIRT_IMAGE_BASE window must span both
+// ([0, ASCE limit]) — sound but very loose. A readable kernel config
+// (CONFIG_S390=y) resolves which layout is in use WITHOUT trusting version
+// numbers, via SF_VIRT_KERNEL_IMAGE_BASE (CONFIG_KERNEL_IMAGE_BASE, emitted by
+// proc_config / boot_config):
+//
+//   value > 0  — the modern high separate-kernel-mapping layout, in which
+//     CONFIG_KERNEL_IMAGE_BASE is the address the image takes when KASLR is
+//     OFF, and nothing else. arch/s390/Kconfig states it directly ("This is the
+//     address at which the kernel image is loaded in case Kernel Address Space
+//     Layout Randomization (KASLR) is disabled"), and it reaches
+//     setup_kernel_memory_layout() only as __NO_KASLR_START_KERNEL
+//     (asm/page.h: #define __NO_KASLR_START_KERNEL CONFIG_KERNEL_IMAGE_BASE),
+//     which appears in the two branches taken when kaslr_enabled() is false.
+//     So this rule PINS Q_VIRT_IMAGE_BASE only on a positive
+//     SF_VIRT_KASLR_DISABLED, and the pin adds IMAGE_BASE_OFFSET because the
+//     config value is the LOAD address while the quantity solves _text. It
+//     owns the s390 no-KASLR base (s390 opts out of the generic
+//     compile-time-default disabled-pin; see s390.h), pinning the
+//     layout-correct PARSED load address rather than an assumed default.
+//
+//     DO NOT emit this value as a lower bound while KASLR is live. The
+//     randomizing branch anchors the image at the TOP of the address space, not
+//     at the configured base:
+//
+//         kaslr_len  = max(KASLR_LEN, vmax - vsize);
+//         kernel_end = vmax - pos * THREAD_SIZE;
+//         kernel_start = round_down(kernel_end - kernel_size, THREAD_SIZE);
+//
+//     so the reachable range is [vmax - kaslr_len, vmax], which the boot code
+//     prints as "Randomization range". Even where kaslr_len collapses to its
+//     floor KASLR_LEN (2 GiB, asm/pgtable.h) that range opens at vmax - 2 GiB,
+//     while the default CONFIG_KERNEL_IMAGE_BASE is vmax - KERNEL_IMAGE_SIZE
+//     (512 MiB) — so a floor there sits 1.5 GiB ABOVE the lowest placement the
+//     kernel can choose, and higher still whenever vmax - vsize exceeds 2 GiB.
+//     A guest whose CPU has no CPACF PRNG takes the same branch with pos = 0
+//     and lands flush against vmax, which is the one placement such a floor
+//     admits.
+//
+//   value == 0 — config is an s390 config that LACKS the knob: the pre-v6.10
+//     identity-mapped layout (__identity_base = 0, no RANDOMIZE_IDENTITY_BASE),
+//     where virt == phys and kernel text lives in low physical RAM. Cap
+//     Q_VIRT_IMAGE_BASE at the top of spanned RAM: max_pfn (host-true zoneinfo)
+//     at CONF_PARSED, else MemTotal capped at CONF_HEURISTIC — MemTotal is
+//     /proc/meminfo-sourced and container-fakeable, so it never reaches the
+//     guaranteed window.
+//
+//     The cap comes down by the image size. The top is one past the last RAM
+//     byte and the whole image has to sit below it, so no base within
+//     kernel_size of the top is reachable; dram_ceiling and
+//     phys_ceiling_from_memtotal already subtract the same way from a RAM top.
+//     Left at the top itself the bound admits a base the loader cannot
+//     produce, and over a window that is a power-of-two multiple of the grid
+//     that one slot is a whole bit: 1 GiB of RAM over the 16 KiB THREAD_SIZE
+//     grid counts 2^16 + 1 candidates and reports 17 bits where 16 is the
+//     truth.
+//
+// s390 only; inert elsewhere and when no config was readable.
+// ---
+// <bcoles@gmail.com>
+
+#include "include/kasld/engine_rules.h"
+
+#include <string.h>
+
+int rule_s390_image_base_from_config(const struct evidence_set *ev,
+                                     const struct estimate *est,
+                                     struct constraint *out, int out_max) {
+#if defined(__s390x__) || defined(__zarch__)
+  (void)est;
+  if (out_max < 1)
+    return 0;
+
+  unsigned long image_base = 0, max_pfn = 0, memtotal = 0, page_size = 0;
+  uint32_t sel_src = 0, kaslr_off_id = 0;
+  enum kasld_confidence kaslr_off_conf = CONF_UNKNOWN;
+  /* Presence and value both matter and the plain scalar reader cannot carry
+   * both: a config that was read and LACKS the knob is the whole content of the
+   * identity-mapped answer, and it reaches here as a zero that the skip-zero
+   * reader would discard as absent. */
+  int have_sel = kasld_scalar_fact_present(ev, SF_VIRT_KERNEL_IMAGE_BASE,
+                                           &image_base, NULL, &sel_src);
+  for (int i = 0; i < ev->n_obs; i++) {
+    const struct observation *o = &ev->obs[i];
+    if (!o->valid || o->value_kind != OBS_SCALAR)
+      continue;
+    switch (o->scalar_fact) {
+    case SF_VIRT_KASLR_DISABLED:
+      if (o->scalar_value != 0) {
+        kaslr_off_id = o->id;
+        kaslr_off_conf = o->conf;
+      }
+      break;
+    case SF_PHYS_MAX_PFN:
+      max_pfn = o->scalar_value;
+      break;
+    case SF_PHYS_MEMTOTAL:
+      memtotal = o->scalar_value;
+      break;
+    default:
+      break;
+    }
+  }
+
+  page_size = kasld_page_size_observed(ev, NULL, NULL);
+  if (!have_sel)
+    return 0;
+
+  struct constraint *c = &out[0];
+  memset(c, 0, sizeof(*c));
+  c->q = Q_VIRT_IMAGE_BASE;
+  c->conf = CONF_PARSED;
+  c->derived_from[0] = sel_src;
+  c->lineage_count = 1;
+  snprintf(c->origin, ORIGIN_LEN, "s390_image_base_from_config");
+
+  if (s390_layout_from_config(have_sel, image_base) == S390_LAYOUT_UNCOUPLED) {
+    /* Modern layout. The configured base describes the KASLR-off placement
+     * only, so without that signal there is nothing here to narrow with: the
+     * randomizing branch can put the image below this value. See the header. */
+    if (!kaslr_off_id)
+      return 0;
+    /* Guard against an implausible value pushing past the top. */
+    if (image_base >= (unsigned long)VIRT_TEXT_PLAUSIBLE_MAX)
+      return 0;
+    c->value = image_base;
+    {
+      /* KASLR confirmed off + parsed modern base ⇒ the load address IS
+       * CONFIG_KERNEL_IMAGE_BASE exactly (no slide): PIN the text base.
+       *
+       * The pin must add IMAGE_BASE_OFFSET. The config value is the image's
+       * LOAD address while this quantity solves _text, which sits
+       * IMAGE_BASE_OFFSET into the image, so pinning the raw value pins one
+       * offset below the real _text and puts the truth outside the guaranteed
+       * window. A live nokaslr boot reported exactly that — truth
+       * 0x3ffe0100000 against a window pinned at 0x3ffe0000000, short by the
+       * 1 MiB .text offset.
+       *
+       * The sum is the arch's own no-KASLR text base, so it agrees with
+       * KERNEL_VIRT_TEXT_DEFAULT by construction rather than by coincidence;
+       * what this rule adds over that constant is that the load address is
+       * PARSED from the target's config instead of assumed.
+       *
+       * Confidence is the weaker of the parsed config and the off-signal: a
+       * parsed off-signal keeps the pin in the guaranteed window; a weaker
+       * detector lands it in likely. */
+      if (image_base > ULONG_MAX - (unsigned long)IMAGE_BASE_OFFSET)
+        return 0;
+      c->value = image_base + (unsigned long)IMAGE_BASE_OFFSET;
+      if (c->value >= (unsigned long)VIRT_TEXT_PLAUSIBLE_MAX)
+        return 0;
+      c->op = C_EQUALS;
+      c->conf = kasld_conf_min(CONF_PARSED, kaslr_off_conf);
+      c->derived_from[c->lineage_count++] = kaslr_off_id;
+    }
+    return 1;
+  }
+
+  /* Identity-mapped layout: cap at the top of spanned physical RAM (virt ==
+   * phys). max_pfn is the principled top; MemTotal is the fallback. */
+  /* s390 admits exactly one page size, so PAGE_SIZE_MIN is that size and an
+   * observation can only agree with it. Stated through the axis rather than as
+   * a literal, so an architecture that ever admits several cannot inherit a
+   * silent 4 KiB assumption here. */
+  if (page_size == 0)
+    page_size = (unsigned long)PAGE_SIZE_MIN;
+  unsigned long ram_top = 0;
+  if (max_pfn > 0 && max_pfn < (~0ul / page_size)) {
+    ram_top = (max_pfn + 1ul) * page_size; /* last RAM byte < this */
+  } else if (memtotal > 0) {
+    /* MemTotal fallback: /proc/meminfo is container-fakeable (lxcfs reports the
+     * cgroup limit, not host RAM), so a faked-small value would drop this
+     * ceiling below the true base. Cap it below the sound floor — it shapes the
+     * likely window only. The max_pfn path above is host-true (zoneinfo) and
+     * keeps CONF_PARSED. */
+    ram_top = memtotal;
+    c->conf = kasld_conf_min(CONF_HEURISTIC, c->conf);
+  }
+  if (ram_top == 0)
+    return 0;
+  /* Floored accessor: where no size was observed this still subtracts
+   * KASLD_MIN_IMAGE_SIZE, which every kernel image exceeds, so the bound holds
+   * at a vantage with no readable /boot. */
+  unsigned long min_image = evidence_image_size_min_or_floor(ev);
+  if (min_image >= ram_top)
+    return 0;
+  c->op = C_UPPER_BOUND;
+  c->value = ram_top - min_image;
+  return 1;
+#else
+  (void)ev;
+  (void)est;
+  (void)out;
+  (void)out_max;
+  return 0;
+#endif
+}

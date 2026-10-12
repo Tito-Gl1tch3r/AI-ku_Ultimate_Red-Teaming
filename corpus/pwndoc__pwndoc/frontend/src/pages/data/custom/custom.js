@@ -1,0 +1,1009 @@
+import { Dialog, Notify } from 'quasar';
+import draggable from 'vuedraggable'
+import BasicEditor from 'components/editor/Editor.vue';
+import CustomFields from 'components/custom-fields'
+import DraftRecoveryStatus from 'components/draft-recovery-status.vue'
+
+import DataService from '@/services/data'
+import Utils from '@/services/utils'
+import TemplateService from '@/services/template'
+import { useUserStore } from 'src/stores/user'
+import { createDraftRecovery } from '@/composables/useDraftRecovery'
+import DraftRecoveryService from '@/services/draft-recovery'
+
+import { $t } from '@/boot/i18n'
+
+const userStore = useUserStore()
+
+function buildDefaultCustomField(overrides = {}) {
+    return {
+        label: "",
+        fieldType: "",
+        display: "general",
+        displaySub: "",
+        size: 12,
+        offset: 0,
+        required: false,
+        inline: false,
+        description: '',
+        text: [],
+        options: [],
+        ...overrides
+    }
+}
+
+export default {
+    data: () => {
+        return {
+            userStore: userStore,
+            Utils: Utils,
+            templates: [],
+
+            languages: [],
+            newLanguage: {locale: "", language: ""},
+            editLanguages: [],
+            editLanguage: false,
+
+            auditTypes: [],
+            newAuditType: {name: "", templates: [], sections: [], hidden: [], stage: 'default'},
+            editAuditTypes: [],
+            editAuditType: false,
+
+            vulnTypes: [],
+            newVulnType: {name: "", locale: ""},
+            editVulnTypes: [],
+            editVulnType: false,
+
+            vulnCategories: [],
+            newVulnCat: {name: "", sortValue: "cvssScore", sortOrder: "desc", sortAuto: true},
+            editCategories: [],
+            editCategory: false,
+            sortValueOptions: [
+                {label: $t('cvssScore'), value: 'cvssScore'},
+                {label: $t('cvssTemporalScore'), value: 'cvssTemporalScore'},
+                {label: $t('cvssEnvironmentalScore'), value: 'cvssEnvironmentalScore'},
+                {label: $t('priority'), value: 'priority'},
+                {label: $t('remediationDifficulty'), value: 'remediationComplexity'}
+            ],
+            sortOrderOptions: [
+                {label: $t('ascending'), value: 'asc'},
+                {label: $t('descending'), value: 'desc'}
+            ],
+
+            customFields: [],
+            customFieldsOrig: [],
+            newCustomField: buildDefaultCustomField(),
+            cfLocale: "",
+            cfDisplayOptions: [
+                {label: $t('auditGeneral'), value: 'general'},
+                {label: $t('auditFinding'), value: 'finding'},
+                {label: $t('auditSection'), value: 'section'},
+                {label: $t('vulnerability'), value: 'vulnerability'}
+            ],
+            cfComponentOptions: [
+                {label: $t('checkbox'), value: 'checkbox', icon: 'check_box'},
+                {label: $t('date'), value: 'date', icon: 'event'},
+                {label: $t('editor'), value: 'text', icon: 'mdi-format-pilcrow'},
+                {label: $t('input'), value: 'input', icon: 'title'},
+                {label: $t('radio'), value: 'radio', icon: 'radio_button_checked'},
+                {label: $t('select'), value: 'select', icon: 'far fa-caret-square-down'},
+                {label: $t('selectMultiple'), value: 'select-multiple', icon: 'filter_none'},
+                {label: $t('space'), value: 'space', icon: 'space_bar'}
+            ],
+            newCustomOption: "",
+
+            sections: [],
+            newSection: {field: "", name: "", icon: ""},
+            editSections: [],
+            editSection: false,
+
+            errors: {locale: '', language: '', auditType: '', vulnType: '', vulnCat: '', vulnCatField: '', sectionField: '', sectionName: '', fieldLabel: '', fieldType: ''},
+
+            selectedTab: "languages",
+            draftRecovery: null,
+            customFieldDrafts: [],
+        }
+    },
+
+    components: {
+        BasicEditor,
+        CustomFields,
+        DraftRecoveryStatus,
+        draggable
+    },
+
+    mounted: function() {
+        this.getTemplates()
+        this.getLanguages()
+        this.getAuditTypes()
+        this.getVulnerabilityTypes()
+        this.getVulnerabilityCategories()
+        this.getSections()
+        this.getCustomFields()
+        this.setupDraftRecovery()
+        this.draftRecovery.maybePromptRecovery()
+    },
+
+    unmounted: function() {
+        if (this.draftRecovery)
+            this.draftRecovery.stop()
+    },
+
+    watch: {
+        selectedTab: async function() {
+            if (this.draftRecovery) {
+                await this.draftRecovery.flushPendingWrite()
+                await this.draftRecovery.maybePromptRecovery()
+            }
+            if (this.selectedTab === 'custom-fields')
+                this.refreshCustomFieldDrafts()
+        },
+        'newCustomField.display': async function() {
+            await this.handleCustomFieldDraftContextChanged()
+        },
+        'newCustomField.displaySub': async function() {
+            await this.handleCustomFieldDraftContextChanged()
+        },
+        draftRecoveryRevision: function() {
+            this.refreshCustomFieldDrafts()
+        }
+    },
+
+    computed: {
+        filteredCustomFields() {
+            return this.customFields.filter(field =>
+                (field.display === this.newCustomField.display && field.displayList.every(e => this.newCustomField.displayList.indexOf(e) > -1))
+            )
+        },
+
+        newCustomFieldLangOptions() {
+            return this.newCustomField.options.filter(e => e.locale === this.cfLocale)
+        },
+
+        vulnTypesLocale() {
+            return this.vulnTypes.filter(e => e.locale === this.newVulnType.locale)
+        },
+
+        draftRecoveryRevision() {
+            return DraftRecoveryService.state.revision
+        },
+
+        hasAnyCustomFieldDraft() {
+            return this.customFieldDrafts.length > 0
+        }
+    },
+
+    methods: {
+        getTemplates: function() {
+            TemplateService.getTemplates()
+            .then((data) => {
+                this.templates = data.data.datas;
+            })
+            .catch((err) => {
+                console.log(err)
+            })
+        },
+
+        requiredFieldsEmpty: function() {
+            Object.keys(this.$refs).forEach(key => {
+                if (key.startsWith('validate') && this.$refs[key]) {
+                    if (Array.isArray(this.$refs[key]))
+                        this.$refs[key].forEach(e => e.validate())
+                    else
+                        this.$refs[key].validate()
+                }
+            })
+            if (this.selectedTab === 'languages')
+                return !this.newLanguage.language || !this.newLanguage.locale
+            if (this.selectedTab === 'audit-types') 
+                return !this.newAuditType.name || this.newAuditType.templates.length !== this.languages.length || this.newAuditType.templates.some(e => !e)
+        },
+
+/* ===== LANGUAGES ===== */
+
+        // Get available languages
+        getLanguages: function() {
+            DataService.getLanguages()
+            .then((data) => {
+                this.languages = data.data.datas;
+                if (this.languages.length > 0) {
+                    this.newVulnType.locale = this.languages[0].locale;
+                    this.cfLocale = this.languages[0].locale;
+                }
+            })
+            .catch((err) => {
+                console.log(err)
+            })
+        },
+
+        // Create Language
+        createLanguage: function() {
+            if (this.requiredFieldsEmpty())
+                return;
+
+            DataService.createLanguage(this.newLanguage)
+            .then((data) => {
+                if (this.draftRecovery)
+                    this.draftRecovery.clearDraft()
+                this.newLanguage.locale = "";
+                this.newLanguage.language = "";
+                this.getLanguages();
+                Notify.create({
+                    message: 'Language created successfully',
+                    color: 'positive',
+                    textColor:'white',
+                    position: 'top-right'
+                })
+            })
+            .catch((err) => {
+                Notify.create({
+                    message: err.response.data.datas,
+                    color: 'negative',
+                    textColor: 'white',
+                    position: 'top-right'
+                })
+            })
+        },
+
+         // Update Languages
+         updateLanguages: function() {
+            DataService.updateLanguages(this.editLanguages)
+            .then((data) => {
+                this.getLanguages()
+                this.editLanguage = false
+                Notify.create({
+                    message: 'Languages updated successfully',
+                    color: 'positive',
+                    textColor:'white',
+                    position: 'top-right'
+                })
+            })
+            .catch((err) => {
+                Notify.create({
+                    message: err.response.data.datas,
+                    color: 'negative',
+                    textColor: 'white',
+                    position: 'top-right'
+                })
+            })
+        },
+
+        // Remove Language
+        removeLanguage: function(locale) {
+            this.editLanguages = this.editLanguages.filter(e => e.locale !== locale)
+        },
+
+/* ===== AUDIT TYPES ===== */
+
+        // Get available audit types
+        getAuditTypes: function() {
+            DataService.getAuditTypes()
+            .then((data) => {
+                this.auditTypes = data.data.datas;
+            })
+            .catch((err) => {
+                console.log(err)
+            })
+        },
+
+        // Create Audit type
+        createAuditType: function() {
+            if (this.requiredFieldsEmpty())
+                return
+
+            DataService.createAuditType(this.newAuditType)
+            .then((data) => {
+                if (this.draftRecovery)
+                    this.draftRecovery.clearDraft()
+                this.newAuditType.name = "";
+                this.newAuditType.templates = [];
+                this.newAuditType.sections = [];
+                this.newAuditType.hidden = [];
+                this.getAuditTypes();
+                Notify.create({
+                    message: 'Audit type created successfully',
+                    color: 'positive',
+                    textColor:'white',
+                    position: 'top-right'
+                })
+            })
+            .catch((err) => {
+                Notify.create({
+                    message: err.response.data.datas,
+                    color: 'negative',
+                    textColor: 'white',
+                    position: 'top-right'
+                })
+            })
+        },
+
+        // Update Audit Types
+        updateAuditTypes: function() {
+            DataService.updateAuditTypes(this.editAuditTypes)
+            .then((data) => {
+                this.getAuditTypes()
+                this.editAuditType = false
+                Notify.create({
+                    message: 'Audit Types updated successfully',
+                    color: 'positive',
+                    textColor:'white',
+                    position: 'top-right'
+                })
+            })
+            .catch((err) => {
+                Notify.create({
+                    message: err.response.data.datas,
+                    color: 'negative',
+                    textColor: 'white',
+                    position: 'top-right'
+                })
+            })
+        },
+
+        // Remove Audit Type
+        removeAuditType: function(auditType) {
+            this.editAuditTypes = this.editAuditTypes.filter(e => e.name !== auditType.name)
+        },
+
+        getTemplateOptionsLanguage: function(locale) {
+            var result = []
+            this.templates.forEach(e => result.push({name: e.name, locale: locale, template: e._id}))
+            return result
+        },
+
+/* ===== VULNERABILITY TYPES ===== */
+
+        // Get available vulnerability types
+        getVulnerabilityTypes: function() {
+            DataService.getVulnerabilityTypes()
+            .then((data) => {
+                this.vulnTypes = data.data.datas;
+            })
+            .catch((err) => {
+                console.log(err)
+            })
+        },
+
+        // Create vulnerability type
+        createVulnerabilityType: function() {
+            this.cleanErrors();
+            if (!this.newVulnType.name)
+                this.errors.vulnType = "Name required";
+            
+            if (this.errors.vulnType)
+                return;
+
+            DataService.createVulnerabilityType(this.newVulnType)
+            .then((data) => {
+                if (this.draftRecovery)
+                    this.draftRecovery.clearDraft()
+                this.newVulnType.name = "";
+                this.getVulnerabilityTypes();
+                Notify.create({
+                    message: 'Vulnerability type created successfully',
+                    color: 'positive',
+                    textColor:'white',
+                    position: 'top-right'
+                })
+            })
+            .catch((err) => {
+                Notify.create({
+                    message: err.response.data.datas,
+                    color: 'negative',
+                    textColor: 'white',
+                    position: 'top-right'
+                })
+            })
+        },
+
+        // Update Audit Types
+        updateVulnTypes: function() {
+            DataService.updateVulnTypes(this.editVulnTypes)
+            .then((data) => {
+                this.getVulnerabilityTypes()
+                this.editVulnType = false
+                Notify.create({
+                    message: 'Vulnerability Types updated successfully',
+                    color: 'positive',
+                    textColor:'white',
+                    position: 'top-right'
+                })
+            })
+            .catch((err) => {
+                Notify.create({
+                    message: err.response.data.datas,
+                    color: 'negative',
+                    textColor: 'white',
+                    position: 'top-right'
+                })
+            })
+        },
+
+        // Remove vulnerability type
+        removeVulnType: function(vulnType) {
+            this.editVulnTypes = this.editVulnTypes.filter(e => e.name !== vulnType.name || e.locale !== vulnType.locale)
+        },
+
+/* ===== CATEGORIES ===== */
+
+        // Get available vulnerability categories
+        getVulnerabilityCategories: function() {
+            DataService.getVulnerabilityCategories()
+            .then((data) => {
+                this.vulnCategories = data.data.datas;
+            })
+            .catch((err) => {
+                console.log(err)
+            })
+        },
+
+        // Create vulnerability category
+        createVulnerabilityCategory: function() {
+            this.cleanErrors();
+            if (!this.newVulnCat.name)
+                this.errors.vulnCat = "Name required";
+            
+            if (this.errors.vulnCat)
+                return;
+
+            DataService.createVulnerabilityCategory(this.newVulnCat)
+            .then((data) => {
+                if (this.draftRecovery)
+                    this.draftRecovery.clearDraft()
+                this.newVulnCat = {name: "", sortValue: "cvssScore", sortOrder: "desc", sortAuto: true}
+                this.getVulnerabilityCategories();
+                Notify.create({
+                    message: 'Vulnerability category created successfully',
+                    color: 'positive',
+                    textColor:'white',
+                    position: 'top-right'
+                })
+            })
+            .catch((err) => {
+                Notify.create({
+                    message: err.response.data.datas,
+                    color: 'negative',
+                    textColor: 'white',
+                    position: 'top-right'
+                })
+            })
+        },
+
+         // Update Vulnerability Categories
+         updateVulnCategories: function() {
+            DataService.updateVulnerabilityCategories(this.editCategories)
+            .then((data) => {
+                this.getVulnerabilityCategories()
+                this.editCategory = false
+                Notify.create({
+                    message: 'Vulnerability Categories updated successfully',
+                    color: 'positive',
+                    textColor:'white',
+                    position: 'top-right'
+                })
+            })
+            .catch((err) => {
+                Notify.create({
+                    message: err.response.data.datas,
+                    color: 'negative',
+                    textColor: 'white',
+                    position: 'top-right'
+                })
+            })
+        },
+        
+        // Remove Category
+        removeCategory: function(vulnCat) {
+            this.editCategories = this.editCategories.filter(e => e.name !== vulnCat.name)
+        },
+
+        getSortOptions: function(category) {
+            var options = [
+                {label: $t('cvssScore'), value: 'cvssScore'},
+                {label: $t('cvssTemporalScore'), value: 'cvssTemporalScore'},
+                {label: $t('cvssEnvironmentalScore'), value: 'cvssEnvironmentalScore'},
+                {label: $t('priority'), value: 'priority'},
+                {label: $t('remediationComplexity'), value: 'remediationComplexity'}
+            ]
+            var allowedFieldTypes = ['date', 'input', 'radio', 'select']
+            this.customFields.forEach(e => {
+                if (
+                    (e.display === 'finding' || e.display === 'vulnerability') && 
+                    (!e.displaySub || e.displaySub === category) && 
+                    allowedFieldTypes.includes(e.fieldType)
+                ) {
+                    options.push({label: e.label, value: e.label})
+                }
+            })
+            return options
+        },
+
+/* ===== CUSTOM FIELDS ===== */
+
+        // Get available custom fields
+        getCustomFields: function() {
+            DataService.getCustomFields()
+            .then((data) => {
+                this.customFields = data.data.datas.filter(e => e.display)
+                this.customFieldsOrig = this.$_.cloneDeep(this.customFields)
+                this.refreshCustomFieldDrafts()
+            })
+            .catch((err) => {
+                console.log(err)
+            })
+        },
+
+        // Create custom field
+        createCustomField: function() {
+            if (this.newCustomField.fieldType !== 'space') {
+                this.$refs['select-component'].validate()
+                this.$refs['input-label'].validate()
+
+                if (this.$refs['select-component'].hasError || this.$refs['input-label'].hasError)
+                    return
+            }
+
+            this.newCustomField.position = this.customFields.length
+            DataService.createCustomField(this.newCustomField)
+            .then(async (data) => {
+                const currentDisplay = this.newCustomField.display
+                const currentDisplaySub = this.newCustomField.displaySub
+                this.newCustomField = buildDefaultCustomField({
+                    display: currentDisplay,
+                    displaySub: currentDisplaySub
+                })
+                if (this.draftRecovery)
+                    await this.draftRecovery.clearDraft()
+                this.getCustomFields()
+                Notify.create({
+                    message: 'Custom Field created successfully',
+                    color: 'positive',
+                    textColor:'white',
+                    position: 'top-right'
+                })
+            })
+            .catch((err) => {
+                Notify.create({
+                    message: err.response.data.datas,
+                    color: 'negative',
+                    textColor: 'white',
+                    position: 'top-right'
+                })
+            })
+        },
+
+        // Update Custom Fields
+        updateCustomFields: function() {
+            Utils.syncEditors(this.$refs)
+            var position = 0
+            const customFieldsToSave = this.getCustomFieldsSavePayload()
+            customFieldsToSave.forEach(e => e.position = position++)
+            DataService.updateCustomFields(customFieldsToSave)
+            .then(async (data) => {
+                this.customFieldsOrig = this.$_.cloneDeep(customFieldsToSave)
+                if (this.draftRecovery)
+                    await this.draftRecovery.clearDraft()
+                this.getCustomFields()
+                Notify.create({
+                    message: 'Custom Fields updated successfully',
+                    color: 'positive',
+                    textColor:'white',
+                    position: 'top-right'
+                })
+            })
+            .catch((err) => {
+                Notify.create({
+                    message: err.response.data.datas,
+                    color: 'negative',
+                    textColor: 'white',
+                    position: 'top-right'
+                })
+            })
+        },
+
+        getCustomFieldsSavePayload: function() {
+            const display = this.newCustomField.display
+            const displaySub = this.normalizeCustomFieldDisplaySub(this.newCustomField.displaySub)
+            const currentContextFields = this.customFields.filter(field =>
+                this.fieldMatchesExactCustomFieldContext(field, display, displaySub)
+            )
+
+            if (!currentContextFields.length)
+                return this.$_.cloneDeep(this.customFieldsOrig.length ? this.customFieldsOrig : this.customFields)
+
+            return this.$_.cloneDeep([
+                ...this.customFieldsOrig.filter(field =>
+                    !this.fieldMatchesExactCustomFieldContext(field, display, displaySub)
+                ),
+                ...currentContextFields
+            ])
+        },
+
+         // Delete custom field
+         deleteCustomField: function(customField) {
+            Dialog.create({
+                title: 'Confirm Suppression',
+                message: `
+                <div class="row">
+                    <div class="col-md-2">
+                        <i class="material-icons text-warning" style="font-size:42px">warning</i>
+                    </div>
+                    <div class="col-md-10">
+                        Custom Field <strong>${customField.label}</strong> will be permanently deleted.<br>
+                        This field will be removed from <strong>ALL</strong> Vulnerablities and associated data
+                        will be permanently <strong>LOST</strong>!
+                    </div>
+                </div>
+                `,
+                ok: {label: $t('btn.confirm'), color: 'negative'},
+                cancel: {label: $t('btn.cancel'), color: 'white'},
+                html: true,
+                style: "width: 600px"
+            })
+            .onOk(() => {
+                DataService.deleteCustomField(customField._id)
+                .then((data) => {
+                    this.getCustomFields()
+                    Notify.create({
+                        message: `
+                        Custom Field <strong>${customField.label}</strong> deleted successfully.<br>
+                        <strong>${data.data.datas.vulnCount}</strong> Vulnerabilities were affected.`,
+                        color: 'positive',
+                        textColor:'white',
+                        position: 'top-right',
+                        html: true
+                    })
+                })
+                .catch((err) => {
+                    console.log(err)
+                    Notify.create({
+                        message: err.response.data.datas.msg || err.response.data.datas,
+                        color: 'negative',
+                        textColor: 'white',
+                        position: 'top-right'
+                    })
+                })
+            })
+        },
+
+        canDisplayCustomField: function(field) {
+            return this.fieldMatchesCustomFieldContext(
+                field,
+                this.newCustomField.display,
+                this.normalizeCustomFieldDisplaySub(this.newCustomField.displaySub)
+            )
+        },
+
+        fieldMatchesCustomFieldContext: function(field, display, displaySub) {
+            displaySub = this.normalizeCustomFieldDisplaySub(displaySub)
+            return (
+                (display === field.display || (display === 'finding' && field.display === 'vulnerability')) &&
+                (displaySub === field.displaySub || field.displaySub === '')
+            )
+        },
+
+        fieldMatchesExactCustomFieldContext: function(field, display, displaySub) {
+            displaySub = this.normalizeCustomFieldDisplaySub(displaySub)
+            return (
+                (display === field.display || (display === 'finding' && field.display === 'vulnerability')) &&
+                displaySub === this.normalizeCustomFieldDisplaySub(field.displaySub)
+            )
+        },
+
+        canDisplayCustomFields: function() {
+            return this.customFields.some(field => this.canDisplayCustomField(field))
+        },
+
+        // Return the index of the text array that match the selected locale
+        // Also push default empty value if index not found
+        getFieldLocaleText: function(fieldIdx) {
+            var text = this.customFields[fieldIdx].text
+            for (var i=0; i<text.length; i++) {
+                if (text[i].locale === this.cfLocale)
+                    return i
+            }
+            if (['select-multiple', 'checkbox'].includes(this.customFields[fieldIdx].fieldType))
+                text.push({locale: this.cfLocale, value: []})
+            else
+                text.push({locale: this.cfLocale, value: ""})
+            return i
+        },
+
+        addCustomFieldOption: function(options) {
+            options.push({locale: this.cfLocale, value: this.newCustomOption})
+            this.newCustomOption = ""
+        },
+
+        // Remove option of options based on index of computed lang Option
+        removeCustomFieldOption: function(options, option) {
+            var index = options.findIndex(e => e.locale === option.locale && e.value === option.value)
+            options.splice(index, 1)
+        },
+
+        getOptionsGroup: function(options) {
+            return options
+            .filter(e => e.locale === this.cfLocale)
+            .map(e => {return {label: e.value, value: e.value}})
+        },
+
+        getFieldLangOptions: function(options) {
+            return options.filter(e => e.locale === this.cfLocale)
+        },
+
+/* ===== SECTIONS ===== */
+
+        // Get available sections
+        getSections: function() {
+            DataService.getSections()
+            .then((data) => {
+                this.sections = data.data.datas;
+            })
+            .catch((err) => {
+                console.log(err)
+            })
+        },
+
+        // Create section
+        createSection: function() {
+            this.cleanErrors();
+            if (!this.newSection.field)
+                this.errors.sectionField = "Field required";
+            if (!this.newSection.name)
+                this.errors.sectionName = "Name required";
+            
+            if (this.errors.sectionName || this.errors.sectionField)
+                return;
+
+            DataService.createSection(this.newSection)
+            .then((data) => {
+                if (this.draftRecovery)
+                    this.draftRecovery.clearDraft()
+                this.newSection.field = "";
+                this.newSection.name = "";
+                this.newSection.icon = ""
+                this.getSections();
+                Notify.create({
+                    message: 'Section created successfully',
+                    color: 'positive',
+                    textColor:'white',
+                    position: 'top-right'
+                })
+            })
+            .catch((err) => {
+                Notify.create({
+                    message: err.response.data.datas,
+                    color: 'negative',
+                    textColor: 'white',
+                    position: 'top-right'
+                })
+            })
+        },
+
+         // Update Sections
+         updateSections: function() {
+            Utils.syncEditors(this.$refs)
+            DataService.updateSections(this.editSections)
+            .then((data) => {
+                this.sections = this.editSections
+                this.editSection = false
+                Notify.create({
+                    message: 'Sections updated successfully',
+                    color: 'positive',
+                    textColor:'white',
+                    position: 'top-right'
+                })
+            })
+            .catch((err) => {
+                Notify.create({
+                    message: err.response.data.datas,
+                    color: 'negative',
+                    textColor: 'white',
+                    position: 'top-right'
+                })
+            })
+        },
+
+        // Remove section
+        removeSection: function(index) {
+            this.editSections.splice(index, 1)
+        },
+
+        cleanErrors: function() {
+            this.errors.locale = ''
+            this.errors.language = ''
+            this.errors.auditType = ''
+            this.errors.vulnType = ''
+            this.errors.vulnCat = ''
+            this.errors.fieldLabel = ''
+            this.errors.fieldType = ''
+            this.errors.sectionField = ''
+            this.errors.sectionName = ''
+        },
+
+        setupDraftRecovery: function() {
+            if (this.draftRecovery)
+                return
+
+            this.draftRecovery = createDraftRecovery(this, {
+                scope: () => this.getCustomDraftScope(),
+                refKey: () => this.getCustomDraftRefKey(),
+                userId: () => userStore.id,
+                getCurrent: () => this.getCustomDraftCurrent(),
+                setCurrent: (data) => this.setCustomDraftCurrent(data),
+                getOriginal: () => this.getCustomDraftOriginal(),
+                diffProps: () => ({ languages: this.languages }),
+                isDirty: () => !this.$_.isEqual(this.getCustomDraftCurrent(), this.getCustomDraftOriginal()),
+                isReadOnly: () => !this.canWriteCustomDraft(),
+                syncBeforeCapture: () => Utils.syncEditors(this.$refs)
+            })
+        },
+
+        handleCustomFieldDraftContextChanged: async function() {
+            if (this.selectedTab !== 'custom-fields' || !this.draftRecovery)
+                return
+
+            await this.draftRecovery.flushPendingWrite()
+            await this.refreshCustomFieldDrafts()
+            await this.draftRecovery.maybePromptRecovery()
+        },
+
+        canWriteCustomDraft: function() {
+            if (this.selectedTab === 'custom-fields')
+                return userStore.isAllowed('custom-fields:create') || userStore.isAllowed('custom-fields:update')
+            return userStore.isAllowed(`${this.getCustomPermissionBase()}:create`)
+        },
+
+        getCustomDraftScope: function() {
+            return {
+                languages: 'custom-language',
+                'audit-types': 'custom-audit-type',
+                'vulnerability-types': 'custom-vuln-type',
+                'vulnerability-categories': 'custom-vuln-category',
+                'custom-fields': 'custom-field',
+                'custom-sections': 'custom-section'
+            }[this.selectedTab]
+        },
+
+        getCustomDraftRefKey: function() {
+            if (this.selectedTab !== 'custom-fields')
+                return '_new'
+
+            const display = this.newCustomField.display || 'general'
+            const displaySub = this.normalizeCustomFieldDisplaySub(this.newCustomField.displaySub) || 'none'
+            if (display === 'general')
+                return 'general'
+            return `${display}:${displaySub}`
+        },
+
+        normalizeCustomFieldDisplaySub: function(displaySub) {
+            return displaySub || ''
+        },
+
+        getCustomPermissionBase: function() {
+            return {
+                languages: 'languages',
+                'audit-types': 'audit-types',
+                'vulnerability-types': 'vulnerability-types',
+                'vulnerability-categories': 'vulnerability-categories',
+                'custom-fields': 'custom-fields',
+                'custom-sections': 'sections'
+            }[this.selectedTab]
+        },
+
+        getCustomDraftCurrent: function() {
+            if (this.selectedTab === 'custom-fields') {
+                return this.$_.cloneDeep({
+                    newCustomField: buildDefaultCustomField({
+                        ...this.newCustomField,
+                        displaySub: this.normalizeCustomFieldDisplaySub(this.newCustomField.displaySub)
+                    }),
+                    customFields: this.customFields.filter(field => this.canDisplayCustomField(field))
+                })
+            }
+
+            return this.$_.cloneDeep({
+                languages: this.newLanguage,
+                'audit-types': this.newAuditType,
+                'vulnerability-types': this.newVulnType,
+                'vulnerability-categories': this.newVulnCat,
+                'custom-fields': this.newCustomField,
+                'custom-sections': this.newSection
+            }[this.selectedTab] || {})
+        },
+
+        setCustomDraftCurrent: function(data) {
+            if (this.selectedTab === 'languages')
+                this.newLanguage = data
+            else if (this.selectedTab === 'audit-types')
+                this.newAuditType = data
+            else if (this.selectedTab === 'vulnerability-types')
+                this.newVulnType = data
+            else if (this.selectedTab === 'vulnerability-categories')
+                this.newVulnCat = data
+            else if (this.selectedTab === 'custom-fields') {
+                const isCompositeDraft = data && (
+                    Object.prototype.hasOwnProperty.call(data, 'newCustomField') ||
+                    Object.prototype.hasOwnProperty.call(data, 'customFields')
+                )
+                if (isCompositeDraft) {
+                    const draftNewCustomField = data.newCustomField || buildDefaultCustomField()
+                    this.newCustomField = draftNewCustomField
+                    this.mergeCustomFieldDraftList(data.customFields || [], draftNewCustomField.display, draftNewCustomField.displaySub)
+                }
+                else {
+                    this.newCustomField = buildDefaultCustomField(data)
+                }
+            }
+            else if (this.selectedTab === 'custom-sections')
+                this.newSection = data
+        },
+
+        getCustomDraftOriginal: function() {
+            if (this.selectedTab === 'custom-fields') {
+                return this.$_.cloneDeep({
+                    newCustomField: buildDefaultCustomField({
+                        display: this.newCustomField.display,
+                        displaySub: this.normalizeCustomFieldDisplaySub(this.newCustomField.displaySub)
+                    }),
+                    customFields: this.customFieldsOrig.filter(field => this.canDisplayCustomField(field))
+                })
+            }
+
+            return this.$_.cloneDeep({
+                languages: {locale: "", language: ""},
+                'audit-types': {name: "", templates: [], sections: [], hidden: [], stage: 'default'},
+                'vulnerability-types': {name: "", locale: this.languages[0]?.locale || ""},
+                'vulnerability-categories': {name: "", sortValue: "cvssScore", sortOrder: "desc", sortAuto: true},
+                'custom-fields': buildDefaultCustomField(),
+                'custom-sections': {field: "", name: "", icon: ""}
+            }[this.selectedTab] || {})
+        },
+
+        mergeCustomFieldDraftList: function(draftFields, display, displaySub) {
+            const draftIds = new Set(draftFields.filter(field => field._id).map(field => field._id))
+            const nonDraftContextFields = this.customFields.filter(field => {
+                if (!this.fieldMatchesCustomFieldContext(field, display, displaySub))
+                    return true
+                return field._id && !draftIds.has(field._id) && !this.customFieldsOrig.some(origField => origField._id === field._id)
+            })
+            this.customFields = [
+                ...nonDraftContextFields,
+                ...this.$_.cloneDeep(draftFields)
+            ]
+        },
+
+        refreshCustomFieldDrafts: async function() {
+            if (!userStore.id) {
+                this.customFieldDrafts = []
+                return
+            }
+
+            this.customFieldDrafts = await DraftRecoveryService.listDrafts({
+                userId: userStore.id,
+                scopes: ['custom-field']
+            })
+        },
+
+        isCurrentCustomFieldDraft: function(refKey) {
+            return this.selectedTab === 'custom-fields' && this.getCustomDraftRefKey() === refKey
+        },
+
+        hasCustomFieldDraft: function(refKey, includeCurrent = false) {
+            if (!includeCurrent && this.isCurrentCustomFieldDraft(refKey))
+                return false
+            return this.customFieldDrafts.some(draft => draft.scope === 'custom-field' && draft.refKey === refKey)
+        },
+
+        hasCustomFieldDraftForView: function(view) {
+            return this.customFieldDrafts.some(draft =>
+                draft.scope === 'custom-field' &&
+                (draft.refKey === view || draft.refKey?.startsWith(`${view}:`))
+            )
+        },
+
+        hasCustomFieldDraftForSub: function(view, displaySub) {
+            const refKey = view === 'general' ? 'general' : `${view}:${displaySub || 'none'}`
+            return this.hasCustomFieldDraft(refKey)
+        }
+    }
+}

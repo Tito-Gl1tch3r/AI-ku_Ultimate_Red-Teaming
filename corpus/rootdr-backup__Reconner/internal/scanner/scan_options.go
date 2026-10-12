@@ -1,0 +1,306 @@
+package scanner
+
+import (
+	"context"
+	"net"
+	"net/url"
+	"strings"
+)
+
+type NetworkProfile string
+
+const (
+	NetworkFast   NetworkProfile = "fast"
+	NetworkNormal NetworkProfile = "normal"
+	NetworkDeep   NetworkProfile = "deep"
+)
+
+type networkProfileKey string
+
+const ctxNetworkProfile networkProfileKey = "network_profile"
+
+func WithNetworkProfile(ctx context.Context, profile NetworkProfile) context.Context {
+	switch profile {
+	case NetworkFast, NetworkNormal, NetworkDeep:
+		return context.WithValue(ctx, ctxNetworkProfile, profile)
+	default:
+		return context.WithValue(ctx, ctxNetworkProfile, NetworkNormal)
+	}
+}
+
+func networkProfileFromContext(ctx context.Context) NetworkProfile {
+	if value, ok := ctx.Value(ctxNetworkProfile).(NetworkProfile); ok {
+		return value
+	}
+	return NetworkNormal
+}
+
+// Per-scan toggles carried on the scan context (set by the scheduler from the
+// scan request's pseudo-modules, the same channel as the speed profile). Each
+// defaults to the historical behaviour when unset, so an older client that sends
+// no toggle is unaffected.
+
+type subBruteKey string
+
+const ctxSubBrute subBruteKey = "subdomain_brute"
+
+// WithSubdomainBrute toggles the SLOW active phase of subdomain enumeration —
+// wordlist brute-force + permutation generation (activeEnum) and the deep
+// alterx/dnsx/puredns pass (deepDNSEnum). Passive sources, verified resolution and
+// vhost discovery still run; ASN has its own explicit scope toggle. Operators disable it per scan when they only want a
+// fast passive map (it is by far the longest part of enumeration).
+func WithSubdomainBrute(ctx context.Context, enabled bool) context.Context {
+	return context.WithValue(ctx, ctxSubBrute, enabled)
+}
+
+// subdomainBruteEnabled reports whether the slow brute/permutation phase should
+// run. Defaults to TRUE when unset (preserves existing behaviour).
+func subdomainBruteEnabled(ctx context.Context) bool {
+	if v, ok := ctx.Value(ctxSubBrute).(bool); ok {
+		return v
+	}
+	return true
+}
+
+type asnDiscoveryKey string
+
+const ctxASNDiscovery asnDiscoveryKey = "asn_discovery"
+
+// WithASNDiscovery controls the ASN/CIDR reverse-DNS sweep independently from
+// ordinary subdomain enumeration. The sweep can touch addresses which are not
+// in a bug-bounty program even when asnmap associates them with the same
+// organisation, so the dashboard exposes this as an explicit scope decision.
+func WithASNDiscovery(ctx context.Context, enabled bool) context.Context {
+	return context.WithValue(ctx, ctxASNDiscovery, enabled)
+}
+
+// asnDiscoveryEnabled is fail-closed: a missing toggle means no CIDR sweep. This
+// also keeps automated monitor tasks from silently expanding beyond program
+// scope; operators explicitly opt in after verifying the netblocks.
+func asnDiscoveryEnabled(ctx context.Context) bool {
+	if v, ok := ctx.Value(ctxASNDiscovery).(bool); ok {
+		return v
+	}
+	return false
+}
+
+type wpCredAuthKey string
+
+const ctxWPCredAuth wpCredAuthKey = "wp_cred_authorized"
+
+// WithWPCredAuthorized marks THIS scan as explicitly authorized to run the active
+// WordPress weak-credential audit (module wp_credaudit). The WP Scanner UI sets it
+// from the operator's confirmed "weak-credential audit" tick. It is an alternative
+// to the server-wide enable_wp_credential_audit switch; without either, the audit
+// never submits a password.
+func WithWPCredAuthorized(ctx context.Context, authorized bool) context.Context {
+	return context.WithValue(ctx, ctxWPCredAuth, authorized)
+}
+
+// wpCredAuthorizedFromContext is fail-closed: a missing flag means NOT authorized.
+func wpCredAuthorizedFromContext(ctx context.Context) bool {
+	if v, ok := ctx.Value(ctxWPCredAuth).(bool); ok {
+		return v
+	}
+	return false
+}
+
+type netCredAuthKey string
+
+const ctxNetCredAuth netCredAuthKey = "net_cred_authorized"
+
+// WithNetCredAuthorized marks THIS scan as explicitly authorized to run the
+// active network per-service credential audit (SSH/FTP/MySQL/PostgreSQL/Redis).
+// The Network Scanner UI sets it from the operator's confirmed brute-force
+// ticks. It is an alternative to the server-wide enable_network_credential_audit
+// switch; without either, no module submits a password.
+func WithNetCredAuthorized(ctx context.Context, authorized bool) context.Context {
+	return context.WithValue(ctx, ctxNetCredAuth, authorized)
+}
+
+// netCredAuthorizedFromContext is fail-closed: a missing flag means NOT authorized.
+func netCredAuthorizedFromContext(ctx context.Context) bool {
+	if v, ok := ctx.Value(ctxNetCredAuth).(bool); ok {
+		return v
+	}
+	return false
+}
+
+// ── Single-endpoint scan mode ────────────────────────────────────────────────
+//
+// When the operator scans a single URL and ticks "single endpoint", the whole
+// pipeline is confined to THAT url and the paths under it: crawling stays under
+// the seed's directory prefix, discovery never wanders to sibling paths or other
+// hosts, and every discovered surface (parameters, http_services, JS) is filtered
+// to the endpoint scope before any module consumes it. The seed URL's own query
+// AND path parameters are always in scope. Off by default (unset ⇒ full scan).
+
+type endpointScopeKey string
+
+const ctxEndpointScope endpointScopeKey = "endpoint_scope"
+
+// WithEndpointScope confines the scan to the given seed URL prefixes (each is a
+// full URL; its host + directory path becomes the allowed prefix). An empty list
+// clears confinement.
+func WithEndpointScope(ctx context.Context, seedURLs []string) context.Context {
+	var prefixes []string
+	for _, u := range seedURLs {
+		if p := endpointPrefix(u); p != "" {
+			prefixes = append(prefixes, p)
+		}
+	}
+	if len(prefixes) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxEndpointScope, prefixes)
+}
+
+// endpointScopePrefixes returns the confinement prefixes, or nil when the scan is
+// not in single-endpoint mode.
+func endpointScopePrefixes(ctx context.Context) []string {
+	if v, ok := ctx.Value(ctxEndpointScope).([]string); ok {
+		return v
+	}
+	return nil
+}
+
+// endpointPrefix reduces a URL to its confinement prefix: lowercased host + the
+// directory portion of the path (everything up to and including the last '/').
+// e.g. https://x.com/a/b?q=1 → "x.com/a/"  and  https://x.com/a/b/ → "x.com/a/b/".
+func endpointPrefix(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	path := u.Path
+	if path == "" {
+		path = "/"
+	}
+	if !strings.HasSuffix(path, "/") {
+		if i := strings.LastIndexByte(path, '/'); i >= 0 {
+			path = path[:i+1]
+		} else {
+			path = "/"
+		}
+	}
+	return strings.ToLower(u.Host) + path
+}
+
+// urlInEndpointScope reports whether rawURL falls under any confinement prefix.
+// When there are no prefixes (not single-endpoint mode) everything is in scope.
+func urlInEndpointScope(ctx context.Context, rawURL string) bool {
+	prefixes := endpointScopePrefixes(ctx)
+	if len(prefixes) == 0 {
+		return true
+	}
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Host == "" {
+		return false
+	}
+	hostPath := strings.ToLower(u.Host) + u.Path
+	for _, p := range prefixes {
+		if strings.HasPrefix(hostPath, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// ── Per-asset host scope ─────────────────────────────────────────────────────
+// When the operator scans a single asset (scope_override), the pipeline is
+// confined to that asset's host(s). Unset ⇒ full target (no confinement).
+
+type hostScopeKey string
+
+const ctxHostScope hostScopeKey = "host_scope"
+
+// WithHostScope confines the scan to the given hostnames (exact, lowercased).
+func WithHostScope(ctx context.Context, hosts []string) context.Context {
+	set := map[string]bool{}
+	for _, h := range hosts {
+		h = strings.ToLower(strings.TrimSpace(h))
+		h = strings.TrimPrefix(h, "*.")
+		if u, err := url.Parse(h); err == nil && u.Hostname() != "" {
+			h = u.Hostname()
+		}
+		h = strings.TrimSuffix(h, ".")
+		if h == "" {
+			continue
+		}
+		if hh, _, err := net.SplitHostPort(h); err == nil {
+			h = hh
+		}
+		set[h] = true
+	}
+	if len(set) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxHostScope, set)
+}
+
+func hostScopeSet(ctx context.Context) map[string]bool {
+	if v, ok := ctx.Value(ctxHostScope).(map[string]bool); ok {
+		return v
+	}
+	return nil
+}
+
+// hostInScope reports whether host is allowed. Unset scope ⇒ everything in scope.
+func hostInScope(ctx context.Context, host string) bool {
+	set := hostScopeSet(ctx)
+	if set == nil {
+		return true
+	}
+	host = strings.ToLower(strings.TrimSpace(host))
+	host = strings.TrimSuffix(host, ".")
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	for allowed := range set {
+		if host == allowed || (net.ParseIP(host) == nil && net.ParseIP(allowed) == nil && strings.HasSuffix(host, "."+allowed)) {
+			return true
+		}
+	}
+	return false
+}
+
+// urlHostInScope extracts the host from rawURL and checks hostInScope.
+func urlHostInScope(ctx context.Context, rawURL string) bool {
+	if hostScopeSet(ctx) == nil {
+		return true
+	}
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return hostInScope(ctx, u.Host)
+}
+
+// filterURLsByHostScope drops URLs whose host is outside the per-asset scope.
+// No-op when host scope is unset (full-target scan).
+func filterURLsByHostScope(ctx context.Context, urls []string) []string {
+	if hostScopeSet(ctx) == nil || len(urls) == 0 {
+		return urls
+	}
+	kept := urls[:0]
+	for _, u := range urls {
+		if urlHostInScope(ctx, u) {
+			kept = append(kept, u)
+		}
+	}
+	return kept
+}
+
+// filterHostsByHostScope drops bare hostnames outside the per-asset scope.
+func filterHostsByHostScope(ctx context.Context, hosts []string) []string {
+	if hostScopeSet(ctx) == nil || len(hosts) == 0 {
+		return hosts
+	}
+	kept := hosts[:0]
+	for _, h := range hosts {
+		if hostInScope(ctx, h) {
+			kept = append(kept, h)
+		}
+	}
+	return kept
+}

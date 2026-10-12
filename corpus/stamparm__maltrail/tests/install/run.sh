@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+#
+# install.sh, run inside real distributions and then checked.
+#
+#     bash tests/install/run.sh              # every environment
+#     bash tests/install/run.sh debian       # just one
+#     VERBOSE=1 bash tests/install/run.sh    # show the installer's output even when it passes
+#
+# "It installed" is not the assertion. In each environment the server is started and asked for
+# /ping, the sensor is asked to validate itself with -T, the units are checked for paths that
+# resolve, the installer is re-run to prove an upgrade keeps operator configuration, and
+# --uninstall is run. Everything a support thread ever came from - a package named differently, a
+# missing setcap, a user that was never created, a unit pointing at a binary that is not there -
+# fails here instead of on someone's box.
+#
+# Two limits, stated rather than discovered:
+#
+#   * systemd does not run in a plain container, so the units are RENDERED into --unit-dir and
+#     checked there; `systemctl enable --now` is not exercised.
+#   * BSD cannot be tested this way at all - containers share the host's Linux kernel. That needs a
+#     VM, rc.d scripts and a FreeBSD sensor target, none of which exist yet.
+#
+# The clone is served from the working tree over file://, so this needs no network and still
+# exercises the real git path. The sensor binary comes from sensor/target/release if it is built.
+set -uo pipefail
+
+cd "$(dirname "$0")/../.." || exit 1
+REPO_ROOT=$PWD
+
+# install.sh knows six package managers (apt-get, dnf, yum, zypper, apk, pacman), so the coverage
+# below is bounded by what has actually been RUN rather than by what the installer can do - arch
+# was supported by pacman and never once exercised, and the README claimed RHEL with nothing
+# behind it.
+ENVIRONMENTS="ubuntu ubuntu2204 debian debian13 fedora fedora41 rocky alma arch opensuse tumbleweed alpine"
+image_for() {
+    case $1 in
+        ubuntu)     echo "ubuntu:24.04" ;;
+        ubuntu2204) echo "ubuntu:22.04" ;;
+        debian)     echo "debian:12" ;;
+        debian13)   echo "debian:13" ;;
+        fedora)     echo "fedora:latest" ;;
+        fedora41)   echo "fedora:41" ;;
+        rocky)      echo "rockylinux:9" ;;
+        alma)       echo "almalinux:9" ;;
+        arch)       echo "archlinux:latest" ;;
+        opensuse)   echo "opensuse/leap:15.6" ;;
+        tumbleweed) echo "opensuse/tumbleweed" ;;
+        alpine)     echo "alpine:3.20" ;;
+        *)          echo "" ;;
+    esac
+}
+
+# Every environment here is expected to end up with a working sensor. Alpine used to be the
+# exception - the release shipped no musl binary, so the installer refused and told the operator to
+# install a Rust toolchain. The sensor builds and runs on musl in about a minute, so that was a
+# packaging gap dressed up as a platform limit; the release ships musl targets now.
+expects_sensor() { :; }
+
+# MALTRAIL_TEST_SENSOR points this at any binary - a locally built one, or a release artefact you
+# want to check runs on all five distributions before publishing it.
+SENSOR_BIN=${MALTRAIL_TEST_SENSOR:-sensor/target/release/maltrail-sensor}
+[ -x "$SENSOR_BIN" ] || SENSOR_BIN=""
+case $SENSOR_BIN in /*) SENSOR_MOUNT=$SENSOR_BIN ;; ?*) SENSOR_MOUNT=$REPO_ROOT/$SENSOR_BIN ;; *) SENSOR_MOUNT="" ;; esac
+
+# A glibc binary cannot run on musl, so a musl environment needs its own. Supply one with
+# MALTRAIL_TEST_SENSOR_MUSL, or this builds it - two apk packages and about a minute, which is what
+# the release does too. Built once and reused by every musl environment in the run.
+is_musl_env() { case $1 in alpine*) return 0 ;; *) return 1 ;; esac; }
+MUSL_BIN=${MALTRAIL_TEST_SENSOR_MUSL:-}
+musl_sensor() {
+    [ -n "$MUSL_BIN" ] && { printf '%s' "$MUSL_BIN"; return 0; }
+    [ -n "$SENSOR_BIN" ] || return 1          # no sensor under test at all: nothing to do
+    MUSL_BIN=$WORK/musl-sensor
+    printf '    building a musl sensor (no MALTRAIL_TEST_SENSOR_MUSL supplied)...\n' >&2
+    docker run --rm -v "$REPO_ROOT:/src:ro" -v "$WORK:/out" alpine:3.20 sh -c '
+        set -e
+        apk add --no-cache -q cargo libpcap-dev musl-dev >/dev/null 2>&1
+        mkdir -p /tmp/b && cd /tmp/b
+        tar -C /src -cf - --exclude=sensor/target --exclude=.git sensor data core 2>/dev/null | tar -xf -
+        cd sensor && cargo build --release --bin maltrail-sensor >/dev/null 2>&1
+        strip target/release/maltrail-sensor 2>/dev/null || true
+        cp target/release/maltrail-sensor /out/musl-sensor' >/dev/null 2>&1 || return 1
+    [ -x "$MUSL_BIN" ] || return 1
+    printf '%s' "$MUSL_BIN"
+}
+
+pass=0; fail=0; failed=""; findings=""
+ok()  { printf '    \033[32mok\033[0m       %s\n' "$1"; pass=$((pass + 1)); }
+bad() { printf '    \033[31mFAIL\033[0m     %s%s\n' "$1" "${2:+  ($2)}"; fail=$((fail + 1)); failed="$failed $3/$1"; }
+
+# One container, judging nothing: the output is only captured, so all five environments can be in
+# flight at once. They share nothing, and running them one after another was pure waiting.
+install_in() {
+    local env=$1 image
+    image=$(image_for "$env")
+    [ -n "$image" ] || { echo "unknown environment: $env"; return 1; }
+
+    # A CI checkout is a detached HEAD, where --abbrev-ref says "HEAD" and no such branch exists.
+    local ref; ref=$(git symbolic-ref --short -q HEAD || git rev-parse HEAD)
+    local args=(--repo file:///src --ref "$ref"
+                --no-service --unit-dir /run/maltrail-units)
+    local mounts=(-v "$REPO_ROOT:/src:ro") bin=$SENSOR_MOUNT
+    if is_musl_env "$env"; then bin=$(musl_sensor) || bin=""; fi
+    if [ -n "$bin" ]; then
+        mounts+=(-v "$bin:/sensor-under-test:ro")
+        args+=(--sensor-bin /sensor-under-test)
+    fi
+
+    docker run --rm "${mounts[@]}" "$image" sh /src/tests/install/assert.sh "${args[@]}" 2>&1
+}
+
+judge() {
+    local env=$1 out marks
+    out=$(cat "$WORK/$env.out" 2>/dev/null)
+    printf '\n\033[1;36m== %s (%s)\033[0m\n' "$env" "$(image_for "$env")"
+    marks=$(printf '%s\n' "$out" | sed -n 's/^A //p')
+    got() { printf '%s\n' "$marks" | grep -qx "$1"; }
+
+    local skip_sensor=0
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        printf '    \033[35mFINDING\033[0m  %s\n' "$f"
+        findings="$findings|$env: $f"
+        case $f in glibc:*) skip_sensor=1 ;; esac
+    done < <(printf '%s\n' "$out" | sed -n 's/^F //p')
+
+    local expected=(tree conf user logdir logdir-writable conf-managed-block
+                    unit-server unit-server-conf server-ping
+                    rerun-ok conf-preserved tree-after-rerun
+                    inplace-adopted inplace-kept-edit inplace-kept-custom-trail
+                    inplace-cloned-nothing inplace-uninstall-kept-tree
+                    dirty-tree-refused dirty-tree-edit-kept force-upgraded force-kept-custom-trail
+                    uninstall-ran uninstall-removed-tree uninstall-removed-units
+                    uninstall-kept-conf uninstall-kept-logs)
+    if expects_sensor "$env" && [ -n "$SENSOR_BIN" ]; then
+        expected+=(unit-sensor unit-sensor-conf)
+        # A binary that cannot even start on this distribution says nothing about install.sh.
+        [ "$skip_sensor" = 0 ] && expected+=(sensor-runs sensor-selftest)
+    fi
+
+    local before=$fail
+    for check in "${expected[@]}"; do
+        if got "$check"; then ok "$check"; else bad "$check" "" "$env"; fi
+    done
+
+    # Nothing may be REFUSED for being musl any more. The warning that used to be the correct
+    # answer on Alpine is now the symptom of a missing musl artefact.
+    if printf '%s\n' "$out" | grep -qi 'glibc-linked and'; then
+        bad "musl-not-refused" "installer still refuses musl instead of using the musl build" "$env"
+    else
+        ok "musl-not-refused"
+    fi
+
+    if [ "$fail" -gt "$before" ] || [ -n "${VERBOSE:-}" ]; then
+        printf '\n    ---- %s: what happened ----\n' "$env"
+        printf '%s\n' "$out" | sed 's/^/    /'
+        printf '    ---------------------------\n'
+    fi
+}
+
+[ -n "$SENSOR_BIN" ] || printf '\033[1;33m[!]\033[0m no built sensor at %s - sensor checks skipped\n' "sensor/target/release"
+
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+targets=${*:-$ENVIRONMENTS}
+start=$(date +%s)
+
+printf 'installing in parallel: %s\n' "$targets"
+for env in $targets; do
+    install_in "$env" > "$WORK/$env.out" 2>&1 &
+done
+wait
+
+for env in $targets; do
+    judge "$env"
+done
+
+# tests/install/record.py reads these to build docs/compat rows. Off by default: the raw output is
+# a diagnostic, and leaving it behind on every run would litter.
+if [ -n "${MALTRAIL_INSTALL_RAW:-}" ]; then
+    mkdir -p "$MALTRAIL_INSTALL_RAW"
+    for env in $targets; do
+        cp "$WORK/$env.out" "$MALTRAIL_INSTALL_RAW/$env.out" 2>/dev/null || true
+        printf '%s\n' "$(image_for "$env")" > "$MALTRAIL_INSTALL_RAW/$env.image"
+    done
+fi
+
+printf '\n=============================================\n'
+printf 'install.sh: %d passed, %d failed, %d seconds\n' "$pass" "$fail" "$(( $(date +%s) - start ))"
+[ -n "$failed" ] && printf 'failed:%s\n' "$failed"
+if [ -n "$findings" ]; then
+    printf '\nfindings (real, but not install.sh bugs):\n'
+    printf '%s\n' "$findings" | tr '|' '\n' | sed '/^$/d;s/^/  * /'
+fi
+exit $((fail > 0))

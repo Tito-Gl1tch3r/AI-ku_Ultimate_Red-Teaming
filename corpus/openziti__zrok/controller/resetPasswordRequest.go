@@ -1,0 +1,80 @@
+package controller
+
+import (
+	stderrors "errors"
+
+	"github.com/go-openapi/runtime/middleware"
+	"github.com/michaelquigley/df/dl"
+	"github.com/openziti/zrok/v2/controller/store"
+	"github.com/openziti/zrok/v2/rest_server_zrok/operations/account"
+	"github.com/openziti/zrok/v2/util"
+)
+
+type resetPasswordRequestHandler struct{}
+
+func newResetPasswordRequestHandler() *resetPasswordRequestHandler {
+	return &resetPasswordRequestHandler{}
+}
+
+func (handler *resetPasswordRequestHandler) Handle(params account.ResetPasswordRequestParams) middleware.Responder {
+	if params.Body.EmailAddress == "" {
+		dl.Errorf("missing email")
+		return account.NewResetPasswordRequestBadRequest()
+	}
+	if !util.IsValidEmail(params.Body.EmailAddress) {
+		dl.Errorf("'%v' is not a valid email address", params.Body.EmailAddress)
+		return account.NewResetPasswordRequestBadRequest()
+	}
+	dl.Infof("received reset password request for email '%v'", params.Body.EmailAddress)
+
+	trx, err := str.Begin()
+	if err != nil {
+		dl.Errorf("error starting transaction for request '%v': %v", params.Body.EmailAddress, err)
+		return account.NewResetPasswordRequestInternalServerError()
+	}
+	defer func() { _ = trx.Rollback() }()
+
+	a, err := str.FindAccountWithEmail(params.Body.EmailAddress, trx)
+	if err != nil {
+		if stderrors.Is(err, store.ErrAccountNotFound) {
+			dl.Infof("received reset password request for unknown email '%v'", params.Body.EmailAddress)
+			return account.NewResetPasswordRequestCreated()
+		}
+		dl.Errorf("error looking up account for '%v': %v", params.Body.EmailAddress, err)
+		return account.NewResetPasswordRequestInternalServerError()
+	}
+
+	token, err := CreateToken()
+	if err != nil {
+		dl.Errorf("error creating token for '%v': %v", params.Body.EmailAddress, err)
+		return account.NewResetPasswordRequestInternalServerError()
+	}
+
+	prr := &store.PasswordResetRequest{
+		Token:     token,
+		AccountId: a.Id,
+	}
+
+	if _, err := str.CreatePasswordResetRequest(prr, trx); err != nil {
+		dl.Errorf("error creating reset password request for '%v': %v", a.Email, err)
+		return account.NewResetPasswordRequestInternalServerError()
+	}
+
+	if err := trx.Commit(); err != nil {
+		dl.Errorf("error committing reset password request for '%v': %v", a.Email, err)
+		return account.NewResetPasswordRequestInternalServerError()
+	}
+
+	if cfg.Email != nil && cfg.Registration != nil && cfg.ResetPassword != nil {
+		if err := sendResetPasswordEmail(a.Email, token); err != nil {
+			dl.Errorf("error sending reset password email for '%v': %v", a.Email, err)
+			return account.NewResetPasswordRequestInternalServerError()
+		}
+	} else {
+		dl.Errorf("'email', 'registration', and 'reset_password' configuration missing; skipping reset password email")
+	}
+
+	dl.Infof("reset password request for '%v' has token '%v'", a.Email, prr.Token)
+
+	return account.NewResetPasswordRequestCreated()
+}

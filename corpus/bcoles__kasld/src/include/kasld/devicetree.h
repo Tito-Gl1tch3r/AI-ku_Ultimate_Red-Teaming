@@ -1,0 +1,150 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Device-tree firmware-region reader (ppc64), without privileges.
+//
+// On POWER systems the kernel image must fit below the firmware reserved
+// regions whose bases live in the device tree (big-endian):
+//   OPAL (PowerNV): /sys/firmware/devicetree/base/ibm,opal/opal-base-address
+//   (u64) RTAS (pseries): /sys/firmware/devicetree/base/rtas/rtas-base (u32)
+// The kernel must fit below BOTH, so the binding constraint is the lower base.
+// Read by the engine bridge. Reads
+// route through the kasld_* wrappers (KASLD_SYSROOT-aware). Returns 0 when no
+// firmware base is present (non-POWER, or the nodes absent).
+// ---
+// <bcoles@gmail.com>
+
+#ifndef KASLD_DEVICETREE_H
+#define KASLD_DEVICETREE_H
+
+#include "sysroot.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <unistd.h>
+
+/* Read a raw device-tree property blob (e.g. a node's `reg`) into buf. Returns
+ * the byte count read, or -1 on open failure. Route through kasld_fopen so the
+ * KASLD_SYSROOT replay layer applies. */
+__attribute__((unused)) static int
+kasld_dt_read_blob(const char *path, unsigned char *buf, size_t len) {
+  FILE *f = kasld_fopen(path, "rb");
+  if (!f)
+    return -1;
+  int n = (int)fread(buf, 1, len, f);
+  fclose(f);
+  return n;
+}
+
+/* 1 if the device-tree root exists (the caller could open the directory) but a
+ * representative property (#address-cells) is unreadable to this vantage
+ * (EACCES/EPERM): the "denied, not absent" signal. A confined observer — an
+ * SELinux-enforcing Android shell/app that can list the DT directory but not
+ * read its 0444 property files — hits this. It lets a DT component report a
+ * denial rather than default #address-cells to 1 and call the region absent.
+ * 0 when the property is readable OR genuinely missing (not a permission
+ * problem). Only meaningful for a component whose target could exist on this
+ * platform; a structurally-absent node (e.g. a PowerPC-only property on arm64)
+ * is absent regardless, so those callers must not consult this. */
+__attribute__((unused)) static int kasld_dt_root_denied(const char *root) {
+  char p[512];
+  snprintf(p, sizeof(p), "%s/#address-cells", root);
+  errno = 0;
+  int fd = kasld_open(p, O_RDONLY);
+  if (fd >= 0) {
+    close(fd);
+    return 0;
+  }
+  return (errno == EACCES || errno == EPERM);
+}
+
+/* Decode a big-endian 32-bit cell from a property blob at p. */
+__attribute__((unused)) static uint32_t kasld_dt_be32(const unsigned char *p) {
+  return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+         ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+/* Decode a 1- or 2-cell big-endian value (per #address-cells / #size-cells)
+ * from a property blob at p into a host ulong. */
+__attribute__((unused)) static unsigned long
+kasld_dt_cells(const unsigned char *p, int ncells) {
+  if (ncells == 2) {
+    uint64_t hi = kasld_dt_be32(p);
+    uint64_t lo = kasld_dt_be32(p + 4);
+    return (unsigned long)((hi << 32) | lo);
+  }
+  return (unsigned long)kasld_dt_be32(p);
+}
+
+/* Read a big-endian device-tree integer (4 or 8 bytes) into a host ulong.
+ * Returns 0 on failure. width must be 4 or 8. */
+__attribute__((unused)) static unsigned long kasld_dt_read_be(const char *path,
+                                                              int width) {
+  uint8_t buf[8];
+  if (width != 4 && width != 8)
+    return 0;
+  int fd = kasld_open(path, O_RDONLY);
+  if (fd < 0)
+    return 0;
+  ssize_t n = read(fd, buf, (size_t)width);
+  close(fd);
+  if (n != width)
+    return 0;
+  unsigned long v = 0;
+  for (int i = 0; i < width; i++)
+    v = (v << 8) | buf[i];
+  return v;
+}
+
+/* Read a big-endian DT scalar whose width is whatever the file holds.
+ * Many DT chosen scalars are 4 bytes on 32-bit targets and 8 bytes on
+ * 64-bit (the #address-cells / #size-cells properties decide); this
+ * helper accepts either by reading whatever the file contains and
+ * inspecting the actual read length. Stores the value in *out and
+ * returns 1 on success; returns 0 if the path is missing, unreadable,
+ * or holds an unsupported size. */
+__attribute__((unused)) static int kasld_dt_read_be_auto(const char *path,
+                                                         unsigned long *out) {
+  uint8_t buf[8];
+  int fd = kasld_open(path, O_RDONLY);
+  if (fd < 0)
+    return 0;
+  ssize_t n = read(fd, buf, sizeof(buf));
+  close(fd);
+  if (n != 4 && n != 8)
+    return 0;
+  unsigned long v = 0;
+  for (ssize_t i = 0; i < n; i++)
+    v = (v << 8) | buf[i];
+  *out = v;
+  return 1;
+}
+
+/* The lowest ppc64 firmware reserved-region base (OPAL or RTAS) within the
+ * first 4 GiB, or 0 if neither is present/plausible. The kernel must fit below
+ * it. */
+__attribute__((unused)) static unsigned long
+kasld_read_ppc64_fw_reserved_base(void) {
+  unsigned long best = 0;
+  unsigned long opal = kasld_dt_read_be(
+      "/sys/firmware/devicetree/base/ibm,opal/opal-base-address", 8);
+  /* PAPR/pseries names the RTAS base `linux,rtas-base` (Linux's instantiation
+   * address); `slof,rtas-base` is SLOF's view; plain `rtas-base` is a legacy
+   * mis-name that does not exist on real systems. Try in preference order. */
+  unsigned long rtas =
+      kasld_dt_read_be("/sys/firmware/devicetree/base/rtas/linux,rtas-base", 4);
+  if (rtas == 0)
+    rtas = kasld_dt_read_be("/sys/firmware/devicetree/base/rtas/slof,rtas-base",
+                            4);
+  if (rtas == 0)
+    rtas = kasld_dt_read_be("/sys/firmware/devicetree/base/rtas/rtas-base", 4);
+  /* Plausible firmware bases sit within the first 4 GiB. */
+  if (opal > 0 && opal <= 0xffffffffUL)
+    best = opal;
+  if (rtas > 0 && rtas <= 0xffffffffUL && (best == 0 || rtas < best))
+    best = rtas;
+  return best;
+}
+
+#endif /* KASLD_DEVICETREE_H */

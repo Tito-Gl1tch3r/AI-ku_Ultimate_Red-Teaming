@@ -1,0 +1,163 @@
+package org.pac4j.oidc.metadata.chain;
+
+import com.nimbusds.jose.jwk.JWKSet;
+import com.nimbusds.openid.connect.sdk.federation.entities.EntityID;
+import com.nimbusds.openid.connect.sdk.federation.entities.EntityType;
+import com.nimbusds.openid.connect.sdk.federation.policy.language.PolicyViolationException;
+import com.nimbusds.openid.connect.sdk.federation.trust.*;
+import com.nimbusds.openid.connect.sdk.op.OIDCProviderMetadata;
+import lombok.Getter;
+import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
+import lombok.val;
+import net.minidev.json.JSONArray;
+import org.pac4j.core.exception.TechnicalException;
+import org.pac4j.core.resource.SpringResourceHelper;
+import org.pac4j.oidc.config.OidcConfiguration;
+import org.pac4j.oidc.exceptions.OidcConfigurationException;
+import org.pac4j.oidc.exceptions.OidcException;
+
+import java.io.IOException;
+import java.text.ParseException;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import static org.pac4j.core.util.CommonHelper.assertNotNull;
+
+/**
+ * Resolves OpenID federation trust chains and OP metadata.
+ *
+ * @author Jerome LELEU
+ * @since 6.4.0
+ */
+@Slf4j
+@Setter
+@Getter
+public class FederationChainResolver {
+
+    private long expiryMargin = 2 * 60 * 1000L;
+
+    public ResolutionResult resolve(final OidcConfiguration configuration) {
+        val entityId = configuration.getFederation().getEntityId();
+        LOGGER.info("Resolving federation chain for RP: {}", entityId);
+
+        val anchors = loadTrustAnchors(configuration);
+        LOGGER.debug("Loaded {} trust anchor(s)", anchors.size());
+
+        val resolver = new TrustChainResolver(anchors, configuration.getConnectTimeout(), configuration.getReadTimeout());
+
+        val targetIssuer = new EntityID(configuration.getFederation().getTargetOp());
+        LOGGER.debug("OP target issuer: {}", targetIssuer);
+
+        val opValidator = new FederationEntityMetadataValidator(resolver.getEntityStatementRetriever());
+        val opChain = resolve(resolver, opValidator, targetIssuer);
+        LOGGER.debug("OP chain: {}", opChain);
+        val opResolution = getResolvedProviderMetadata(opChain);
+        val opExpTime = opResolution.expirationTime();
+
+        if (configuration.getFederation().isSendTrustChain()) {
+            val rpEntity = new EntityID(configuration.getFederation().getEntityId());
+            LOGGER.debug("RP entity: {}", rpEntity);
+
+            val rpChain = resolve(resolver, null, rpEntity);
+            LOGGER.debug("RP chain: {}", rpChain);
+            val trustChain = rpChain.toSerializedJWTs();
+            val rpExpTime = new Date(rpChain.resolveExpirationTime().getTime() - expiryMargin);
+            var finalExpTime = opExpTime;
+            if (rpExpTime.before(finalExpTime)) {
+                finalExpTime = rpExpTime;
+            }
+            return new ResolutionResult(opResolution.metadata(), finalExpTime, opResolution.federationJWKS(), trustChain);
+        }
+
+        return opResolution;
+    }
+
+    protected TrustChain resolve(final TrustChainResolver resolver, final EntityMetadataValidator validator, final EntityID entityID) {
+        TrustChainSet resolvedChains;
+        try {
+            resolvedChains = resolver.resolveTrustChains(entityID, validator);
+        } catch (final ResolveException | InvalidEntityMetadataException e) {
+            throw new OidcException(e);
+        }
+        if (resolvedChains.isEmpty()) {
+            throw new OidcException("No valid trust chain found");
+        }
+        return resolvedChains.getShortest();
+    }
+
+    protected ResolutionResult getResolvedProviderMetadata(final TrustChain chain) {
+        val leafStatement = chain.getLeafConfiguration();
+
+        val rawMetadataJson = leafStatement.getClaimsSet().getMetadata(EntityType.OPENID_PROVIDER);
+        if (rawMetadataJson == null) {
+            throw new OidcException("No 'metadata' claim in the leaf Entity Statement");
+        }
+        LOGGER.debug("rawMetadataJson: {}", rawMetadataJson.toJSONString());
+        // RP tests from https://www.certification.openid.net/
+        val registrationTypes = rawMetadataJson.get("client_registration_types_supported");
+        if (registrationTypes == null) {
+            throw new OidcException("No 'client_registration_types_supported' claim in the leaf Entity Statement");
+        }
+        if (registrationTypes instanceof JSONArray arr && arr.size() == 0) {
+            throw new OidcException("Empty 'client_registration_types_supported' claim in the leaf Entity Statement");
+        }
+
+        val federationJWKS = leafStatement.getClaimsSet().getJWKSet();
+        if (federationJWKS == null) {
+            throw new OidcException("No federationJWKS found");
+        }
+
+        try {
+            val combinedPolicy = chain.resolveCombinedMetadataPolicy(EntityType.OPENID_PROVIDER);
+            LOGGER.debug("combinedPolicy: {}", combinedPolicy.toJSONString());
+
+            val resolvedJson = combinedPolicy.apply(rawMetadataJson);
+            LOGGER.debug("resolvedJson: {}", resolvedJson.toJSONString());
+
+            // inject missing issuer if not empty (RP tests from https://www.certification.openid.net/)
+            if (!resolvedJson.isEmpty() && !resolvedJson.containsKey("issuer")) {
+                val iss = chain.getLeafConfiguration().getClaimsSet().getIssuer();
+                assertNotNull("issuer", iss);
+                resolvedJson.put("issuer", iss.getValue());
+            }
+
+            val metadata = OIDCProviderMetadata.parse(resolvedJson);
+            val chainExpirationTime = new Date(chain.resolveExpirationTime().getTime() - expiryMargin);
+            return new ResolutionResult(metadata, chainExpirationTime, federationJWKS, null);
+        } catch (final com.nimbusds.oauth2.sdk.ParseException | PolicyViolationException e) {
+            throw new OidcException("Cannot resolve provider metadata via federation", e);
+        }
+    }
+
+    protected Map<EntityID, JWKSet> loadTrustAnchors(final OidcConfiguration configuration) {
+        val anchors = new HashMap<EntityID, JWKSet>();
+
+        val trustAnchors = configuration.getFederation().getTrustAnchors();
+        if (trustAnchors.size() == 0) {
+            throw new OidcConfigurationException("No trust anchors defined");
+        }
+
+        for (val trustAnchor : trustAnchors) {
+            val entity = new EntityID(trustAnchor.getIssuer());
+            JWKSet jwks = null;
+            val trustAnchorJwks = trustAnchor.getJwks();
+            if (trustAnchorJwks != null && trustAnchorJwks.isDefined()) {
+                try (val in = SpringResourceHelper.getResourceInputStream(trustAnchorJwks.getResource(), null,
+                    configuration.getSslSocketFactory(), configuration.getHostnameVerifier(),
+                    configuration.getConnectTimeout(), configuration.getReadTimeout())) {
+                    jwks = JWKSet.load(in);
+                } catch (final IOException | ParseException e) {
+                    throw new TechnicalException(e);
+                }
+            }
+            anchors.put(entity, jwks);
+        }
+
+        return anchors;
+    }
+
+    public record ResolutionResult(OIDCProviderMetadata metadata, Date expirationTime, JWKSet federationJWKS, List<String> trustChain) {}
+}

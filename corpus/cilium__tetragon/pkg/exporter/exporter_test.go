@@ -1,0 +1,407 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Tetragon
+
+package exporter
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	"github.com/cilium/lumberjack/v2"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/cilium/tetragon/pkg/server/eventlog"
+
+	"github.com/cilium/tetragon/pkg/option"
+
+	"github.com/cilium/tetragon/api/v1/tetragon"
+	"github.com/cilium/tetragon/pkg/encoder"
+	"github.com/cilium/tetragon/pkg/ratelimit"
+	"github.com/cilium/tetragon/pkg/reader/node"
+	"github.com/cilium/tetragon/pkg/rthooks"
+	"github.com/cilium/tetragon/pkg/server"
+)
+
+type arrayWriter struct {
+	items []string
+	done  chan bool
+}
+
+func newArrayWriter(size int) *arrayWriter {
+	return &arrayWriter{
+		items: make([]string, 0, size),
+		// Buffered so Write never blocks the producer goroutine if nobody
+		// is currently waiting on done (e.g. after a polling loop breaks).
+		done: make(chan bool, 1),
+	}
+}
+
+func (a *arrayWriter) Close() error {
+	return nil
+}
+
+func (a *arrayWriter) Write(p []byte) (n int, err error) {
+	a.items = append(a.items, strings.TrimSpace(string(p)))
+	if len(a.items) == cap(a.items) {
+		a.done <- true
+	}
+	return len(p), nil
+}
+
+type fakeNotifier struct {
+	mux       sync.Mutex
+	listeners map[server.Listener]struct{}
+	removed   chan bool
+}
+
+func newFakeNotifier() *fakeNotifier {
+	return &fakeNotifier{
+		listeners: make(map[server.Listener]struct{}),
+		// Buffered so RemoveListener never blocks the producer goroutine if nobody
+		// is currently waiting on removed (e.g. after a polling loop breaks).
+		removed: make(chan bool, 1),
+	}
+}
+
+func (f *fakeNotifier) AddListener(listener server.Listener) {
+	f.mux.Lock()
+	f.listeners[listener] = struct{}{}
+	f.mux.Unlock()
+}
+
+func (f *fakeNotifier) RemoveListener(listener server.Listener) {
+	f.mux.Lock()
+	delete(f.listeners, listener)
+	f.mux.Unlock()
+	f.removed <- true
+}
+
+func (f *fakeNotifier) NotifyListener(_ any, processed *tetragon.GetEventsResponse) {
+	f.mux.Lock()
+	defer f.mux.Unlock()
+	for l := range f.listeners {
+		l.Notify(processed)
+	}
+}
+
+func TestExporter_Send(t *testing.T) {
+	var wg sync.WaitGroup
+
+	eventNotifier := newFakeNotifier()
+	ctx, cancel := context.WithCancel(context.Background())
+	dr := rthooks.DummyHookRunner{}
+	grpcServer := server.NewServer(ctx, &wg, eventNotifier, &server.FakeObserver{}, dr, nil)
+	numRecords := 2
+	results := newArrayWriter(numRecords)
+	encoder := encoder.NewProtojsonEncoder(results)
+	request := tetragon.GetEventsRequest{DenyList: []*tetragon.Filter{{BinaryRegex: []string{"b"}}}}
+	exporter, err := NewExporter(ctx, &request, grpcServer, encoder, results, nil)
+	require.NoError(t, err)
+	require.NoError(t, exporter.Start(), "exporter must start without errors")
+	eventNotifier.NotifyListener(nil, &tetragon.GetEventsResponse{
+		Event: &tetragon.GetEventsResponse_ProcessExec{
+			ProcessExec: &tetragon.ProcessExec{Process: &tetragon.Process{Binary: "a"}},
+		}})
+	eventNotifier.NotifyListener(nil, &tetragon.GetEventsResponse{
+		Event: &tetragon.GetEventsResponse_ProcessExec{
+			ProcessExec: &tetragon.ProcessExec{Process: &tetragon.Process{Binary: "b"}},
+		}})
+	eventNotifier.NotifyListener(nil, &tetragon.GetEventsResponse{
+		Event: &tetragon.GetEventsResponse_ProcessExec{
+			ProcessExec: &tetragon.ProcessExec{Process: &tetragon.Process{Binary: "c"}},
+		}})
+	<-results.done
+	assert.Equal(t, []string{`{"process_exec":{"process":{"binary":"a"}}}`, `{"process_exec":{"process":{"binary":"c"}}}`}, results.items)
+	cancel()
+	<-eventNotifier.removed
+}
+
+type jsonEvent struct {
+	Event         json.RawMessage `json:"process_exec"`
+	RateLimitInfo json.RawMessage `json:"rate_limit_info"`
+}
+
+const nodeName = "test-node-name"
+
+func checkEvents(t *testing.T, eventsJSON []string, wantEvents, wantRateLimitInfo int, wantDropped uint64) {
+	t.Helper()
+
+	gotEvents, gotRateLimitInfo, gotDropped := 0, 0, uint64(0)
+	for _, event := range eventsJSON {
+		if event == "" {
+			continue
+		}
+
+		var ev jsonEvent
+		if err := json.Unmarshal([]byte(event), &ev); err != nil {
+			t.Fatalf("failed to unmarshal JSON event %q: %v", event, err)
+		}
+
+		decoded := 0
+		if len(ev.Event) > 0 {
+			gotEvents++
+			decoded++
+		}
+		if len(ev.RateLimitInfo) > 0 {
+			var res tetragon.GetEventsResponse
+			if err := json.Unmarshal([]byte(event), &res); err != nil {
+				t.Fatalf("failed to unmarshal JSON event %q: %v", event, err)
+			}
+			gotRateLimitInfo++
+			gotDropped += res.GetRateLimitInfo().GetNumberOfDroppedProcessEvents()
+			decoded++
+
+			if nn := res.NodeName; nn != nodeName {
+				t.Errorf("unexpected node name for rate-limit-info event: got %q, want %q", nn, nodeName)
+			}
+		}
+
+		if decoded != 1 {
+			t.Fatalf("expected to decode %q as exactly 1 event, got %d", event, decoded)
+		}
+	}
+	assert.Equal(t, wantEvents, gotEvents, "number of events")
+	assert.Equal(t, wantRateLimitInfo, gotRateLimitInfo, "number of rate_limit_info events")
+	assert.Equal(t, wantDropped, gotDropped, "number of dropped events")
+}
+
+func Test_rateLimitExport(t *testing.T) {
+	// set node name to be reported in RateLimitInfo events
+	hubbleNodeNameEnv := "HUBBLE_NODE_NAME"
+	value, ok := os.LookupEnv(hubbleNodeNameEnv)
+	if !ok || value == "" {
+		if err := os.Setenv(hubbleNodeNameEnv, nodeName); err != nil {
+			t.Fatalf("failed to set %s env var", hubbleNodeNameEnv)
+		}
+		defer os.Unsetenv(hubbleNodeNameEnv)
+	}
+	node.SetExportNodeName()
+
+	tests := []struct {
+		name              string
+		totalEvents       int
+		rateLimit         int
+		wantEvents        int
+		wantRateLimitInfo int
+		wantDropped       uint64
+	}{
+		{"no events", 0, 10, 0, 0, 0},
+		{"rate limit", 100, 10, 10, 1, 90},
+		{"rate limit all ", 100, 0, 0, 1, 100},
+		{"rate limit none", 100, -1, 100, 0, 0},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%s (%d events, %d rate limit)", tt.name, tt.totalEvents, tt.rateLimit), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var wg sync.WaitGroup
+				ctx, cancel := context.WithCancel(context.Background())
+				eventNotifier := newFakeNotifier()
+				dr := rthooks.DummyHookRunner{}
+				grpcServer := server.NewServer(ctx, &wg, eventNotifier, &server.FakeObserver{}, dr, nil)
+				results := newArrayWriter(tt.totalEvents)
+				encoder := encoder.NewProtojsonEncoder(results)
+				request := &tetragon.GetEventsRequest{}
+				exporter, err := NewExporter(
+					ctx,
+					request,
+					grpcServer,
+					encoder,
+					results,
+					ratelimit.NewRateLimiter(ctx, 50*time.Millisecond, tt.rateLimit, encoder),
+				)
+				require.NoError(t, err)
+				require.NoError(t, exporter.Start(), "exporter must start without errors")
+				for i := range tt.totalEvents {
+					eventNotifier.NotifyListener(nil, &tetragon.GetEventsResponse{
+						Event: &tetragon.GetEventsResponse_ProcessExec{
+							ProcessExec: &tetragon.ProcessExec{Process: &tetragon.Process{Binary: fmt.Sprintf("a%d", i)}},
+						}})
+				}
+
+				// Allow the rate limiter (50ms tick) to fire and flush pending
+				// events / emit the rate-limit-info record. Under synctest,
+				// time advances deterministically while goroutines are blocked.
+				synctest.Sleep(100 * time.Millisecond)
+
+				cancel()
+				<-eventNotifier.removed
+
+				checkEvents(t, results.items, tt.wantEvents, tt.wantRateLimitInfo, tt.wantDropped)
+			})
+		})
+	}
+}
+
+type failingEncoder struct {
+	err error
+}
+
+func (f *failingEncoder) Encode(_ any) error {
+	return f.err
+}
+
+func TestExporter_SendEncodeErrorCountsFailed(t *testing.T) {
+	exportedBefore := testutil.ToFloat64(eventsExportedTotal)
+	failedBefore := testutil.ToFloat64(eventsExportFailedTotal)
+
+	e := &Exporter{encoder: &failingEncoder{err: errors.New("disk full")}}
+	ev := &tetragon.GetEventsResponse{
+		Event: &tetragon.GetEventsResponse_ProcessExec{
+			ProcessExec: &tetragon.ProcessExec{Process: &tetragon.Process{Binary: "a"}},
+		},
+	}
+	require.NoError(t, e.Send(ev), "Send keeps warn+continue semantics and returns nil")
+
+	assert.InDelta(t, exportedBefore, testutil.ToFloat64(eventsExportedTotal), 1e-9, "failed encodes must not count as exported")
+	assert.InDelta(t, failedBefore+1, testutil.ToFloat64(eventsExportFailedTotal), 1e-9, "failed encodes must increment failed counter")
+}
+
+func TestExporterSetLoggingParams(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var wg sync.WaitGroup
+		ctx, cancel := context.WithCancel(context.Background())
+		eventNotifier := newFakeNotifier()
+
+		dr := rthooks.DummyHookRunner{}
+		grpcServer := server.NewServer(ctx, &wg, eventNotifier, &server.FakeObserver{}, dr, nil)
+
+		tempDir := t.TempDir()
+
+		oldRotationInterval := option.Config.ExportFileRotationInterval
+		oldExportFilename := option.Config.ExportFilename
+		option.Config.ExportFileRotationInterval = 5 * time.Second
+		option.Config.ExportFilename = filepath.Join(tempDir, "test.txt")
+		t.Cleanup(func() {
+			option.Config.ExportFileRotationInterval = oldRotationInterval
+			option.Config.ExportFilename = oldExportFilename
+		})
+
+		writer := &lumberjack.Logger{
+			Filename: option.Config.ExportFilename,
+		}
+		encoderWriter := NewExportedBytesTotalWriter(writer)
+		encoder := encoder.NewProtojsonEncoder(encoderWriter)
+		request := &tetragon.GetEventsRequest{}
+
+		e, err := NewExporter(
+			ctx,
+			request,
+			grpcServer,
+			encoder,
+			writer,
+			nil,
+		)
+		require.NoError(t, err)
+		require.NoError(t, e.Start(), "exporter must start without errors")
+		// Generate a fake event so that `test.txt` is created by dumping it
+		eventNotifier.NotifyListener(nil, &tetragon.GetEventsResponse{
+			Event: &tetragon.GetEventsResponse_ProcessExec{
+				ProcessExec: &tetragon.ProcessExec{Process: &tetragon.Process{Binary: "a0"}},
+			}})
+
+		// wait for 1s and check that no export file rotation happened yet
+		time.Sleep(1 * time.Second)
+		// check that export file was not rotated
+		files, _ := os.ReadDir(tempDir)
+		assert.Len(t, files, 1) // we have the `test.txt` file only
+
+		// wait for ~5s to allow the ExportFileRotationInterval to kick in
+		time.Sleep(5 * time.Second)
+		// check that export file has been rotated
+		files, _ = os.ReadDir(tempDir)
+		assert.Len(t, files, 2)
+
+		// Set a new export file rotation interval (2s)
+		err = e.SetLogParams(eventlog.Params{
+			RotationInterval: new(2 * time.Second),
+		})
+		require.NoError(t, err)
+
+		// wait for ~3s to allow the new ExportFileRotationInterval to kick in
+		time.Sleep(3 * time.Second)
+		// check that export file has been newly rotated
+		files, _ = os.ReadDir(tempDir)
+		assert.Len(t, files, 3)
+
+		cancel()
+		wg.Wait()
+		<-eventNotifier.removed
+	})
+}
+
+func TestExporterSetRotationIntervalInvalidatesOldTimer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	writer := &lumberjack.Logger{
+		Filename: filepath.Join(t.TempDir(), "test.txt"),
+	}
+	t.Cleanup(func() {
+		require.NoError(t, writer.Close())
+	})
+
+	e := &Exporter{
+		ctx:              ctx,
+		closer:           writer,
+		logFile:          filepath.Base(writer.Filename),
+		logsDir:          filepath.Dir(writer.Filename),
+		rotationInterval: time.Hour,
+	}
+	e.mu.Lock()
+	staleGeneration := e.rotationGeneration
+	e.scheduleRotateLocked()
+	e.mu.Unlock()
+
+	require.NoError(t, e.SetLogParams(eventlog.Params{
+		RotationInterval: new(2 * time.Hour),
+	}))
+
+	e.mu.Lock()
+	rotationInterval := e.rotationInterval
+	rotateTimer := e.rotateTimer
+	e.mu.Unlock()
+	require.Equal(t, 2*time.Hour, rotationInterval)
+	require.NotNil(t, rotateTimer)
+
+	// Simulate the old timer callback completing after SetLogParams installed
+	// the new timer. It must not overwrite the new timer and create a second
+	// independent rotation loop.
+	e.rotate(staleGeneration)
+
+	e.mu.Lock()
+	gotRotateTimer := e.rotateTimer
+	staleGeneration = e.rotationGeneration
+	e.mu.Unlock()
+	require.Same(t, rotateTimer, gotRotateTimer)
+
+	require.NoError(t, e.SetLogParams(eventlog.Params{
+		RotationInterval: new(time.Duration),
+	}))
+
+	e.mu.Lock()
+	rotationInterval = e.rotationInterval
+	rotateTimer = e.rotateTimer
+	e.mu.Unlock()
+	require.Zero(t, rotationInterval)
+	require.Nil(t, rotateTimer)
+
+	// A callback from the previously active configuration must not re-enable
+	// rotation after a zero interval disables it.
+	e.rotate(staleGeneration)
+
+	e.mu.Lock()
+	rotateTimer = e.rotateTimer
+	e.mu.Unlock()
+	require.Nil(t, rotateTimer)
+}

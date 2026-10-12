@@ -1,0 +1,269 @@
+package ghidrassist.core;
+
+import com.vladsch.flexmark.html.HtmlRenderer;
+import com.vladsch.flexmark.html2md.converter.FlexmarkHtmlConverter;
+import com.vladsch.flexmark.parser.Parser;
+import com.vladsch.flexmark.util.ast.Document;
+import com.vladsch.flexmark.util.data.MutableDataSet;
+import com.vladsch.flexmark.ext.tables.TablesExtension;
+import com.vladsch.flexmark.util.misc.Extension;
+
+import java.awt.Color;
+import java.util.Arrays;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import javax.swing.UIManager;
+
+public class MarkdownHelper {
+    /**
+     * Shared CSS for consistent markdown rendering in Swing JEditorPane.
+     * Used for both streaming and final rendering.
+     * Minimal/empty to rely on JEditorPane's clean default styling.
+     */
+    public static final String MARKDOWN_CSS = "";
+
+    /**
+     * Generate theme-aware CSS for markdown rendering in Swing JEditorPane.
+     * Derives colors from the current UIManager theme so it works in both
+     * light and dark modes.
+     */
+    public static String getThemeAwareCSS() {
+        Color bg = UIManager.getColor("Panel.background");
+        Color fg = UIManager.getColor("Panel.foreground");
+        if (bg == null) bg = Color.WHITE;
+        if (fg == null) fg = Color.BLACK;
+
+        boolean isDark = (bg.getRed() + bg.getGreen() + bg.getBlue()) / 3 < 128;
+
+        // Code block background: slightly offset from panel background
+        Color codeBg = isDark
+            ? brighter(bg, 20)
+            : darker(bg, 12);
+        Color codeBorder = isDark
+            ? brighter(bg, 40)
+            : darker(bg, 30);
+
+        // Table header background
+        Color thBg = isDark
+            ? brighter(bg, 15)
+            : darker(bg, 8);
+
+        // Blockquote accent
+        Color bqBorder = isDark
+            ? brighter(bg, 50)
+            : darker(bg, 40);
+        Color bqText = isDark
+            ? brighter(fg, -40)
+            : darker(fg, -40);
+
+        return "body { font-family: sans-serif; font-size: 10px; margin: 8px; " +
+                   "color: " + hex(fg) + "; background-color: " + hex(bg) + "; width: auto; }" +
+               "pre { background-color: " + hex(codeBg) + "; padding: 10px; " +
+                   "border: 1px solid " + hex(codeBorder) + "; white-space: pre-wrap; " +
+                   "word-wrap: break-word; overflow-wrap: anywhere; " +
+                   "border-radius: 4px; }" +
+               "code { background-color: " + hex(codeBg) + "; padding: 2px 5px; " +
+                   "border-radius: 3px; word-wrap: break-word; }" +
+               "table { margin: 8px 0; border-top: 1px solid " + hex(codeBorder) + "; " +
+                   "border-left: 1px solid " + hex(codeBorder) + "; width: 100%; table-layout: fixed; }" +
+               "th { border-bottom: 1px solid " + hex(codeBorder) + "; " +
+                   "border-right: 1px solid " + hex(codeBorder) + "; padding: 4px 8px; " +
+                   "font-weight: bold; background-color: " + hex(thBg) + "; }" +
+               "td { border-bottom: 1px solid " + hex(codeBorder) + "; " +
+                   "border-right: 1px solid " + hex(codeBorder) + "; padding: 4px 8px; " +
+                   "word-wrap: break-word; overflow-wrap: anywhere; vertical-align: top; }" +
+               "div, p, li, span { word-wrap: break-word; overflow-wrap: anywhere; }" +
+               "blockquote { border-left: 3px solid " + hex(bqBorder) + "; margin-left: 0; " +
+                   "padding-left: 12px; color: " + hex(bqText) + "; }" +
+               "a { color: " + hex(isDark ? new Color(100, 160, 255) : new Color(0, 100, 200)) + "; }";
+    }
+
+    private static Color brighter(Color c, int amount) {
+        return new Color(
+            Math.min(255, Math.max(0, c.getRed() + amount)),
+            Math.min(255, Math.max(0, c.getGreen() + amount)),
+            Math.min(255, Math.max(0, c.getBlue() + amount))
+        );
+    }
+
+    private static Color darker(Color c, int amount) {
+        return brighter(c, -amount);
+    }
+
+    private static String hex(Color c) {
+        return String.format("#%02x%02x%02x", c.getRed(), c.getGreen(), c.getBlue());
+    }
+
+    private final Parser parser;
+    private final HtmlRenderer renderer;
+    private final FlexmarkHtmlConverter htmlToMdConverter;
+
+    public MarkdownHelper() {
+        MutableDataSet options = new MutableDataSet();
+
+        // Enable table extension for proper table rendering
+        options.set(Parser.EXTENSIONS, Arrays.asList(TablesExtension.create()));
+
+        // Configure rendering options
+        options.set(HtmlRenderer.SOFT_BREAK, "<br />\n");
+
+        this.parser = Parser.builder(options).build();
+        this.renderer = HtmlRenderer.builder(options).build();
+        this.htmlToMdConverter = FlexmarkHtmlConverter.builder().build();
+    }
+    
+    /**
+     * Convert Markdown text to HTML for display
+     * Includes feedback buttons in the HTML output
+     * 
+     * @param markdown The markdown text to convert
+     * @return HTML representation of the markdown
+     */
+    public String markdownToHtml(String markdown) {
+        if (markdown == null) {
+            return "";
+        }
+        
+        Document document = parser.parse(markdown);
+        String html = renderer.render(document);
+        
+        // Add feedback buttons (using BMP-compatible symbols for JEditorPane compatibility)
+        String feedbackLinks = "<br><div style=\"text-align: center; color: grey; font-size: 18px;\">" +
+            "<a href='thumbsup'>\u2714</a> | <a href='thumbsdown'>\u2716</a></div>";
+            
+        return "<html><head><style>" + getThemeAwareCSS() + "</style></head><body>" +
+               html + feedbackLinks + "</body></html>";
+    }
+    
+    /**
+     * Convert Markdown text to HTML without adding feedback buttons
+     * Used for preview or when feedback isn't needed
+     *
+     * @param markdown The markdown text to convert
+     * @return HTML representation of the markdown
+     */
+    public String markdownToHtmlSimple(String markdown) {
+        if (markdown == null) {
+            return "";
+        }
+
+        Document document = parser.parse(markdown);
+        String html = renderer.render(document);
+
+        return "<html><head><style>" + getThemeAwareCSS() + "</style></head><body>" +
+               html + "</body></html>";
+    }
+
+    /**
+     * Convert Markdown text to HTML fragment without any wrapper tags.
+     * Used for streaming rendering where fragments are inserted into an existing document.
+     * Includes table attribute post-processing for Swing compatibility.
+     *
+     * @param markdown The markdown text to convert
+     * @return HTML fragment without html/body wrapper tags
+     */
+    public String markdownToHtmlFragment(String markdown) {
+        if (markdown == null || markdown.isEmpty()) {
+            return "";
+        }
+
+        Document document = parser.parse(markdown);
+        String html = renderer.render(document);
+
+        // Post-process: add HTML attributes for table rendering in Swing
+        // (Swing's HTMLDocument needs cellspacing="0" to avoid double borders)
+        html = html.replace("<table>", "<table cellpadding=\"4\" cellspacing=\"0\">");
+
+        return html;
+    }
+
+    /**
+     * Convert plain text to HTML without markdown parsing.
+     * PERFORMANCE OPTIMIZATION: Used during streaming for better responsiveness.
+     * Full markdown rendering happens at completion.
+     *
+     * @param plainText The plain text to convert
+     * @return HTML representation with proper escaping
+     */
+    public String plainTextToHtml(String plainText) {
+        if (plainText == null || plainText.isEmpty()) {
+            return "<html><body></body></html>";
+        }
+
+        // Escape HTML entities to prevent rendering issues
+        String escaped = plainText
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\"", "&quot;")
+            .replace("\n", "<br>");
+
+        // Wrap in HTML structure with monospace font for readability
+        StringBuilder html = new StringBuilder();
+        html.append("<html><body>");
+        html.append("<div style='font-family: monospace; padding: 10px; white-space: pre-wrap;'>");
+        html.append(escaped);
+        html.append("</div>");
+        html.append("</body></html>");
+
+        return html.toString();
+    }
+
+    /**
+     * Convert HTML to Markdown
+     * 
+     * @param html The HTML to convert
+     * @return Markdown representation of the HTML
+     */
+    public String htmlToMarkdown(String html) {
+        if (html == null || html.isEmpty()) {
+            return "";
+        }
+        
+        // Remove feedback buttons if present
+        html = removeFeedbackButtons(html);
+        
+        // Remove html wrapper tags if present
+        html = removeHtmlWrapperTags(html);
+        
+        // Use flexmark converter for the HTML to Markdown conversion
+        return htmlToMdConverter.convert(html);
+    }
+    
+    /**
+     * Extract markdown from a response that might be in various formats
+     * 
+     * @param response The response to extract markdown from
+     * @return Extracted markdown content
+     */
+    public String extractMarkdownFromLlmResponse(String response) {
+        if (response == null || response.isEmpty()) {
+            return "";
+        }
+        
+        // Check if it's HTML
+        if (response.toLowerCase().contains("<html>") || response.toLowerCase().contains("<body>")) {
+            return htmlToMarkdown(response);
+        }
+        
+        // Otherwise, assume it's already markdown or plain text
+        return response;
+    }
+    
+    /**
+     * Remove feedback buttons from HTML string
+     */
+    private String removeFeedbackButtons(String html) {
+        // Pattern to match the feedback buttons div
+        Pattern feedbackPattern = Pattern.compile("<br><div style=\"text-align: center; color: grey; font-size: 18px;\">.*?</div>");
+        Matcher matcher = feedbackPattern.matcher(html);
+        return matcher.replaceAll("");
+    }
+    
+    /**
+     * Remove HTML and BODY wrapper tags
+     */
+    private String removeHtmlWrapperTags(String html) {
+        return html.replaceAll("(?i)<html>|</html>|<body>|</body>", "");
+    }
+}

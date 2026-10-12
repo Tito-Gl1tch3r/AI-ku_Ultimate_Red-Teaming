@@ -1,0 +1,4853 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 - now Marco Neumann (kalink0)
+"""Table viewer — displays SQLite tables as a sortable, searchable grid."""
+from __future__ import annotations
+
+from typing import Any
+
+import csv
+import html
+import re
+import sqlite3
+import zlib
+from contextlib import contextmanager
+import struct
+import time
+from collections import Counter
+from pathlib import Path
+
+from PySide6.QtCore import (
+    QT_TRANSLATE_NOOP,
+    QAbstractTableModel,
+    QModelIndex,
+    QObject,
+    QRegularExpression,
+    QSortFilterProxyModel,
+    QStringListModel,
+    Qt,
+    QTimer,
+    Signal,
+)
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QKeyEvent,
+    QKeySequence,
+    QStandardItem,
+    QStandardItemModel,
+    QSyntaxHighlighter,
+    QTextCharFormat,
+    QTextCursor,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QCompleter,
+    QDialog,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMenu,
+    QPushButton,
+    QPlainTextEdit,
+    QSizePolicy,
+    QSplitter,
+    QTableView,
+    QTreeView,
+    QVBoxLayout,
+    QWidget,
+)
+
+from crush.core.cell_locator import CellLocator
+from crush.core.sqlite_freeblocks import scan_database_freeblocks
+from crush.core.sqlite_freelist import (
+    carve_freelist_rows,
+    column_affinity,
+    read_raw_page as _read_freelist_page,
+    value_matches_affinity,
+    walk_freelist_pages,
+)
+from crush.core.sqlite_journal import (
+    JournalParseResult,
+    build_journal_page_overlay,
+    extract_journal_rows,
+    parse_rollback_journal,
+)
+from crush.core.sqlite_structure import (
+    StructureNode,
+    build_page_detail_nodes,
+    build_sqlite_structure_tree,
+)
+from crush.core.sqlite_unallocated import scan_database_unallocated
+from crush.core.sqlite_wal import (
+    SqliteCellLocator,
+    build_page_table_map,
+    build_wal_page_index,
+    build_wal_page_overlay,
+    classify_wal_frames,
+    column_ranges_from_layout,
+    page_accessors,
+    parse_table_leaf_page,
+    row_ranges_from_layout,
+)
+from crush.core.ts_decode import TS_FORMATS as _TS_FORMATS
+from crush.core.ts_decode import decode_cell as _decode_cell
+from crush.core.work_priority import (
+    acquire_foreground_io,
+    foreground_io,
+    release_foreground_io,
+)
+from crush.core.issues import ParseIssue, render_value
+from crush.ui.busy_dialog import run_with_busy_dialog
+from crush.ui.wheel_scroll import install_horizontal_wheel_scroll
+from crush.viewers.blob_inspector import BlobInspector
+from crush.viewers.open_bytes import request_open_bytes
+from crush.viewers.hex_viewer import HexViewer
+from crush.ui.i18n import translate
+from crush.viewers.generated_text import (
+    EXPORT_TEXT_ROLE as _EXPORT_TEXT_ROLE,
+    Gen as _Gen,
+    Localized as _Localized,
+    export_cell_text as _export_cell_text,
+    export_header_text as _export_header_text,
+    gen_item as _gen_item,
+    gen_text as _gen_text,
+    gens as _gens,
+    set_headers as _set_headers,
+)
+
+
+_MAX_COL_WIDTH = 400
+_QUERY_ROW_LIMIT = 10_000
+_COLUMN_SIZE_SAMPLE = 250
+_VIRTUAL_PATH_BAD_CHARS = re.compile(r"[\\/:\x00-\x1f]+")
+
+# Custom role (distinct from the plain UserRole already used for the "Row"
+# column's display index) storing a real table row's SQLite rowid, when
+# known -- see _append_row()'s rowid param and the embedded Hex pane.
+_ROWID_ROLE = Qt.ItemDataRole.UserRole + 1
+# _STRUCTURE_FILE_KIND_ROLE / _STRUCTURE_BYTE_RANGE_ROLE: which file a row's
+# bytes live in ("base"/"wal") and their range in it. Introduced for the File
+# Structure tree, but also set on WAL Frames rows (_load_wal_frames()) --
+# same need, a row with no rowid/table-name identity a CellLocator could
+# resolve, just knowing its own exact bytes instead. See _sync_wal_hex_pane().
+_STRUCTURE_FILE_KIND_ROLE = Qt.ItemDataRole.UserRole + 20
+_STRUCTURE_BYTE_RANGE_ROLE = Qt.ItemDataRole.UserRole + 21
+_STRUCTURE_HIGHLIGHT_RANGES_ROLE = Qt.ItemDataRole.UserRole + 22
+# Set on a "Page N" item until its detail children (cells/columns/etc.) are
+# actually built -- cleared once populated, so it doubles as the "already
+# loaded?" check. See _populate_structure_page_if_needed().
+_STRUCTURE_LAZY_PAGE_ROLE = Qt.ItemDataRole.UserRole + 23
+# Finer-grained companions to _STRUCTURE_BYTE_RANGE_ROLE for a WAL-history
+# row injected by _inject_wal_rows(): _STRUCTURE_BYTE_RANGE_ROLE alone only
+# gets a coarse whole-frame range (enough for the Hex → Table reverse
+# lookup to know which row a click landed in), but a click that lands on
+# one specific COLUMN deserves that column's own exact bytes drawn on top,
+# same as a real row's CellLocation.row_ranges/column_ranges. Row 0's item
+# gets _WAL_ROW_RANGES_ROLE (list[tuple[int, int]], mirroring
+# CellLocation.row_ranges) and _WAL_COLUMN_RANGES_ROLE (one entry per value
+# column, each a list[tuple[int, int]] or None if unresolvable -- e.g. an
+# overflow segment that itself later became WAL-resident and no longer
+# matches the row's own home file).
+_WAL_ROW_RANGES_ROLE = Qt.ItemDataRole.UserRole + 24
+_WAL_COLUMN_RANGES_ROLE = Qt.ItemDataRole.UserRole + 25
+# "Decode column as timestamp" on the QStandardItemModel path rewrites a cell's
+# displayed text (and, for a cell that can't be decoded, its colour), so the
+# as-stored text and the original foreground are kept here to restore exactly on
+# "Clear timestamp format" -- the raw value itself is never touched.
+_TS_ORIGINAL_TEXT_ROLE = Qt.ItemDataRole.UserRole + 26
+_TS_ORIGINAL_FG_ROLE = Qt.ItemDataRole.UserRole + 27  # False = no foreground was set
+_TS_UNDECODED_COLOR = QColor("#cc8800")
+# A header's own tooltip (why a column is derived, what "Row" is), kept so the
+# timestamp decoding's header tooltip can give way to it and restore it.
+_HEADER_BASE_TIP_ROLE = Qt.ItemDataRole.UserRole + 29
+# Values a generated view gets from crush.core at runtime (so they can't be
+# marked where they're written). Marked here, translated by their English
+# text via _gen_text(); anything not listed is shown as it is.
+_GENERATED_VALUES = (
+    # sqlite_wal frame status
+    QT_TRANSLATE_NOOP("GeneratedView", "Active"),
+    QT_TRANSLATE_NOOP("GeneratedView", "Superseded"),
+    QT_TRANSLATE_NOOP("GeneratedView", "Uncommitted"),
+    QT_TRANSLATE_NOOP("GeneratedView", "WAL slack"),
+    # sqlite_journal row kind
+    QT_TRANSLATE_NOOP("GeneratedView", "Live cell"),
+    QT_TRANSLATE_NOOP("GeneratedView", "Freeblock (deleted)"),
+    QT_TRANSLATE_NOOP("GeneratedView", "Unallocated slack"),
+)
+
+
+def _row_header_tooltip() -> str:
+    return translate(
+        "TableViewer",
+        "Crush's number for this row in the order it was read (table) or "
+        "returned (query) -- not stored in the file.",
+    )
+
+
+def _derived_header_tooltip(reason: object) -> str:
+    return translate(
+        "TableViewer", "Derived by Crush, not stored in the file: {reason}"
+    ).format(reason=render_value(reason, localized=True))
+
+
+def _ts_suffix(fmt: str) -> str:
+    return next(s for key, _, s in _TS_FORMATS if key == fmt)
+
+
+def _ts_header_pair(
+    base_english: str, base_display: str, fmt: str, decoded: int, failed: int
+) -> tuple[str, str]:
+    """(English original, display) header label for a column decoded as
+    *fmt*. When nothing in the column decoded, say so in the header itself
+    rather than showing a suffix that looks like a working decode."""
+    suffix = _ts_suffix(fmt)
+    if decoded == 0 and failed > 0:
+        template = QT_TRANSLATE_NOOP("GeneratedView", "{base} [{suffix}: none decodable]")
+        english = template.format(base=base_english, suffix=suffix)
+        try:
+            display = _gen_text(template).format(base=base_display, suffix=suffix)
+        except (KeyError, IndexError, ValueError):
+            display = english
+        return english, display
+    return f"{base_english} [{suffix}]", f"{base_display} [{suffix}]"
+
+
+def _ts_header_tooltip(fmt: str, decoded: int, failed: int) -> str | None:
+    if not failed:
+        return None
+    return translate(
+        "TableViewer",
+        "{failed:,} of {total:,} values could not be decoded as "
+        "{format} and are shown as stored (orange) -- hover a cell for the reason.",
+    ).format(failed=failed, total=decoded + failed, format=_ts_suffix(fmt))
+
+
+def _ts_cell_tooltip(fmt: str, problem: object) -> str:
+    return translate("TableViewer", "Not decoded as {format}: {problem}. Shown as stored.").format(
+        format=_ts_suffix(fmt), problem=render_value(problem, localized=True)
+    )
+
+
+def _valid_structure_range(value: object) -> bool:
+    return (
+        isinstance(value, tuple)
+        and len(value) == 2
+        and isinstance(value[0], int)
+        and isinstance(value[1], int)
+        and value[0] <= value[1]
+    )
+
+
+def _page_file_location(
+    page_num: int, page_size: int, wal_index: dict[int, tuple[int, bytes]]
+) -> tuple[str, int]:
+    """Which file *page_num* currently lives in ("base"/"wal") and that
+    file's own absolute byte offset for it -- same small helper
+    sqlite_structure.py's File Structure tab uses, duplicated rather than
+    imported to avoid coupling two independent tabs' internals together."""
+    if page_num in wal_index:
+        return "wal", wal_index[page_num][0]
+    return "base", (page_num - 1) * page_size
+
+
+def _virtual_path_component(value: object, fallback: str) -> str:
+    text = str(value or "").strip()
+    text = _VIRTUAL_PATH_BAD_CHARS.sub("_", text)
+    text = text.strip(" .")
+    return text or fallback
+
+
+
+def _rows_label(total: int) -> str:
+    """"(1 row)" / "(12,345 rows)" for the row-count label."""
+    return (
+        translate("TableViewer", "({total:,} row)")
+        if total == 1
+        else translate("TableViewer", "({total:,} rows)")
+    ).format(total=total)
+
+class _QueryResultModel(QAbstractTableModel):
+    """Virtual SQL result model that creates cell values only when requested."""
+
+    def __init__(
+        self,
+        columns: list[str],
+        rows: list[list[Any]],
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._headers = ["Row"] + columns
+        self._rows = rows
+        self._ts_formats: dict[int, str] = {}
+        # col -> (cells decoded, cells left as stored because they couldn't be)
+        self._ts_stats: dict[int, tuple[int, int]] = {}
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._rows)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._headers)
+
+    def headerData(
+        self,
+        section: int,
+        orientation: Qt.Orientation,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ) -> Any:
+        if orientation != Qt.Orientation.Horizontal:
+            return None
+        if role not in (
+            Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ToolTipRole, _EXPORT_TEXT_ROLE
+        ):
+            return None
+        header = self._headers[section]
+        # Column 0 is Crush's "Row"; the others are the query's column names.
+        english, display = (
+            _Gen(QT_TRANSLATE_NOOP("GeneratedView", "Row")).pair()
+            if section == 0
+            else (header, header)
+        )
+        fmt = self._ts_formats.get(section)
+        if fmt is not None:
+            decoded, failed = self._ts_stats.get(section, (0, 0))
+            if role == Qt.ItemDataRole.ToolTipRole:
+                return _ts_header_tooltip(fmt, decoded, failed)
+            english, display = _ts_header_pair(english, display, fmt, decoded, failed)
+        elif role == Qt.ItemDataRole.ToolTipRole:
+            return _row_header_tooltip() if section == 0 else None
+        if role == _EXPORT_TEXT_ROLE:
+            return english if english != display else None
+        return display
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
+        if not index.isValid():
+            return None
+        col = index.column()
+        value: Any = index.row() + 1 if col == 0 else self._rows[index.row()][col - 1]
+
+        if role == Qt.ItemDataRole.DisplayRole:
+            if value is None:
+                return ""
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                return f"<BLOB {len(value):,} B>"
+            fmt = self._ts_formats.get(col)
+            if fmt is not None:
+                decoded, _problem = _decode_cell(value, fmt)
+                if decoded is not None:
+                    return decoded
+            return str(value)
+        if role == Qt.ItemDataRole.UserRole:
+            if isinstance(value, memoryview):
+                return value.tobytes()
+            if isinstance(value, bytearray):
+                return bytes(value)
+            return value
+        if role == Qt.ItemDataRole.ForegroundRole:
+            if value is None:
+                return Qt.GlobalColor.gray
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                return Qt.GlobalColor.blue
+            fmt = self._ts_formats.get(col)
+            if fmt is not None and _decode_cell(value, fmt)[1] is not None:
+                return _TS_UNDECODED_COLOR
+        if role == Qt.ItemDataRole.ToolTipRole:
+            fmt = self._ts_formats.get(col)
+            if fmt is not None:
+                problem = _decode_cell(value, fmt)[1]
+                if problem is not None:
+                    return _ts_cell_tooltip(fmt, problem)
+        return None
+
+    def set_timestamp_format(self, col: int, fmt: str | None) -> None:
+        if fmt is None:
+            self._ts_formats.pop(col, None)
+            self._ts_stats.pop(col, None)
+        else:
+            self._ts_formats[col] = fmt
+            decoded = failed = 0
+            for row in self._rows:
+                text, problem = _decode_cell(row[col - 1], fmt)
+                if text is not None:
+                    decoded += 1
+                elif problem is not None:
+                    failed += 1
+            self._ts_stats[col] = (decoded, failed)
+        self.headerDataChanged.emit(Qt.Orientation.Horizontal, col, col)
+        if self._rows:
+            self.dataChanged.emit(
+                self.index(0, col),
+                self.index(len(self._rows) - 1, col),
+                [
+                    Qt.ItemDataRole.DisplayRole,
+                    Qt.ItemDataRole.ForegroundRole,
+                    Qt.ItemDataRole.ToolTipRole,
+                ],
+            )
+
+
+def _cap_columns(view: QTableView) -> None:
+    """Clamp every column to _MAX_COL_WIDTH so wide cells don't force horizontal scrolling."""
+    header = view.horizontalHeader()
+    for col in range(view.model().columnCount()):
+        if header.sectionSize(col) > _MAX_COL_WIDTH:
+            header.resizeSection(col, _MAX_COL_WIDTH)
+
+
+def _wal_diag(db_path: "str | None", parser_diag: "_Localized | None" = None) -> _Gen:
+    """A short diagnostic explaining why WAL parsing failed."""
+    if db_path is None:
+        return _Gen(QT_TRANSLATE_NOOP("GeneratedView", "db_path is None"))
+    wal_path = Path(str(db_path) + "-wal")
+    if not wal_path.exists():
+        if parser_diag:
+            return _Gen(
+                QT_TRANSLATE_NOOP(
+                    "GeneratedView", "WAL file not found at temp path (parser: {diag})"
+                ),
+                diag=parser_diag,
+            )
+        return _Gen(QT_TRANSLATE_NOOP("GeneratedView", "WAL file not found at temp path"))
+    size = wal_path.stat().st_size
+    if size < 32:
+        if parser_diag:
+            return _Gen(
+                QT_TRANSLATE_NOOP("GeneratedView", "WAL too small ({size} B) — parser: {diag}"),
+                size=size,
+                diag=parser_diag,
+            )
+        return _Gen(QT_TRANSLATE_NOOP("GeneratedView", "WAL too small ({size} B)"), size=size)
+    try:
+        magic = struct.unpack_from(">I", wal_path.read_bytes(), 0)[0]
+    except Exception as exc:
+        return _Gen(QT_TRANSLATE_NOOP("GeneratedView", "read error: {error}"), error=exc)
+    if magic not in _WAL_MAGIC:
+        return _Gen(QT_TRANSLATE_NOOP("GeneratedView", "invalid magic 0x{magic:08x}"), magic=magic)
+    return _Gen(
+        QT_TRANSLATE_NOOP(
+            "GeneratedView", "WAL ok (size={size} B, magic=0x{magic:08x}) — frames list empty"
+        ),
+        size=size,
+        magic=magic,
+    )
+
+
+def _format_wal_frame_content(rows: list[tuple[int, list[Any]]], col_names: list[str]) -> str:
+    """Render decoded (rowid, values) tuples from a WAL frame's page as one
+    compact string for the Content column — real column names when the
+    frame's page maps to a known table with a matching column count,
+    positional otherwise."""
+    parts: list[str] = []
+    for rowid, values in rows:
+        if col_names and len(col_names) == len(values):
+            body = ", ".join(f"{c}={v}" for c, v in zip(col_names, values))
+        else:
+            body = ", ".join(str(v) for v in values)
+        parts.append(f"{rowid}: [{body}]")
+    return "; ".join(parts)
+
+
+class _SqlHighlighter(QSyntaxHighlighter):
+    _KEYWORDS = (
+        "SELECT FROM WHERE INSERT UPDATE DELETE CREATE DROP TABLE VIEW INDEX TRIGGER "
+        "JOIN LEFT RIGHT INNER OUTER CROSS ON AS AND OR NOT IN IS NULL LIKE GLOB "
+        "LIMIT OFFSET ORDER BY GROUP HAVING DISTINCT UNION ALL WITH PRAGMA BETWEEN "
+        "CASE WHEN THEN ELSE END EXISTS PRIMARY KEY FOREIGN REFERENCES UNIQUE "
+        "INTO VALUES SET BEGIN COMMIT ROLLBACK REPLACE UPSERT RETURNING "
+        "COUNT SUM AVG MIN MAX COALESCE IFNULL NULLIF CAST TYPEOF LENGTH "
+        "SUBSTR TRIM UPPER LOWER DATE TIME DATETIME STRFTIME"
+    ).split()
+
+    def __init__(self, document: object) -> None:
+        super().__init__(document)
+        is_dark = QApplication.palette().window().color().lightness() < 128
+
+        def fmt(color: str, bold: bool = False, italic: bool = False) -> QTextCharFormat:
+            f = QTextCharFormat()
+            f.setForeground(QColor(color))
+            if bold:
+                f.setFontWeight(QFont.Weight.Bold)
+            if italic:
+                f.setFontItalic(True)
+            return f
+
+        if is_dark:
+            kw  = fmt("#569cd6", bold=True)
+            str_ = fmt("#ce9178")
+            num  = fmt("#b5cea8")
+            cmt  = fmt("#6a9955", italic=True)
+        else:
+            kw  = fmt("#0000cc", bold=True)
+            str_ = fmt("#a31515")
+            num  = fmt("#098658")
+            cmt  = fmt("#008000", italic=True)
+
+        ci = QRegularExpression.PatternOption.CaseInsensitiveOption
+        kw_rx = r"\b(?:" + "|".join(self._KEYWORDS) + r")\b"
+        self._rules: list[tuple[QRegularExpression, QTextCharFormat]] = [
+            (QRegularExpression(kw_rx, ci),         kw),
+            (QRegularExpression(r"'(?:[^'\\]|\\.)*'"),  str_),
+            (QRegularExpression(r'"(?:[^"\\]|\\.)*"'),  str_),
+            (QRegularExpression(r"\[([^\]]*)\]"),        str_),
+            (QRegularExpression(r"\b\d+\.?\d*\b"),       num),
+            (QRegularExpression(r"--[^\n]*"),            cmt),
+        ]
+
+    def highlightBlock(self, text: str) -> None:
+        for rx, fmt in self._rules:
+            it = rx.globalMatch(text)
+            while it.hasNext():
+                m = it.next()
+                self.setFormat(m.capturedStart(), m.capturedLength(), fmt)
+
+
+class _SqlEditor(QPlainTextEdit):
+    """Plain-text SQL editor with F5 run and context-aware identifier autocomplete."""
+
+    run_requested = Signal()
+
+    # After FROM/JOIN/INTO/UPDATE/TABLE and before any clause-breaking keyword
+    # → complete table names only.
+    _TABLE_CTX_RX = re.compile(r"\b(FROM|JOIN|INTO|UPDATE|TABLE)\b", re.IGNORECASE)
+    _BREAK_CTX_RX = re.compile(
+        r"\b(SELECT|SET|WHERE|ON|HAVING|LIMIT|OFFSET|ORDER|GROUP|AND|OR|CASE|WHEN|THEN|ELSE)\b",
+        re.IGNORECASE,
+    )
+    # FROM/JOIN table_name [AS] alias  → captures (table_name, as_alias, bare_alias)
+    _ALIAS_RX = re.compile(
+        r"\b(?:FROM|JOIN)\s+(\w+)(?:\s+AS\s+(\w+)|\s+(\w+))?",
+        re.IGNORECASE,
+    )
+    _ALIAS_KW = frozenset({
+        "ON", "WHERE", "SET", "LEFT", "RIGHT", "INNER", "OUTER", "CROSS",
+        "NATURAL", "JOIN", "HAVING", "GROUP", "ORDER", "LIMIT", "OFFSET",
+        "UNION", "INTERSECT", "EXCEPT", "SELECT", "AND", "OR", "NOT",
+        "AS", "FROM", "INTO", "UPDATE", "TABLE",
+    })
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._completer: QCompleter | None = None
+        self._completer_model: QStringListModel | None = None
+        self._schema: dict[str, list[str]] = {}
+
+    def set_schema(self, schema: dict[str, list[str]]) -> None:
+        """Set the DB schema for context-aware autocomplete. schema = {table: [col, ...]}."""
+        self._schema = schema
+        if not schema:
+            return
+        all_words = sorted(
+            set(list(schema.keys()) + [c for cols in schema.values() for c in cols])
+        )
+        self._completer_model = QStringListModel(all_words, self)
+        if self._completer is not None:
+            self._completer.setParent(None)
+        self._completer = QCompleter(self._completer_model, self)
+        self._completer.setWidget(self)
+        self._completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self._completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self._completer.activated.connect(self._insert_completion)
+
+    def _get_context(self) -> tuple[str, str, str]:
+        """Return (mode, prefix, table_name).
+
+        mode 'table'  → complete table/view names only (after FROM/JOIN/…)
+        mode 'column' → complete columns of table_name (dot notation: table.col)
+        mode 'any'    → complete tables + all columns
+        """
+        text = self.toPlainText()
+        pos = self.textCursor().position()
+
+        start = pos
+        while start > 0 and (text[start - 1].isalnum() or text[start - 1] == "_"):
+            start -= 1
+        prefix = text[start:pos]
+
+        # Dot notation: users.na or alias.na → complete columns of resolved table
+        if start > 0 and text[start - 1] == ".":
+            tbl_end = start - 1
+            tbl_start = tbl_end
+            while tbl_start > 0 and (text[tbl_start - 1].isalnum() or text[tbl_start - 1] == "_"):
+                tbl_start -= 1
+            identifier = text[tbl_start:tbl_end]
+            # Resolve alias (e.g. 'o' → 'orders') using FROM/JOIN declarations in the text
+            aliases = self._parse_aliases(text)
+            table_name = aliases.get(identifier.lower(), identifier)
+            return "column", prefix, table_name
+
+        # FROM/JOIN context: last table-keyword has no clause-breaking keyword after it
+        before = text[:start]
+        last_tbl_kw = None
+        for m in self._TABLE_CTX_RX.finditer(before):
+            last_tbl_kw = m
+        if last_tbl_kw and not self._BREAK_CTX_RX.search(before[last_tbl_kw.end():]):
+            return "table", prefix, ""
+
+        return "any", prefix, ""
+
+    def _parse_aliases(self, text: str) -> dict[str, str]:
+        """Return {alias_lower: table_name} for all FROM/JOIN references in text."""
+        result: dict[str, str] = {}
+        for m in self._ALIAS_RX.finditer(text):
+            table_name = m.group(1)
+            alias = m.group(2) or m.group(3)
+            if alias and alias.upper() not in self._ALIAS_KW:
+                result[alias.lower()] = table_name
+        return result
+
+    def _words_for_context(self, mode: str, table_name: str) -> list[str]:
+        if mode == "column":
+            cols = self._schema.get(table_name)
+            if cols is None:
+                for t, c in self._schema.items():
+                    if t.lower() == table_name.lower():
+                        cols = c
+                        break
+            return sorted(cols or [])
+        if mode == "table":
+            return sorted(self._schema.keys())
+        return sorted(
+            set(list(self._schema.keys()) + [c for cols in self._schema.values() for c in cols])
+        )
+
+    def _insert_completion(self, completion: str) -> None:
+        cursor = self.textCursor()
+        text = self.toPlainText()
+        pos = cursor.position()
+        start = pos
+        while start > 0 and (text[start - 1].isalnum() or text[start - 1] == "_"):
+            start -= 1
+        cursor.setPosition(start)
+        cursor.setPosition(pos, QTextCursor.MoveMode.KeepAnchor)
+        cursor.removeSelectedText()
+        cursor.insertText(completion)
+        self.setTextCursor(cursor)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        run_modifiers = (
+            Qt.KeyboardModifier.ControlModifier
+            | Qt.KeyboardModifier.MetaModifier
+        )
+        if event.key() == Qt.Key.Key_F5 or (
+            event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            and event.modifiers() & run_modifiers
+        ):
+            self.run_requested.emit()
+            return
+
+        # Let the completer popup consume its own navigation keys
+        if self._completer and self._completer.popup().isVisible():
+            if event.key() in (
+                Qt.Key.Key_Return, Qt.Key.Key_Enter,
+                Qt.Key.Key_Escape, Qt.Key.Key_Tab, Qt.Key.Key_Backtab,
+            ):
+                event.ignore()
+                return
+
+        super().keyPressEvent(event)
+
+        if not self._completer or not self._schema:
+            return
+
+        mode, prefix, table_name = self._get_context()
+
+        if not prefix:
+            self._completer.popup().hide()
+            return
+
+        words = self._words_for_context(mode, table_name)
+        if not words:
+            self._completer.popup().hide()
+            return
+
+        assert self._completer_model is not None
+        self._completer_model.setStringList(words)
+        self._completer.setCompletionPrefix(prefix)
+        self._completer.popup().setCurrentIndex(
+            self._completer.completionModel().index(0, 0)
+        )
+
+        if self._completer.completionCount() == 0:
+            self._completer.popup().hide()
+            return
+
+        # Show popup only when user typed an identifier char or used backspace
+        ch = event.text()
+        if (ch and (ch.isalnum() or ch == "_")) or event.key() == Qt.Key.Key_Backspace:
+            rect = self.cursorRect()
+            rect.setWidth(
+                self._completer.popup().sizeHintForColumn(0)
+                + self._completer.popup().verticalScrollBar().sizeHint().width()
+            )
+            self._completer.complete(rect)
+        else:
+            self._completer.popup().hide()
+
+
+_WAL_MAGIC = (0x377F0682, 0x377F0683)
+
+# (pragma, display label, kind, enum_map | None, description)
+# kind values: "int" | "bool" | "enum" | "str"
+_PRAGMA_CATALOG: list[tuple[str, str, str, dict[int, str] | None, str]] = [
+    # File format
+    (
+        "application_id",
+        QT_TRANSLATE_NOOP("GeneratedView", "Application ID"),
+        "int",
+        None,
+        QT_TRANSLATE_NOOP(
+            "GeneratedView",
+            "32-bit magic number identifying the application that created this database",
+        ),
+    ),
+    (
+        "user_version",
+        QT_TRANSLATE_NOOP("GeneratedView", "User version"),
+        "int",
+        None,
+        QT_TRANSLATE_NOOP("GeneratedView", "Application-defined schema version number"),
+    ),
+    (
+        "schema_version",
+        QT_TRANSLATE_NOOP("GeneratedView", "Schema version"),
+        "int",
+        None,
+        QT_TRANSLATE_NOOP("GeneratedView", "Internal counter incremented on every schema change"),
+    ),
+    (
+        "encoding",
+        QT_TRANSLATE_NOOP("GeneratedView", "Encoding"),
+        "str",
+        None,
+        QT_TRANSLATE_NOOP("GeneratedView", "Text encoding for all string data in this database"),
+    ),
+    (
+        "page_size",
+        QT_TRANSLATE_NOOP("GeneratedView", "Page size (B)"),
+        "int",
+        None,
+        QT_TRANSLATE_NOOP(
+            "GeneratedView", "Size of each B-tree page; fixed at database creation time"
+        ),
+    ),
+    (
+        "page_count",
+        QT_TRANSLATE_NOOP("GeneratedView", "Page count"),
+        "int",
+        None,
+        QT_TRANSLATE_NOOP(
+            "GeneratedView",
+            "Total allocated pages; multiply by page_size to get expected file size",
+        ),
+    ),
+    (
+        "freelist_count",
+        QT_TRANSLATE_NOOP("GeneratedView", "Free pages"),
+        "int",
+        None,
+        QT_TRANSLATE_NOOP(
+            "GeneratedView",
+            "Unallocated pages that may contain deleted data — forensically significant. "
+            "See the 'Freelist Recovery' tab to carve any leftover rows",
+        ),
+    ),
+    # Journal / safety
+    (
+        "journal_mode",
+        QT_TRANSLATE_NOOP("GeneratedView", "Journal mode"),
+        "str",
+        None,
+        QT_TRANSLATE_NOOP(
+            "GeneratedView",
+            "Rollback journal strategy (delete / wal / truncate / persist / memory / off). "
+            "Only the WAL/non-WAL distinction is stored in the file header — that part is "
+            "reliable; any other value is this connection's default, not necessarily what "
+            "was active historically (though the specific non-WAL sub-mode has no effect "
+            "on recoverable data, only on journal file cleanup)",
+        ),
+    ),
+    # Vacuum / storage
+    (
+        "auto_vacuum",
+        QT_TRANSLATE_NOOP("GeneratedView", "Auto vacuum"),
+        "enum",
+        {0: "NONE", 1: "FULL", 2: "INCREMENTAL"},
+        QT_TRANSLATE_NOOP("GeneratedView", "Automatic reclamation of free pages after DELETE"),
+    ),
+]
+
+
+class TableViewer(QWidget):
+    """Viewer for SQLite databases.
+
+    data shape:
+        {
+          "table_name": {
+              "columns": ["col1", "col2", ...],
+              "rows":    [[val, val, ...], ...]
+          },
+          ...
+        }
+    """
+    open_bytes_requested = Signal(bytes, str)
+    open_bytes_with_format_requested = Signal(bytes, str, object, dict)
+
+    def __init__(
+        self,
+        data: dict[str, Any],
+        parent: QWidget | None = None,
+        show_db_tabs: bool = True,
+        summary_nav_table: str | None = None,
+        source_name: str = "sqlite",
+    ) -> None:
+        super().__init__(parent)
+        self._data = data
+        self._source_name = source_name
+        self._show_db_tabs = show_db_tabs
+        self._summary_nav_table = summary_nav_table
+        self._col_ts_formats: dict[int, str] = {}
+        db_path_value = data.get("__db_path") if isinstance(data, dict) else None
+        if isinstance(db_path_value, str) and db_path_value:
+            candidate = Path(db_path_value)
+            self._db_path = candidate if candidate.is_file() else None
+        else:
+            self._db_path = None
+        # Set only when SQLiteParser found a valid/hot rollback journal and
+        # reconstructed the post-rollback "current" state -- _ensure_db()
+        # opens this instead of __db_path so the main table grid, SQL bar,
+        # and DB Info PRAGMAs all consistently reflect it. Physical/raw tabs
+        # (File Structure, Freelist, Freeblocks, Unallocated Space, WAL
+        # Frames) keep reading __db_path directly regardless -- their whole
+        # purpose is showing actual on-disk layout, recovered or not.
+        recovered_db_value = data.get("__recovered_db_path") if isinstance(data, dict) else None
+        if isinstance(recovered_db_value, str) and recovered_db_value:
+            candidate = Path(recovered_db_value)
+            self._recovered_db_path = candidate if candidate.is_file() else None
+        else:
+            self._recovered_db_path = None
+        journal_path_value = data.get("__journal_path") if isinstance(data, dict) else None
+        if isinstance(journal_path_value, str) and journal_path_value:
+            candidate = Path(journal_path_value)
+            self._journal_path = candidate if candidate.is_file() else None
+        else:
+            self._journal_path = None
+        self._db_conn: sqlite3.Connection | None = None
+        # A connection to __db_path that's never redirected to
+        # __recovered_db_path -- see _ensure_raw_db(). The physical/raw tabs
+        # need this for build_page_table_map() (it resolves its own file via
+        # PRAGMA database_list on whatever connection it's given), so they
+        # don't inherit _ensure_db()'s post-rollback redirect.
+        self._raw_db_conn: sqlite3.Connection | None = None
+        # Embedded Hex pane byte-provenance: a caller (e.g. RealmViewer) may
+        # supply its own CellLocator against the real source file, via
+        # "__cell_locator" -- takes priority over the default SqliteCellLocator
+        # built from __db_path (which, for Realm, points at a synthetic
+        # SQLite copy of the data used only for querying/sorting, not for
+        # hex bytes -- see crush/core/realm_offsets.py).
+        external_locator = data.get("__cell_locator") if isinstance(data, dict) else None
+        self._cell_locator: CellLocator | None
+        if external_locator is not None:
+            self._cell_locator = external_locator
+        elif self._db_path is not None:
+            self._cell_locator = SqliteCellLocator(
+                self._db_path, self._get_page_size, self._ensure_page_table_map, self._get_wal_data,
+            )
+        else:
+            self._cell_locator = None
+        # The generated views' names: the English name is the key (item data
+        # in the table combo, used by every check below); only the combo
+        # shows it translated -- see _add_generated_view()/_current_table().
+        self._summary_label = QT_TRANSLATE_NOOP("GeneratedView", "Summary (generated)")
+        self._db_structure_label = QT_TRANSLATE_NOOP("GeneratedView", "DB Structure (generated)")
+        self._file_structure_label = QT_TRANSLATE_NOOP(
+            "GeneratedView", "File Structure (generated)"
+        )
+        self._db_info_label = QT_TRANSLATE_NOOP("GeneratedView", "DB Info (generated)")
+        self._wal_label = QT_TRANSLATE_NOOP("GeneratedView", "WAL Frames (generated)")
+        self._journal_label = QT_TRANSLATE_NOOP("GeneratedView", "Rollback Journal (generated)")
+        self._freelist_label = QT_TRANSLATE_NOOP("GeneratedView", "Freelist Recovery (generated)")
+        self._freeblocks_label = QT_TRANSLATE_NOOP("GeneratedView", "Freeblocks (generated)")
+        self._unallocated_label = QT_TRANSLATE_NOOP(
+            "GeneratedView", "Unallocated Space (generated)"
+        )
+        self._journal_result_cache: JournalParseResult | None = None
+        self._journal_result_loaded = False
+        self._wal_frames_cache: list[dict] | None = None
+        self._wal_page_size: int = 0
+        self._db_page_size: int = 0
+        self._wal_data_loaded = False
+        self._wal_data_cache: bytes | None = None
+        self._wal_page_overlay_cache: dict[int, bytes] | None = None
+        self._freelist_cache: tuple[list[dict], list[dict]] | None = None
+        self._freelist_render_state: (
+            tuple[list[dict], list[dict], dict[str, list[tuple[str, str]]]] | None
+        ) = None
+        self._freeblocks_cache: list[dict] | None = None
+        self._unallocated_cache: list[dict] | None = None
+        self._page_table_map: dict[int, str] = {}  # page_num → table_name
+        # Why a scan's result may be empty or partial (see _set_source_status).
+        self._freelist_problems: list[Any] = []
+        self._freeblocks_problems: list[Any] = []
+        self._unallocated_problems: list[Any] = []
+        self._page_table_problems: list[Any] = []
+        self._injection_problems: list[Any] = []
+        self._structure_table_columns: dict[str, list[str]] = {}
+        self._table_interaction_active = False
+        self._hex_pane_loaded = False
+        self._hex_file_kind: str | None = None  # "base" or "wal" -- whichever is currently loaded
+        self._syncing_hex_selection = False
+        self._build_ui()
+        if data:
+            table_names = [k for k in data.keys() if not k.startswith("__")]
+            if self._db_path:
+                self._table_combo.clear()
+                if show_db_tabs:
+                    self._add_generated_view(self._summary_label)
+                    self._add_generated_view(self._db_structure_label)
+                    self._add_generated_view(self._file_structure_label)
+                    self._add_generated_view(self._db_info_label)
+                    if self._db_path and Path(str(self._db_path) + "-wal").exists():
+                        self._add_generated_view(self._wal_label)
+                    if self._journal_path is not None:
+                        self._add_generated_view(self._journal_label)
+                    self._add_generated_view(self._freelist_label)
+                    self._add_generated_view(self._freeblocks_label)
+                    self._add_generated_view(self._unallocated_label)
+                for name in table_names:
+                    self._add_table_item(name)
+                if show_db_tabs:
+                    conn = self._ensure_db()
+                    if conn:
+                        try:
+                            view_names = [
+                                r[0] for r in conn.execute(
+                                    "SELECT name FROM sqlite_master WHERE type='view' ORDER BY name"
+                                ).fetchall()
+                            ]
+                            if view_names:
+                                self._table_combo.insertSeparator(self._table_combo.count())
+                                self._table_combo.addItems(view_names)
+                        except Exception:
+                            pass
+                    self._load_summary()
+                else:
+                    if table_names:
+                        self._load_table(table_names[0])
+                    self._refresh_sql_completions()
+            else:
+                if table_names:
+                    self._load_table(table_names[0])
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Toolbar row: table selector + row count + search
+        toolbar = QWidget()
+        toolbar.setFixedHeight(36)
+        toolbar_layout = QHBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(8, 4, 8, 4)
+        toolbar_layout.setSpacing(8)
+
+        toolbar_layout.addWidget(QLabel(translate("TableViewer", "Table:")))
+
+        self._table_combo = QComboBox()
+        for name in [k for k in self._data.keys() if not k.startswith("__")]:
+            self._add_table_item(name)
+        self._table_combo.currentIndexChanged.connect(
+            lambda _index: self._load_table(self._current_table())
+        )
+        toolbar_layout.addWidget(self._table_combo)
+
+        self._row_count_label = QLabel("")
+        toolbar_layout.addWidget(self._row_count_label)
+
+        self._wal_toggle = QCheckBox(translate("TableViewer", "Show WAL history"))
+        self._wal_toggle.setVisible(False)
+        self._wal_toggle.stateChanged.connect(self._on_wal_toggle)
+        toolbar_layout.addWidget(self._wal_toggle)
+
+        self._journal_toggle = QCheckBox(translate("TableViewer", "Show pre-rollback state"))
+        self._journal_toggle.setVisible(False)
+        self._journal_toggle.stateChanged.connect(self._on_journal_toggle)
+        toolbar_layout.addWidget(self._journal_toggle)
+
+        self._prev_ref_toggle = QCheckBox(translate("TableViewer", "Show diff to prev ref"))
+        self._prev_ref_toggle.setVisible(False)
+        self._prev_ref_toggle.stateChanged.connect(self._on_prev_ref_toggle)
+        toolbar_layout.addWidget(self._prev_ref_toggle)
+
+        self._freelist_table_filter_label = QLabel(translate("TableViewer", "View as:"))
+        self._freelist_table_filter_label.setVisible(False)
+        toolbar_layout.addWidget(self._freelist_table_filter_label)
+
+        self._freelist_table_filter = QComboBox()
+        self._freelist_table_filter.setVisible(False)
+        self._freelist_table_filter.setMinimumWidth(160)
+        self._freelist_table_filter.currentIndexChanged.connect(
+            self._on_freelist_table_filter_changed
+        )
+        toolbar_layout.addWidget(self._freelist_table_filter)
+
+        toolbar_layout.addStretch()
+
+        search_label = QLabel(translate("TableViewer", "Search:"))
+        toolbar_layout.addWidget(search_label)
+
+        self._search = QLineEdit()
+        self._search.setPlaceholderText(translate("TableViewer", "Filter rows…"))
+        self._search.setClearButtonEnabled(True)
+        self._search.setFixedWidth(200)
+        self._search.textChanged.connect(self._apply_filter)
+        toolbar_layout.addWidget(self._search)
+
+        self._hex_toggle_btn = QPushButton(translate("TableViewer", "Show Hex"))
+        self._hex_toggle_btn.clicked.connect(self._toggle_hex_pane)
+        toolbar_layout.addWidget(self._hex_toggle_btn)
+
+        layout.addWidget(toolbar)
+
+        # SQL section: input row + status row below
+        self._sql_bar = QWidget()
+        sql_outer = QVBoxLayout(self._sql_bar)
+        sql_outer.setContentsMargins(8, 4, 8, 2)
+        sql_outer.setSpacing(2)
+
+        sql_row = QWidget()
+        sql_layout = QHBoxLayout(sql_row)
+        sql_layout.setContentsMargins(0, 0, 0, 0)
+        sql_layout.setSpacing(8)
+        sql_layout.addWidget(QLabel(translate("TableViewer", "SQL:")))
+        self._sql_input = _SqlEditor()
+        self._sql_input.run_requested.connect(self._run_sql)
+        self._sql_input.setPlaceholderText("SELECT * FROM table LIMIT 100;")  # i18n: keep -- SQL
+        line_h = self._sql_input.fontMetrics().lineSpacing()
+        self._sql_input.setMinimumHeight(line_h * 6 + 8)
+        self._sql_highlighter = _SqlHighlighter(self._sql_input.document())
+        sql_layout.addWidget(self._sql_input, stretch=1)
+
+        run_controls = QWidget()
+        run_controls_layout = QVBoxLayout(run_controls)
+        run_controls_layout.setContentsMargins(0, 0, 0, 0)
+        run_controls_layout.setSpacing(4)
+        self._run_sql_btn = QPushButton(translate("TableViewer", "Run"))
+        self._run_sql_btn.setToolTip(
+            translate("TableViewer", "Run query (F5 or Command+Enter / Ctrl+Enter)")
+        )
+        self._run_sql_btn.clicked.connect(self._run_sql)
+        run_controls_layout.addWidget(self._run_sql_btn)
+        self._auto_limit = QCheckBox(translate("TableViewer", "Auto limit"))
+        self._auto_limit.setChecked(True)
+        self._auto_limit.setToolTip(
+            translate(
+                "TableViewer",
+                "Cap query results at {_QUERY_ROW_LIMIT:,} rows. Turn off to fetch every row.",
+            ).format(_QUERY_ROW_LIMIT=_QUERY_ROW_LIMIT)
+        )
+        run_controls_layout.addWidget(self._auto_limit)
+        run_controls_layout.addStretch()
+        sql_layout.addWidget(run_controls)
+
+        export_controls = QWidget()
+        export_controls_layout = QVBoxLayout(export_controls)
+        export_controls_layout.setContentsMargins(0, 0, 0, 0)
+        export_controls_layout.setSpacing(4)
+        self._export_btn = QPushButton(translate("TableViewer", "Export CSV…"))
+        self._export_btn.clicked.connect(self._export_csv)
+        export_controls_layout.addWidget(self._export_btn)
+        export_controls_layout.addStretch()
+        sql_layout.addWidget(export_controls)
+        sql_outer.addWidget(sql_row)
+
+        self._sql_status = QLabel("")
+        self._sql_status.setContentsMargins(4, 0, 0, 2)
+        self._sql_status.setWordWrap(True)
+        self._sql_status.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Fixed,
+        )
+        self._sql_status.setMinimumWidth(0)
+        sql_outer.addWidget(self._sql_status)
+
+        # Table view
+        self._source_model = QStandardItemModel()
+        self._query_model: _QueryResultModel | None = None
+        self._query_results_active = False
+        self._last_executed_query = ""
+        self._proxy_model = _NumericSortProxy()
+        self._proxy_model.setSourceModel(self._source_model)
+        self._proxy_model.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self._proxy_model.setFilterKeyColumn(-1)  # Search all columns
+
+        self._table_view = QTableView()
+        self._table_view.setModel(self._proxy_model)
+        self._table_view.setSortingEnabled(True)
+        self._table_view.setAlternatingRowColors(True)
+        self._table_view.setSelectionBehavior(
+            QTableView.SelectionBehavior.SelectRows
+        )
+        self._table_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._table_view.customContextMenuRequested.connect(self._on_context_menu)
+        self._table_view.horizontalHeader().setStretchLastSection(True)
+        self._table_view.horizontalHeader().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._table_view.horizontalHeader().customContextMenuRequested.connect(self._on_header_context_menu)
+        self._table_view.verticalHeader().setDefaultSectionSize(22)
+        self._table_view.doubleClicked.connect(self._on_table_double_clicked)
+        install_horizontal_wheel_scroll(
+            self._table_view, on_wheel=self._on_table_scroll_activity
+        )
+        self._table_view.verticalScrollBar().valueChanged.connect(
+            self._on_table_scroll_activity
+        )
+        self._table_view.horizontalScrollBar().valueChanged.connect(
+            self._on_table_scroll_activity
+        )
+        self._table_interaction_timer = QTimer(self)
+        self._table_interaction_timer.setSingleShot(True)
+        self._table_interaction_timer.setInterval(250)
+        self._table_interaction_timer.timeout.connect(self._end_table_interaction)
+
+        # Cell detail panel — shown below the table, updates on selection
+        self._structure_model = QStandardItemModel(self)
+        _set_headers(
+            self._structure_model,
+            _gens(
+                QT_TRANSLATE_NOOP("GeneratedView", "Structure"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Value"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Type"),
+            ),
+        )
+        self._structure_tree = QTreeView()
+        self._structure_tree.setModel(self._structure_model)
+        self._structure_tree.setAlternatingRowColors(True)
+        self._structure_tree.setAnimated(True)
+        self._structure_tree.setSelectionBehavior(QTreeView.SelectionBehavior.SelectRows)
+        self._structure_tree.header().setStretchLastSection(False)
+        self._structure_tree.setColumnWidth(0, 260)
+        self._structure_tree.setColumnWidth(1, 420)
+        install_horizontal_wheel_scroll(self._structure_tree)
+        self._structure_tree.selectionModel().currentChanged.connect(
+            self._on_structure_current_changed
+        )
+        self._structure_tree.expanded.connect(self._on_structure_item_expanded)
+        self._structure_tree.setVisible(False)
+
+        self._cell_detail_panel = QWidget()
+        cell_detail_layout = QVBoxLayout(self._cell_detail_panel)
+        cell_detail_layout.setContentsMargins(4, 2, 4, 2)
+        cell_detail_layout.setSpacing(2)
+        self._cell_detail_label = QLabel(translate("TableViewer", "—  No cell selected"))
+        self._cell_detail_label.setStyleSheet("color: gray; font-size: 11px;")
+        cell_detail_layout.addWidget(self._cell_detail_label)
+        self._cell_detail_view = QPlainTextEdit()
+        self._cell_detail_view.setReadOnly(True)
+        self._cell_detail_view.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        self._cell_detail_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        cell_detail_layout.addWidget(self._cell_detail_view, stretch=1)
+
+        # Why a generated view (Freelist Recovery, Freeblocks, Unallocated,
+        # WAL history) is empty or partial -- hidden unless a scan reported
+        # something (see _set_source_status).
+        self._source_status = QLabel("")
+        self._source_status.setWordWrap(True)
+        self._source_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._source_status.setStyleSheet("padding: 2px 8px; color: palette(mid);")
+        self._source_status.setVisible(False)
+        table_container = QWidget()
+        table_container_layout = QVBoxLayout(table_container)
+        table_container_layout.setContentsMargins(0, 0, 0, 0)
+        table_container_layout.setSpacing(0)
+        table_container_layout.addWidget(self._source_status)
+        table_container_layout.addWidget(self._table_view, stretch=1)
+
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.addWidget(self._sql_bar)
+        splitter.addWidget(table_container)
+        splitter.addWidget(self._structure_tree)
+        splitter.addWidget(self._cell_detail_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 1)
+        splitter.setStretchFactor(3, 0)
+        splitter.setSizes([140, 500, 500, 80])
+
+        # Embedded, bidirectional Hex pane -- same "Show Hex" toggle
+        # convention as TreeViewer/ProtobufTreeWidget, hidden until toggled
+        # on and loaded lazily then (see _ensure_hex_pane_loaded). The
+        # label above it names which physical file's bytes are currently
+        # loaded -- a row whose current version is only in a not-yet-
+        # checkpointed -wal frame switches the pane to that file instead of
+        # ever implying the base file's (stale) bytes are it.
+        self._hex_panel = QWidget()
+        hex_panel_layout = QVBoxLayout(self._hex_panel)
+        hex_panel_layout.setContentsMargins(0, 0, 0, 0)
+        hex_panel_layout.setSpacing(2)
+        self._hex_file_label = QLabel("")
+        self._hex_file_label.setStyleSheet("color: gray; font-size: 11px;")
+        hex_panel_layout.addWidget(self._hex_file_label)
+        self._hex_viewer = HexViewer(b"")
+        self._hex_viewer.byteOffsetFocused.connect(self._on_hex_offset_focused)
+        hex_panel_layout.addWidget(self._hex_viewer, stretch=1)
+        self._hex_panel.setVisible(False)
+
+        hex_splitter = QSplitter(Qt.Orientation.Horizontal)
+        hex_splitter.addWidget(splitter)
+        hex_splitter.addWidget(self._hex_panel)
+        hex_splitter.setStretchFactor(0, 1)
+        hex_splitter.setStretchFactor(1, 1)
+        layout.addWidget(hex_splitter, stretch=1)
+
+        self._table_view.selectionModel().currentChanged.connect(
+            self._on_current_cell_changed
+        )
+
+    def _add_generated_view(self, name: str) -> None:
+        self._table_combo.addItem(_gen_text(name), name)
+
+    def _add_table_item(self, name: str) -> None:
+        """A table from the data dict. One another viewer generated can carry
+        a "__label" (_Gen) -- shown translated, keyed by its name; its
+        columns and cells may be _Gen too (see _set_headers / _append_row)."""
+        table = self._data.get(name) if isinstance(self._data, dict) else None
+        label = table.get("__label") if isinstance(table, dict) else None
+        if isinstance(label, _Gen):
+            self._table_combo.addItem(label.pair()[1], name)
+        else:
+            self._table_combo.addItem(name, name)
+
+    def _current_table(self) -> str:
+        """The selected table's name, or a generated view's English name
+        (whatever the combo shows in the UI language)."""
+        key = self._table_combo.currentData()
+        return key if isinstance(key, str) else self._table_combo.currentText()
+
+    def _load_table(self, table_name: str) -> None:
+        """Populate the model with the selected table's data.
+
+        Disables the proxy model's dynamic sorting for the duration of the
+        population loop below (which does self._reset_source_model() +
+        many appendRow() calls) and re-sorts once at the end, instead of
+        re-sorting incrementally on every single row insertion -- for a
+        table with hundreds/thousands of rows and wide text columns (e.g.
+        the Freeblocks tab's raw carved bytes), incremental re-sort turned
+        an already-fast, cached data fetch into a many-second UI freeze on
+        every tab switch.
+        """
+        # Switching tables must not leave the previous table's last-selected
+        # cell visible in the detail box below — nothing is selected in the
+        # freshly loaded table yet, so the box should say so too (#73).
+        self._cell_detail_label.setText(translate("TableViewer", "—  No cell selected"))
+        self._cell_detail_view.setPlainText("")
+
+        # Same bug class: the status line below the SQL box is tab-specific
+        # (e.g. WAL Frames' "double-click to open in hex viewer", Freelist
+        # Recovery's carve summary) but was never cleared on switch, so it
+        # kept describing the *previous* tab after landing on a plain table
+        # -- which never sets it itself and so never overwrote the leftover
+        # text. Every generated tab sets its own status right after loading,
+        # so clearing here is always immediately superseded except for plain
+        # tables, which is exactly the case that needs it cleared.
+        self._sql_status.setText("")
+        self._sql_status.setStyleSheet("")
+
+        # _activate_standard_model() itself turns dynamic sorting back on
+        # (when leaving query-results mode), so it must run *before* it's
+        # switched off here, or that reset would win.
+        self._activate_standard_model()
+        self._proxy_model.setDynamicSortFilter(False)
+        try:
+            self._load_table_impl(table_name)
+        finally:
+            self._proxy_model.setDynamicSortFilter(True)
+            self._proxy_model.sort(
+                self._proxy_model.sortColumn(), self._proxy_model.sortOrder()
+            )
+
+    def _load_table_impl(self, table_name: str) -> None:
+        self._freelist_table_filter.setVisible(False)
+        self._freelist_table_filter_label.setVisible(False)
+        # File Structure has no text search of its own -- see _apply_filter.
+        self._search.setVisible(table_name != self._file_structure_label)
+        if table_name != self._file_structure_label:
+            self._set_structure_view_visible(False)
+        if table_name == self._summary_label:
+            self._load_summary()
+            return
+        if table_name == self._db_structure_label:
+            self._load_db_structure()
+            return
+        if table_name == self._file_structure_label:
+            self._load_file_structure()
+            return
+        if table_name == self._db_info_label:
+            self._load_db_info()
+            return
+        if table_name == self._wal_label:
+            self._wal_toggle.setVisible(False)
+            self._journal_toggle.setVisible(False)
+            self._load_wal_frames()
+            return
+        if table_name == self._journal_label:
+            self._wal_toggle.setVisible(False)
+            self._journal_toggle.setVisible(False)
+            self._load_journal_records()
+            return
+        if table_name == self._freelist_label:
+            self._wal_toggle.setVisible(False)
+            self._journal_toggle.setVisible(False)
+            self._load_freelist_recovery()
+            return
+        if table_name == self._freeblocks_label:
+            self._wal_toggle.setVisible(False)
+            self._journal_toggle.setVisible(False)
+            self._load_freeblocks()
+            return
+        if table_name == self._unallocated_label:
+            self._wal_toggle.setVisible(False)
+            self._journal_toggle.setVisible(False)
+            self._load_unallocated_space()
+            return
+        table = self._data.get(table_name)
+        if table is None:
+            # Not pre-loaded (e.g. a view) — query live from the DB
+            conn = self._ensure_db()
+            if conn is None:
+                return
+            try:
+                cur = conn.execute(f"SELECT * FROM [{table_name}] LIMIT 10001")  # noqa: S608
+                raw_rows = cur.fetchall()
+                was_truncated = len(raw_rows) > 10_000
+                table = {
+                    "columns": [d[0] for d in cur.description or []],
+                    "rows": [list(r) for r in raw_rows[:10_000]],
+                    "truncated": was_truncated,
+                }
+            except Exception as exc:
+                self._sql_status.setStyleSheet("color: red;")
+                self._sql_status.setText(str(exc))
+                return
+
+        # Ensure _page_table_map is populated before checking has_wal/has_journal
+        # (each cached after its first call; _get_wal_frames() only builds the
+        # map as a side effect when a -wal file exists, so a non-WAL database
+        # with a rollback journal still needs the explicit build below -- only
+        # attempted when a journal actually exists, since _ensure_page_table_map()
+        # unconditionally calls _ensure_db(), which sets an error status as a
+        # side effect for callers with no real db file at all).
+        self._get_wal_frames()
+        if self._journal_path is not None:
+            self._ensure_page_table_map()
+
+        # Show WAL toggle only for real tables that have WAL data
+        has_wal = bool(self._page_table_map) and any(
+            v == table_name for v in self._page_table_map.values()
+        )
+        self._wal_toggle.setVisible(has_wal)
+
+        # Show prev-ref diff toggle only for tables that have inactive-ref data
+        _prev_ref_all: dict | None = (
+            self._data.get("__prev_ref_data") if isinstance(self._data, dict) else None
+        )
+        has_prev_ref = bool(_prev_ref_all and _prev_ref_all.get(table_name))
+        self._prev_ref_toggle.setVisible(has_prev_ref)
+
+        # Show "pre-rollback state" toggle only for tables with at least one
+        # page a valid/hot journal overrode -- see _get_journal_overlay().
+        journal_overlay = self._get_journal_overlay()
+        has_journal = bool(journal_overlay) and any(
+            self._page_table_map.get(pn) == table_name for pn in journal_overlay
+        )
+        self._journal_toggle.setVisible(has_journal)
+
+        self._col_ts_formats.clear()
+        columns: list[str] = table["columns"]
+        rows: list[list[Any]] = table["rows"]
+        rowids: list[int] | None = table.get("rowids")
+        if rowids is not None and len(rowids) != len(rows):
+            rowids = None  # defensive: should always line up 1:1 with rows
+
+        self._reset_source_model()
+        show_wal = has_wal and self._wal_toggle.isChecked()
+        show_prev_ref = has_prev_ref and self._prev_ref_toggle.isChecked()
+        show_journal = has_journal and self._journal_toggle.isChecked()
+        show_source_col = show_wal or show_prev_ref or show_journal
+        source_col_name = _Gen(
+            QT_TRANSLATE_NOOP("GeneratedView", "WAL Source")
+            if show_wal
+            else QT_TRANSLATE_NOOP("GeneratedView", "Journal Source")
+            if show_journal
+            else QT_TRANSLATE_NOOP("GeneratedView", "Source")
+        )
+        # "Row" and the source column are Crush's; the others are the
+        # table's own column names (file data, never translated).
+        # A column the parser computed rather than read from the file
+        # (table["derived_columns"]: name -> why) is marked in its header.
+        derived: dict[str, Any] = table.get("derived_columns") or {}
+        headers: list[str | _Gen] = [_Gen(QT_TRANSLATE_NOOP("GeneratedView", "Row"))]
+        headers += [
+            _Gen(QT_TRANSLATE_NOOP("GeneratedView", "{name} [derived]"), name=col)
+            if col in derived
+            else col
+            for col in columns
+        ]
+        if show_source_col:
+            headers.append(source_col_name)
+        _set_headers(self._source_model, headers)
+        header_tips = {0: _row_header_tooltip()}
+        header_tips.update(
+            {i + 1: _derived_header_tooltip(derived[col]) for i, col in enumerate(columns) if col in derived}
+        )
+        for col_idx, tip in header_tips.items():
+            h_item = self._source_model.horizontalHeaderItem(col_idx)
+            if h_item is not None:
+                h_item.setData(tip, _HEADER_BASE_TIP_ROLE)
+                h_item.setToolTip(tip)
+
+        def _append_row(row_data: list[Any], source_label: _Gen | None = None,
+                        row_color: object = None, rowid: int | None = None,
+                        wal_byte_range: tuple[int, int] | None = None,
+                        wal_row_ranges: list[tuple[int, int]] | None = None,
+                        wal_column_ranges: list[list[tuple[int, int]] | None] | None = None,
+                        injected_file_kind: str = "wal",
+                        ) -> None:
+            row_index = self._source_model.rowCount() + 1
+            row_item = QStandardItem(str(row_index))
+            row_item.setEditable(False)
+            row_item.setData(row_index, Qt.ItemDataRole.UserRole)
+            if rowid is not None:
+                row_item.setData(rowid, _ROWID_ROLE)
+            if wal_byte_range is not None:
+                # A row injected from a WAL frame (see _inject_wal_rows()) or
+                # a journal-overridden page (see _inject_journal_rows()) has
+                # no rowid a CellLocator could resolve -- several frames/
+                # versions of the same page can share one, and the whole
+                # point here is showing a *superseded*/*pre-rollback*
+                # version. Stash its own exact bytes instead, same roles the
+                # WAL Frames/Rollback Journal tabs and File Structure tree
+                # use, so _sync_hex_pane()'s fallback can highlight it
+                # directly. wal_row_ranges/wal_column_ranges (when
+                # resolvable) refine that fallback to the row's own cell, and
+                # one specific column's own bytes, instead of the whole frame.
+                row_item.setData(injected_file_kind, _STRUCTURE_FILE_KIND_ROLE)
+                row_item.setData(wal_byte_range, _STRUCTURE_BYTE_RANGE_ROLE)
+                if wal_row_ranges:
+                    row_item.setData(wal_row_ranges, _WAL_ROW_RANGES_ROLE)
+                if wal_column_ranges is not None:
+                    row_item.setData(wal_column_ranges, _WAL_COLUMN_RANGES_ROLE)
+            if row_color:
+                row_item.setForeground(row_color)
+            items = [row_item]
+            for val in row_data:
+                if isinstance(val, _Gen):
+                    # Crush's own words in a table another viewer generated
+                    # (e.g. Realm's Summary notes): translated, English kept.
+                    cell = _gen_item(val)
+                elif val is None:
+                    cell = QStandardItem("")
+                    cell.setForeground(Qt.GlobalColor.gray)
+                elif isinstance(val, (bytes, bytearray, memoryview)):
+                    blob = val if isinstance(val, bytes) else bytes(val)
+                    cell = QStandardItem(f"<BLOB {len(blob):,} B>")
+                    cell.setForeground(Qt.GlobalColor.blue)
+                    cell.setData(blob, Qt.ItemDataRole.UserRole)
+                elif (
+                    isinstance(val, tuple) and len(val) == 2
+                    and isinstance(val[0], str) and isinstance(val[1], (bytes, bytearray))
+                ):
+                    display, raw = val[0], val[1] if isinstance(val[1], bytes) else bytes(val[1])
+                    cell = QStandardItem(display)
+                    cell.setData(raw, Qt.ItemDataRole.UserRole)
+                    if row_color:
+                        cell.setForeground(row_color)
+                elif isinstance(val, list):
+                    # Realm List/Set/LinkList columns decode to a Python list.
+                    # Flag it visibly -- it otherwise looks like plain bracketed
+                    # text, and in SQL exports the same value is JSON text
+                    # (queryable via json_each(), or already resolved in the
+                    # auto-generated "v_<table>" view).
+                    cell = QStandardItem(str(val) if val else "[]")
+                    cell.setForeground(Qt.GlobalColor.gray if not val else QColor("#8844cc"))
+                    cell.setToolTip(
+                        translate(
+                            "TableViewer",
+                            'List/Set column — {val_count} item(s). Stored as JSON text in SQL exports; query with json_each(...) or use the matching "v_<table>" view for already-resolved link names.',
+                        ).format(val_count=len(val))
+                    )
+                    cell.setData(val, Qt.ItemDataRole.UserRole)
+                elif isinstance(val, dict):
+                    # Realm Dictionary<K,Mixed> columns decode to a Python dict.
+                    cell = QStandardItem(str(val) if val else "{}")
+                    cell.setForeground(Qt.GlobalColor.gray if not val else QColor("#2a9d8f"))
+                    cell.setToolTip(
+                        translate(
+                            "TableViewer",
+                            "Dictionary column — {val_count} entrie(s). Stored as JSON text in SQL exports; query with json_each(..., 'value').",
+                        ).format(val_count=len(val))
+                    )
+                    cell.setData(val, Qt.ItemDataRole.UserRole)
+                else:
+                    cell = QStandardItem(str(val))
+                    if row_color:
+                        cell.setForeground(row_color)
+                if isinstance(val, (int, float)):
+                    try:
+                        cell.setData(val, Qt.ItemDataRole.UserRole)
+                    except (OverflowError, Exception):
+                        pass
+                cell.setEditable(False)
+                items.append(cell)
+            if show_source_col:
+                src = _gen_item(source_label) if source_label else QStandardItem("")
+                src.setEditable(False)
+                if row_color:
+                    src.setForeground(row_color)
+                items.append(src)
+            self._source_model.appendRow(items)
+
+        if show_prev_ref:
+            prev_ref_table = (_prev_ref_all or {}).get(table_name, {})
+            prev_obj_keys_set = {
+                k for k in (prev_ref_table.get("__obj_keys") or []) if k is not None
+            }
+            active_obj_keys: list = (self._data.get(table_name) or {}).get("__obj_keys") or []
+            _added_color = QColor("#228833")
+            for r, row_data in enumerate(rows):
+                objkey = active_obj_keys[r] if r < len(active_obj_keys) else None
+                rowid = rowids[r] if rowids is not None else None
+                if objkey is not None and objkey not in prev_obj_keys_set:
+                    _append_row(
+                        row_data,
+                        _Gen(QT_TRANSLATE_NOOP("GeneratedView", "added")),
+                        _added_color,
+                        rowid=rowid,
+                    )
+                else:
+                    _append_row(row_data, rowid=rowid)
+        else:
+            for r, row_data in enumerate(rows):
+                _append_row(row_data, rowid=rowids[r] if rowids is not None else None)
+
+        # Cells the injected WAL / pre-rollback pages held but that couldn't
+        # be decoded (see parse_table_leaf_page's problems).
+        self._injection_problems = []
+        wal_row_count = 0
+        if show_wal:
+            wal_row_count = self._inject_wal_rows(table_name, columns, _append_row)
+
+        prev_ref_count = 0
+        if show_prev_ref:
+            prev_ref_count = self._inject_prev_ref_rows(table_name, columns, _append_row)
+
+        journal_row_count = 0
+        if show_journal:
+            journal_row_count = self._inject_journal_rows(table_name, columns, _append_row)
+        if show_wal or show_journal:
+            self._set_source_status(
+                (self._page_table_problems if show_wal else []) + self._injection_problems
+            )
+
+        self._resize_and_cap()
+        table_meta = self._data.get(table_name, {}) if isinstance(self._data, dict) else {}
+        was_truncated = isinstance(table_meta, dict) and table_meta.get("truncated", False)
+        total = len(rows)
+        if was_truncated:
+            label = (
+                translate("TableViewer", "(first {total:,} row — use SQL to load more)")
+                if total == 1
+                else translate("TableViewer", "(first {total:,} rows — use SQL to load more)")
+            ).format(total=total)
+        else:
+            label = _rows_label(total)
+        if wal_row_count:
+            label += translate("TableViewer", "  +{count} from WAL").format(count=wal_row_count)
+        if prev_ref_count:
+            label += translate("TableViewer", "  +{count} from prev ref").format(
+                count=prev_ref_count
+            )
+        if journal_row_count:
+            label += translate("TableViewer", "  +{count} from pre-rollback state").format(
+                count=journal_row_count
+            )
+        self._row_count_label.setText(label)
+
+    def _inject_wal_rows(
+        self,
+        table_name: str,
+        columns: list[str],
+        append_row: object,
+    ) -> int:
+        """Parse non-Active WAL frames for *table_name* and inject their rows.
+
+        Returns the number of rows injected.
+        """
+        frames = self._get_wal_frames()
+        if not frames or self._db_path is None or self._wal_page_size == 0:
+            return 0
+
+        _status_color: dict[str, object] = {
+            "Superseded":  QColor("#cc8800"),
+            "Uncommitted": QColor("#4488ff"),
+            "WAL slack":   Qt.GlobalColor.darkGray,
+        }
+
+        try:
+            wal_data = Path(str(self._db_path) + "-wal").read_bytes()
+        except OSError:
+            return 0
+
+        wal_index = build_wal_page_index(wal_data, self._wal_page_size)
+        page_locator, read_page = page_accessors(self._db_path, self._wal_page_size, wal_index)
+
+        injected = 0
+        for f in frames:
+            if f["status"] == "Active":
+                continue
+            if self._page_table_map.get(f["page"]) != table_name:
+                continue
+
+            page_start = f["offset"] + 24
+            page_bytes = wal_data[page_start: page_start + self._wal_page_size]
+            btree_offset = 100 if f["page"] == 1 else 0
+            parsed = parse_table_leaf_page(
+                page_bytes,
+                page_size=self._wal_page_size,
+                btree_offset=btree_offset,
+                overflow_reader=read_page,
+                want_ranges=True,
+                problems=self._injection_problems,
+                page_num=f"{f['page']} (WAL frame {f['frame']})",
+            )
+            if not parsed:
+                continue
+
+            color = _status_color.get(f["status"])
+            label = _Gen(
+                QT_TRANSLATE_NOOP("GeneratedView", "WAL {status} (frame {frame})"),
+                status=_Gen(f["status"]),
+                frame=f["frame"],
+            )
+            n_cols = len(columns)
+            byte_range = (f["offset"], f["offset"] + 24 + self._wal_page_size)
+            for _rowid, values, layout in parsed:
+                padded: list[Any] = (values + [None] * n_cols)[:n_cols]
+                row_ranges = row_ranges_from_layout(layout, page_start, "wal", page_locator)
+                col_ranges: list[list[tuple[int, int]] | None] = [
+                    column_ranges_from_layout(layout, i, page_start, "wal", page_locator)
+                    if i < len(layout.column_logical_ranges) else None
+                    for i in range(n_cols)
+                ]
+                append_row(  # type: ignore[operator]
+                    padded, label, color,
+                    wal_byte_range=byte_range,
+                    wal_row_ranges=row_ranges,
+                    wal_column_ranges=col_ranges,
+                )
+                injected += 1
+
+        return injected
+
+    def _get_journal_result(self) -> JournalParseResult | None:
+        """Parse (and cache) the -journal companion's copy the parser staged
+        next to the working copy, if any. Never re-parses on every call --
+        this can be invoked once per table switch (has_journal check)."""
+        if self._journal_result_loaded:
+            return self._journal_result_cache
+        self._journal_result_loaded = True
+        if self._journal_path is None:
+            return None
+        try:
+            data = self._journal_path.read_bytes()
+        except OSError:
+            return None
+        self._journal_result_cache = parse_rollback_journal(data)
+        return self._journal_result_cache
+
+    def _get_journal_overlay(self) -> dict[int, bytes]:
+        result = self._get_journal_result()
+        return build_journal_page_overlay(result) if result is not None else {}
+
+    def _inject_journal_rows(
+        self,
+        table_name: str,
+        columns: list[str],
+        append_row: object,
+    ) -> int:
+        """Decode the as-found, pre-rollback version of every page a valid
+        journal overrode for *table_name* -- straight from the *base* file's
+        own raw bytes, not the journal.
+
+        This is easy to get backwards: the journal holds each overridden
+        page's *old* (pre-transaction) content, and that is exactly what
+        becomes the default/recovered view once merged (see
+        reconstruct_post_rollback_image()) -- the default table view is
+        already showing it. What "Show pre-rollback state" (the
+        _inject_wal_rows()-style Superseded/Uncommitted analog) needs to
+        reveal instead is what the interrupted transaction actually wrote,
+        which never got rolled back on disk: the base file's current,
+        as-found bytes for that same page. Overflow values show as
+        "<OVERFLOW>" rather than being chased -- a page number a valid
+        journal overrode says nothing about whether ITS overflow chain was
+        also part of the interrupted write. Returns the number of rows
+        injected.
+        """
+        result = self._get_journal_result()
+        if result is None or not result.mergeable or self._db_path is None:
+            return 0
+
+        overlay_pages = build_journal_page_overlay(result)  # only page numbers are used here
+        if not overlay_pages:
+            return 0
+        page_size = result.page_size
+
+        injected = 0
+        n_cols = len(columns)
+        try:
+            with open(self._db_path, "rb") as fh:
+                for page_num in overlay_pages:
+                    if self._page_table_map.get(page_num) != table_name:
+                        continue
+                    fh.seek((page_num - 1) * page_size)
+                    page_bytes = fh.read(page_size)
+                    if len(page_bytes) != page_size:
+                        continue
+                    btree_offset = 100 if page_num == 1 else 0
+                    parsed = parse_table_leaf_page(
+                        page_bytes, page_size=page_size, btree_offset=btree_offset, want_ranges=True,
+                        problems=self._injection_problems, page_num=page_num,
+                    )
+                    if not parsed:
+                        continue
+
+                    page_file_offset = (page_num - 1) * page_size
+                    byte_range = (page_file_offset, page_file_offset + page_size)
+                    for _rowid, values, layout in parsed:
+                        padded: list[Any] = (values + [None] * n_cols)[:n_cols]
+                        cell_start, cell_end = layout.page_local_range
+                        row_ranges = [(page_file_offset + cell_start, page_file_offset + cell_end)]
+                        append_row(  # type: ignore[operator]
+                            padded,
+                            _Gen(QT_TRANSLATE_NOOP("GeneratedView", "As found (pre-rollback)")),
+                            QColor("#cc8800"),
+                            wal_byte_range=byte_range,
+                            wal_row_ranges=row_ranges,
+                            wal_column_ranges=None,
+                            injected_file_kind="base",
+                        )
+                        injected += 1
+        except OSError:
+            return 0
+
+        return injected
+
+    def _on_wal_toggle(self, _state: int) -> None:
+        """Re-load the current table when the WAL history toggle changes."""
+        current = self._current_table()
+        if current and current not in (
+            self._summary_label,
+            self._db_structure_label,
+            self._file_structure_label,
+            self._db_info_label,
+            self._wal_label,
+            self._journal_label,
+            self._freelist_label,
+            self._freeblocks_label,
+            self._unallocated_label,
+        ):
+            self._load_table(current)
+
+    def _on_journal_toggle(self, _state: int) -> None:
+        """Re-load the current table when the pre-rollback-state toggle changes."""
+        current = self._current_table()
+        if current and current not in (
+            self._summary_label,
+            self._db_structure_label,
+            self._file_structure_label,
+            self._db_info_label,
+            self._wal_label,
+            self._journal_label,
+            self._freelist_label,
+            self._freeblocks_label,
+            self._unallocated_label,
+        ):
+            self._load_table(current)
+
+    def _on_prev_ref_toggle(self, _state: int) -> None:
+        """Re-load the current table when the prev-ref diff toggle changes."""
+        current = self._current_table()
+        if current and current not in (
+            self._summary_label,
+            self._db_structure_label,
+            self._file_structure_label,
+            self._db_info_label,
+            self._wal_label,
+            self._journal_label,
+            self._freelist_label,
+            self._freeblocks_label,
+            self._unallocated_label,
+        ):
+            self._load_table(current)
+
+    def _inject_prev_ref_rows(
+        self,
+        table_name: str,
+        columns: list[str],
+        append_row: object,
+    ) -> int:
+        """Append deleted and modified-previous-version rows from the inactive Realm ref.
+
+        Color coding mirrors the WAL viewer:
+          - deleted  (in prev ref, not in active): red
+          - prev version (modified row, previous state): orange
+        Returns the number of rows injected.
+        """
+        prev_ref_all: dict | None = (
+            self._data.get("__prev_ref_data") if isinstance(self._data, dict) else None
+        )
+        if not prev_ref_all:
+            return 0
+        prev_data = prev_ref_all.get(table_name)
+        if not prev_data:
+            return 0
+
+        active_data = self._data.get(table_name) or {}
+        active_obj_keys: list = active_data.get("__obj_keys") or []
+        active_rows: list = active_data.get("rows") or []
+        prev_obj_keys: list = prev_data.get("__obj_keys") or []
+        prev_rows: list = prev_data.get("rows") or []
+
+        active_by_key = {
+            k: list(r) for k, r in zip(active_obj_keys, active_rows) if k is not None
+        }
+        prev_by_key = {
+            k: list(r) for k, r in zip(prev_obj_keys, prev_rows) if k is not None
+        }
+
+        n_cols = len(columns)
+        del_color = QColor("#cc3333")
+        mod_color = QColor("#cc8800")
+        injected = 0
+
+        for key, prev_row in prev_by_key.items():
+            padded_prev = (prev_row + [None] * n_cols)[:n_cols]
+            if key not in active_by_key:
+                append_row(  # type: ignore[operator]
+                    padded_prev, _Gen(QT_TRANSLATE_NOOP("GeneratedView", "deleted")), del_color
+                )
+                injected += 1
+            else:
+                padded_active = (active_by_key[key] + [None] * n_cols)[:n_cols]
+                if padded_prev != padded_active:
+                    append_row(  # type: ignore[operator]
+                        padded_prev,
+                        _Gen(QT_TRANSLATE_NOOP("GeneratedView", "prev version")),
+                        mod_color,
+                    )
+                    injected += 1
+
+        return injected
+
+    def _load_summary(self) -> None:
+        """Show tables and views with row counts; label includes full schema object counts."""
+        conn = self._ensure_db()
+        if conn is None:
+            return
+        cursor = conn.cursor()
+        try:
+            rows_tv = cursor.execute(
+                "SELECT name, type FROM sqlite_master "
+                "WHERE type IN ('table', 'view') ORDER BY type, name"
+            ).fetchall()
+            counts = dict(
+                cursor.execute(
+                    "SELECT type, COUNT(*) FROM sqlite_master "
+                    "WHERE type IN ('table', 'view', 'index', 'trigger') GROUP BY type"
+                ).fetchall()
+            )
+        except Exception as exc:
+            self._sql_status.setStyleSheet("color: red;")
+            self._sql_status.setText(str(exc))
+            return
+
+        self._reset_source_model()
+        _set_headers(
+            self._source_model,
+            _gens(
+                QT_TRANSLATE_NOOP("GeneratedView", "Name (generated)"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Type"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Rows"),
+            ),
+        )
+        self._sql_status.setStyleSheet("")
+
+        for name, obj_type in rows_tv:
+            try:
+                count = cursor.execute(f"SELECT COUNT(*) FROM [{name}]").fetchone()[0]  # noqa: S608
+            except Exception:
+                count = "?"
+            name_item = QStandardItem(name)
+            name_item.setEditable(False)
+            type_item = QStandardItem(obj_type)
+            type_item.setEditable(False)
+            if isinstance(count, int):
+                count_item = _gen_item(
+                    _Gen(QT_TRANSLATE_NOOP("GeneratedView", "{count:,} row"), count=count)
+                    if count == 1
+                    else _Gen(QT_TRANSLATE_NOOP("GeneratedView", "{count:,} rows"), count=count)
+                )
+            else:
+                count_item = QStandardItem("?")
+            count_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            count_item.setEditable(False)
+            if isinstance(count, int):
+                count_item.setData(count, Qt.ItemDataRole.UserRole)
+            self._source_model.appendRow([name_item, type_item, count_item])
+
+        self._resize_and_cap()
+
+        def _c(key: str) -> int:
+            return counts.get(key, 0)
+
+        def _count(n: int, one: str, many: str) -> str:
+            return (one if n == 1 else many).format(count=n)
+
+        parts = [
+            _count(
+                _c("table"),
+                translate("TableViewer", "{count} table"),
+                translate("TableViewer", "{count} tables"),
+            ),
+            _count(
+                _c("view"),
+                translate("TableViewer", "{count} view"),
+                translate("TableViewer", "{count} views"),
+            ),
+            _count(
+                _c("index"),
+                translate("TableViewer", "{count} index"),
+                translate("TableViewer", "{count} indexes"),
+            ),
+            _count(
+                _c("trigger"),
+                translate("TableViewer", "{count} trigger"),
+                translate("TableViewer", "{count} triggers"),
+            ),
+        ]
+        summary = ", ".join(parts)
+        self._row_count_label.setText(f"({summary})")  # i18n: keep -- layout
+        self._sql_status.setText(summary)
+        self._refresh_sql_completions()
+
+    def _load_db_structure(self) -> None:
+        """Show all schema objects (tables, views, indexes, triggers) with structural info."""
+        conn = self._ensure_db()
+        if conn is None:
+            return
+        cursor = conn.cursor()
+        try:
+            objects = cursor.execute(
+                "SELECT name, type, tbl_name, sql FROM sqlite_master "
+                "WHERE type IN ('table', 'view', 'index', 'trigger') ORDER BY type, name"
+            ).fetchall()
+        except Exception as exc:
+            self._sql_status.setStyleSheet("color: red;")
+            self._sql_status.setText(str(exc))
+            return
+
+        self._reset_source_model()
+        _set_headers(
+            self._source_model,
+            _gens(
+                QT_TRANSLATE_NOOP("GeneratedView", "Name (generated)"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Type"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Info"),
+            ),
+        )
+        self._sql_status.setStyleSheet("")
+
+        for name, obj_type, tbl_name, sql in objects:
+            name_item = QStandardItem(name)
+            name_item.setEditable(False)
+            type_item = QStandardItem(obj_type)
+            type_item.setEditable(False)
+
+            info_text: str | _Gen
+            if obj_type == "table":
+                try:
+                    cols = cursor.execute(f"PRAGMA table_info([{name}])").fetchall()
+                    col_names = ", ".join(r[1] for r in cols)
+                    info_text = f"({col_names})"
+                except Exception:
+                    info_text = ""
+            elif obj_type == "view":
+                info_text = (sql or "").replace("\n", " ").strip()
+            elif obj_type == "index":
+                try:
+                    idx_rows = cursor.execute(f"PRAGMA index_info([{name}])").fetchall()
+                    cols = ", ".join(r[2] for r in idx_rows if r[2])
+                    if cols:
+                        info_text = f"ON {tbl_name} ({cols})"
+                    else:
+                        # SQL keeps its keyword; only Crush's placeholder is translated.
+                        info_text = _Gen(
+                            "ON {table} ({columns})",  # i18n: keep -- SQL, not translated
+                            table=tbl_name,
+                            columns=_Gen(QT_TRANSLATE_NOOP("GeneratedView", "(expression)")),
+                        )
+                except Exception:
+                    info_text = f"ON {tbl_name}"
+            elif obj_type == "trigger":
+                first_line = (sql or "").split("\n")[0].strip()
+                info_text = first_line if first_line else f"ON {tbl_name}"
+            else:
+                info_text = ""
+
+            info_item = (
+                _gen_item(info_text) if isinstance(info_text, _Gen) else QStandardItem(info_text)
+            )
+            info_item.setEditable(False)
+            self._source_model.appendRow([name_item, type_item, info_item])
+
+        self._resize_and_cap()
+        total = self._source_model.rowCount()
+        self._row_count_label.setText(
+            (
+                translate("TableViewer", "({total} schema object)")
+                if total == 1
+                else translate("TableViewer", "({total} schema objects)")
+            ).format(total=total)
+        )
+        self._sql_status.setText("")
+
+    def _get_wal_frames(self) -> list[dict] | None:
+        """Parse WAL file and return classified frame list (cached)."""
+        if self._wal_frames_cache is not None:
+            return self._wal_frames_cache
+        if self._db_path is None:
+            return None
+        wal_path = Path(str(self._db_path) + "-wal")
+        if not wal_path.exists():
+            return None
+        try:
+            data = wal_path.read_bytes()
+        except OSError:
+            return None
+
+        classified = classify_wal_frames(data)
+        if classified is None:
+            return None
+        page_size, raw = classified
+        self._wal_page_size = page_size
+        self._wal_frames_cache = raw
+
+        # Build page→table map (best-effort; silently ignore errors)
+        conn = self._ensure_raw_db()
+        if conn is not None:
+            try:
+                self._page_table_map = self._build_page_table_map(conn, data, page_size)
+            except Exception:
+                self._page_table_map = {}
+
+        return raw
+
+    def _load_wal_frames(self) -> None:
+        """Show full WAL frame inventory."""
+        frames = self._get_wal_frames()
+        self._reset_source_model()
+        _set_headers(
+            self._source_model,
+            _gens(
+                QT_TRANSLATE_NOOP("GeneratedView", "Frame"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Page"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Transaction"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Status"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Table"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Offset (B)"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Content"),
+            ),
+        )
+        if not frames:
+            diag_issues = self._data.get("__wal_diag", []) if isinstance(self._data, dict) else []
+            parser_diag = (
+                _Localized(
+                    " | ".join(render_value(i) for i in diag_issues),
+                    " | ".join(render_value(i, localized=True) for i in diag_issues),
+                )
+                if diag_issues
+                else None
+            )
+            diag = _wal_diag(self._db_path, parser_diag)
+            item = _gen_item(
+                _Gen(
+                    QT_TRANSLATE_NOOP(
+                        "GeneratedView", "No WAL file found or format not recognised — {diag}"
+                    ),
+                    diag=diag,
+                )
+            )
+            item.setEditable(False)
+            self._source_model.appendRow([item])
+            self._row_count_label.setText("")
+            return
+
+        _status_color: dict[str, object] = {
+            "Superseded":  QColor("#cc8800"),
+            "Uncommitted": QColor("#4488ff"),
+            "WAL slack":   Qt.GlobalColor.darkGray,
+        }
+
+        wal_data = self._get_wal_data()
+        wal_page_overlay = self._get_wal_page_overlay()
+
+        def _overflow_reader(page_num: int) -> bytes | None:
+            return _read_freelist_page(self._db_path, page_num, self._wal_page_size, wal_page_overlay)
+
+        schema_col_names: dict[str, list[str]] = {}
+        conn = self._ensure_db()
+        if conn is not None:
+            schema_col_names = {
+                name: [col for col, _aff in cols]
+                for name, cols in self._table_schema_columns(conn).items()
+            }
+
+        frame_problems: list[Any] = []
+        for f in frames:
+            color = _status_color.get(f["status"])
+            table_name = self._page_table_map.get(f["page"], "—")
+
+            content_text: str | _Gen = "—"
+            if f["salt_ok"] and wal_data is not None and self._wal_page_size:
+                page_start = f["offset"] + 24
+                page_bytes = wal_data[page_start: page_start + self._wal_page_size]
+                btree_offset = 100 if f["page"] == 1 else 0
+                decoded = parse_table_leaf_page(
+                    page_bytes,
+                    page_size=self._wal_page_size,
+                    btree_offset=btree_offset,
+                    overflow_reader=_overflow_reader,
+                    problems=frame_problems,
+                    page_num=f"{f['page']} (WAL frame {f['frame']})",
+                )
+                if decoded is None:
+                    content_text = _Gen(QT_TRANSLATE_NOOP("GeneratedView", "(not a leaf page)"))
+                elif not decoded:
+                    content_text = _Gen(QT_TRANSLATE_NOOP("GeneratedView", "(empty leaf page)"))
+                else:
+                    content_text = _format_wal_frame_content(
+                        decoded, schema_col_names.get(table_name, [])
+                    )
+
+            def _item(
+                text: str | _Gen, sort_val: object = None, _c: object = color
+            ) -> QStandardItem:
+                it = _gen_item(text) if isinstance(text, _Gen) else QStandardItem(text)
+                it.setEditable(False)
+                if sort_val is not None:
+                    it.setData(sort_val, Qt.ItemDataRole.UserRole)
+                if _c is not None:
+                    it.setForeground(_c)
+                return it
+
+            frame_item = _item(str(f["frame"]), f["frame"])
+            if self._wal_page_size:
+                frame_item.setData("wal", _STRUCTURE_FILE_KIND_ROLE)
+                frame_item.setData(
+                    (f["offset"], f["offset"] + 24 + self._wal_page_size),
+                    _STRUCTURE_BYTE_RANGE_ROLE,
+                )
+
+            self._source_model.appendRow([
+                frame_item,
+                _item(str(f["page"]),                    f["page"]),
+                _item(str(f["tx"]) if f["tx"] else "—",  f["tx"] or 0),
+                _item(_Gen(f["status"])),
+                _item(table_name),
+                _item(str(f["offset"]),                  f["offset"]),
+                _item(content_text),
+            ])
+
+        self._resize_and_cap()
+        self._set_source_status(self._page_table_problems + frame_problems)
+
+        counts = Counter(f["status"] for f in frames)
+        parts = [translate("TableViewer", "{count} total").format(count=len(frames))]
+        for status in ("Active", "Superseded", "Uncommitted", "WAL slack"):
+            n = counts.get(status, 0)
+            if n:
+                parts.append(f"{n} {_gen_text(status).lower()}")  # i18n: keep -- layout
+        self._row_count_label.setText(f"({', '.join(parts)})")  # i18n: keep -- layout
+        self._sql_status.setText(
+            translate("TableViewer", "Double-click a row to open the raw page in the hex viewer — "
+            "click a Content cell to see the full decoded value below")
+        )
+
+    def _load_journal_records(self) -> None:
+        """Full raw inventory of a -journal companion's page records: every
+        live cell, every deleted-but-still-recoverable freeblock, and every
+        non-zero unallocated-space gap on each journaled page -- reusing the
+        same decoders as the WAL Frames/Freeblocks/Unallocated Space tabs,
+        since a journal page record is byte-for-byte the same page format
+        (see crush.core.sqlite_journal.extract_journal_rows()). Shown
+        regardless of whether the journal validated as mergeable, so an
+        examiner can still inspect a corrupt/partial journal's raw content --
+        only the default table view's automatic merge (see _ensure_db())
+        requires full validation.
+        """
+        self._reset_source_model()
+        _set_headers(
+            self._source_model,
+            _gens(
+                QT_TRANSLATE_NOOP("GeneratedView", "Segment"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Record"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Page"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Table"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Kind"),
+                QT_TRANSLATE_NOOP("GeneratedView", "RowID"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Value"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Checksum"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Offset (B)"),
+            ),
+        )
+        result = self._get_journal_result()
+        if result is None or self._journal_path is None:
+            item = _gen_item(
+                _Gen(
+                    QT_TRANSLATE_NOOP(
+                        "GeneratedView", "No -journal companion found or it could not be read"
+                    )
+                )
+            )
+            item.setEditable(False)
+            self._source_model.appendRow([item])
+            self._row_count_label.setText("")
+            return
+        if not result.segments:
+            item = _gen_item(
+                _Gen(
+                    QT_TRANSLATE_NOOP(
+                        "GeneratedView", "Journal present but not a valid rollback journal -- {error}"
+                    ),
+                    error=result.error,
+                )
+            )
+            item.setEditable(False)
+            self._source_model.appendRow([item])
+            self._row_count_label.setText("")
+            return
+
+        self._ensure_page_table_map()  # cached after first call; works with or without a -wal file
+
+        _kind_color: dict[str, object] = {
+            "Live cell":              None,
+            "Freeblock (deleted)":    QColor("#cc4444"),
+            "Unallocated slack":      Qt.GlobalColor.darkGray,
+        }
+
+        journal_problems: list[Any] = []
+        rows = extract_journal_rows(result, journal_problems)
+        self._set_source_status(journal_problems)
+        with self._dynamic_sort_suspended():
+            for row in rows:
+                color = _kind_color.get(row.kind)
+                table_name = self._page_table_map.get(row.page_num, "—")
+
+                value_text: str | _Gen
+                if row.kind == "Live cell":
+                    value_text = str(row.values)
+                elif row.raw is not None and not any(row.raw):
+                    value_text = _Gen(
+                        QT_TRANSLATE_NOOP("GeneratedView", "(all zero — {size} B)"),
+                        size=len(row.raw),
+                    )
+                elif row.raw is not None:
+                    value_text = row.raw.decode("utf-8", errors="replace")
+                else:
+                    value_text = ""
+
+                seg_item = QStandardItem(str(row.segment_index))
+                seg_item.setData("journal", _STRUCTURE_FILE_KIND_ROLE)
+                seg_item.setData(
+                    (row.file_offset, row.file_offset + row.byte_length),
+                    _STRUCTURE_BYTE_RANGE_ROLE,
+                )
+
+                def _item(
+                    text: str | _Gen, sort_val: object = None, _c: object = color
+                ) -> QStandardItem:
+                    it = _gen_item(text) if isinstance(text, _Gen) else QStandardItem(text)
+                    it.setEditable(False)
+                    if sort_val is not None:
+                        it.setData(sort_val, Qt.ItemDataRole.UserRole)
+                    if _c is not None:
+                        it.setForeground(_c)
+                    return it
+
+                if color is not None:
+                    seg_item.setForeground(color)
+                seg_item.setEditable(False)
+
+                self._source_model.appendRow([
+                    seg_item,
+                    _item(str(row.record_index),               row.record_index),
+                    _item(str(row.page_num),                   row.page_num),
+                    _item(table_name),
+                    _item(_Gen(row.kind)),
+                    _item(str(row.rowid) if row.rowid is not None else "—",
+                          row.rowid if row.rowid is not None else 0),
+                    _item(value_text),
+                    _item(
+                        _Gen(QT_TRANSLATE_NOOP("GeneratedView", "valid"))
+                        if row.checksum_valid
+                        else _Gen(QT_TRANSLATE_NOOP("GeneratedView", "MISMATCH"))
+                    ),
+                    _item(str(row.file_offset),                 row.file_offset),
+                ])
+
+        self._resize_and_cap()
+        kind_counts = Counter(r.kind for r in rows)
+        n_bad = sum(1 for r in rows if not r.checksum_valid)
+        parts = [translate("TableViewer", "{count} total").format(count=len(rows))]
+        for kind in ("Live cell", "Freeblock (deleted)", "Unallocated slack"):
+            n = kind_counts.get(kind, 0)
+            if n:
+                parts.append(f"{n} {_gen_text(kind).lower()}")  # i18n: keep -- layout
+        if n_bad:
+            parts.append(
+                translate("TableViewer", "{count} checksum mismatch").format(count=n_bad)
+            )
+        self._row_count_label.setText(f"({', '.join(parts)})")  # i18n: keep -- layout
+        merged_note = (
+            translate("TableViewer", "already merged into the current view above")
+            if result.mergeable
+            else translate("TableViewer", "NOT merged into the current view -- {reason}").format(
+                reason=result.error
+                or translate("TableViewer", "checksum validation failed")
+            )
+        )
+        self._sql_status.setText(
+            translate(
+                "TableViewer",
+                "Every entry's own bytes are in this -journal file ({merged_note}). Double-click a row to open its exact bytes in the hex viewer.",
+            ).format(merged_note=merged_note)
+        )
+
+    def _get_wal_data(self) -> bytes | None:
+        """Return (and cache) the raw -wal sidecar's bytes, or None if there
+        isn't one. Shared by every caller that needs the live WAL's content
+        (as opposed to _get_wal_frames()'s classified, page-size-validated
+        frame list) so the file is only read once per viewer instance."""
+        if self._wal_data_loaded:
+            return self._wal_data_cache
+        self._wal_data_loaded = True
+        if self._db_path is not None:
+            try:
+                self._wal_data_cache = Path(str(self._db_path) + "-wal").read_bytes()
+            except OSError:
+                self._wal_data_cache = None
+        return self._wal_data_cache
+
+    def _get_wal_page_overlay(self) -> dict[int, bytes]:
+        """Return (and cache) {page_num: bytes} for whatever the live -wal
+        file has committed but not yet checkpointed into the base file.
+
+        Every SQLite-recovery scanner (sqlite_freelist, sqlite_freeblocks,
+        sqlite_unallocated) reads the base file's raw bytes directly rather
+        than through sqlite3, so none of them see WAL content on their own —
+        a page whose current, forensically-relevant content sits only in a
+        not-yet-checkpointed WAL frame would otherwise look stale, missing,
+        or (for the freelist header itself) simply absent even though
+        PRAGMA freelist_count on a live connection already reports it.
+        """
+        if self._wal_page_overlay_cache is not None:
+            return self._wal_page_overlay_cache
+        page_size = self._get_page_size()
+        self._wal_page_overlay_cache = build_wal_page_overlay(self._get_wal_data(), page_size)
+        return self._wal_page_overlay_cache
+
+    def _get_page_size(self) -> int:
+        """Return (and cache) the database's page size via PRAGMA."""
+        if self._db_page_size:
+            return self._db_page_size
+        conn = self._ensure_db()
+        if conn is None:
+            return 0
+        try:
+            row = conn.execute("PRAGMA page_size").fetchone()
+            self._db_page_size = int(row[0]) if row else 0
+        except Exception:
+            self._db_page_size = 0
+        return self._db_page_size
+
+    def _ensure_page_table_map(self) -> dict[int, str]:
+        """Return (and cache) self._page_table_map, building it on demand.
+
+        _get_wal_frames() also populates it, but only as a side effect of a
+        live -wal file existing — most forensic SQLite files have long
+        since been checkpointed and have no -wal sidecar, so the embedded
+        Hex pane's sync can't rely on that path alone.
+        """
+        if self._page_table_map:
+            return self._page_table_map
+        page_size = self._get_page_size()
+        conn = self._ensure_raw_db()
+        if conn is None or page_size == 0:
+            return self._page_table_map
+        try:
+            self._page_table_map = self._build_page_table_map(conn, self._get_wal_data(), page_size)
+        except Exception:
+            pass
+        return self._page_table_map
+
+    def _get_freelist_data(self) -> tuple[list[dict], list[dict]]:
+        """Return (and cache) (freelist entries, carved leftover rows)."""
+        if self._freelist_cache is not None:
+            return self._freelist_cache
+        page_size = self._get_page_size()
+        if self._db_path is None or page_size == 0:
+            self._freelist_cache = ([], [])
+            return self._freelist_cache
+        wal_pages = self._get_wal_page_overlay()
+        problems: list[Any] = []
+        entries = walk_freelist_pages(self._db_path, page_size, wal_pages, problems)
+        carved = carve_freelist_rows(self._db_path, page_size, entries, wal_pages, problems)
+        self._freelist_problems = problems
+        self._freelist_cache = (entries, carved)
+        return self._freelist_cache
+
+    def _table_schema_columns(
+        self, conn: sqlite3.Connection
+    ) -> dict[str, list[tuple[str, str]]]:
+        """Return {table_name: [(column_name, column_affinity), ...]} for
+        every table in the schema, columns in declaration order."""
+        result: dict[str, list[tuple[str, str]]] = {}
+        try:
+            names = [
+                r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            ]
+        except Exception:
+            return result
+        for name in names:
+            try:
+                cols = conn.execute(f"PRAGMA table_info([{name}])").fetchall()  # noqa: S608
+                result[name] = [(c[1], column_affinity(c[2])) for c in cols]
+            except Exception:
+                continue
+        return result
+
+    def _table_record_columns(self, conn: sqlite3.Connection) -> dict[str, list[str]]:
+        """Return table columns in declaration order for structure-view labels."""
+        result: dict[str, list[str]] = {}
+        try:
+            names = [
+                r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            ]
+        except Exception:
+            return result
+        for name in names:
+            try:
+                cols = conn.execute(f"PRAGMA table_info([{name}])").fetchall()  # noqa: S608
+            except Exception:
+                continue
+            result[name] = [str(col[1]) for col in cols]
+        return result
+
+    def _load_freelist_recovery(self) -> None:
+        """Carve leftover table-leaf rows out of freed (freelist) pages.
+
+        SQLite does not zero freed pages by default, so a page that used to
+        hold table data can still carry its old cells until reused. Since a
+        freed page is no longer referenced by any B-tree, the table it
+        originally belonged to cannot be determined with certainty —
+        "Candidate Tables" is a heuristic match by column count, refined by
+        whether each value's storage class is possible under the candidate
+        column's type affinity (see column_affinity()/value_matches_affinity()
+        in sqlite_freelist.py). All matches are shown, tiered by confidence,
+        rather than guessing a single one.
+        """
+        self._reset_source_model()
+        conn = self._ensure_db()
+        page_size = self._get_page_size()
+
+        if conn is None or self._db_path is None or page_size == 0:
+            _set_headers(
+                self._source_model,
+                _gens(
+                    QT_TRANSLATE_NOOP("GeneratedView", "Freelist Recovery (generated)"),
+                ),
+            )
+            item = _gen_item(
+                _Gen(QT_TRANSLATE_NOOP("GeneratedView", "Database file or page size unavailable"))
+            )
+            item.setEditable(False)
+            self._source_model.appendRow([item])
+            self._row_count_label.setText("")
+            return
+
+        # Fast path: already cached, populate directly.
+        if self._freelist_cache is not None:
+            entries, carved = self._freelist_cache
+            schema_cols = self._table_schema_columns(conn)
+            self._render_freelist_recovery(entries, carved, schema_cols)
+            return
+
+        # Slow path: walk_freelist_pages/carve_freelist_rows haven't run yet
+        # for this database -- do the full scan off the UI thread.
+        def _work() -> tuple[list[dict], list[dict], dict[str, list[tuple[str, str]]]]:
+            entries, carved = self._get_freelist_data()
+            schema_cols = self._table_schema_columns(self._ensure_db())
+            return entries, carved, schema_cols
+
+        def _on_done(result: object) -> None:
+            entries, carved, schema_cols = result  # type: ignore[misc]
+            self._render_freelist_recovery(entries, carved, schema_cols)
+
+        def _on_error(message: str) -> None:
+            self._sql_status.setStyleSheet("color: red;")
+            self._sql_status.setText(
+                translate("TableViewer", "Error scanning freelist pages: {message}").format(
+                    message=message
+                )
+            )
+
+        run_with_busy_dialog(
+            self, translate("TableViewer", "Scanning freelist pages…"), _work, _on_done, _on_error
+        )
+
+    def _render_freelist_recovery(
+        self,
+        entries: list[dict],
+        carved: list[dict],
+        schema_cols: dict[str, list[tuple[str, str]]],
+    ) -> None:
+        """Store freshly (re)scanned freelist data and (re)populate the
+        table, refreshing the 'View as' pivot options against it."""
+        self._freelist_render_state = (entries, carved, schema_cols)
+        self._refresh_freelist_table_filter_options(carved, schema_cols)
+        self._populate_freelist_recovery_table(
+            entries, carved, schema_cols, self._freelist_table_filter.currentData()
+        )
+
+    def _refresh_freelist_table_filter_options(
+        self, carved: list[dict], schema_cols: dict[str, list[tuple[str, str]]]
+    ) -> None:
+        """Populate the 'View as' combo with every table that is a candidate
+        (either tier) for at least one carved row, keeping the current
+        selection if it is still valid."""
+        candidate_tables: set[str] = set()
+        for c in carved:
+            for _rowid, values in c["rows"]:
+                full, count_only = self._candidate_table_tiers(values, schema_cols)
+                candidate_tables.update(full)
+                candidate_tables.update(count_only)
+
+        # Item data is the table name (None = all tables); the text is only
+        # the display, so a table that happens to be called like the
+        # "all tables" entry can't be confused with it.
+        previous = self._freelist_table_filter.currentData()
+        self._freelist_table_filter.blockSignals(True)
+        self._freelist_table_filter.clear()
+        self._freelist_table_filter.addItem(translate("TableViewer", "(all tables)"), None)
+        for name in sorted(candidate_tables):
+            self._freelist_table_filter.addItem(name, name)
+        idx = self._freelist_table_filter.findData(previous) if previous is not None else 0
+        self._freelist_table_filter.setCurrentIndex(idx if idx >= 0 else 0)
+        self._freelist_table_filter.blockSignals(False)
+
+        visible = bool(candidate_tables)
+        self._freelist_table_filter.setVisible(visible)
+        self._freelist_table_filter_label.setVisible(visible)
+
+    def _on_freelist_table_filter_changed(self, _index: object) -> None:
+        if self._freelist_render_state is None:
+            return
+        self._cell_detail_label.setText(translate("TableViewer", "—  No cell selected"))
+        self._cell_detail_view.setPlainText("")
+        entries, carved, schema_cols = self._freelist_render_state
+        self._populate_freelist_recovery_table(
+            entries, carved, schema_cols, self._freelist_table_filter.currentData()
+        )
+
+    @staticmethod
+    def _candidate_table_tiers(
+        values: tuple, schema_cols: dict[str, list[tuple[str, str]]]
+    ) -> tuple[list[str], list[str]]:
+        """Split tables whose column count matches *values* into (types also
+        match, count only) candidate-name lists, both sorted."""
+        full: list[str] = []
+        count_only: list[str] = []
+        for name, cols in schema_cols.items():
+            if len(cols) != len(values):
+                continue
+            if all(value_matches_affinity(v, aff) for v, (_name, aff) in zip(values, cols)):
+                full.append(name)
+            else:
+                count_only.append(name)
+        return sorted(full), sorted(count_only)
+
+    @staticmethod
+    def _freelist_cell_text(v: Any) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, bytes):
+            return v.decode("utf-8", errors="replace")
+        return str(v)
+
+    def _populate_freelist_recovery_table(
+        self,
+        entries: list[dict],
+        carved: list[dict],
+        schema_cols: dict[str, list[tuple[str, str]]],
+        selected_table: str | None = None,
+    ) -> None:
+        problems = self._freelist_problems
+        self._reset_source_model()
+        self._set_source_status(problems)
+        if not entries:
+            _set_headers(
+                self._source_model,
+                _gens(
+                    QT_TRANSLATE_NOOP("GeneratedView", "Freelist Recovery (generated)"),
+                ),
+            )
+            item = (
+                QStandardItem("")
+                if problems
+                else _gen_item(_Gen(QT_TRANSLATE_NOOP("GeneratedView", "No freelist pages found")))
+            )
+            item.setEditable(False)
+            self._source_model.appendRow([item])
+            self._row_count_label.setText("")
+            return
+
+        pivot_table = selected_table or None
+        pivot_cols = schema_cols.get(pivot_table, []) if pivot_table else []
+
+        # The pivoted table's own column names are file data; the rest is Crush's.
+        headers: list[str | _Gen]
+        if pivot_table:
+            headers = _gens(
+                QT_TRANSLATE_NOOP("GeneratedView", "Page"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Kind"),
+                QT_TRANSLATE_NOOP("GeneratedView", "RowID"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Match"),
+            )
+            headers += [name for name, _aff in pivot_cols]
+        else:
+            max_cols = max(
+                (len(values) for c in carved for _rowid, values in c["rows"]), default=0
+            )
+            headers = _gens(
+                QT_TRANSLATE_NOOP("GeneratedView", "Page"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Kind"),
+                QT_TRANSLATE_NOOP("GeneratedView", "RowID"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Candidate Tables"),
+            )
+            headers += [
+                _Gen(QT_TRANSLATE_NOOP("GeneratedView", "col{index}"), index=i)
+                for i in range(max_cols)
+            ]
+        _set_headers(self._source_model, headers)
+
+        cand_tooltip = translate(
+            "TableViewer",
+            "✓ = column count and value types both match (higher confidence). "
+            "Others match column count only — value types don't rule them out, "
+            "but don't confirm them either.",
+        )
+        total_rows = 0
+        with self._dynamic_sort_suspended():
+            for c in carved:
+                page, kind = c["page"], c["kind"]
+                for rowid, values in c["rows"]:
+                    full, count_only = self._candidate_table_tiers(values, schema_cols)
+
+                    if pivot_table:
+                        if pivot_table in full:
+                            match_item = _gen_item(
+                                _Gen(QT_TRANSLATE_NOOP("GeneratedView", "✓ types match"))
+                            )
+                            match_item.setForeground(QColor("#2a9d8f"))
+                        elif pivot_table in count_only:
+                            match_item = _gen_item(
+                                _Gen(QT_TRANSLATE_NOOP("GeneratedView", "count only"))
+                            )
+                            match_item.setForeground(Qt.GlobalColor.gray)
+                        else:
+                            continue  # row isn't a candidate for the pivoted table at all
+                        match_item.setToolTip(cand_tooltip)
+                        lead_items = [
+                            QStandardItem(str(page)),
+                            QStandardItem(kind),
+                            QStandardItem(str(rowid)),
+                            match_item,
+                        ]
+                        n_value_cols = len(pivot_cols)
+                    else:
+                        if full and count_only:
+                            cand_text = (
+                                "✓ " + ", ".join(full) + "   |   " + ", ".join(count_only)
+                            )
+                        elif full:
+                            cand_text = "✓ " + ", ".join(full)
+                        elif count_only:
+                            cand_text = ", ".join(count_only)
+                        else:
+                            cand_text = "—"
+                        cand_item = QStandardItem(cand_text)
+                        cand_item.setToolTip(cand_tooltip)
+                        if full and not count_only:
+                            cand_item.setForeground(QColor("#2a9d8f"))
+                        elif count_only and not full:
+                            cand_item.setForeground(Qt.GlobalColor.gray)
+                        lead_items = [
+                            QStandardItem(str(page)),
+                            QStandardItem(kind),
+                            QStandardItem(str(rowid)),
+                            cand_item,
+                        ]
+                        n_value_cols = len(headers) - 4
+
+                    items = lead_items
+                    for i in range(n_value_cols):
+                        text = self._freelist_cell_text(values[i]) if i < len(values) else ""
+                        items.append(QStandardItem(text))
+                    for it in items:
+                        it.setEditable(False)
+                    self._source_model.appendRow(items)
+                    total_rows += 1
+
+        self._resize_and_cap()
+        n_pages_with_data = len({c["page"] for c in carved})
+        if pivot_table:
+            self._row_count_label.setText(
+                translate(
+                    "TableViewer", "({total_rows} rows carved matching '{pivot_table}')"
+                ).format(total_rows=total_rows, pivot_table=pivot_table)
+            )
+            self._sql_status.setText(
+                translate(
+                    "TableViewer",
+                    "Showing carved rows candidate for table '{pivot_table}', columns mapped to its real names — this is still a candidate match, not a confirmed recovery. ✓ rows also match on value types (higher confidence); 'count only' rows match column count alone. Double-click a row to open the raw page in the hex viewer.",
+                ).format(pivot_table=pivot_table)
+            )
+        else:
+            self._row_count_label.setText(
+                translate(
+                    "TableViewer",
+                    "({entries_count} freelist pages, {n_pages_with_data} with recoverable data, {total_rows} rows carved)",
+                ).format(
+                    entries_count=len(entries),
+                    n_pages_with_data=n_pages_with_data,
+                    total_rows=total_rows,
+                )
+            )
+            if total_rows == 0:
+                self._sql_status.setText(
+                    translate(
+                        "TableViewer",
+                        "{entries_count} freed page(s) found, but none still carry leftover cell data — not a parsing failure. Either a later allocation already overwrote them, or secure_delete was enabled at write time.",
+                    ).format(entries_count=len(entries))
+                )
+            else:
+                self._sql_status.setText(
+                    translate(
+                        "TableViewer",
+                        "Candidate tables are a heuristic match — the source table cannot be "
+                        "determined with certainty from a freed page. ✓-marked candidates match on "
+                        "both column count and value types (higher confidence); unmarked candidates "
+                        "match column count only. Values spilling onto overflow "
+                        "pages are reconstructed when those pages are still on the freelist "
+                        "unmodified; otherwise shown as '<OVERFLOW>'. Double-click a row to open the "
+                        "raw page in the hex viewer.",
+                    )
+                )
+
+    def _get_page_table_map(self) -> dict[int, str]:
+        """Return (and cache) {page_num: table_name}, WAL-aware like
+        _get_wal_frames() builds it -- unlike that method, this one is
+        reachable without ever visiting the WAL Frames tab first (Freeblocks
+        and Unallocated Space use it too), so it has to fetch the WAL data
+        itself rather than assume _page_table_map was already populated."""
+        if self._page_table_map:
+            return self._page_table_map
+        conn = self._ensure_raw_db()
+        page_size = self._get_page_size()
+        if conn is None or page_size == 0:
+            return {}
+        try:
+            self._page_table_map = self._build_page_table_map(conn, self._get_wal_data(), page_size)
+        except Exception:
+            self._page_table_map = {}
+        return self._page_table_map
+
+    def _get_freeblocks_data(self) -> list[dict]:
+        """Return (and cache) every freeblock found anywhere in the database file."""
+        if self._freeblocks_cache is not None:
+            return self._freeblocks_cache
+        page_size = self._get_page_size()
+        if self._db_path is None or page_size == 0:
+            self._freeblocks_cache = []
+            return self._freeblocks_cache
+        self._freeblocks_problems = []
+        self._freeblocks_cache = scan_database_freeblocks(
+            self._db_path, page_size, self._get_wal_page_overlay(), self._freeblocks_problems
+        )
+        return self._freeblocks_cache
+
+    def _load_freeblocks(self) -> None:
+        """Carve leftover cell fragments out of in-page freeblocks.
+
+        Unlike the Freelist Recovery tab (whole freed pages), this catches
+        ordinary single-row DELETEs that never freed an entire page — SQLite
+        splices the deleted cell into the page's freeblock list instead of
+        zeroing it. The freeblock's own 4-byte header overwrites the start
+        of the old cell, so the leftover bytes are shown raw rather than
+        decoded into columns.
+        """
+        self._reset_source_model()
+        conn = self._ensure_db()
+        page_size = self._get_page_size()
+
+        if conn is None or self._db_path is None or page_size == 0:
+            _set_headers(
+                self._source_model,
+                _gens(
+                    QT_TRANSLATE_NOOP("GeneratedView", "Freeblocks (generated)"),
+                ),
+            )
+            item = _gen_item(
+                _Gen(QT_TRANSLATE_NOOP("GeneratedView", "Database file or page size unavailable"))
+            )
+            item.setEditable(False)
+            self._source_model.appendRow([item])
+            self._row_count_label.setText("")
+            return
+
+        # Fast path: everything needed is already cached from a previous
+        # visit to this or another SQLite-recovery tab -- populate directly,
+        # no need for a background thread/busy dialog.
+        if (
+            self._freeblocks_cache is not None
+            and self._page_table_map
+            and self._freelist_cache is not None
+        ):
+            freelist_pages = {e["page"] for e in self._freelist_cache[0]}
+            self._populate_freeblocks_table(
+                self._freeblocks_cache, self._page_table_map, freelist_pages
+            )
+            return
+
+        # Slow path: at least one of these caches is cold and needs a full
+        # file scan (scan_database_freeblocks / build_page_table_map /
+        # walk_freelist_pages+carve_freelist_rows) -- do that off the UI
+        # thread so the window stays responsive instead of freezing for
+        # however long the scan takes on this particular database.
+        def _work() -> tuple[list[dict], dict[int, str], set[int]]:
+            freeblocks = self._get_freeblocks_data()
+            page_table_map = self._get_page_table_map()
+            freelist_pages = {e["page"] for e in self._get_freelist_data()[0]}
+            return freeblocks, page_table_map, freelist_pages
+
+        def _on_done(result: object) -> None:
+            freeblocks, page_table_map, freelist_pages = result  # type: ignore[misc]
+            self._populate_freeblocks_table(freeblocks, page_table_map, freelist_pages)
+
+        def _on_error(message: str) -> None:
+            self._sql_status.setStyleSheet("color: red;")
+            self._sql_status.setText(
+                translate("TableViewer", "Error scanning freeblocks: {message}").format(
+                    message=message
+                )
+            )
+
+        run_with_busy_dialog(
+            self, translate("TableViewer", "Scanning for freeblocks…"), _work, _on_done, _on_error
+        )
+
+    def _populate_freeblocks_table(
+        self,
+        freeblocks: list[dict],
+        page_table_map: dict[int, str],
+        freelist_pages: set[int],
+    ) -> None:
+        problems = self._freeblocks_problems + self._page_table_problems
+        self._set_source_status(problems)
+        if not freeblocks:
+            _set_headers(
+                self._source_model,
+                _gens(
+                    QT_TRANSLATE_NOOP("GeneratedView", "Freeblocks (generated)"),
+                ),
+            )
+            item = (
+                QStandardItem("")
+                if problems
+                else _gen_item(_Gen(QT_TRANSLATE_NOOP("GeneratedView", "No freeblocks found")))
+            )
+            item.setEditable(False)
+            self._source_model.appendRow([item])
+            self._row_count_label.setText("")
+            return
+
+        _set_headers(
+            self._source_model,
+            _gens(
+                QT_TRANSLATE_NOOP("GeneratedView", "Page"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Table"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Offset (B)"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Size (B)"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Data"),
+            ),
+        )
+
+        page_size = self._get_page_size()
+        wal_index = build_wal_page_index(self._get_wal_data(), page_size)
+
+        with self._dynamic_sort_suspended():
+            for fb in freeblocks:
+                page = fb["page"]
+                # A table name (file data) or Crush's "Freelist".
+                origin: str | _Gen
+                if page in page_table_map:
+                    origin = page_table_map[page]
+                elif page in freelist_pages:
+                    origin = _Gen(QT_TRANSLATE_NOOP("GeneratedView", "Freelist"))
+                else:
+                    origin = "—"
+                raw = fb["data"]
+                text: str | _Gen
+                if not raw:
+                    text = ""
+                elif not any(raw):
+                    # A string of NUL bytes decodes fine but renders as an
+                    # invisible blank cell in the table -- indistinguishable
+                    # from "nothing here" even though Size (B) shows this
+                    # freeblock is real. Say so explicitly instead (this is
+                    # itself a legitimate, forensically meaningful result:
+                    # e.g. secure_delete was on, or the space was never
+                    # written to before being linked into the freeblock).
+                    text = _Gen(
+                        QT_TRANSLATE_NOOP("GeneratedView", "(all zero — {size} B)"), size=len(raw)
+                    )
+                else:
+                    text = raw.decode("utf-8", errors="replace")
+
+                page_item = QStandardItem(str(page))
+                if page_size:
+                    file_kind, page_file_offset = _page_file_location(page, page_size, wal_index)
+                    page_item.setData(file_kind, _STRUCTURE_FILE_KIND_ROLE)
+                    page_item.setData(
+                        (page_file_offset + fb["offset"], page_file_offset + fb["offset"] + fb["size"]),
+                        _STRUCTURE_BYTE_RANGE_ROLE,
+                    )
+                items = [
+                    page_item,
+                    _gen_item(origin) if isinstance(origin, _Gen) else QStandardItem(origin),
+                    QStandardItem(str(fb["offset"])),
+                    QStandardItem(str(fb["size"])),
+                    _gen_item(text) if isinstance(text, _Gen) else QStandardItem(text),
+                ]
+                for it in items:
+                    it.setEditable(False)
+                self._source_model.appendRow(items)
+
+        self._resize_and_cap()
+        self._row_count_label.setText(
+            translate("TableViewer", "({freeblocks_count} freeblocks)").format(
+                freeblocks_count=len(freeblocks)
+            )
+        )
+        self._sql_status.setText(
+            translate(
+                "TableViewer",
+                "Raw leftover bytes from deleted cells still linked in each page's freeblock "
+                "list — not decoded into columns, since the freeblock's own header overwrites "
+                "the start of the original cell. Double-click a row to open the raw page in "
+                "the hex viewer.",
+            )
+        )
+
+    def _get_unallocated_data(self) -> list[dict]:
+        """Return (and cache) every non-empty unallocated-space gap in the file."""
+        if self._unallocated_cache is not None:
+            return self._unallocated_cache
+        page_size = self._get_page_size()
+        if self._db_path is None or page_size == 0:
+            self._unallocated_cache = []
+            return self._unallocated_cache
+        self._unallocated_problems = []
+        self._unallocated_cache = scan_database_unallocated(
+            self._db_path, page_size, self._get_wal_page_overlay(), self._unallocated_problems
+        )
+        return self._unallocated_cache
+
+    def _load_unallocated_space(self) -> None:
+        """Show raw bytes from the gap between each table-leaf page's cell-pointer
+        array and its cell-content area.
+
+        Unlike Freeblocks, this space isn't a maintained structure — it's
+        just whatever bytes happen to be sitting there, and SQLite makes no
+        promise they're leftover row content rather than zeroed space or
+        stale pointer values from a shrunk pointer array. Shown raw and
+        unfiltered so the analyst can judge each entry themselves; entries
+        that were entirely zero are not shown at all (nothing to judge).
+        """
+        self._reset_source_model()
+        conn = self._ensure_db()
+        page_size = self._get_page_size()
+
+        if conn is None or self._db_path is None or page_size == 0:
+            _set_headers(
+                self._source_model,
+                _gens(
+                    QT_TRANSLATE_NOOP("GeneratedView", "Unallocated Space (generated)"),
+                ),
+            )
+            item = _gen_item(
+                _Gen(QT_TRANSLATE_NOOP("GeneratedView", "Database file or page size unavailable"))
+            )
+            item.setEditable(False)
+            self._source_model.appendRow([item])
+            self._row_count_label.setText("")
+            return
+
+        # Fast path: already cached, populate directly.
+        if (
+            self._unallocated_cache is not None
+            and self._page_table_map
+            and self._freelist_cache is not None
+        ):
+            freelist_pages = {e["page"] for e in self._freelist_cache[0]}
+            self._populate_unallocated_table(
+                self._unallocated_cache, self._page_table_map, freelist_pages
+            )
+            return
+
+        # Slow path: at least one of these needs a fresh full-file scan.
+        def _work() -> tuple[list[dict], dict[int, str], set[int]]:
+            entries = self._get_unallocated_data()
+            page_table_map = self._get_page_table_map()
+            freelist_pages = {e["page"] for e in self._get_freelist_data()[0]}
+            return entries, page_table_map, freelist_pages
+
+        def _on_done(result: object) -> None:
+            entries, page_table_map, freelist_pages = result  # type: ignore[misc]
+            self._populate_unallocated_table(entries, page_table_map, freelist_pages)
+
+        def _on_error(message: str) -> None:
+            self._sql_status.setStyleSheet("color: red;")
+            self._sql_status.setText(
+                translate("TableViewer", "Error scanning unallocated space: {message}").format(
+                    message=message
+                )
+            )
+
+        run_with_busy_dialog(
+            self,
+            translate("TableViewer", "Scanning unallocated space…"),
+            _work,
+            _on_done,
+            _on_error,
+        )
+
+    def _populate_unallocated_table(
+        self,
+        entries: list[dict],
+        page_table_map: dict[int, str],
+        freelist_pages: set[int],
+    ) -> None:
+        problems = self._unallocated_problems + self._page_table_problems
+        self._set_source_status(problems)
+        if not entries:
+            _set_headers(
+                self._source_model,
+                _gens(
+                    QT_TRANSLATE_NOOP("GeneratedView", "Unallocated Space (generated)"),
+                ),
+            )
+            item = (
+                QStandardItem("")
+                if problems
+                else _gen_item(
+                    _Gen(QT_TRANSLATE_NOOP("GeneratedView", "No non-empty unallocated space found"))
+                )
+            )
+            item.setEditable(False)
+            self._source_model.appendRow([item])
+            self._row_count_label.setText("")
+            return
+
+        _set_headers(
+            self._source_model,
+            _gens(
+                QT_TRANSLATE_NOOP("GeneratedView", "Page"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Table"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Offset (B)"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Size (B)"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Data"),
+            ),
+        )
+
+        page_size = self._get_page_size()
+        wal_index = build_wal_page_index(self._get_wal_data(), page_size)
+
+        with self._dynamic_sort_suspended():
+            for entry in entries:
+                page = entry["page"]
+                # A table name (file data) or Crush's "Freelist".
+                origin: str | _Gen
+                if page in page_table_map:
+                    origin = page_table_map[page]
+                elif page in freelist_pages:
+                    origin = _Gen(QT_TRANSLATE_NOOP("GeneratedView", "Freelist"))
+                else:
+                    origin = "—"
+                text = entry["data"].decode("utf-8", errors="replace")
+
+                page_item = QStandardItem(str(page))
+                if page_size:
+                    file_kind, page_file_offset = _page_file_location(page, page_size, wal_index)
+                    page_item.setData(file_kind, _STRUCTURE_FILE_KIND_ROLE)
+                    page_item.setData(
+                        (
+                            page_file_offset + entry["offset"],
+                            page_file_offset + entry["offset"] + entry["size"],
+                        ),
+                        _STRUCTURE_BYTE_RANGE_ROLE,
+                    )
+                items = [
+                    page_item,
+                    _gen_item(origin) if isinstance(origin, _Gen) else QStandardItem(origin),
+                    QStandardItem(str(entry["offset"])),
+                    QStandardItem(str(entry["size"])),
+                    QStandardItem(text),
+                ]
+                for it in items:
+                    it.setEditable(False)
+                self._source_model.appendRow(items)
+
+        self._resize_and_cap()
+        self._row_count_label.setText(
+            translate(
+                "TableViewer", "({entries_count} pages with non-empty unallocated space)"
+            ).format(entries_count=len(entries))
+        )
+        self._sql_status.setText(
+            translate(
+                "TableViewer",
+                "Raw bytes only, not verified as recoverable row content — SQLite doesn't "
+                "guarantee anything meaningful survives here, unlike Freeblocks. Often noise "
+                "(stale pointer values) or empty. Double-click a row to open the raw page in "
+                "the hex viewer.",
+            )
+        )
+
+    def _on_table_double_clicked(self, index: object) -> None:
+        """Double-click handler: navigate to table from summary, open WAL page in hex viewer, or inspect bytes cell."""
+        current = self._current_table()
+
+        if self._query_results_active:
+            model_index = self._proxy_model.index(index.row(), index.column())  # type: ignore[union-attr]
+            raw = self._proxy_model.data(model_index, Qt.ItemDataRole.UserRole)
+            display = self._proxy_model.data(model_index, Qt.ItemDataRole.DisplayRole)
+            blob = _coerce_blob(raw)
+            display_text = str(display) if display is not None else ""
+            if blob is not None:
+                is_placeholder = display_text.startswith("<BLOB ") and display_text.endswith(" B>")
+                self._preview_blob(
+                    blob,
+                    display_text=display_text if display_text and not is_placeholder else None,
+                    index=index,
+                )
+            elif display_text:
+                self._preview_blob(
+                    display_text.encode("utf-8", errors="replace"),
+                    display_text=display_text,
+                    index=index,
+                    from_text=True,
+                )
+            return
+
+        if current in (self._summary_label, self._summary_nav_table):
+            src_row = self._proxy_model.mapToSource(
+                self._proxy_model.index(index.row(), 0)  # type: ignore[union-attr]
+            ).row()
+            # _summary_label rows are built by _load_summary (no "Row" prefix col → name at col 0).
+            # _summary_nav_table rows go through _load_table which prepends a "Row" col → name at col 1.
+            name_col = 0 if current == self._summary_label else 1
+            name_item = self._source_model.item(src_row, name_col)
+            if name_item and self._table_combo.findText(name_item.text()) >= 0:
+                self._table_combo.setCurrentText(name_item.text())
+            return
+
+        if current == self._freelist_label:
+            if self._db_path is None:
+                return
+            page_size = self._get_page_size()
+            if page_size == 0:
+                return
+            row = self._proxy_model.mapToSource(self._proxy_model.index(index.row(), 0)).row()  # type: ignore[union-attr]
+            page_item = self._source_model.item(row, 0)
+            if page_item is None:
+                return
+            try:
+                page_num = int(page_item.text())
+            except ValueError:
+                return
+            page_bytes = _read_freelist_page(
+                self._db_path, page_num, page_size, self._get_wal_page_overlay()
+            )
+            if page_bytes:
+                self.open_bytes_requested.emit(page_bytes, f"Freelist page {page_num}")
+            return
+
+        if current == self._freeblocks_label:
+            if self._db_path is None:
+                return
+            page_size = self._get_page_size()
+            if page_size == 0:
+                return
+            row = self._proxy_model.mapToSource(self._proxy_model.index(index.row(), 0)).row()  # type: ignore[union-attr]
+            page_item = self._source_model.item(row, 0)
+            if page_item is None:
+                return
+            try:
+                page_num = int(page_item.text())
+            except ValueError:
+                return
+            page_bytes = _read_freelist_page(
+                self._db_path, page_num, page_size, self._get_wal_page_overlay()
+            )
+            if page_bytes:
+                self.open_bytes_requested.emit(page_bytes, f"Page {page_num} (freeblock)")
+            return
+
+        if current == self._unallocated_label:
+            if self._db_path is None:
+                return
+            page_size = self._get_page_size()
+            if page_size == 0:
+                return
+            row = self._proxy_model.mapToSource(self._proxy_model.index(index.row(), 0)).row()  # type: ignore[union-attr]
+            page_item = self._source_model.item(row, 0)
+            if page_item is None:
+                return
+            try:
+                page_num = int(page_item.text())
+            except ValueError:
+                return
+            page_bytes = _read_freelist_page(
+                self._db_path, page_num, page_size, self._get_wal_page_overlay()
+            )
+            if page_bytes:
+                self.open_bytes_requested.emit(page_bytes, f"Page {page_num} (unallocated space)")
+            return
+
+        if current != self._wal_label:
+            source = self._proxy_model.mapToSource(index)
+            item = self._source_model.item(source.row(), source.column())
+            if item is not None:
+                blob = _coerce_blob(item.data(Qt.ItemDataRole.UserRole))
+                display_val = item.text()
+                if blob is not None:
+                    is_blob_placeholder = display_val.startswith("<BLOB ") and display_val.endswith(" B>")
+                    decoded = display_val if not is_blob_placeholder and display_val else None
+                    self._preview_blob(blob, display_text=decoded, index=index)
+                elif display_val:
+                    # SQL result cells: no raw bytes, but display text is the decoded content
+                    self._preview_blob(
+                        display_val.encode("utf-8", errors="replace"),
+                        display_text=display_val, index=index, from_text=True,
+                    )
+            return
+        if self._db_path is None or self._wal_page_size == 0:
+            return
+
+        row = self._proxy_model.mapToSource(self._proxy_model.index(index.row(), 0)).row()  # type: ignore[union-attr]
+
+        def _user(col: int) -> object:
+            return self._source_model.item(row, col).data(Qt.ItemDataRole.UserRole)
+
+        frame_num = _user(0)
+        page_num  = _user(1)
+        offset    = _user(5)
+        if offset is None:
+            return
+
+        wal_path = Path(str(self._db_path) + "-wal")
+        try:
+            wal_data = wal_path.read_bytes()
+            page_start = int(offset) + 24  # skip 24-byte frame header
+            page_bytes = wal_data[page_start : page_start + self._wal_page_size]
+        except OSError:
+            return
+
+        if page_bytes:
+            self.open_bytes_requested.emit(
+                page_bytes,
+                f"WAL frame {frame_num} — page {page_num}",
+            )
+
+    def _set_structure_view_visible(self, visible: bool) -> None:
+        self._sql_bar.setVisible(not visible)
+        self._structure_tree.setVisible(visible)
+        self._table_view.setVisible(not visible)
+        self._cell_detail_panel.setVisible(not visible)
+
+    def _load_file_structure(self) -> None:
+        self._set_structure_view_visible(True)
+        self._wal_toggle.setVisible(False)
+        self._prev_ref_toggle.setVisible(False)
+        self._freelist_table_filter.setVisible(False)
+        self._freelist_table_filter_label.setVisible(False)
+        self._row_count_label.setText("")
+        self._sql_status.setStyleSheet("")
+        self._sql_status.setText("")
+        self._structure_model.removeRows(0, self._structure_model.rowCount())
+        _set_headers(
+            self._structure_model,
+            _gens(
+                QT_TRANSLATE_NOOP("GeneratedView", "Structure"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Value"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Type"),
+            ),
+        )
+
+        if self._db_path is None:
+            self._append_structure_node(
+                self._structure_model.invisibleRootItem(),
+                StructureNode(
+                    "SQLite file",
+                    translate("GeneratedView", "database file unavailable"),
+                ),
+            )
+            return
+
+        page_size = self._get_page_size()
+        if page_size == 0:
+            self._append_structure_node(
+                self._structure_model.invisibleRootItem(),
+                StructureNode("SQLite file", translate("GeneratedView", "page size unavailable")),
+            )
+            return
+
+        page_table_map = self._ensure_page_table_map()
+        conn = self._ensure_db()
+        self._structure_table_columns = self._table_record_columns(conn) if conn is not None else {}
+        freelist_entries = self._get_freelist_data()[0]
+        try:
+            nodes = build_sqlite_structure_tree(
+                self._db_path,
+                page_size,
+                page_table_map,
+                freelist_entries,
+                self._get_wal_data(),
+            )
+        except Exception as exc:
+            self._append_structure_node(
+                self._structure_model.invisibleRootItem(),
+                StructureNode(
+                    "SQLite file",
+                    translate("GeneratedView", "structure parse failed: {error}").format(
+                        error=exc
+                    ),
+                ),
+            )
+            return
+
+        root = self._structure_model.invisibleRootItem()
+        for node in nodes:
+            self._append_structure_node(root, node)
+        # depth 0 only -- expandToDepth(1) would also expand every "Page N"
+        # item itself, firing this tab's lazy-populate-on-expand for all of
+        # them immediately and reintroducing the exact eager-decode hang
+        # this lazy loading exists to avoid.
+        self._structure_tree.expandToDepth(0)
+        pages = next((n for n in nodes if n.label == "Pages"), None)
+        page_count = len(pages.children) if pages is not None else 0
+        self._row_count_label.setText(
+            translate("TableViewer", "({page_count:,} pages)").format(page_count=page_count)
+        )
+        self._sql_status.setText(
+            translate(
+                "TableViewer",
+                "Select a structure item to highlight its bytes; click the hex pane to "
+                "select the deepest matching header, page, cell, freeblock, or unallocated entry. "
+                "Pages load their cell/column detail on first expand. To find specific content, "
+                "query the table itself (SQL) and use Locate in Hex, or search in the hex pane.",
+            )
+        )
+        if self._hex_panel.isVisible():
+            self._ensure_hex_pane_loaded()
+            self._sync_structure_hex_pane(self._structure_tree.currentIndex())
+
+    def _append_structure_node(self, parent: QStandardItem, node: StructureNode) -> None:
+        label = QStandardItem(node.label)
+        # A value can be a ParseIssue (unreadable page etc.): UI language.
+        value_text = render_value(node.value, localized=True)
+        value = QStandardItem(value_text)
+        # The cell is one line, elided at the column edge; the tooltip wraps
+        # the whole value (nothing is cut off, see _display_cell_value).
+        value.setToolTip(
+            f"<p style='white-space: pre-wrap'>{html.escape(value_text)}</p>"  # i18n: keep -- markup
+        )
+        kind = QStandardItem(node.kind)
+        for item in (label, value, kind):
+            item.setEditable(False)
+        if node.file_kind == "wal":
+            label.setForeground(QColor("#4488ff"))
+            value.setForeground(QColor("#4488ff"))
+        label.setData(node.file_kind, _STRUCTURE_FILE_KIND_ROLE)
+        if node.byte_range is not None:
+            label.setData(node.byte_range, _STRUCTURE_BYTE_RANGE_ROLE)
+        if node.highlight_ranges:
+            label.setData(node.highlight_ranges, _STRUCTURE_HIGHLIGHT_RANGES_ROLE)
+        parent.appendRow([label, value, kind])
+        for child in node.children:
+            self._append_structure_node(label, child)
+        if node.lazy_page is not None:
+            label.setData(node.lazy_page, _STRUCTURE_LAZY_PAGE_ROLE)
+            placeholder = QStandardItem(translate("GeneratedView", "Loading…"))
+            placeholder.setEditable(False)
+            placeholder.setSelectable(False)
+            label.appendRow([placeholder, QStandardItem(""), QStandardItem("")])
+
+    def _on_structure_item_expanded(self, index: QModelIndex) -> None:
+        item = self._structure_model.itemFromIndex(index)
+        if item is not None:
+            self._populate_structure_page_if_needed(item)
+
+    def _populate_structure_page_if_needed(self, item: QStandardItem) -> bool:
+        """Build a "Page N" item's detail children (header/cells/etc.) the
+        first time it's expanded -- see StructureNode.lazy_page. Returns
+        whether this item actually needed (and got) populating, so callers
+        that jump straight to a byte offset can tell whether to re-search
+        the now-real children for a more specific match."""
+        page_num = item.data(_STRUCTURE_LAZY_PAGE_ROLE)
+        if page_num is None:
+            return False
+        item.setData(None, _STRUCTURE_LAZY_PAGE_ROLE)
+        item.removeRows(0, item.rowCount())
+        if self._db_path is None:
+            return True
+        page_size = self._get_page_size()
+        try:
+            detail_nodes = build_page_detail_nodes(
+                self._db_path,
+                page_size,
+                page_num,
+                self._ensure_page_table_map(),
+                self._structure_table_columns,
+                self._get_wal_data(),
+            )
+        except Exception as exc:
+            self._append_structure_node(
+                item, StructureNode(translate("GeneratedView", "Error"), f"{exc}")
+            )
+            return True
+        for node in detail_nodes:
+            self._append_structure_node(item, node)
+        return True
+
+    def _load_db_info(self) -> None:
+        """Show all PRAGMA settings with decoded enum values and descriptions."""
+        conn = self._ensure_db()
+        if conn is None:
+            return
+        cursor = conn.cursor()
+        self._reset_source_model()
+        _set_headers(
+            self._source_model,
+            _gens(
+                QT_TRANSLATE_NOOP("GeneratedView", "Setting (generated)"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Value"),
+                QT_TRANSLATE_NOOP("GeneratedView", "Description"),
+            ),
+        )
+
+        # WAL summary block (if present)
+        frames = self._get_wal_frames()
+        if frames is not None:
+
+            counts = Counter(f["status"] for f in frames)
+
+            def _wal_row(label: str, value: str, desc: str, color: object = None) -> None:
+                s = _gen_item(_Gen(label))
+                s.setEditable(False)
+                v = QStandardItem(value)
+                v.setEditable(False)
+                d = _gen_item(_Gen(desc))
+                d.setForeground(Qt.GlobalColor.gray)
+                d.setEditable(False)
+                if color is not None:
+                    for item in (s, v):
+                        item.setForeground(color)
+                self._source_model.appendRow([s, v, d])
+
+            wal_path = Path(str(self._db_path) + "-wal")
+            wal_size = wal_path.stat().st_size if wal_path.exists() else 0
+            _wal_row(
+                QT_TRANSLATE_NOOP("GeneratedView", "WAL file size (B)"),
+                f"{wal_size:,}",
+                QT_TRANSLATE_NOOP("GeneratedView", "Size of the -wal companion file on disk"),
+            )
+            _wal_row(
+                QT_TRANSLATE_NOOP("GeneratedView", "WAL total frames"),
+                str(len(frames)),
+                QT_TRANSLATE_NOOP("GeneratedView", "Total frames found in WAL file"),
+            )
+            _wal_row(
+                QT_TRANSLATE_NOOP("GeneratedView", "WAL active frames"),
+                str(counts.get("Active", 0)),
+                QT_TRANSLATE_NOOP(
+                    "GeneratedView", "Frames currently read by SQLite (newest per page)"
+                ),
+            )
+            n_sup = counts.get("Superseded", 0)
+            _wal_row(
+                QT_TRANSLATE_NOOP("GeneratedView", "WAL superseded frames"),
+                str(n_sup),
+                QT_TRANSLATE_NOOP(
+                    "GeneratedView",
+                    "Older versions of pages — may contain overwritten or deleted data",
+                ),
+                QColor("#cc8800") if n_sup else None,
+            )
+            n_unc = counts.get("Uncommitted", 0)
+            _wal_row(
+                QT_TRANSLATE_NOOP("GeneratedView", "WAL uncommitted frames"),
+                str(n_unc),
+                QT_TRANSLATE_NOOP(
+                    "GeneratedView",
+                    "Frames beyond the last commit marker — captured mid-transaction",
+                ),
+                QColor("#4488ff") if n_unc else None,
+            )
+            n_slack = counts.get("WAL slack", 0)
+            _wal_row(
+                QT_TRANSLATE_NOOP("GeneratedView", "WAL slack frames"),
+                str(n_slack),
+                QT_TRANSLATE_NOOP(
+                    "GeneratedView",
+                    "Salt-mismatch frames from a previous WAL cycle — reused WAL space",
+                ),
+                Qt.GlobalColor.darkGray if n_slack else None,
+            )
+
+            # Visual separator
+            sep = QStandardItem("─" * 30)
+            sep.setForeground(Qt.GlobalColor.gray)
+            sep.setEditable(False)
+            self._source_model.appendRow([sep, QStandardItem(""), QStandardItem("")])
+
+        # Rollback journal summary block (if a -journal companion was found)
+        journal_result = self._get_journal_result()
+        if journal_result is not None and self._journal_path is not None:
+
+            def _journal_row(
+                label: str, value: str | _Gen, desc: str | _Gen, color: object = None
+            ) -> None:
+                s = _gen_item(_Gen(label))
+                s.setEditable(False)
+                v = _gen_item(value) if isinstance(value, _Gen) else QStandardItem(value)
+                v.setEditable(False)
+                d = _gen_item(desc if isinstance(desc, _Gen) else _Gen(desc))
+                d.setForeground(Qt.GlobalColor.gray)
+                d.setEditable(False)
+                if color is not None:
+                    for item in (s, v):
+                        item.setForeground(color)
+                self._source_model.appendRow([s, v, d])
+
+            journal_size = self._journal_path.stat().st_size if self._journal_path.exists() else 0
+            n_records = sum(len(s.records) for s in journal_result.segments)
+            n_bad = sum(
+                1 for s in journal_result.segments for r in s.records if not r.checksum_valid
+            )
+            _journal_row(
+                QT_TRANSLATE_NOOP("GeneratedView", "Journal file size (B)"),
+                f"{journal_size:,}",
+                QT_TRANSLATE_NOOP("GeneratedView", "Size of the -journal companion file on disk"),
+            )
+            _journal_row(
+                QT_TRANSLATE_NOOP("GeneratedView", "Journal segments"),
+                str(len(journal_result.segments)),
+                QT_TRANSLATE_NOOP(
+                    "GeneratedView",
+                    "Header+records groups (SQLite starts a new one on each mid-transaction sync)",
+                ),
+            )
+            _journal_row(
+                QT_TRANSLATE_NOOP("GeneratedView", "Journal page records"),
+                str(n_records),
+                QT_TRANSLATE_NOOP(
+                    "GeneratedView", "Pre-transaction page images captured in this journal"
+                ),
+            )
+            merged_desc: str | _Gen
+            if journal_result.mergeable:
+                merged_desc = _Gen(
+                    QT_TRANSLATE_NOOP(
+                        "GeneratedView",
+                        "Every segment's header and page checksum validated — the table grid, "
+                        "SQL bar, and PRAGMAs above already reflect the post-rollback state",
+                    )
+                )
+            elif journal_result.error:
+                # The parser's ParseIssue: shown translated, exported English.
+                merged_desc = _Gen(
+                    "{error}", error=journal_result.error  # i18n: keep -- layout only
+                )
+            else:
+                merged_desc = _Gen(
+                    QT_TRANSLATE_NOOP(
+                        "GeneratedView",
+                        "One or more page checksums did not validate — "
+                        "see the 'Rollback Journal' tab for the raw, unmerged record inventory",
+                    )
+                )
+            _journal_row(
+                QT_TRANSLATE_NOOP("GeneratedView", "Journal merged into current view"),
+                _Gen(QT_TRANSLATE_NOOP("GeneratedView", "Yes"))
+                if journal_result.mergeable
+                else _Gen(QT_TRANSLATE_NOOP("GeneratedView", "No")),
+                merged_desc,
+                QColor("#228833") if journal_result.mergeable else QColor("#cc4444"),
+            )
+            if n_bad:
+                _journal_row(
+                    QT_TRANSLATE_NOOP("GeneratedView", "Journal checksum mismatches"),
+                    str(n_bad),
+                    QT_TRANSLATE_NOOP(
+                        "GeneratedView", "Page records that failed checksum validation — not merged"
+                    ),
+                    QColor("#cc4444"),
+                )
+
+            sep2 = QStandardItem("─" * 30)
+            sep2.setForeground(Qt.GlobalColor.gray)
+            sep2.setEditable(False)
+            self._source_model.appendRow([sep2, QStandardItem(""), QStandardItem("")])
+
+        for pragma, label, ptype, enum_map, description in _PRAGMA_CATALOG:
+            try:
+                row = cursor.execute(f"PRAGMA {pragma}").fetchone()
+                raw = row[0] if row else None
+            except Exception:
+                raw = None
+
+            if raw is None:
+                display = "—"
+            elif ptype == "bool":
+                try:
+                    iv = int(raw)
+                    display = f"{iv} — {'ON' if iv else 'OFF'}"
+                except (ValueError, TypeError):
+                    display = str(raw)
+            elif ptype == "enum" and enum_map:
+                try:
+                    iv = int(raw)
+                    label_str = enum_map.get(iv, str(iv))
+                    display = f"{iv} — {label_str}"
+                except (ValueError, TypeError):
+                    display = str(raw)
+            else:
+                display = str(raw)
+
+            setting_item = _gen_item(_Gen(label))
+            setting_item.setEditable(False)
+            value_item = QStandardItem(display)
+            value_item.setEditable(False)
+            desc_item = _gen_item(_Gen(description))
+            desc_item.setForeground(Qt.GlobalColor.gray)
+            desc_item.setEditable(False)
+            self._source_model.appendRow([setting_item, value_item, desc_item])
+
+        hint_item = _gen_item(_Gen(QT_TRANSLATE_NOOP("GeneratedView", "Integrity check")))
+        hint_item.setEditable(False)
+        hint_value = _gen_item(
+            _Gen(QT_TRANSLATE_NOOP("GeneratedView", "→ run in SQL bar: PRAGMA integrity_check"))
+        )
+        hint_value.setForeground(Qt.GlobalColor.gray)
+        hint_value.setEditable(False)
+        hint_desc = _gen_item(
+            _Gen(
+                QT_TRANSLATE_NOOP(
+                    "GeneratedView", "Scans database for corruption (can be slow on large files)"
+                )
+            )
+        )
+        hint_desc.setForeground(Qt.GlobalColor.gray)
+        hint_desc.setEditable(False)
+        self._source_model.appendRow([hint_item, hint_value, hint_desc])
+
+        self._resize_and_cap()
+        self._row_count_label.setText(
+            translate("TableViewer", "({_PRAGMA_CATALOG_count} settings)").format(
+                _PRAGMA_CATALOG_count=len(_PRAGMA_CATALOG)
+            )
+        )
+        self._sql_input.setPlainText("PRAGMA integrity_check;")  # i18n: keep -- SQL
+        self._sql_status.setText("")
+
+    def _apply_filter(self, text: str) -> None:
+        # File Structure has no text search of its own -- see _load_file_structure's
+        # docstring-equivalent comment for why (would need to either skip
+        # not-yet-expanded pages' cell content, silently incomplete, or
+        # decode everything to search it, reintroducing the hang this tab's
+        # lazy loading exists to avoid). Filter rows by table content: use
+        # SQL on the table itself, then "Locate in Hex" / a Hex-pane search
+        # to jump to the physical bytes from there.
+        if self._current_table() == self._file_structure_label:
+            return
+        self._proxy_model.setFilterFixedString(text)
+        visible = self._proxy_model.rowCount()
+        source = self._proxy_model.sourceModel()
+        total = source.rowCount() if source is not None else 0
+        if text:
+            self._row_count_label.setText(
+                translate("TableViewer", "({visible:,} of {total:,} rows)").format(
+                    visible=visible, total=total
+                )
+            )
+        else:
+            self._row_count_label.setText(_rows_label(total))
+
+    def _ensure_db(self) -> sqlite3.Connection | None:
+        # A valid/hot rollback journal's reconstructed "current" image (see
+        # SQLiteParser / sqlite_journal.reconstruct_post_rollback_image) is
+        # used here instead of the raw base file so the table grid, SQL bar,
+        # and DB Info PRAGMAs all consistently reflect the post-rollback
+        # state -- the raw-layout tabs (File Structure, Freelist,
+        # Freeblocks, Unallocated Space, WAL Frames) read __db_path directly
+        # instead of going through this connection for their own page bytes,
+        # so they still show the database exactly as it physically sits on
+        # disk regardless of this redirect.
+        open_path = self._recovered_db_path or self._db_path
+        if not open_path or not open_path.exists():
+            self._sql_status.setText(translate("TableViewer", "Database file missing"))
+            return None
+        if self._db_conn is None:
+            self._db_conn = sqlite3.connect(
+                f"file:{open_path}?mode=ro",
+                uri=True,
+                check_same_thread=False,
+            )
+            self._db_conn.row_factory = sqlite3.Row
+        return self._db_conn
+
+    def _ensure_raw_db(self) -> sqlite3.Connection | None:
+        """Like _ensure_db(), but always against __db_path -- never redirected
+        to __recovered_db_path. Physical/raw tabs (File Structure, Freelist,
+        Freeblocks, Unallocated Space, WAL Frames, Rollback Journal) use this
+        for build_page_table_map(), since that function resolves its own file
+        to walk via PRAGMA database_list on whatever connection it's given --
+        handing it _ensure_db()'s connection would silently compute the
+        page→table map from the reconstructed image instead of the physical
+        file these tabs otherwise read directly."""
+        if not self._db_path or not self._db_path.exists():
+            return None
+        if self._raw_db_conn is None:
+            self._raw_db_conn = sqlite3.connect(
+                f"file:{self._db_path}?mode=ro",
+                uri=True,
+                check_same_thread=False,
+            )
+            self._raw_db_conn.row_factory = sqlite3.Row
+        return self._raw_db_conn
+
+    def _refresh_sql_completions(self) -> None:
+        """Populate the SQL editor autocomplete with the full DB schema."""
+        conn = self._ensure_db()
+        if conn is None:
+            return
+        schema: dict[str, list[str]] = {}
+        try:
+            objects = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY name"
+            ).fetchall()
+            for row in objects:
+                name = row["name"]
+                try:
+                    col_rows = conn.execute(f"PRAGMA table_info([{name}])").fetchall()
+                    schema[name] = [c["name"] for c in col_rows]
+                except Exception:
+                    schema[name] = []
+        except Exception:
+            pass
+        self._sql_input.set_schema(schema)
+
+    def _run_sql(self) -> None:
+        cursor = self._sql_input.textCursor()
+        # selectedText() separates lines with U+2029 (paragraph separator).
+        # Kept as an escape: the invisible literal got lost twice in edits.
+        selected = cursor.selectedText().replace("\u2029", "\n").strip()
+        sql = selected if selected else self._sql_input.toPlainText().strip()
+        if not sql:
+            self._sql_status.setStyleSheet("color: red;")
+            self._sql_status.setText(translate("TableViewer", "Enter a SELECT or PRAGMA query"))
+            self._sql_status.setToolTip("")
+            return
+        lowered = sql.lstrip().lower()
+        if not (lowered.startswith("select") or lowered.startswith("with") or lowered.startswith("pragma")):
+            self._sql_status.setStyleSheet("color: red;")
+            self._sql_status.setText(
+                translate("TableViewer", "Only SELECT and PRAGMA queries are allowed")
+            )
+            self._sql_status.setToolTip("")
+            return
+        conn = self._ensure_db()
+        if conn is None:
+            return
+        started = time.perf_counter()
+        try:
+            with foreground_io():
+                priority_wait_elapsed = time.perf_counter() - started
+                execute_started = time.perf_counter()
+                cur = conn.cursor()
+                cur.execute(sql)
+                execute_elapsed = time.perf_counter() - execute_started
+                columns = [desc[0] for desc in cur.description or []]
+                fetch_started = time.perf_counter()
+                fetch_cpu_started = time.process_time()
+                if self._auto_limit.isChecked():
+                    rows = cur.fetchmany(_QUERY_ROW_LIMIT + 1)
+                else:
+                    rows = cur.fetchall()
+                fetch_cpu_elapsed = time.process_time() - fetch_cpu_started
+                fetch_elapsed = time.perf_counter() - fetch_started
+        except sqlite3.Error as exc:
+            elapsed = time.perf_counter() - started
+            self._sql_status.setStyleSheet("color: red;")
+            self._sql_status.setText(
+                translate("TableViewer", "{exc} (failed after {elapsed:.2f} s)").format(
+                    exc=exc, elapsed=elapsed
+                )
+            )
+            self._sql_status.setToolTip("")
+            return
+
+        was_truncated = self._auto_limit.isChecked() and len(rows) > _QUERY_ROW_LIMIT
+        if was_truncated:
+            rows = rows[:_QUERY_ROW_LIMIT]
+        prepare_started = time.perf_counter()
+        data = {
+            "columns": columns,
+            "rows": [list(row) for row in rows],
+            "truncated": was_truncated,
+        }
+        prepare_elapsed = time.perf_counter() - prepare_started
+        self._last_executed_query = sql
+        model_elapsed, resize_elapsed = self._load_table_from_query(data)
+        elapsed = time.perf_counter() - started
+
+        self._sql_status.setStyleSheet("")
+        if was_truncated:
+            status = (
+                translate("TableViewer", "First {count:,} row returned in {elapsed:.2f} s")
+                if len(rows) == 1
+                else translate("TableViewer", "First {count:,} rows returned in {elapsed:.2f} s")
+            ).format(count=len(rows), elapsed=elapsed)
+        else:
+            status = (
+                translate("TableViewer", "{count:,} row returned in {elapsed:.2f} s")
+                if len(rows) == 1
+                else translate("TableViewer", "{count:,} rows returned in {elapsed:.2f} s")
+            ).format(count=len(rows), elapsed=elapsed)
+        timing_details = translate(
+            "TableViewer",
+            "Index wait: {wait:.2f} s\n"
+            "Execute: {execute:.2f} s\n"
+            "Fetch: {fetch:.2f} s wall / {fetch_cpu:.2f} s CPU\n"
+            "Rows: {prepare:.2f} s\n"
+            "Model: {model:.2f} s\n"
+            "Column sizing: {resize:.2f} s\n"
+            "Total: {total:.2f} s",
+        ).format(
+            wait=priority_wait_elapsed,
+            execute=execute_elapsed,
+            fetch=fetch_elapsed,
+            fetch_cpu=fetch_cpu_elapsed,
+            prepare=prepare_elapsed,
+            model=model_elapsed,
+            resize=resize_elapsed,
+            total=elapsed,
+        )
+        if was_truncated:
+            timing_details += "\n\n" + translate(
+                "TableViewer",
+                "Auto limit capped the result at {limit:,} rows. "
+                "Add filters or turn off Auto limit to fetch more.",
+            ).format(limit=_QUERY_ROW_LIMIT)
+        self._sql_status.setText(status)
+        self._sql_status.setToolTip(timing_details)
+
+    def _load_table_from_query(self, table: dict[str, Any]) -> tuple[float, float]:
+        self._cell_detail_label.setText(translate("TableViewer", "—  No cell selected"))
+        self._cell_detail_view.setPlainText("")
+        self._col_ts_formats.clear()
+        columns: list[str] = table["columns"]
+        rows: list[list[Any]] = table["rows"]
+
+        model_started = time.perf_counter()
+        old_query_model = self._query_model
+        self._query_model = _QueryResultModel(columns, rows, self)
+        self._query_results_active = True
+        self._proxy_model.setDynamicSortFilter(False)
+        self._proxy_model.sort(-1, Qt.SortOrder.AscendingOrder)
+        self._proxy_model.setSourceModel(self._query_model)
+        if old_query_model is not None:
+            old_query_model.deleteLater()
+        model_elapsed = time.perf_counter() - model_started
+
+        resize_started = time.perf_counter()
+        self._resize_and_cap()
+        resize_elapsed = time.perf_counter() - resize_started
+        if table.get("truncated", False):
+            label = (
+                translate("TableViewer", "(first {total:,} row)")
+                if len(rows) == 1
+                else translate("TableViewer", "(first {total:,} rows)")
+            ).format(total=len(rows))
+        else:
+            label = _rows_label(len(rows))
+        self._row_count_label.setText(label)
+        return model_elapsed, resize_elapsed
+
+    def _export_csv(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            translate("TableViewer", "Export CSV"),
+            "",
+            "CSV (*.csv)",  # i18n: keep -- file filter
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                headers = [
+                    _export_header_text(self._proxy_model, i)
+                    for i in range(self._proxy_model.columnCount())
+                ]
+                writer.writerow(headers)
+                for row in range(self._proxy_model.rowCount()):
+                    row_values: list[str] = []
+                    for col in range(self._proxy_model.columnCount()):
+                        idx = self._proxy_model.index(row, col)
+                        row_values.append(_export_cell_text(self._proxy_model, idx))
+                    writer.writerow(row_values)
+            self._sql_status.setText(translate("TableViewer", "Exported: {path}").format(path=path))
+        except Exception as exc:
+            self._sql_status.setText(str(exc))
+
+    def _on_context_menu(self, pos: object) -> None:
+        index = self._table_view.indexAt(pos)
+        if not index.isValid():
+            return
+        try:
+            blob = self._table_view.model().data(index, Qt.ItemDataRole.UserRole)
+        except OverflowError:
+            blob = None
+        menu = QMenu(self)
+        copy_cell = menu.addAction(translate("TableViewer", "Copy cell"))
+        copy_row = menu.addAction(translate("TableViewer", "Copy row (TSV)"))
+        copy_sel = menu.addAction(translate("TableViewer", "Copy selection (TSV)"))
+        blob_preview = menu.addAction(translate("TableViewer", "Inspect Cell…"))
+        blob_hex = menu.addAction(translate("TableViewer", "Open in Hex"))
+        blob_export = menu.addAction(translate("TableViewer", "Export…"))
+        open_tab_menu = menu.addMenu(translate("TableViewer", "Open as new tab"))
+        open_tab_auto = open_tab_menu.addAction(translate("TableViewer", "Auto-detect"))
+        open_tab_hex = open_tab_menu.addAction(translate("TableViewer", "Hex"))
+        open_tab_text = open_tab_menu.addAction(translate("TableViewer", "Text"))
+        open_tab_proto = open_tab_menu.addAction(translate("TableViewer", "Protobuf"))
+        blob_bytes = _coerce_blob(blob)
+        display_val = self._table_view.model().data(index, Qt.ItemDataRole.DisplayRole)
+        display_str = str(display_val) if display_val is not None else ""
+        has_display = bool(display_str)
+        is_blob_placeholder = display_str.startswith("<BLOB ") and display_str.endswith(" B>")
+        if blob_bytes is None and not has_display:
+            open_tab_menu.setEnabled(False)
+            blob_preview.setEnabled(False)
+            blob_hex.setEnabled(False)
+            blob_export.setEnabled(False)
+        if blob_bytes is None and has_display:
+            blob_preview.setEnabled(True)
+            blob_hex.setEnabled(True)
+            blob_export.setEnabled(True)
+        action = menu.exec(self._table_view.viewport().mapToGlobal(pos))
+        if action == copy_cell:
+            cell_val = self._table_view.model().data(index, Qt.ItemDataRole.UserRole)
+            blob_bytes = _coerce_blob(cell_val)
+            if blob_bytes is not None:
+                QApplication.clipboard().setText(blob_bytes.hex())
+            else:
+                QApplication.clipboard().setText(
+                    _export_cell_text(self._table_view.model(), index)
+                )
+        elif action == copy_row:
+            self._copy_rows([index.row()])
+        elif action == copy_sel:
+            rows = sorted({i.row() for i in self._table_view.selectedIndexes()})
+            self._copy_rows(rows)
+        elif action == blob_preview:
+            decoded = display_str if (blob_bytes is not None and not is_blob_placeholder and display_str) else None
+            if blob_bytes is not None:
+                self._preview_blob(blob_bytes, display_text=decoded, index=index)
+            elif has_display:
+                self._preview_blob(
+                    display_str.encode("utf-8", errors="replace"), index=index, from_text=True
+                )
+        elif action == blob_hex:
+            if blob_bytes is not None:
+                self._open_blob_hex(blob_bytes)
+            elif has_display:
+                self._open_blob_hex(str(display_val).encode("utf-8", errors="replace"))
+        elif action == blob_export:
+            if blob_bytes is not None:
+                self._export_blob(blob_bytes)
+            elif has_display:
+                self._export_blob(str(display_val).encode("utf-8", errors="replace"))
+        elif action in {open_tab_auto, open_tab_hex, open_tab_text, open_tab_proto}:
+            data_to_open = blob_bytes
+            if data_to_open is None and has_display:
+                data_to_open = str(display_val).encode("utf-8", errors="replace")
+            if data_to_open is not None:
+                col_header = self._table_view.model().headerData(
+                    index.column(), Qt.Orientation.Horizontal
+                ) or "blob"
+                artifact_path, artifact_meta = self._virtual_cell_path_and_metadata(index, col_header)
+                if action == open_tab_auto:
+                    request_open_bytes(
+                        self, data_to_open, artifact_path, None, artifact_meta
+                    )
+                elif action == open_tab_hex:
+                    request_open_bytes(
+                        self, data_to_open, artifact_path, "__hex__", artifact_meta
+                    )
+                elif action == open_tab_text:
+                    request_open_bytes(
+                        self, data_to_open, artifact_path, "__text__", artifact_meta
+                    )
+                elif action == open_tab_proto:
+                    request_open_bytes(
+                        self, data_to_open, artifact_path, "Protobuf (schema-less)", artifact_meta
+                    )
+
+    def _virtual_cell_path_and_metadata(
+        self, index: QModelIndex, col_header: object
+    ) -> tuple[str, dict[str, str]]:
+        """Build the tab-dedup path (kept short and technical — it's shown
+        verbatim in the tab tooltip) plus a separate, fully readable
+        provenance dict for the Properties panel (table/query, column, row).
+        Query text especially is never truncated here or in the path, since
+        it can be arbitrarily long — see the Properties panel, not the path
+        or the tooltip, for that."""
+        db_name = _virtual_path_component(self._source_name, "sqlite")
+        query_text = self._last_executed_query if self._query_results_active else ""
+        if query_text:
+            table_name = f"query-{zlib.crc32(query_text.encode('utf-8')):08x}"
+        elif self._query_results_active:
+            table_name = "query"
+        else:
+            table_name = self._current_table()
+        table = _virtual_path_component(table_name, "table")
+        column_text = str(col_header)
+        column = _virtual_path_component(column_text, "column")
+        row_index = self._table_view.model().index(index.row(), 0)
+        row_value = self._table_view.model().data(row_index, Qt.ItemDataRole.DisplayRole)
+        row = _virtual_path_component(row_value, str(index.row() + 1))
+        path = f"/virtual/{db_name}/{table}/{column}/{row}"
+
+        metadata: dict[str, str] = {
+            "Source column": column_text,
+            "Source row": str(row_value) if row_value is not None else str(index.row() + 1),
+        }
+        if query_text:
+            metadata["Source query"] = query_text
+        else:
+            metadata["Source table"] = self._current_table()
+        return path, metadata
+
+    def _on_header_context_menu(self, pos: object) -> None:
+        header = self._table_view.horizontalHeader()
+        col = header.logicalIndexAt(pos)
+        if col <= 0:  # column 0 is "Row" — skip
+            return
+
+        menu = QMenu(self)
+        ts_submenu = menu.addMenu(translate("TableViewer", "Decode column as timestamp"))
+        fmt_actions: dict[object, str] = {}
+        active = self._col_ts_formats.get(col)
+        for key, label, _ in _TS_FORMATS:
+            act = ts_submenu.addAction(
+                translate("TimestampFormat", label)  # i18n: keep -- marked in ts_decode
+            )
+            act.setCheckable(True)
+            act.setChecked(active == key)
+            fmt_actions[act] = key
+
+        menu.addSeparator()
+        clear_act = menu.addAction(translate("TableViewer", "Clear timestamp format"))
+        clear_act.setEnabled(col in self._col_ts_formats)
+
+        chosen = menu.exec(header.mapToGlobal(pos))
+        if chosen in fmt_actions:
+            self._col_ts_formats[col] = fmt_actions[chosen]
+            self._apply_col_ts_format(col)
+        elif chosen == clear_act:
+            self._col_ts_formats.pop(col, None)
+            self._revert_col_ts_format(col)
+
+    def _apply_col_ts_format(self, col: int) -> None:
+        fmt = self._col_ts_formats.get(col)
+        if fmt is None:
+            return
+        if self._query_results_active and self._query_model is not None:
+            self._query_model.set_timestamp_format(col, fmt)
+            return
+        decoded_count = failed_count = 0
+        for row in range(self._source_model.rowCount()):
+            item = self._source_model.item(row, col)
+            if item is None:
+                continue
+            self._reset_ts_cell(item)  # a re-apply starts from the as-stored cell
+            raw = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(raw, (int, float)):
+                value: object = raw
+            elif raw is None:
+                # A plain text (or NULL) cell: no UserRole, the displayed text is the value.
+                value = item.text()
+            else:
+                continue  # BLOB / list / dict cell -- not something a timestamp applies to
+            decoded, problem = _decode_cell(value, fmt)
+            if decoded is not None:
+                item.setData(item.text(), _TS_ORIGINAL_TEXT_ROLE)
+                item.setText(decoded)
+                decoded_count += 1
+            elif problem is not None:
+                original_fg = item.data(Qt.ItemDataRole.ForegroundRole)
+                item.setData(original_fg if original_fg is not None else False, _TS_ORIGINAL_FG_ROLE)
+                item.setForeground(_TS_UNDECODED_COLOR)
+                item.setToolTip(_ts_cell_tooltip(fmt, problem))
+                failed_count += 1
+        h_item = self._source_model.horizontalHeaderItem(col)
+        if h_item is not None:
+            # The undecorated label is kept (display in UserRole, its English
+            # original in _TS_ORIGINAL_TEXT_ROLE) so a re-decode or "Clear"
+            # restores it exactly.
+            base = h_item.data(Qt.ItemDataRole.UserRole) or h_item.text()
+            base_english = (
+                h_item.data(_TS_ORIGINAL_TEXT_ROLE) or h_item.data(_EXPORT_TEXT_ROLE) or base
+            )
+            h_item.setData(base, Qt.ItemDataRole.UserRole)
+            h_item.setData(base_english, _TS_ORIGINAL_TEXT_ROLE)
+            english, display = _ts_header_pair(
+                str(base_english), str(base), fmt, decoded_count, failed_count
+            )
+            h_item.setText(display)
+            h_item.setData(english if english != display else None, _EXPORT_TEXT_ROLE)
+            h_item.setData(
+                _ts_header_tooltip(fmt, decoded_count, failed_count)
+                or h_item.data(_HEADER_BASE_TIP_ROLE),
+                Qt.ItemDataRole.ToolTipRole,
+            )
+
+    @staticmethod
+    def _reset_ts_cell(item: QStandardItem) -> None:
+        """Undo a timestamp decode / undecodable-cell marking on one cell,
+        restoring exactly what was there before. A cell never touched has
+        neither role set, so this is a no-op for it."""
+        original_text = item.data(_TS_ORIGINAL_TEXT_ROLE)
+        if original_text is not None:
+            item.setText(original_text)
+            item.setData(None, _TS_ORIGINAL_TEXT_ROLE)
+        original_fg = item.data(_TS_ORIGINAL_FG_ROLE)
+        if original_fg is not None:
+            item.setData(None if original_fg is False else original_fg, Qt.ItemDataRole.ForegroundRole)
+            item.setData(None, _TS_ORIGINAL_FG_ROLE)
+            item.setData(None, Qt.ItemDataRole.ToolTipRole)
+
+    def _revert_col_ts_format(self, col: int) -> None:
+        if self._query_results_active and self._query_model is not None:
+            self._query_model.set_timestamp_format(col, None)
+            return
+        for row in range(self._source_model.rowCount()):
+            item = self._source_model.item(row, col)
+            if item is not None:
+                self._reset_ts_cell(item)
+        h_item = self._source_model.horizontalHeaderItem(col)
+        if h_item is not None:
+            base = h_item.data(Qt.ItemDataRole.UserRole)
+            base_english = h_item.data(_TS_ORIGINAL_TEXT_ROLE)
+            if base:
+                h_item.setText(str(base))
+                h_item.setData(
+                    base_english if base_english and base_english != base else None,
+                    _EXPORT_TEXT_ROLE,
+                )
+            h_item.setData(h_item.data(_HEADER_BASE_TIP_ROLE), Qt.ItemDataRole.ToolTipRole)
+
+    def _copy_rows(self, rows: list[int]) -> None:
+        lines: list[str] = []
+        for row in rows:
+            values = []
+            for col in range(self._proxy_model.columnCount()):
+                idx = self._proxy_model.index(row, col)
+                values.append(_export_cell_text(self._proxy_model, idx))
+            lines.append("\t".join(values))
+        QApplication.clipboard().setText("\n".join(lines))
+
+    def _open_blob_hex(self, blob: bytes) -> None:
+        from crush.viewers.hex_viewer import HexViewer
+        dialog = QDialog(self)
+        dialog.setWindowTitle(
+            translate("TableViewer", "BLOB Hex ({blob_count:,} B)").format(blob_count=len(blob))
+        )
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(8, 8, 8, 8)
+        viewer = HexViewer(blob, dialog)
+        layout.addWidget(viewer)
+        dialog.resize(900, 600)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.show()
+
+    def _export_blob(self, blob: bytes) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, translate("TableViewer", "Export BLOB"), "",
+            translate("TableViewer", "All files") + " (*)",  # i18n: keep -- file filter pattern
+        )
+        if not path:
+            return
+        try:
+            with open(path, "wb") as f:
+                f.write(blob)
+            self._sql_status.setText(
+                translate("TableViewer", "BLOB exported: {path}").format(path=path)
+            )
+        except Exception as exc:
+            self._sql_status.setText(str(exc))
+
+    def _preview_blob(
+        self,
+        blob: bytes,
+        *,
+        display_text: str | None = None,
+        index: QModelIndex | None = None,
+        from_text: bool = False,
+    ) -> None:
+        """Open the BLOB Inspector on a cell's bytes -- or, for a cell
+        without bytes (*from_text*), on its text encoded as UTF-8 -- with the
+        cell's table/query, column and row as provenance."""
+        path, meta = "", {}
+        if index is not None and index.isValid():
+            col_header = self._table_view.model().headerData(
+                index.column(), Qt.Orientation.Horizontal
+            ) or "blob"
+            path, meta = self._virtual_cell_path_and_metadata(index, col_header)
+        meta["Inspected bytes"] = (
+            translate("TableViewer", "the cell's text, UTF-8 encoded (the cell holds no bytes)")
+            if from_text else translate("TableViewer", "the cell's bytes")
+        )
+        BlobInspector(
+            blob, self, display_text=display_text, artifact_path=path, provenance=meta
+        ).show()
+
+    def _resize_and_cap(self) -> None:
+        model = self._table_view.model()
+        if model.rowCount() <= _COLUMN_SIZE_SAMPLE:
+            self._table_view.resizeColumnsToContents()
+            _cap_columns(self._table_view)
+            return
+
+        metrics = self._table_view.fontMetrics()
+        for col in range(model.columnCount()):
+            header = model.headerData(col, Qt.Orientation.Horizontal) or ""
+            width = metrics.horizontalAdvance(str(header)) + 28
+            for row in range(_COLUMN_SIZE_SAMPLE):
+                value = model.data(model.index(row, col), Qt.ItemDataRole.DisplayRole)
+                width = max(width, metrics.horizontalAdvance(str(value or "")) + 20)
+            self._table_view.setColumnWidth(col, min(width, _MAX_COL_WIDTH))
+
+    def _build_page_table_map(
+        self, conn: sqlite3.Connection, wal_data: bytes | None, page_size: int,
+    ) -> dict[int, str]:
+        """build_page_table_map(), keeping why attribution may be missing."""
+        self._page_table_problems = []
+        return build_page_table_map(conn, wal_data, page_size, self._page_table_problems)
+
+    def _set_source_status(self, problems: list[Any]) -> None:
+        """Show what a scan reported (unreadable file, stopped chains,
+        skipped cells ...) above the table; hidden when there is nothing."""
+        self._source_status.setText("\n".join(render_value(p, localized=True) for p in problems))
+        self._source_status.setVisible(bool(problems))
+
+    def _reset_source_model(self) -> None:
+        """Replace self._source_model with a fresh, empty QStandardItemModel
+        instead of calling .clear() on the existing one.
+
+        A tab that carved a wide/heavily-populated result (e.g. Freelist
+        Recovery on a table with many columns) can leave _source_model
+        holding hundreds of thousands of QStandardItem cells --
+        QStandardItemModel.clear() on a model that size is drastically
+        slow (tens of seconds), since it has to synchronously tear down
+        every cell before the caller can start repopulating it. Swapping
+        in a fresh model and deferring destruction of the old one via
+        deleteLater() avoids that synchronous cost entirely -- the same
+        pattern _load_table_from_query() already uses for _query_model.
+        """
+        self._set_source_status([])
+        old_model = self._source_model
+        self._source_model = QStandardItemModel(self)
+        self._proxy_model.setSourceModel(self._source_model)
+        old_model.deleteLater()
+
+    @contextmanager
+    def _dynamic_sort_suspended(self):
+        """Disable the proxy model's incremental re-sort for a bulk
+        appendRow() loop, re-enabling it (and sorting once) afterward.
+
+        _load_table()'s own wrapper does this too, but only around the
+        *synchronous* portion of a tab load -- a tab whose data comes back
+        via run_with_busy_dialog() populates its rows later, after that
+        wrapper has already re-enabled dynamic sorting. Any appendRow loop
+        that might run asynchronously needs its own copy of this guard
+        rather than relying on the wrapper's timing.
+        """
+        self._proxy_model.setDynamicSortFilter(False)
+        try:
+            yield
+        finally:
+            self._proxy_model.setDynamicSortFilter(True)
+            self._proxy_model.sort(
+                self._proxy_model.sortColumn(), self._proxy_model.sortOrder()
+            )
+
+    def _activate_standard_model(self) -> None:
+        if not self._query_results_active:
+            return
+        old_query_model = self._query_model
+        self._proxy_model.setSourceModel(self._source_model)
+        self._proxy_model.setDynamicSortFilter(True)
+        self._query_model = None
+        self._query_results_active = False
+        self._last_executed_query = ""
+        if old_query_model is not None:
+            old_query_model.deleteLater()
+
+    def _on_current_cell_changed(self, current: QModelIndex, _previous: QModelIndex) -> None:
+        if not current.isValid():
+            self._cell_detail_label.setText(translate("TableViewer", "—  No cell selected"))
+            self._cell_detail_view.setPlainText("")
+            if not self._syncing_hex_selection:
+                self._sync_hex_pane(None)
+            return
+
+        col = current.column()
+        col_name = self._proxy_model.headerData(col, Qt.Orientation.Horizontal) or ""
+        row_num = current.row() + 1
+        self._cell_detail_label.setText(
+            translate("TableViewer", "Row {row_num}  ·  {col_name}").format(
+                row_num=row_num, col_name=col_name
+            )
+        )
+
+        display_val = self._proxy_model.data(current, Qt.ItemDataRole.DisplayRole)
+        blob = self._proxy_model.data(current, Qt.ItemDataRole.UserRole)
+        blob_bytes = _coerce_blob(blob)
+
+        display_str = str(display_val) if display_val is not None else ""
+        is_blob_placeholder = display_str.startswith("<BLOB ") and display_str.endswith(" B>")
+        if not is_blob_placeholder and display_str:
+            self._cell_detail_view.setPlainText(display_str)
+        elif blob_bytes is not None:
+            try:
+                self._cell_detail_view.setPlainText(blob_bytes.decode("utf-8"))
+            except UnicodeDecodeError:
+                preview = blob_bytes[:256].hex(" ", 1)
+                if len(blob_bytes) > 256:
+                    preview += f"\n… ({len(blob_bytes):,} B total — use Inspect Cell for full view)"
+                self._cell_detail_view.setPlainText(preview)
+        else:
+            self._cell_detail_view.setPlainText(display_str)
+
+        if not self._syncing_hex_selection:
+            self._sync_hex_pane(current)
+
+    def _is_pseudo_table(self, table_name: str) -> bool:
+        return table_name in (
+            self._summary_label, self._db_structure_label, self._file_structure_label,
+            self._db_info_label,
+            self._wal_label, self._freelist_label, self._freeblocks_label,
+            self._unallocated_label,
+        )
+
+    def _toggle_hex_pane(self) -> None:
+        visible = not self._hex_panel.isVisible()
+        self._hex_panel.setVisible(visible)
+        self._hex_toggle_btn.setText(
+            translate("TableViewer", "Hide Hex")
+            if visible
+            else translate("TableViewer", "Show Hex")
+        )
+        if visible:
+            self._ensure_hex_pane_loaded()
+            if self._current_table() == self._file_structure_label:
+                self._sync_structure_hex_pane(self._structure_tree.currentIndex())
+            else:
+                self._sync_hex_pane(self._table_view.currentIndex())
+
+    def _ensure_hex_pane_loaded(self) -> None:
+        if self._hex_pane_loaded or self._cell_locator is None:
+            return
+        file_kind = self._cell_locator.default_file_kind()
+        data = self._cell_locator.read_file(file_kind)
+        if data is None:
+            return
+        self._hex_viewer.set_data(data)
+        self._hex_file_kind = file_kind
+        self._hex_file_label.setText(
+            f"{self._source_name}  ·  {self._cell_locator.label_for(file_kind)}"  # i18n: keep -- layout
+        )
+        self._hex_pane_loaded = True
+
+    def _sync_hex_pane(self, current: QModelIndex | None) -> None:
+        """Table → Hex: highlight the current cell's row (and, when a
+        specific column is selected, that column too, drawn on top) in the
+        embedded Hex pane via HexViewer.highlight_byte_range_groups(): the
+        row's ranges are one group, the column's another, painted on top."""
+        if not self._hex_panel.isVisible():
+            return
+
+        table_name = self._current_table()
+        if table_name in (self._wal_label, self._journal_label):
+            self._sync_wal_hex_pane(current)
+            return
+
+        row_item = None
+        rowid = None
+        col_idx = None
+        if current is not None and current.isValid():
+            source_index = self._proxy_model.mapToSource(current)
+            row_item = self._source_model.item(source_index.row(), 0)
+            rowid = row_item.data(_ROWID_ROLE) if row_item is not None else None
+            col_idx = current.column() - 1  # column 0 is "Row"
+
+        if rowid is None and row_item is not None:
+            # A row with no rowid a CellLocator could resolve is either a
+            # normal table with nothing selected, or a row that carries its
+            # own exact byte range directly instead: a WAL-history row
+            # injected by _inject_wal_rows() (Show WAL history toggle), or a
+            # Freeblocks/Unallocated Space row (see _populate_freeblocks_table()/
+            # _populate_unallocated_table()). Try that before giving up.
+            stashed_file_kind = row_item.data(_STRUCTURE_FILE_KIND_ROLE)
+            stashed_byte_range = row_item.data(_STRUCTURE_BYTE_RANGE_ROLE)
+            if stashed_file_kind and _valid_structure_range(stashed_byte_range):
+                self._ensure_hex_pane_loaded()
+                stashed_row_ranges = row_item.data(_WAL_ROW_RANGES_ROLE)
+                if isinstance(stashed_row_ranges, list) and stashed_row_ranges:
+                    # A WAL-history row has its own precise (row, column)
+                    # ranges available, same shape as a real row's
+                    # CellLocation -- prefer those over the coarse whole-frame
+                    # range so selecting one column highlights just its bytes.
+                    groups = [list(stashed_row_ranges)]
+                    stashed_col_ranges = row_item.data(_WAL_COLUMN_RANGES_ROLE)
+                    if (
+                        isinstance(stashed_col_ranges, list) and col_idx is not None
+                        and 0 <= col_idx < len(stashed_col_ranges)
+                        and stashed_col_ranges[col_idx]
+                    ):
+                        groups.append(list(stashed_col_ranges[col_idx]))
+                    self._highlight_stashed_byte_ranges(stashed_file_kind, groups)
+                else:
+                    self._highlight_stashed_byte_ranges(stashed_file_kind, [[stashed_byte_range]])
+                return
+
+        if (
+            rowid is None or col_idx is None or col_idx < 0
+            or self._is_pseudo_table(table_name)
+            or self._query_results_active
+            or self._cell_locator is None
+        ):
+            self._hex_viewer.clear_byte_range_highlight()
+            return
+
+        self._ensure_hex_pane_loaded()
+        location = self._cell_locator.locate_cell(table_name, rowid, col_idx)
+        file_label = f"{self._source_name}  ·  {self._cell_locator.label_for(self._hex_file_kind)}"
+        if location is None:
+            self._hex_viewer.clear_byte_range_highlight()
+            # Say so rather than just leaving nothing highlighted.
+            why = getattr(self._cell_locator, "why_not_located", None)
+            reason = why(table_name, rowid) if why is not None else None
+            note = ParseIssue("locate.no_range", {
+                "reason": reason or ParseIssue("locate.not_recorded"),
+            })
+            self._hex_file_label.setText(
+                translate("TableViewer", "{file_label}  —  {note}").format(
+                    file_label=file_label, note=note
+                )
+            )
+            return
+
+        if location.file_kind != self._hex_file_kind:
+            data = self._cell_locator.read_file(location.file_kind)
+            if data is None:
+                self._hex_viewer.clear_byte_range_highlight()
+                return
+            self._hex_viewer.set_data(data)
+            self._hex_file_kind = location.file_kind
+            file_label = f"{self._source_name}  ·  {self._cell_locator.label_for(location.file_kind)}"
+        self._hex_file_label.setText(file_label)
+
+        # One color for every piece of the row, one on top of it for every
+        # piece of the column, however many pages each spans.
+        self._hex_viewer.highlight_byte_range_groups(
+            [list(location.row_ranges), list(location.column_ranges or [])]
+        )
+
+    def _sync_wal_hex_pane(self, current: QModelIndex | None) -> None:
+        """WAL Frames / Rollback Journal tab -> Hex: highlight the selected
+        row's own bytes directly in its file (-wal or the staged -journal
+        copy). Neither a WAL frame nor a journal record has a rowid/table-
+        name identity a CellLocator could resolve (several frames/records on
+        the same page can share one), so this uses the (file_kind,
+        byte_range) _load_wal_frames()/_load_journal_records() already
+        stashed on the row instead -- same _STRUCTURE_*_ROLE roles the File
+        Structure tab uses, since the need (know which bytes a row means, in
+        which file) is identical."""
+        item = None
+        if current is not None and current.isValid():
+            source_index = self._proxy_model.mapToSource(current)
+            item = self._source_model.item(source_index.row(), 0)
+        file_kind = item.data(_STRUCTURE_FILE_KIND_ROLE) if item is not None else None
+        byte_range = item.data(_STRUCTURE_BYTE_RANGE_ROLE) if item is not None else None
+        if not file_kind or not _valid_structure_range(byte_range):
+            self._hex_viewer.clear_byte_range_highlight()
+            return
+
+        self._ensure_hex_pane_loaded()
+        self._highlight_stashed_byte_ranges(file_kind, [[byte_range]])
+
+    def _resolve_hex_file_kind(self, file_kind: str) -> tuple[Path | None, str]:
+        """Return (path, human label) for a _STRUCTURE_FILE_KIND_ROLE value
+        ("base" / "wal" / "journal") -- shared by _highlight_stashed_byte_ranges()
+        and _sync_structure_hex_pane() so a new file kind only needs adding here.
+        """
+        if file_kind == "wal":
+            path = Path(str(self._db_path) + "-wal") if self._db_path is not None else None
+            return path, "-wal file"
+        if file_kind == "journal":
+            return self._journal_path, "-journal file"
+        return self._db_path, "db file"
+
+    def _highlight_stashed_byte_ranges(
+        self, file_kind: str, groups: list[list[tuple[int, int]]]
+    ) -> None:
+        """Switch the embedded Hex pane to *file_kind* if it isn't already
+        showing it, then highlight *groups* (one color each) -- shared by
+        the WAL Frames / Rollback Journal tabs (_sync_wal_hex_pane, always
+        one whole-frame/whole-record range) and any row with no rowid a
+        CellLocator could resolve, which carries its own byte range(s)
+        directly instead
+        (_sync_hex_pane's fallback: a WAL-history or pre-rollback-state
+        row's precise row/column ranges when available, else its one
+        whole-page range; Freeblocks/Unallocated Space's one range)."""
+        if file_kind != self._hex_file_kind:
+            target_path, suffix = self._resolve_hex_file_kind(file_kind)
+            if target_path is None:
+                self._hex_viewer.clear_byte_range_highlight()
+                return
+            try:
+                data = target_path.read_bytes()
+            except OSError:
+                self._hex_viewer.clear_byte_range_highlight()
+                return
+            self._hex_viewer.set_data(data)
+            self._hex_file_kind = str(file_kind)
+            self._hex_file_label.setText(
+                translate("TableViewer", "{source_name}  ·  {suffix}").format(
+                    source_name=self._source_name, suffix=suffix
+                )
+            )
+        self._hex_viewer.highlight_byte_range_groups(groups)
+
+    def _structure_item_from_index(self, index: QModelIndex) -> QStandardItem | None:
+        if not index.isValid():
+            return None
+        return self._structure_model.itemFromIndex(
+            self._structure_model.index(index.row(), 0, index.parent())
+        )
+
+    def _on_structure_current_changed(
+        self, current: QModelIndex, _previous: QModelIndex
+    ) -> None:
+        if self._current_table() != self._file_structure_label:
+            return
+        self._sync_structure_hex_pane(current)
+
+    def _sync_structure_hex_pane(self, current: QModelIndex | None) -> None:
+        if not self._hex_panel.isVisible():
+            return
+        item = self._structure_item_from_index(current) if current is not None else None
+        if item is None:
+            self._hex_viewer.clear_byte_range_highlight()
+            return
+        file_kind = item.data(_STRUCTURE_FILE_KIND_ROLE) or "base"
+        ranges = item.data(_STRUCTURE_HIGHLIGHT_RANGES_ROLE)
+        if not isinstance(ranges, list):
+            rng = item.data(_STRUCTURE_BYTE_RANGE_ROLE)
+            ranges = [rng] if _valid_structure_range(rng) else []
+        else:
+            ranges = [rng for rng in ranges if _valid_structure_range(rng)]
+        if not ranges:
+            self._hex_viewer.clear_byte_range_highlight()
+            return
+        if file_kind != self._hex_file_kind:
+            target_path, suffix = self._resolve_hex_file_kind(file_kind)
+            if target_path is None:
+                self._hex_viewer.clear_byte_range_highlight()
+                return
+            try:
+                data = target_path.read_bytes()
+            except OSError:
+                self._hex_viewer.clear_byte_range_highlight()
+                return
+            self._hex_viewer.set_data(data)
+            self._hex_file_kind = str(file_kind)
+            self._hex_file_label.setText(
+                translate("TableViewer", "{source_name}  ·  {suffix}").format(
+                    source_name=self._source_name, suffix=suffix
+                )
+            )
+        # The ranges are the pieces of one item (a column's value spread
+        # over overflow pages): one color for all of them.
+        self._hex_viewer.highlight_byte_range_groups([ranges])
+
+    def _on_hex_offset_focused(self, offset: int) -> None:
+        """Hex → Table: clicking a byte in the pane selects the matching
+        table cell, when resolvable (see CellLocator.locate_offset()'s
+        docstring for the cases it can't -- e.g. a click landing on a
+        SQLite overflow-only page -- where this is simply a no-op, never a
+        wrong selection)."""
+        if self._hex_file_kind is None or self._cell_locator is None:
+            return
+        table_name = self._current_table()
+        if table_name == self._file_structure_label:
+            self._select_structure_item_for_offset(offset)
+            return
+        if self._is_pseudo_table(table_name):
+            # WAL Frames, Freeblocks, Unallocated Space: rows here have no
+            # rowid a CellLocator could resolve, only their own stashed byte
+            # range (see _select_row_for_byte_offset()).
+            self._select_row_for_byte_offset(offset)
+            return
+        if self._query_results_active:
+            return
+
+        result = self._cell_locator.locate_offset(table_name, self._hex_file_kind, offset)
+        if result is None:
+            # Not attributable to any real row -- could still be a
+            # WAL-history row _inject_wal_rows() injected into this same
+            # table view, which carries its own frame byte range rather
+            # than a rowid a CellLocator could resolve.
+            self._select_row_for_byte_offset(offset)
+            return
+        rowid, col_idx = result
+
+        for row in range(self._source_model.rowCount()):
+            row_item = self._source_model.item(row, 0)
+            if row_item is None or row_item.data(_ROWID_ROLE) != rowid:
+                continue
+            target_col = (col_idx + 1) if col_idx is not None else 0
+            source_index = self._source_model.index(row, target_col)
+            proxy_index = self._proxy_model.mapFromSource(source_index)
+            if proxy_index.isValid():
+                self._syncing_hex_selection = True
+                self._table_view.setCurrentIndex(proxy_index)
+                self._table_view.scrollTo(proxy_index)
+                self._syncing_hex_selection = False
+            break
+
+    def _select_row_for_byte_offset(self, offset: int) -> None:
+        """Hex → Table: select the row whose own stashed (file_kind,
+        byte_range) -- WAL Frames, a WAL-history row injected into a normal
+        table, or a Freeblocks/Unallocated Space row -- covers *offset* in
+        whichever file the Hex pane is currently showing. None of these have
+        a rowid a CellLocator could resolve, only their own exact bytes."""
+        for row in range(self._source_model.rowCount()):
+            row_item = self._source_model.item(row, 0)
+            if row_item is None:
+                continue
+            file_kind = row_item.data(_STRUCTURE_FILE_KIND_ROLE)
+            byte_range = row_item.data(_STRUCTURE_BYTE_RANGE_ROLE)
+            if file_kind != self._hex_file_kind or not _valid_structure_range(byte_range):
+                continue
+            start, end = byte_range
+            if not (start <= offset < end):
+                continue
+            source_index = self._source_model.index(row, 0)
+            proxy_index = self._proxy_model.mapFromSource(source_index)
+            if proxy_index.isValid():
+                self._syncing_hex_selection = True
+                self._table_view.setCurrentIndex(proxy_index)
+                self._table_view.scrollTo(proxy_index)
+                self._syncing_hex_selection = False
+            break
+
+    def _select_structure_item_for_offset(self, offset: int) -> None:
+        if self._hex_file_kind is None:
+            return
+        item = self._find_structure_item_for_offset(
+            self._structure_model.invisibleRootItem(),
+            offset,
+            self._hex_file_kind,
+        )
+        if item is None:
+            return
+        # A match that landed on a not-yet-expanded "Page N" item is only
+        # as specific as that coarse page-level range -- populate it and
+        # look again, so jumping from a hex click still resolves to the
+        # actual field/cell/column instead of stopping at the page.
+        if self._populate_structure_page_if_needed(item):
+            self._structure_tree.expand(self._structure_model.indexFromItem(item))
+            refined = self._find_structure_item_for_offset(item, offset, self._hex_file_kind)
+            if refined is not None:
+                item = refined
+        index = self._structure_model.indexFromItem(item)
+        if not index.isValid():
+            return
+        self._syncing_hex_selection = True
+        self._structure_tree.setCurrentIndex(index)
+        self._structure_tree.scrollTo(index)
+        self._syncing_hex_selection = False
+        self._sync_structure_hex_pane(index)
+
+    def _find_structure_item_for_offset(
+        self,
+        parent: QStandardItem,
+        offset: int,
+        file_kind: str,
+    ) -> QStandardItem | None:
+        item, _span = self._find_structure_item_for_offset_ex(parent, offset, file_kind)
+        return item
+
+    def _find_structure_item_for_offset_ex(
+        self,
+        parent: QStandardItem,
+        offset: int,
+        file_kind: str,
+    ) -> tuple[QStandardItem | None, int]:
+        """Return the narrowest-range match for *offset*, depth-first.
+
+        Sibling subtrees can legitimately have overlapping ranges (e.g. the
+        dedicated database-header breakdown and the generic Page 1 area both
+        cover the same header bytes), so ties aren't resolved by iteration
+        order -- the match with the smallest covering byte range wins,
+        recursively, since a more specific entry always describes fewer
+        bytes than the coarse one that contains it.
+        """
+        best: QStandardItem | None = None
+        best_span = -1
+        for row in range(parent.rowCount()):
+            item = parent.child(row, 0)
+            if item is None:
+                continue
+            child_match, child_span = self._find_structure_item_for_offset_ex(
+                item, offset, file_kind
+            )
+            if child_match is not None and (best is None or child_span < best_span):
+                best, best_span = child_match, child_span
+            item_file_kind = item.data(_STRUCTURE_FILE_KIND_ROLE) or "base"
+            if item_file_kind != file_kind:
+                continue
+            ranges = item.data(_STRUCTURE_HIGHLIGHT_RANGES_ROLE)
+            if not isinstance(ranges, list):
+                rng = item.data(_STRUCTURE_BYTE_RANGE_ROLE)
+                ranges = [rng] if _valid_structure_range(rng) else []
+            matching_spans = [end - start for start, end in ranges if start <= offset < end]
+            if matching_spans:
+                span = min(matching_spans)
+                if best is None or span < best_span:
+                    best, best_span = item, span
+        return best, best_span
+
+    def _on_table_scroll_activity(self, _value: int = 0) -> None:
+        if not self._table_interaction_active:
+            acquire_foreground_io()
+            self._table_interaction_active = True
+        self._table_interaction_timer.start()
+
+    def _end_table_interaction(self) -> None:
+        if not self._table_interaction_active:
+            return
+        self._table_interaction_active = False
+        release_foreground_io()
+
+    def keyPressEvent(self, event: object) -> None:  # type: ignore[override]
+        if hasattr(event, "matches") and event.matches(QKeySequence.StandardKey.Copy):
+            rows = sorted({i.row() for i in self._table_view.selectedIndexes()})
+            if not rows and self._table_view.currentIndex().isValid():
+                rows = [self._table_view.currentIndex().row()]
+            if rows:
+                self._copy_rows(rows)
+            return
+        super().keyPressEvent(event)  # type: ignore[arg-type]
+
+    def closeEvent(self, event: object) -> None:  # type: ignore[override]
+        self._table_interaction_timer.stop()
+        self._end_table_interaction()
+        if self._db_conn is not None:
+            self._db_conn.close()
+            self._db_conn = None
+        if self._raw_db_conn is not None:
+            self._raw_db_conn.close()
+            self._raw_db_conn = None
+        if self._db_path:
+            for suffix in ("", "-wal", "-shm"):
+                companion = Path(str(self._db_path) + suffix)
+                if companion.exists():
+                    try:
+                        companion.unlink()
+                    except Exception:
+                        pass
+        super().closeEvent(event)  # type: ignore[arg-type]
+
+
+class _NumericSortProxy(QSortFilterProxyModel):
+    def lessThan(self, left, right) -> bool:  # type: ignore[override]
+        try:
+            left_data = self.sourceModel().data(left, Qt.ItemDataRole.UserRole)
+            right_data = self.sourceModel().data(right, Qt.ItemDataRole.UserRole)
+        except OverflowError:
+            left_data = None
+            right_data = None
+        if isinstance(left_data, (int, float)) and isinstance(right_data, (int, float)):
+            return left_data < right_data
+        # Also handle TEXT columns that store numeric-looking strings (SQLite TEXT
+        # affinity returns Python str, so no UserRole is set for those values).
+        left_str = self.sourceModel().data(left, Qt.ItemDataRole.DisplayRole) or ""
+        right_str = self.sourceModel().data(right, Qt.ItemDataRole.DisplayRole) or ""
+        try:
+            return float(left_str) < float(right_str)
+        except (ValueError, TypeError):
+            pass
+        return super().lessThan(left, right)
+
+
+def _coerce_blob(value: object) -> bytes | None:
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, memoryview):
+        return value.tobytes()
+    return None

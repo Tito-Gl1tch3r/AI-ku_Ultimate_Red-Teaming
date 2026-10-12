@@ -1,0 +1,687 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Forensic integrity audit report: run data model + HTML/Markdown rendering.
+
+Shared by conftest.py (one run → reports/forensic_audit.{json,html}) and
+scripts/combine_forensic_audit.py (one run per OS → the combined report
+attached to every GitHub release). Standard library only, so the combine
+step needs no dependency install.
+
+A *run* is a plain dict (see build_run()); schema_version bumps whenever a
+field changes meaning, so an archived JSON stays interpretable.
+"""
+from __future__ import annotations
+
+import datetime
+import html as _html
+import json
+import os
+import platform
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+from crush.data import site_theme
+
+SCHEMA_VERSION = 1
+DEFAULT_REPOSITORY = "https://github.com/kalink0/crush-forensics"
+
+CATEGORY_ORDER = [
+    "Source Immutability",
+    "No Side Effects",
+    "Read-only Media",
+    "Known-output Verification",
+    "Completeness",
+    "Reproducibility",
+]
+
+CATEGORY_INTROS: dict[str, str] = {
+    "Source Immutability": (
+        "The tool must never modify digital evidence it reads. "
+        "These tests verify that after any VFS read operation the source data is "
+        "byte-identical to its pre-examination state."
+    ),
+    "No Side Effects": (
+        "Parsing an artifact must not create additional files next to the evidence. "
+        "Sibling files such as SQLite WAL or journal entries would alter the "
+        "evidence directory and compromise the examination."
+    ),
+    "Read-only Media": (
+        "The tool must operate correctly when evidence has read-only permissions "
+        "(chmod 0o444 / 0o555), simulating examination of write-protected forensic media."
+    ),
+    "Known-output Verification": (
+        "Committed reference artifacts must parse to their exact, pre-computed values. "
+        "These are fixed-point checks: if parser output changes for a known input, "
+        "the test fails."
+    ),
+    "Completeness": (
+        "Every plausible interpretation of a value must always be produced — silently "
+        "omitting a valid interpretation means potentially missing forensic evidence. "
+        "These tests verify that no interpretation group is ever dropped."
+    ),
+    "Reproducibility": (
+        "Parsing the same artifact twice must produce identical results. "
+        "Non-deterministic output would undermine the reliability of forensic findings."
+    ),
+}
+
+# What a forensic check is about: every @pytest.mark.forensic names one of these
+# as its subject. Listed in the order crush/docs/forensic-test-coverage.md shows
+# them. test_forensic_coverage holds the list against the code -- every source
+# type, disk-image filesystem and parser must be here -- so something new that
+# Crush reads shows up on the coverage page, as "not tested" until it has checks.
+SUBJECT_GROUPS: dict[str, tuple[str, ...]] = {
+    "Sources": (
+        "Folder",
+        "Single file",
+        "ZIP archive",
+        "7z archive",
+        "TAR archive",
+        "gzip file",
+        "Android backup (.ab)",
+        "iTunes backup",
+        "Cellebrite UFDR",
+        "Cellebrite UFD",
+        "Cellebrite UFDX",
+        "Raw disk image",
+        "EWF acquisition (.E01)",
+        "SMART acquisition (.s01)",
+        "EWF2 acquisition (.Ex01)",
+        "AFF acquisition (.aff/.afd)",
+        "AFF4 acquisition (.aff4)",
+        "EnCase logical evidence (.L01)",
+        "FTK Imager logical evidence (.ad1)",
+        "Apple disk image (.dmg/.sparseimage/.sparsebundle)",
+        "VHD/VHDX virtual disk",
+        "VMDK virtual disk",
+        "QCOW virtual disk",
+    ),
+    "Disk image filesystems": (
+        "NTFS",
+        "FAT32",
+        "exFAT",
+        "ext2/3/4",
+        "F2FS",
+        "HFS+",
+        "APFS",
+        "QNX6",
+        "QNX4",
+        "QNX IFS",
+        "ETFS",
+        "EFS",
+        "SquashFS",
+        "JFFS2",
+        "UBI",
+        "UBIFS",
+        "YAFFS1/YAFFS2",
+        "U-Boot environment / NVRAM store",
+    ),
+    "File formats": (
+        "SQLite database",
+        "SQLite WAL",
+        "SQLite rollback journal",
+        "Realm database",
+        "LevelDB",
+        "MMKV",
+        "Property list (plist)",
+        "Android Binary XML (ABX)",
+        "SEGB",
+        "XML",
+        "JSON",
+        "Protobuf",
+        "Protobuf with .proto schema",
+        "PDF",
+        "Image",
+        "Apple ATX",
+        "Apple KTX",
+        "Audio/video",
+        "Log file",
+        "Hex view (any file)",
+    ),
+    "Tools": (
+        "BLOB Inspector",
+        "Value Inspector",
+        "Multi-Log Studio",
+    ),
+}
+SUBJECTS: tuple[str, ...] = tuple(s for group in SUBJECT_GROUPS.values() for s in group)
+
+# (subject, category) pairs a check cannot exist for, with the reason the
+# coverage page shows -- so "no check" there reads as not applicable rather
+# than as a gap.
+_NO_FILE = "decodes values typed or pasted by the analyst; reads no file"
+NOT_APPLICABLE: dict[tuple[str, str], str] = {
+    ("Value Inspector", "Source Immutability"): _NO_FILE,
+    ("Value Inspector", "No Side Effects"): _NO_FILE,
+    ("Value Inspector", "Read-only Media"): _NO_FILE,
+}
+
+
+# ---------------------------------------------------------------------------
+# Run data
+# ---------------------------------------------------------------------------
+
+def _git(rootdir: Path, *args: str) -> str | None:
+    try:
+        out = subprocess.run(
+            ["git", *args], cwd=rootdir, capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def collect_environment(rootdir: Path) -> dict[str, Any]:
+    """What this run was executed against: code revision, OS, interpreter."""
+    from crush import __version__
+
+    commit = os.environ.get("GITHUB_SHA") or _git(rootdir, "rev-parse", "HEAD")
+    # Uncommitted tracked changes mean the report does not describe `commit`
+    # exactly; None when git itself isn't available.
+    status = _git(rootdir, "status", "--porcelain", "--untracked-files=no")
+    try:
+        import PySide6
+        pyside: str | None = PySide6.__version__
+    except ImportError:
+        pyside = None
+
+    server = os.environ.get("GITHUB_SERVER_URL")
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    return {
+        "crush_version": __version__,
+        "commit": commit,
+        "commit_dirty": None if status is None else bool(status),
+        "ref": os.environ.get("GITHUB_REF_NAME"),
+        "repository": f"{server}/{repo}" if server and repo else DEFAULT_REPOSITORY,
+        "os": platform.system(),
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "python": sys.version.split()[0],
+        "pyside6": pyside,
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+    }
+
+
+def build_run(
+    results: list[dict[str, Any]],
+    environment: dict[str, Any],
+    corpus: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "environment": environment,
+        "corpus": corpus,
+        "results": results,
+    }
+
+
+def counts(results: list[dict[str, Any]]) -> dict[str, int]:
+    c = {"passed": 0, "failed": 0, "skipped": 0}
+    for r in results:
+        c[r["outcome"]] = c.get(r["outcome"], 0) + 1
+    return c
+
+
+# ---------------------------------------------------------------------------
+# Rendering helpers
+# ---------------------------------------------------------------------------
+
+def _source_url(env: dict[str, Any], path: str | None, line: int | None) -> str | None:
+    """Commit-pinned link to the test's source, so a reader sees exactly the
+    code that produced this result. None without a commit to pin to."""
+    if not env.get("commit") or not path:
+        return None
+    # A Windows run records the path with backslashes; the URL needs slashes
+    # whichever OS renders it.
+    url = f"{env['repository']}/blob/{env['commit']}/{path.replace(chr(92), '/')}"
+    return f"{url}#L{line}" if line else url
+
+
+def _run_label(env: dict[str, Any]) -> str:
+    os_name = str(env.get("os") or "unknown")
+    return "macOS" if os_name == "Darwin" else os_name
+
+
+def _merged_tests(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Union of all runs' tests, first-seen order, with per-run outcomes."""
+    merged: dict[str, dict[str, Any]] = {}
+    for idx, run in enumerate(runs):
+        for r in run["results"]:
+            entry = merged.setdefault(r["nodeid"], {**r, "outcomes": {}})
+            entry["outcomes"][idx] = r
+    return list(merged.values())
+
+
+def _by_category(tests: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    by_cat: dict[str, list[dict[str, Any]]] = {c: [] for c in CATEGORY_ORDER}
+    for t in tests:
+        by_cat.setdefault(t["category"], []).append(t)
+    return by_cat
+
+
+def overall_verdict(runs: list[dict[str, Any]], expected: int | None = None) -> str:
+    """FAIL on any failed check, or when a platform produced no run at all."""
+    if expected is not None and len(runs) < expected:
+        return "FAIL"
+    return "FAIL" if any(counts(r["results"])["failed"] for r in runs) else "PASS"
+
+
+def missing_runs_note(runs: list[dict[str, Any]], expected: int | None) -> str:
+    if expected is None or len(runs) >= expected:
+        return ""
+    return (
+        f"Only {len(runs)} of {expected} platforms produced results; the missing "
+        "platform(s) never reached the end of the test run (see the workflow log)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# HTML
+# ---------------------------------------------------------------------------
+
+_CSS = site_theme.CSS + """
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+         font-size:14px;color:var(--text);background:var(--bg)}
+    a{color:inherit}
+    header{background:var(--header-bg);color:var(--header-text);padding:24px 72px 20px 32px}
+    header h1{font-size:20px;font-weight:600;letter-spacing:.3px}
+    .meta{margin-top:5px;font-size:12px;opacity:.75;line-height:1.6}
+    .meta code{font-family:"SF Mono","Fira Code",monospace}
+    .overall{display:inline-flex;align-items:center;gap:12px;
+             margin-top:14px;background:rgba(255,255,255,.08);
+             padding:8px 16px;border-radius:6px}
+    .verdict{font-size:18px;font-weight:700;letter-spacing:1px}
+    .verdict.pass{color:#4ade80}.verdict.fail{color:#f87171}
+    .counts{font-size:12px;opacity:.75}
+    main{max-width:1040px;margin:0 auto;padding:24px 16px 40px}
+    section{background:var(--surface);border-radius:8px;padding:20px 24px;
+            margin-bottom:18px;box-shadow:0 1px 3px var(--shadow);overflow-x:auto}
+    .cat-header{display:flex;align-items:center;gap:10px;margin-bottom:6px}
+    .cat-header h2{font-size:15px;font-weight:600}
+    .cat-count{font-size:12px;color:var(--muted)}
+    .badge{font-size:11px;font-weight:700;letter-spacing:.4px;
+           padding:2px 8px;border-radius:4px}
+    .badge.pass{background:var(--badge-pass-bg);color:var(--badge-pass-fg)}
+    .badge.fail{background:var(--badge-fail-bg);color:var(--badge-fail-fg)}
+    .cat-intro{font-size:13px;color:var(--muted);line-height:1.55;margin-bottom:14px}
+    table{width:100%;border-collapse:collapse}
+    th{text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;
+       letter-spacing:.5px;color:var(--faint);padding:6px 10px;
+       border-bottom:2px solid var(--border-strong)}
+    td{padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top}
+    tr:last-child td{border-bottom:none}
+    .col-status{width:80px}.col-fn{width:260px}
+    .cell-status{font-weight:700;font-size:11px;letter-spacing:.5px;white-space:nowrap}
+    .status-passed{color:var(--pass)}.status-failed{color:var(--fail)}
+    .status-skipped,.status-missing{color:var(--skip)}
+    .cell-fn{font-family:"SF Mono","Fira Code",monospace;font-size:12px;color:var(--accent);
+             word-break:break-all}
+    .cell-hash{font-family:"SF Mono","Fira Code",monospace;font-size:11px;
+               color:var(--faint);word-break:break-all}
+    .cell-size{text-align:right;color:var(--faint);font-size:12px;white-space:nowrap}
+    .row-failed{background:var(--row-failed)}
+    details{margin-top:6px;font-size:12px;color:var(--muted)}
+    details pre{white-space:pre-wrap;word-break:break-word;font-size:11px;
+                background:var(--code-bg);padding:8px;border-radius:4px;margin-top:4px}
+    footer{text-align:center;font-size:11px;color:var(--faint);padding:0 0 24px}
+"""
+
+
+def _status_cell(result: dict[str, Any] | None) -> str:
+    oc = result["outcome"] if result else "missing"
+    label = "NOT RUN" if oc == "missing" else oc.upper()
+    return f'<td class="cell-status status-{oc}">{label}</td>'
+
+
+def _reason_block(test: dict[str, Any], labels: list[str]) -> str:
+    parts = ""
+    for idx, r in sorted(test["outcomes"].items()):
+        if r["outcome"] != "passed" and r.get("reason"):
+            parts += (
+                f"<details><summary>{_html.escape(labels[idx])}: "
+                f"{_html.escape(r['outcome'])}</summary>"
+                f"<pre>{_html.escape(r['reason'])}</pre></details>"
+            )
+    return parts
+
+
+def _environment_table(runs: list[dict[str, Any]]) -> str:
+    rows = ""
+    for run in runs:
+        env = run["environment"]
+        c = counts(run["results"])
+        rows += (
+            "<tr>"
+            f"<td>{_html.escape(_run_label(env))}</td>"
+            f'<td class="cell-fn">{_html.escape(str(env.get("platform") or ""))}</td>'
+            f"<td>{_html.escape(str(env.get('python') or ''))}</td>"
+            f"<td>{_html.escape(str(env.get('pyside6') or '—'))}</td>"
+            f"<td>{c['passed']} passed · {c['failed']} failed · {c['skipped']} skipped</td>"
+            f"<td>{_html.escape(str(env.get('generated_at') or ''))}</td>"
+            "</tr>\n"
+        )
+    return f"""
+<section>
+  <div class="cat-header"><h2>Test Environments</h2></div>
+  <p class="cat-intro">
+    Every platform below ran the same forensic test suite against the same
+    commit. A test marked NOT RUN was not collected on that platform.
+  </p>
+  <table>
+    <thead><tr>
+      <th>OS</th><th>Platform</th><th>Python</th><th>PySide6</th>
+      <th>Result</th><th>Run at (UTC)</th>
+    </tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+</section>"""
+
+
+def _corpus_section(corpus: dict[str, dict[str, Any]]) -> str:
+    rows = ""
+    for name, info in sorted(corpus.items()):
+        rows += (
+            "<tr>"
+            f'<td class="cell-fn">{_html.escape(name)}</td>'
+            f'<td class="cell-hash">{_html.escape(info["sha256"])}</td>'
+            f'<td class="cell-size">{info["size"]:,}&thinsp;B</td>'
+            "</tr>\n"
+        )
+    return f"""
+<section>
+  <div class="cat-header">
+    <h2>Reference Corpus</h2>
+    <span class="badge pass">VERIFIED</span>
+  </div>
+  <p class="cat-intro">
+    SHA-256 checksums of the committed test-evidence files.
+    The corpus integrity check runs before the first test and aborts the session
+    if any file has been modified.
+  </p>
+  <table>
+    <thead><tr>
+      <th class="col-fn">File</th>
+      <th>SHA-256</th>
+      <th style="text-align:right">Size</th>
+    </tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+</section>"""
+
+
+def render_html(
+    runs: list[dict[str, Any]], expected: int | None = None, history_url: str | None = None,
+) -> str:
+    """Render one or more runs (one per OS) of the same commit as one report.
+
+    `expected`: how many platforms should have reported; fewer is shown as a
+    FAIL with a warning rather than as a clean report over fewer columns.
+    `history_url`: absolute link to the published overview of all releases'
+    reports (the file is also opened from a release download, so no relative link).
+    """
+    if not runs:
+        raise ValueError("no runs to render")
+    env0 = runs[0]["environment"]
+    labels = [_run_label(r["environment"]) for r in runs]
+    tests = _merged_tests(runs)
+    verdict = overall_verdict(runs, expected)
+    ov_cls = verdict.lower()
+    missing = missing_runs_note(runs, expected)
+    warning = f'<div class="meta"><strong>{_html.escape(missing)}</strong></div>' if missing else ""
+    history = (
+        f'<div class="meta"><a href="{_html.escape(history_url)}">'
+        "Audit reports of all releases</a></div>"
+        if history_url else ""
+    )
+    total = counts([r for run in runs for r in run["results"]])
+
+    status_heads = "".join(
+        f'<th class="col-status">{_html.escape(lbl)}</th>' for lbl in labels
+    )
+    sections = ""
+    for category, cat_tests in _by_category(tests).items():
+        if not cat_tests:
+            continue
+        cat_results = [r for t in cat_tests for r in t["outcomes"].values()]
+        c = counts(cat_results)
+        badge_cls = "pass" if c["failed"] == 0 else "fail"
+        counter = f"{len(cat_tests)} checks"
+        if c["failed"]:
+            counter += f" &nbsp;·&nbsp; {c['failed']} failed"
+        rows = ""
+        for t in cat_tests:
+            failed = any(r["outcome"] == "failed" for r in t["outcomes"].values())
+            url = _source_url(env0, t.get("path"), t.get("line"))
+            name = _html.escape(t["name"])
+            fn = f'<a href="{_html.escape(url)}">{name}</a>' if url else name
+            statuses = "".join(_status_cell(t["outcomes"].get(i)) for i in range(len(runs)))
+            rows += (
+                f'<tr class="{"row-failed" if failed else ""}">'
+                f"{statuses}"
+                f'<td>{_html.escape(t["desc"])}{_reason_block(t, labels)}</td>'
+                f'<td class="cell-fn">{fn}</td>'
+                "</tr>\n"
+            )
+        sections += f"""
+<section>
+  <div class="cat-header">
+    <h2>{_html.escape(category)}</h2>
+    <span class="badge {badge_cls}">{badge_cls.upper()}</span>
+    <span class="cat-count">{counter}</span>
+  </div>
+  <p class="cat-intro">{_html.escape(CATEGORY_INTROS.get(category, ""))}</p>
+  <table>
+    <thead><tr>
+      {status_heads}
+      <th>Forensic Property Verified</th>
+      <th class="col-fn">Test Function</th>
+    </tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+</section>"""
+
+    commit = env0.get("commit")
+    if commit:
+        commit_html = (
+            f'<a href="{_html.escape(env0["repository"])}/tree/{_html.escape(commit)}">'
+            f"<code>{_html.escape(commit[:12])}</code></a>"
+        )
+        if env0.get("commit_dirty"):
+            commit_html += " (with uncommitted changes)"
+    else:
+        commit_html = "unknown"
+    ref = f" &nbsp;|&nbsp; {_html.escape(env0['ref'])}" if env0.get("ref") else ""
+    generated = _html.escape(max(str(r["environment"].get("generated_at", "")) for r in runs))
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Crush Forensic Audit</title>
+  {site_theme.HEAD_SCRIPT}
+  <style>{_CSS}</style>
+</head>
+<body>
+<header>
+  {site_theme.toggle()}
+  <h1>Crush &mdash; Forensic Integrity Audit Report</h1>
+  <div class="meta">
+    Crush {_html.escape(str(env0.get("crush_version")))}{ref} &nbsp;|&nbsp;
+    Commit {commit_html} &nbsp;|&nbsp;
+    Platforms: {_html.escape(", ".join(labels))}
+  </div>
+  <div class="overall">
+    <span class="verdict {ov_cls}">{verdict}</span>
+    <span class="counts">
+      {len(tests)} checks &nbsp;&middot;&nbsp;
+      {total["passed"]} passed &nbsp;&middot;&nbsp;
+      {total["failed"]} failed &nbsp;&middot;&nbsp;
+      {total["skipped"]} skipped (across all platforms)
+    </span>
+  </div>
+  {warning}
+  {history}
+</header>
+<main>
+{_environment_table(runs)}
+{sections}
+{_corpus_section(runs[0]["corpus"])}
+</main>
+<footer>crush-forensics &nbsp;&middot;&nbsp; forensic audit report &nbsp;&middot;&nbsp; {generated}</footer>
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------------------
+# Markdown (GitHub Actions job summary / release notes)
+# ---------------------------------------------------------------------------
+
+def render_markdown_summary(
+    runs: list[dict[str, Any]], footer: str, expected: int | None = None,
+) -> str:
+    verdict = overall_verdict(runs, expected)
+    missing = missing_runs_note(runs, expected)
+    icon = "white_check_mark" if verdict == "PASS" else "x"
+    labels = [_run_label(r["environment"]) for r in runs]
+    tests = _merged_tests(runs)
+
+    head = "| Category | " + " | ".join(labels) + " |\n"
+    head += "|---|" + "---|" * len(labels) + "\n"
+    rows = ""
+    for category, cat_tests in _by_category(tests).items():
+        if not cat_tests:
+            continue
+        cells = []
+        for idx in range(len(runs)):
+            c = counts([t["outcomes"][idx] for t in cat_tests if idx in t["outcomes"]])
+            cell = f"{':white_check_mark:' if c['failed'] == 0 else ':x:'} {c['passed']} passed"
+            if c["failed"]:
+                cell += f", {c['failed']} failed"
+            if c["skipped"]:
+                cell += f", {c['skipped']} skipped"
+            cells.append(cell)
+        rows += f"| {category} | " + " | ".join(cells) + " |\n"
+
+    return (
+        f"\n## :{icon}: Forensic Integrity Audit &mdash; {verdict}\n\n"
+        f"{head}{rows}\n"
+        + (f"> **Warning:** {missing}\n\n" if missing else "")
+        + f"{footer}\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# GitHub Pages: release history + badge (scripts/build_audit_pages.py)
+# ---------------------------------------------------------------------------
+
+def release_summary(
+    combined: dict[str, Any], fallback_expected: int | None = None,
+) -> dict[str, Any]:
+    """Headline figures of one release's combined report, computed exactly as
+    render_html() computes them. `fallback_expected` stands in only for a
+    combined JSON written before expected_platforms was stored."""
+    runs = combined["runs"]
+    if not runs:
+        raise ValueError("combined report holds no runs")
+    expected = combined.get("expected_platforms", fallback_expected)
+    env0 = runs[0]["environment"]
+    return {
+        "verdict": overall_verdict(runs, expected),
+        "checks": len(_merged_tests(runs)),
+        "counts": counts([r for run in runs for r in run["results"]]),
+        "platforms": [_run_label(r["environment"]) for r in runs],
+        "expected_platforms": expected,
+        "missing_note": missing_runs_note(runs, expected),
+        "commit": env0.get("commit"),
+        "repository": env0.get("repository") or DEFAULT_REPOSITORY,
+        "crush_version": env0.get("crush_version"),
+    }
+
+
+def render_badge_json(summary: dict[str, Any]) -> str:
+    """shields.io endpoint badge (https://shields.io/badges/endpoint-badge)."""
+    passed = summary["verdict"] == "PASS"
+    return json.dumps({
+        "schemaVersion": 1,
+        "label": "forensic audit",
+        "message": f"{summary['verdict']} · {summary['checks']} checks",
+        "color": "brightgreen" if passed else "red",
+    })
+
+
+def render_history_html(entries: list[dict[str, Any]], latest: str) -> str:
+    """Overview of every release that has an audit report attached, in the
+    order given. Each entry: tag, published_at, release_url, summary."""
+    rows = ""
+    for e in entries:
+        s = e["summary"]
+        c = s["counts"]
+        tag = _html.escape(e["tag"])
+        verdict_cls = s["verdict"].lower()
+        commit = s["commit"]
+        commit_html = (
+            f'<a href="{_html.escape(s["repository"])}/tree/{_html.escape(commit)}">'
+            f"<code>{_html.escape(commit[:12])}</code></a>"
+            if commit else "unknown"
+        )
+        note = f"<br><small>{_html.escape(s['missing_note'])}</small>" if s["missing_note"] else ""
+        marker = " (latest)" if e["tag"] == latest else ""
+        rows += (
+            f'<tr class="{"row-failed" if verdict_cls == "fail" else ""}">'
+            f'<td><a href="{_html.escape(e["release_url"])}">{tag}</a>{marker}</td>'
+            f"<td>{_html.escape(str(e['published_at'] or ''))}</td>"
+            f'<td class="cell-fn">{commit_html}</td>'
+            f'<td class="cell-status status-{"passed" if verdict_cls == "pass" else "failed"}">'
+            f"{s['verdict']}</td>"
+            f"<td>{s['checks']} checks<br><small>{c['passed']} passed · {c['failed']} failed · "
+            f"{c['skipped']} skipped (across all platforms)</small>{note}</td>"
+            f"<td>{_html.escape(', '.join(s['platforms']))}</td>"
+            f'<td><a href="{tag}/">HTML</a> · <a href="{tag}/report.json">JSON</a></td>'
+            "</tr>\n"
+        )
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Crush Forensic Audit — All Releases</title>
+  {site_theme.HEAD_SCRIPT}
+  <style>{_CSS}</style>
+</head>
+<body>
+<header>
+  {site_theme.toggle()}
+  <h1>Crush &mdash; Forensic Integrity Audit: All Releases</h1>
+  <div class="meta">
+    One row per release that has an audit report attached. Each report is the
+    file attached to that GitHub release, unchanged. Releases before v0.21.0
+    have no audit report. <a href="./">Latest report</a>
+  </div>
+</header>
+<main>
+<section>
+  <table>
+    <thead><tr>
+      <th>Release</th><th>Published (UTC)</th><th>Commit</th><th>Verdict</th>
+      <th>Checks</th><th>Platforms</th><th>Report</th>
+    </tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+</section>
+</main>
+</body>
+</html>"""
+
+
+def write_run(run: dict[str, Any], out_dir: Path) -> tuple[Path, Path]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    json_path = out_dir / "forensic_audit.json"
+    html_path = out_dir / "forensic_audit.html"
+    json_path.write_text(json.dumps(run, indent=2), encoding="utf-8")
+    html_path.write_text(render_html([run]), encoding="utf-8")
+    return json_path, html_path

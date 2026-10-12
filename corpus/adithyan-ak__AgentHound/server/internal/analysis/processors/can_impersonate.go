@@ -1,0 +1,224 @@
+package processors
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/adithyan-ak/agenthound/sdk/ingest"
+	"github.com/adithyan-ak/agenthound/server/internal/analysis/similarity"
+	"github.com/adithyan-ak/agenthound/server/internal/graph"
+)
+
+const impersonationThreshold = 0.8
+
+type CanImpersonate struct{}
+
+func (p *CanImpersonate) Name() string           { return "can_impersonate" }
+func (p *CanImpersonate) Dependencies() []string { return nil }
+
+func (p *CanImpersonate) Process(ctx context.Context, db graph.GraphDB, scanID string) (graph.ProcessingStats, error) {
+	start := time.Now()
+
+	agents, err := p.loadAgents(ctx, db)
+	if err != nil {
+		return graph.ProcessingStats{
+			ProcessorName: p.Name(),
+			Duration:      time.Since(start),
+		}, fmt.Errorf("load agents: %w", err)
+	}
+
+	if len(agents) < 2 {
+		return graph.ProcessingStats{
+			ProcessorName: p.Name(),
+			Duration:      time.Since(start),
+		}, nil
+	}
+
+	docs, err := p.buildDocuments(ctx, db, agents)
+	if err != nil {
+		return graph.ProcessingStats{
+			ProcessorName: p.Name(),
+			Duration:      time.Since(start),
+		}, fmt.Errorf("build documents: %w", err)
+	}
+
+	var edges []ingest.Edge
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	for i := 0; i < len(agents); i++ {
+		for j := i + 1; j < len(agents); j++ {
+			if !scopesCompatible(agents[i].scopeCoordinates, agents[j].scopeCoordinates) {
+				continue
+			}
+			if agents[i].provider != "" && agents[i].provider == agents[j].provider {
+				continue
+			}
+			sim := compatiblePairSimilarity(agents, docs, i, j)
+			if sim < impersonationThreshold {
+				continue
+			}
+
+			edges = append(edges, ingest.Edge{
+				Source:     agents[i].id,
+				Target:     agents[j].id,
+				Kind:       "CAN_IMPERSONATE",
+				SourceKind: "A2AAgent",
+				TargetKind: "A2AAgent",
+				Properties: map[string]any{
+					"scan_id":          scanID,
+					"last_seen":        now,
+					"is_composite":     true,
+					"source_collector": "a2a",
+					"confidence":       sim,
+					"risk_weight":      0.6,
+					"evidence_version": 1,
+					"evidence_node_ids": []string{
+						agents[i].id,
+						agents[j].id,
+					},
+					"evidence_relationship_ids": []string{},
+				},
+			})
+
+			edges = append(edges, ingest.Edge{
+				Source:     agents[j].id,
+				Target:     agents[i].id,
+				Kind:       "CAN_IMPERSONATE",
+				SourceKind: "A2AAgent",
+				TargetKind: "A2AAgent",
+				Properties: map[string]any{
+					"scan_id":          scanID,
+					"last_seen":        now,
+					"is_composite":     true,
+					"source_collector": "a2a",
+					"confidence":       sim,
+					"risk_weight":      0.6,
+					"evidence_version": 1,
+					"evidence_node_ids": []string{
+						agents[j].id,
+						agents[i].id,
+					},
+					"evidence_relationship_ids": []string{},
+				},
+			})
+		}
+	}
+
+	if len(edges) == 0 {
+		return graph.ProcessingStats{
+			ProcessorName: p.Name(),
+			Duration:      time.Since(start),
+		}, nil
+	}
+
+	written, err := db.WriteCompositeEdges(ctx, edges, scanID)
+	if err != nil {
+		return graph.ProcessingStats{
+			ProcessorName: p.Name(),
+			Duration:      time.Since(start),
+		}, fmt.Errorf("write edges: %w", err)
+	}
+
+	return graph.ProcessingStats{
+		ProcessorName: p.Name(),
+		EdgesCreated:  written,
+		Duration:      time.Since(start),
+	}, nil
+}
+
+// compatiblePairSimilarity prevents agents from unrelated collection scopes
+// from changing the TF-IDF weights used to decide an otherwise compatible
+// pair. The comparison corpus is the intersection of observations that may
+// compose with both endpoints.
+func compatiblePairSimilarity(agents []agentInfo, docs map[string]string, left, right int) float64 {
+	var texts []string
+	leftIndex, rightIndex := -1, -1
+	for index, agent := range agents {
+		if !scopesCompatible(agents[left].scopeCoordinates, agent.scopeCoordinates) ||
+			!scopesCompatible(agents[right].scopeCoordinates, agent.scopeCoordinates) {
+			continue
+		}
+		if index == left {
+			leftIndex = len(texts)
+		}
+		if index == right {
+			rightIndex = len(texts)
+		}
+		texts = append(texts, docs[agent.id])
+	}
+	if leftIndex < 0 || rightIndex < 0 {
+		return 0
+	}
+	corpus := similarity.NewCorpus(texts)
+	leftVector := corpus.TFIDFVector(texts[leftIndex])
+	rightVector := corpus.TFIDFVector(texts[rightIndex])
+	if leftVector == nil || rightVector == nil {
+		return 0
+	}
+	return similarity.CosineSimilarity(leftVector, rightVector)
+}
+
+type agentInfo struct {
+	id       string
+	provider string
+	scopeCoordinates
+}
+
+func (p *CanImpersonate) loadAgents(ctx context.Context, db graph.GraphDB) ([]agentInfo, error) {
+	rows, err := db.Query(ctx,
+		"MATCH (a:A2AAgent) RETURN a.objectid AS id, a.name AS name, a.provider AS provider, a.identity_scope AS scope_kind, a.identity_scope_id AS scope_id, a.collection_point_id AS collection_point_id, a.network_context_id AS network_context_id",
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	agents := make([]agentInfo, 0, len(rows))
+	for _, row := range rows {
+		id, _ := row["id"].(string)
+		if id == "" {
+			continue
+		}
+		provider, _ := row["provider"].(string)
+		scopeKind, _ := row["scope_kind"].(string)
+		scopeID, _ := row["scope_id"].(string)
+		collectionPoint, _ := row["collection_point_id"].(string)
+		networkContextID, _ := row["network_context_id"].(string)
+		agents = append(agents, agentInfo{
+			id: id, provider: provider,
+			scopeCoordinates: scopeCoordinates{
+				kind: scopeKind, id: scopeID,
+				collectionPoint:  collectionPoint,
+				networkContextID: networkContextID,
+			},
+		})
+	}
+	return agents, nil
+}
+
+func (p *CanImpersonate) buildDocuments(ctx context.Context, db graph.GraphDB, agents []agentInfo) (map[string]string, error) {
+	docs := make(map[string]string, len(agents))
+
+	for _, a := range agents {
+		rows, err := db.Query(ctx,
+			"MATCH (a:A2AAgent {objectid: $id})-[:ADVERTISES_SKILL]->(s:A2ASkill) RETURN s.description AS description",
+			map[string]any{"id": a.id},
+		)
+		if err != nil {
+			return nil, fmt.Errorf("skills for agent %s: %w", a.id, err)
+		}
+
+		var parts []string
+		for _, row := range rows {
+			desc, _ := row["description"].(string)
+			if desc != "" {
+				parts = append(parts, desc)
+			}
+		}
+		docs[a.id] = strings.Join(parts, " ")
+	}
+
+	return docs, nil
+}

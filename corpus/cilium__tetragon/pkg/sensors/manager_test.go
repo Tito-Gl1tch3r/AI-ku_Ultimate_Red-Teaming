@@ -1,0 +1,650 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Tetragon
+
+package sensors
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/cilium/tetragon/api/v1/tetragon"
+	"github.com/cilium/tetragon/pkg/bpf"
+	"github.com/cilium/tetragon/pkg/k8s/apis/cilium.io/v1alpha1"
+	"github.com/cilium/tetragon/pkg/option"
+	"github.com/cilium/tetragon/pkg/policyfilter"
+	"github.com/cilium/tetragon/pkg/sensors/program"
+	"github.com/cilium/tetragon/pkg/server"
+	"github.com/cilium/tetragon/pkg/tracingpolicy"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	slimv1 "github.com/cilium/tetragon/pkg/k8s/slim/k8s/apis/meta/v1"
+)
+
+type dummyHandler struct {
+	s SensorIface
+	e error
+}
+
+func (d *dummyHandler) PolicyHandler(_ tracingpolicy.TracingPolicy, _ policyfilter.PolicyID) (SensorIface, error) {
+	return d.s, d.e
+}
+
+// TestAddPolicy tests the addition of a policy with a dummy sensor
+func TestAddPolicy(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	RegisterPolicyHandlerAtInit("dummy", &dummyHandler{s: &Sensor{Name: "dummy-sensor"}})
+	t.Cleanup(func() {
+		delete(registeredPolicyHandlers, "dummy")
+	})
+
+	policy := v1alpha1.TracingPolicy{}
+	mgr, err := StartSensorManager("")
+	require.NoError(t, err)
+	policy.Name = "test-policy"
+	err = mgr.AddTracingPolicy(ctx, &policy)
+	require.NoError(t, err)
+	l, err := mgr.ListSensors(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []SensorStatus{{Name: "dummy-sensor", Enabled: true, Collection: "test-policy (object:0/) (type:/)"}}, *l)
+}
+
+// TestAddSkippedTracingPolicy verifies a skipped policy is tracked and
+// reported as TP_STATE_SKIPPED without loading any sensor, and can be deleted.
+func TestAddSkippedTracingPolicy(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	RegisterPolicyHandlerAtInit("dummy", &dummyHandler{s: &Sensor{Name: "dummy-sensor"}})
+	t.Cleanup(func() {
+		delete(registeredPolicyHandlers, "dummy")
+	})
+
+	mgr, err := StartSensorManager("")
+	require.NoError(t, err)
+
+	policy := v1alpha1.TracingPolicy{
+		Name: "skipped-policy"}
+	err = mgr.AddTracingPolicyWithState(ctx, &policy, SkippedState)
+	require.NoError(t, err)
+
+	// Reported as skipped.
+	l, err := mgr.ListTracingPolicies(ctx, "")
+	require.NoError(t, err)
+	require.Len(t, l.Policies, 1)
+	assert.Equal(t, "skipped-policy", l.Policies[0].Name)
+	assert.Equal(t, tetragon.TracingPolicyState_TP_STATE_SKIPPED, l.Policies[0].State)
+
+	// No sensor was loaded.
+	sl, err := mgr.ListSensors(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, *sl)
+
+	// A skipped policy has no BPF state to configure.
+	err = mgr.EnableTracingPolicy(ctx, "skipped-policy", "", policy.TpDomain())
+	require.ErrorContains(t, err, "is skipped")
+	err = mgr.DisableTracingPolicy(ctx, "skipped-policy", "", policy.TpDomain())
+	require.ErrorContains(t, err, "is skipped")
+
+	// A skipped policy holds no state, so tracking it again is not an error.
+	err = mgr.AddTracingPolicyWithState(ctx, &policy, SkippedState)
+	require.NoError(t, err)
+
+	// A skipped policy can be deleted like any tracked policy.
+	err = mgr.DeleteTracingPolicy(ctx, "skipped-policy", "", policy.TpDomain())
+	require.NoError(t, err)
+	l, err = mgr.ListTracingPolicies(ctx, "")
+	require.NoError(t, err)
+	assert.Empty(t, l.Policies)
+}
+
+// TestSkippedTracingPolicyLoaded covers the transition the reconcilers rely on
+// when a node is relabelled. A skipped policy holds no BPF state, so it can be
+// loaded either after a delete, or by overriding it directly.
+func TestSkippedTracingPolicyLoaded(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		deleteBeforeAdd bool
+	}{
+		{name: "delete_before_add", deleteBeforeAdd: true},
+		{name: "override_skipped", deleteBeforeAdd: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			RegisterPolicyHandlerAtInit("dummy", &dummyHandler{s: &Sensor{Name: "dummy-sensor"}})
+			t.Cleanup(func() {
+				delete(registeredPolicyHandlers, "dummy")
+			})
+
+			mgr, err := StartSensorManager("")
+			require.NoError(t, err)
+
+			policy := v1alpha1.TracingPolicy{
+				Name: "test-policy"}
+			require.NoError(t, mgr.AddTracingPolicyWithState(ctx, &policy, SkippedState))
+
+			if tc.deleteBeforeAdd {
+				require.NoError(t, mgr.DeleteTracingPolicy(ctx, "test-policy", "", policy.TpDomain()))
+			}
+			require.NoError(t, mgr.AddTracingPolicy(ctx, &policy))
+
+			l, err := mgr.ListTracingPolicies(ctx, "")
+			require.NoError(t, err)
+			require.Len(t, l.Policies, 1)
+			assert.Equal(t, tetragon.TracingPolicyState_TP_STATE_ENABLED, l.Policies[0].State)
+
+			sl, err := mgr.ListSensors(ctx)
+			require.NoError(t, err)
+			require.Len(t, *sl, 1)
+			assert.Equal(t, "dummy-sensor", (*sl)[0].Name)
+		})
+	}
+}
+
+// TestAddPolicies tests the addition of a policy with two dummy sensors
+func TestAddPolicies(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	RegisterPolicyHandlerAtInit("dummy1", &dummyHandler{s: &Sensor{Name: "dummy-sensor1"}})
+	RegisterPolicyHandlerAtInit("dummy2", &dummyHandler{s: &Sensor{Name: "dummy-sensor2"}})
+	t.Cleanup(func() {
+		delete(registeredPolicyHandlers, "dummy1")
+		delete(registeredPolicyHandlers, "dummy2")
+	})
+
+	policy := v1alpha1.TracingPolicy{}
+	mgr, err := StartSensorManager("")
+	require.NoError(t, err)
+	policy.Name = "test-policy"
+	err = mgr.AddTracingPolicy(ctx, &policy)
+	require.NoError(t, err)
+	l, err := mgr.ListSensors(ctx)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []SensorStatus{
+		{Name: "dummy-sensor1", Enabled: true, Collection: "test-policy (object:0/) (type:/)"},
+		{Name: "dummy-sensor2", Enabled: true, Collection: "test-policy (object:0/) (type:/)"},
+	}, *l)
+}
+
+func TestPoliciesDomain(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	RegisterPolicyHandlerAtInit("dummy1", &dummyHandler{s: &Sensor{Name: "dummy-sensor1"}})
+	RegisterPolicyHandlerAtInit("dummy2", &dummyHandler{s: &Sensor{Name: "dummy-sensor2"}})
+	t.Cleanup(func() {
+		delete(registeredPolicyHandlers, "dummy1")
+		delete(registeredPolicyHandlers, "dummy2")
+	})
+
+	policy := v1alpha1.TracingPolicy{}
+	mgr, err := StartSensorManager("")
+	require.NoError(t, err)
+	policy.Name = "test-policy"
+
+	// Add policy first time with "static" domain
+	err = mgr.AddTracingPolicy(ctx, &policy)
+	require.NoError(t, err)
+
+	// Adding it once again to the same domain should fail
+	err = mgr.AddTracingPolicy(ctx, &policy)
+	require.Error(t, err)
+
+	// Adding it to a new domain is ok
+	// Use the GRPCTracingPolicy wrapper to enforce the "grpc" domain.
+	gtp := server.GRPCTracingPolicy{TracingPolicy: &policy}
+	err = mgr.AddTracingPolicy(ctx, &gtp)
+	require.NoError(t, err)
+
+	// Empty domain will list all domains -> 2 policies
+	l, err := mgr.ListTracingPolicies(ctx, "")
+	require.NoError(t, err)
+	assert.Len(t, l.Policies, 2)
+
+	// list "test" domain -> 1 policy
+	l, err = mgr.ListTracingPolicies(ctx, policy.TpDomain())
+	require.NoError(t, err)
+	assert.Len(t, l.Policies, 1)
+
+	// list "test2" domain -> 1 policy
+	l, err = mgr.ListTracingPolicies(ctx, gtp.TpDomain())
+	require.NoError(t, err)
+	assert.Len(t, l.Policies, 1)
+}
+
+// TestAddPolicySpecError tests the addition of a policy where a spec fails to load
+func TestAddPolicySpecError(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	RegisterPolicyHandlerAtInit("dummy", &dummyHandler{s: &Sensor{Name: "dummy-sensor"}})
+	RegisterPolicyHandlerAtInit("spec-fail", &dummyHandler{e: errors.New("spec load is expected to fail: failed")})
+	t.Cleanup(func() {
+		delete(registeredPolicyHandlers, "dummy")
+		delete(registeredPolicyHandlers, "spec-fail")
+	})
+
+	policy := v1alpha1.TracingPolicy{}
+	mgr, err := StartSensorManager("")
+	require.NoError(t, err)
+	policy.Name = "test-policy"
+	err = mgr.AddTracingPolicy(ctx, &policy)
+	require.Error(t, err)
+	t.Logf("got error (as expected): %s", err)
+	l, err := mgr.ListSensors(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []SensorStatus{}, *l)
+}
+
+// TestAddPolicyLoadError tests the addition of a policy where the sensor is expected to fail
+func TestAddPolicyLoadError(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	RegisterPolicyHandlerAtInit("dummy", &dummyHandler{s: &Sensor{Name: "dummy-sensor"}})
+	RegisterPolicyHandlerAtInit("load-fail", &dummyHandler{s: &Sensor{
+		Name:  "dummy-sensor",
+		Progs: []*program.Program{{Name: "bpf-program-that-does-not-exist"}},
+	}})
+	t.Cleanup(func() {
+		delete(registeredPolicyHandlers, "dummy")
+		delete(registeredPolicyHandlers, "load-fail")
+	})
+
+	policy := v1alpha1.TracingPolicy{}
+	mgr, err := StartSensorManager("")
+	require.NoError(t, err)
+	policy.Name = "test-policy"
+	addError := mgr.AddTracingPolicy(ctx, &policy)
+	require.Error(t, addError)
+	t.Logf("got error (as expected): %s", addError)
+
+	l, err := mgr.ListTracingPolicies(ctx, policy.TpDomain())
+	require.NoError(t, err)
+	assert.Len(t, l.Policies, 1)
+	assert.Equal(t, LoadErrorState.ToTetragonState(), l.Policies[0].State)
+	assert.Equal(t, addError.Error(), l.Policies[0].Error)
+}
+
+func TestPolicyFilterDisabled(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	oldEnableK8s := option.Config.EnableK8s
+	option.Config.EnableK8s = true
+	t.Cleanup(func() {
+		option.Config.EnableK8s = oldEnableK8s
+	})
+
+	mgr, err := StartSensorManagerWithPF("", policyfilter.DisabledState())
+	require.NoError(t, err)
+
+	policy := v1alpha1.TracingPolicy{}
+
+	// normal policy should succeed
+	policyName := "test-policy"
+	policyNamespace := ""
+	policy.Name = policyName
+	err = mgr.AddTracingPolicy(ctx, &policy)
+	require.NoError(t, err, "Add tracing policy failed with error: %v", err)
+	err = mgr.DeleteTracingPolicy(ctx, policyName, policyNamespace, policy.TpDomain())
+	require.NoError(t, err)
+	err = mgr.AddTracingPolicy(ctx, &policy)
+	require.NoError(t, err)
+	err = mgr.DeleteTracingPolicy(ctx, policyName, policyNamespace, policy.TpDomain())
+	require.NoError(t, err)
+
+	// namespaced policy with disabled state should fail
+	namespacedPolicy := v1alpha1.TracingPolicyNamespaced{}
+	policy.Name = policyName
+	namespacedPolicy.Name = policyName
+	namespacedPolicy.Namespace = "namespace"
+	err = mgr.AddTracingPolicy(ctx, &namespacedPolicy)
+	require.Error(t, err)
+
+	// policy with pod selector should fail
+	policy.Spec.PodSelector = &slimv1.LabelSelector{
+		MatchExpressions: []slimv1.LabelSelectorRequirement{{
+			Key:      "app",
+			Operator: slimv1.LabelSelectorOpExists,
+		}},
+	}
+	err = mgr.AddTracingPolicy(ctx, &policy)
+	require.Error(t, err)
+}
+
+func TestPolicyStates(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	t.Run("LoadError", func(t *testing.T) {
+		RegisterPolicyHandlerAtInit("load-fail", &dummyHandler{s: &Sensor{
+			Name:  "dummy-sensor",
+			Progs: []*program.Program{{Name: "bpf-program-that-does-not-exist"}},
+		}})
+		t.Cleanup(func() {
+			delete(registeredPolicyHandlers, "load-fail")
+		})
+
+		policy := v1alpha1.TracingPolicy{}
+		mgr, err := StartSensorManager("")
+		require.NoError(t, err)
+		policy.Name = "test-policy"
+		addError := mgr.AddTracingPolicy(ctx, &policy)
+		require.Error(t, addError)
+
+		l, err := mgr.ListTracingPolicies(ctx, policy.TpDomain())
+		require.NoError(t, err)
+		assert.Len(t, l.Policies, 1)
+		assert.Equal(t, LoadErrorState.ToTetragonState(), l.Policies[0].State)
+		assert.Equal(t, addError.Error(), l.Policies[0].Error)
+	})
+
+	t.Run("EnabledDisabled", func(t *testing.T) {
+		RegisterPolicyHandlerAtInit("dummy", &dummyHandler{s: &Sensor{Name: "dummy-sensor"}})
+		t.Cleanup(func() {
+			delete(registeredPolicyHandlers, "dummy")
+		})
+
+		policy := v1alpha1.TracingPolicy{}
+		mgr, err := StartSensorManager("")
+		require.NoError(t, err)
+		policy.Name = "test-policy"
+		err = mgr.AddTracingPolicy(ctx, &policy)
+		require.NoError(t, err)
+
+		l, err := mgr.ListTracingPolicies(ctx, policy.TpDomain())
+		require.NoError(t, err)
+		assert.Len(t, l.Policies, 1)
+		assert.Equal(t, EnabledState.ToTetragonState(), l.Policies[0].State)
+
+		err = mgr.DisableTracingPolicy(ctx, policy.Name, policy.Namespace, policy.TpDomain())
+		require.NoError(t, err)
+		l, err = mgr.ListTracingPolicies(ctx, policy.TpDomain())
+		require.NoError(t, err)
+		assert.Len(t, l.Policies, 1)
+		assert.Equal(t, DisabledState.ToTetragonState(), l.Policies[0].State)
+	})
+
+	t.Run("InitiallyDisabled", func(t *testing.T) {
+		RegisterPolicyHandlerAtInit("dummy", &dummyHandler{s: &Sensor{Name: "dummy-sensor"}})
+		t.Cleanup(func() {
+			delete(registeredPolicyHandlers, "dummy")
+		})
+
+		policy := v1alpha1.TracingPolicy{}
+		mgr, err := StartSensorManager("")
+		require.NoError(t, err)
+		policy.Name = "test-policy"
+		err = mgr.AddTracingPolicyWithState(ctx, &policy, DisabledState)
+		require.NoError(t, err)
+
+		policies, err := mgr.ListTracingPolicies(ctx, policy.TpDomain())
+		require.NoError(t, err)
+		require.Len(t, policies.Policies, 1)
+		assert.Equal(t, DisabledState.ToTetragonState(), policies.Policies[0].State)
+
+		sensorStatuses, err := mgr.ListSensors(ctx)
+		require.NoError(t, err)
+		require.Len(t, *sensorStatuses, 1)
+		assert.False(t, (*sensorStatuses)[0].Enabled)
+
+		err = mgr.EnableTracingPolicy(ctx, policy.Name, policy.Namespace, policy.TpDomain())
+		require.NoError(t, err)
+		policies, err = mgr.ListTracingPolicies(ctx, policy.TpDomain())
+		require.NoError(t, err)
+		require.Len(t, policies.Policies, 1)
+		assert.Equal(t, EnabledState.ToTetragonState(), policies.Policies[0].State)
+		sensorStatuses, err = mgr.ListSensors(ctx)
+		require.NoError(t, err)
+		require.Len(t, *sensorStatuses, 1)
+		assert.True(t, (*sensorStatuses)[0].Enabled)
+	})
+}
+
+// TestPolicyLoadErrorOverride tests the fact that you can add a TracingPolicy
+// with the same name as an existing one if it's in a LoadError state
+func TestPolicyLoadErrorOverride(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	RegisterPolicyHandlerAtInit("load-fail", &dummyHandler{s: &Sensor{
+		Name:  "dummy-sensor",
+		Progs: []*program.Program{{Name: "bpf-program-that-does-not-exist"}},
+	}})
+	t.Cleanup(func() {
+		delete(registeredPolicyHandlers, "load-fail")
+	})
+
+	policy := v1alpha1.TracingPolicy{}
+	mgr, err := StartSensorManager("")
+	require.NoError(t, err)
+	policy.Name = "test-policy"
+	addError := mgr.AddTracingPolicy(ctx, &policy)
+	require.Error(t, addError)
+
+	l, err := mgr.ListTracingPolicies(ctx, policy.TpDomain())
+	require.NoError(t, err)
+	assert.Len(t, l.Policies, 1)
+	assert.Equal(t, LoadErrorState.ToTetragonState(), l.Policies[0].State)
+	assert.Equal(t, addError.Error(), l.Policies[0].Error)
+
+	// try to override the existing registered LoadError policy
+	delete(registeredPolicyHandlers, "load-fail")
+	RegisterPolicyHandlerAtInit("dummy", &dummyHandler{s: &Sensor{Name: "dummy-sensor"}})
+	t.Cleanup(func() {
+		delete(registeredPolicyHandlers, "dummy")
+	})
+	addError = mgr.AddTracingPolicy(ctx, &policy)
+	require.NoError(t, addError)
+
+	l, err = mgr.ListTracingPolicies(ctx, policy.TpDomain())
+	require.NoError(t, err)
+	assert.Len(t, l.Policies, 1)
+	assert.Equal(t, EnabledState.ToTetragonState(), l.Policies[0].State)
+}
+
+func TestPolicyListCollections(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	RegisterPolicyHandlerAtInit("dummy", &dummyHandler{s: &Sensor{Name: "dummy-sensor"}})
+	t.Cleanup(func() {
+		delete(registeredPolicyHandlers, "dummy")
+	})
+
+	kprobes := []v1alpha1.KProbeSpec{
+		{
+			Call:    "dummy",
+			Message: "dummy",
+		},
+	}
+	policy := v1alpha1.TracingPolicy{Spec: v1alpha1.TracingPolicySpec{KProbes: kprobes}}
+	mgr, err := StartSensorManager("")
+	require.NoError(t, err)
+	policy.Name = "test-policy"
+	err = mgr.AddTracingPolicy(ctx, &policy)
+	require.NoError(t, err)
+
+	l, err := mgr.ListTracingPolicies(ctx, policy.TpDomain())
+	require.NoError(t, err)
+	assert.Len(t, l.Policies, 1)
+	assert.Equal(t, EnabledState.ToTetragonState(), l.Policies[0].State)
+
+	collections := mgr.ListCollections(ctx, true)
+	assert.Len(t, collections, 1)
+	assert.Equal(t, kprobes, collections[0].TracingpolicySpec.KProbes)
+}
+
+func TestPolicyListingWhileLoadUnload(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	polName := "test-policy"
+	testSensor := makeTestDelayedSensor(t)
+
+	mgr, err := StartSensorManager("")
+	require.NoError(t, err)
+
+	wrongPolicyErr := errors.New("wrong policy state")
+
+	checkPolicy := func(statuses []*tetragon.TracingPolicyStatus, state tetragon.TracingPolicyState) error {
+		if len(statuses) != 1 {
+			return fmt.Errorf("expected 1 policy, got %d", len(statuses))
+		}
+		pol := statuses[0]
+		if pol.Name != polName {
+			return fmt.Errorf("expected policy name %s, got %s", polName, pol.Name)
+		}
+		if pol.State != state {
+			return fmt.Errorf("%w: expected %v, got %v", wrongPolicyErr, state, pol.State)
+		}
+		return nil
+	}
+
+	verifyState := func(errCh chan error, state tetragon.TracingPolicyState) {
+		// wait until at least one policy shows up, verify that it's in loading/unloading state and
+		// unblock the loading/unloading of the policy
+		for {
+			l, err := mgr.ListTracingPolicies(ctx, "")
+			if err != nil {
+				errCh <- fmt.Errorf("ListTracingPolicies error: %w", err)
+				return
+			}
+			if len(l.Policies) > 0 {
+				err := checkPolicy(l.Policies, state)
+				if err != nil && !errors.Is(err, wrongPolicyErr) {
+					errCh <- err
+					return
+				}
+				testSensor.unblock(t)
+				errCh <- nil
+				return
+			}
+			time.Sleep(1 * time.Millisecond)
+		}
+	}
+
+	errCh := make(chan error, 1)
+	go verifyState(errCh, tetragon.TracingPolicyState_TP_STATE_LOADING)
+
+	t.Log("adding policy")
+	policy := v1alpha1.TracingPolicy{
+		Name: polName}
+	mgrErrCh := make(chan error, 1)
+	go func() {
+		mgrErrCh <- mgr.AddTracingPolicy(ctx, &policy)
+	}()
+
+	for range 2 {
+		select {
+		case err := <-mgrErrCh:
+			require.NoError(t, err)
+		case err := <-errCh:
+			require.NoError(t, err)
+		}
+	}
+
+	// check that policy is now enabled
+	l, err := mgr.ListTracingPolicies(ctx, policy.TpDomain())
+	require.NoError(t, err)
+	err = checkPolicy(l.Policies, tetragon.TracingPolicyState_TP_STATE_ENABLED)
+	require.NoError(t, err)
+
+	errCh = make(chan error, 1)
+	go verifyState(errCh, tetragon.TracingPolicyState_TP_STATE_UNLOADING)
+
+	t.Log("disabling policy")
+	mgrErrCh = make(chan error, 1)
+	go func() {
+		mgrErrCh <- mgr.DisableTracingPolicy(ctx, polName, "", policy.TpDomain())
+	}()
+
+	for range 2 {
+		select {
+		case err := <-mgrErrCh:
+			require.NoError(t, err)
+		case err := <-errCh:
+			require.NoError(t, err)
+		}
+	}
+
+	// check that policy is now disabled
+	l, err = mgr.ListTracingPolicies(ctx, policy.TpDomain())
+	require.NoError(t, err)
+	err = checkPolicy(l.Policies, tetragon.TracingPolicyState_TP_STATE_DISABLED)
+	require.NoError(t, err)
+
+	errCh = make(chan error, 1)
+	go verifyState(errCh, tetragon.TracingPolicyState_TP_STATE_LOADING)
+
+	t.Log("re-enabling policy")
+	mgrErrCh = make(chan error, 1)
+	go func() {
+		mgrErrCh <- mgr.EnableTracingPolicy(ctx, polName, "", policy.TpDomain())
+	}()
+
+	for range 2 {
+		select {
+		case err := <-mgrErrCh:
+			require.NoError(t, err)
+		case err := <-errCh:
+			require.NoError(t, err)
+		}
+	}
+
+	// check that policy is now diabled
+	l, err = mgr.ListTracingPolicies(ctx, policy.TpDomain())
+	require.NoError(t, err)
+	err = checkPolicy(l.Policies, tetragon.TracingPolicyState_TP_STATE_ENABLED)
+	require.NoError(t, err)
+
+	t.Log("deleting policy")
+	err = mgr.DeleteTracingPolicy(ctx, polName, "", policy.TpDomain())
+	require.NoError(t, err)
+	l, err = mgr.ListTracingPolicies(ctx, policy.TpDomain())
+	require.NoError(t, err)
+	require.Empty(t, l.Policies)
+}
+
+func TestPolicyKernelMemoryBytes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	p1 := &program.Program{Name: "bpf-program-that-does-not-exist"}
+	p1.SetLoadedMapsInfo(map[int]bpf.ExtendedMapInfo{0: {Memlock: 110}, 1: {Memlock: 120}})
+	p2 := &program.Program{Name: "bpf-program-that-does-not-exist-2"}
+	p2.SetLoadedMapsInfo(map[int]bpf.ExtendedMapInfo{2: {Memlock: 130}, 3: {Memlock: 140}})
+	// p3's map ID 2 overwrites p2's map ID 2 in the dedup'd TotalMemlock sum.
+	p3 := &program.Program{Name: "bpf-program-that-does-not-exist-3"}
+	p3.SetLoadedMapsInfo(map[int]bpf.ExtendedMapInfo{2: {Memlock: 130}})
+	RegisterPolicyHandlerAtInit("loaded-map", &dummyHandler{s: &Sensor{
+		Name:  "dummy-sensor",
+		Progs: []*program.Program{p1, p2, p3},
+	}})
+	t.Cleanup(func() {
+		delete(registeredPolicyHandlers, "loaded-map")
+	})
+
+	policy := v1alpha1.TracingPolicy{}
+	mgr, err := StartSensorManager("")
+	require.NoError(t, err)
+	policy.Name = "test-policy"
+	addError := mgr.AddTracingPolicy(ctx, &policy)
+	// this will fail to load because the programs do not exist
+	require.Error(t, addError)
+
+	l, err := mgr.ListTracingPolicies(ctx, policy.TpDomain())
+	require.NoError(t, err)
+	require.Len(t, l.Policies, 1)
+	assert.Equal(t, uint64(500), l.Policies[0].KernelMemoryBytes)
+}

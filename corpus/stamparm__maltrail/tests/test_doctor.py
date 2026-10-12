@@ -1,0 +1,255 @@
+# coding: utf-8
+"""`server.py --doctor` checks: each finding must fire on the misconfiguration it names.
+
+The doctor exists because these failures otherwise surface as a silently half-working server
+(LOG_DIR unwritable, trails months old, the reporting port taken by another process). The tests
+build each failure for real - a chmod'd directory, a stale mtime, a bound socket - so the check
+cannot pass vacuously.
+"""
+
+import os
+import shutil
+import socket
+import sys
+import tempfile
+import time
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core import doctor
+from core import settings
+
+
+class DoctorChecks(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="mt-doctor-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self._saved = dict(settings.config)
+        self.addCleanup(self._restore)
+
+        cfg = settings.config
+        cfg.LOG_DIR = os.path.join(self.dir, "logs")
+        cfg.TRAILS_FILE = os.path.join(self.dir, "trails.csv")
+        cfg.UPDATE_PERIOD = 86400
+        cfg.DISABLE_TRAIL_UPDATES = False
+        cfg.USERS = ["admin:<sha256>:1:all"]
+        cfg.USE_SSL = False
+        cfg.SSL_PEM = None
+        cfg.HTTP_ADDRESS = "127.0.0.1"
+        cfg.HTTP_PORT = 0  # port 0 always binds, so the endpoint check stays out of the way
+        # A healthy deployment has somewhere to fetch static trails from. Without it the baseline
+        # is not healthy - which is the point of the check, and why it belongs in the fixture.
+        cfg.STATIC_TRAILS_URL = "https://example.invalid/trails.csv.gz"
+        cfg.UDP_ADDRESS = None
+        cfg.UDP_PORT = None
+        cfg.USE_SERVER_UPDATE_TRAILS = False
+
+    def _restore(self):
+        settings.config.clear()
+        settings.config.update(self._saved)
+
+    # --- log directory ---------------------------------------------------------------
+
+    def test_missing_log_dir_fails(self):
+        findings = doctor.check_log_dir()
+        self.assertEqual(doctor.FAIL, findings[0][0])
+        self.assertIn("does not exist", findings[0][1])
+
+    def test_unwritable_log_dir_fails(self):
+        os.makedirs(settings.config.LOG_DIR)
+        if os.geteuid() == 0:
+            self.skipTest("root writes anywhere")
+        os.chmod(settings.config.LOG_DIR, 0o500)
+        self.addCleanup(os.chmod, settings.config.LOG_DIR, 0o700)
+        findings = doctor.check_log_dir()
+        self.assertEqual(doctor.FAIL, findings[0][0])
+        self.assertIn("not writable", findings[0][1])
+
+    def test_healthy_log_dir_is_silent(self):
+        os.makedirs(settings.config.LOG_DIR)
+        self.assertEqual([], doctor.check_log_dir())
+
+    # --- trails freshness ------------------------------------------------------------
+
+    def test_stale_trails_warn_with_age(self):
+        open(settings.config.TRAILS_FILE, "w").close()
+        month_ago = time.time() - 30 * 86400
+        os.utime(settings.config.TRAILS_FILE, (month_ago, month_ago))
+        findings = doctor.check_trails_freshness()
+        self.assertEqual(doctor.WARN, findings[0][0])
+        self.assertIn("30 days", findings[0][1])
+
+    def test_fresh_trails_are_silent(self):
+        open(settings.config.TRAILS_FILE, "w").close()
+        self.assertEqual([], doctor.check_trails_freshness())
+
+    def test_missing_trails_fail(self):
+        findings = doctor.check_trails_freshness()
+        self.assertEqual(doctor.FAIL, findings[0][0])
+
+    # --- users -----------------------------------------------------------------------
+
+    def test_empty_users_fails(self):
+        settings.config.USERS = []
+        findings = doctor.check_users()
+        self.assertEqual(doctor.FAIL, findings[0][0])
+
+    def test_populated_users_ok(self):
+        findings = doctor.check_users()
+        self.assertEqual([(doctor.OK, findings[0][1])], findings)
+
+    # --- endpoints -------------------------------------------------------------------
+
+    def test_taken_http_port_warns(self):
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        self.addCleanup(blocker.close)
+        settings.config.HTTP_PORT = blocker.getsockname()[1]
+        findings = doctor.check_http_endpoint()
+        self.assertEqual(doctor.WARN, findings[0][0])
+        self.assertIn("not bindable", findings[0][1])
+
+    def test_taken_udp_intake_warns(self):
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        blocker.bind(("127.0.0.1", 0))
+        self.addCleanup(blocker.close)
+        settings.config.UDP_ADDRESS = "127.0.0.1"
+        settings.config.UDP_PORT = blocker.getsockname()[1]
+        findings = doctor.check_udp_intake()
+        self.assertEqual(doctor.WARN, findings[0][0])
+
+    def test_free_udp_intake_is_silent(self):
+        settings.config.UDP_ADDRESS = "127.0.0.1"
+        settings.config.UDP_PORT = 0
+        self.assertEqual([], doctor.check_udp_intake())
+
+    # --- aggregate -------------------------------------------------------------------
+
+    def test_run_exit_code_reflects_failures(self):
+        os.makedirs(settings.config.LOG_DIR)
+        open(settings.config.TRAILS_FILE, "w").close()
+        self.assertEqual(0, doctor.run())  # healthy baseline (port 0, fresh trails)
+        settings.config.USERS = []
+        import io
+        out = io.StringIO()
+        self.assertEqual(1, doctor.run(out))
+        self.assertIn("1 problem(s)", out.getvalue())
+
+
+
+class StaticTrailSource(unittest.TestCase):
+    """Without a static trail source Maltrail matches heuristics and little else.
+
+    That is the whole threat-intelligence half of the product, and every symptom of losing it -
+    a server that starts, a dashboard that renders, a sensor that reports healthy - is
+    indistinguishable from a quiet network. So it is a FAILURE, and it has to stay one.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="mt-static-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self._saved = dict(settings.config)
+        self.addCleanup(self._restore)
+        settings.config.TRAILS_FILE = os.path.join(self.dir, "trails.csv")
+
+    def _restore(self):
+        settings.config.clear()
+        settings.config.update(self._saved)
+
+    def test_unset_and_no_cache_is_a_failure(self):
+        settings.config.STATIC_TRAILS_URL = None
+        findings = doctor.check_static_trails()
+        self.assertEqual([level for level, _ in findings], [doctor.FAIL])
+        self.assertIn("STATIC_TRAILS_URL", findings[0][1])
+
+    def test_unset_with_a_cache_is_a_warning(self):
+        # A cache means detection still works today, but nothing will ever refresh it.
+        with open("%s.static" % settings.config.TRAILS_FILE, "w") as f:
+            f.write("evil.test,x,(static)\n")
+        settings.config.STATIC_TRAILS_URL = None
+        findings = doctor.check_static_trails()
+        self.assertEqual([level for level, _ in findings], [doctor.WARN])
+
+    def test_configured_is_silent(self):
+        settings.config.STATIC_TRAILS_URL = "https://example.invalid/trails.csv.gz"
+        self.assertEqual(doctor.check_static_trails(), [])
+
+    def test_the_check_is_registered(self):
+        # A check that exists but is not in CHECKS never runs, and the suite would still pass.
+        self.assertIn(doctor.check_static_trails, [fn for _, fn in doctor.CHECKS])
+
+
+class TestEveryCheckIsRegistered(unittest.TestCase):
+    """CHECKS is the only thing that runs a check, so an unregistered one runs nowhere.
+
+    The guard above names a single function, which protects the check it was written for and
+    nothing else: a check added later and forgotten would run nowhere and this suite would still
+    be green. `tests/run.sh` already enforces the generic form of this rule for test files ("A
+    test file that is not in TESTS is not run by this script or by CI, and nothing else would ever
+    say so - it just sits there passing locally and covering nothing. Fail instead."). Same rule,
+    same reason.
+    """
+
+    def test_no_check_function_is_left_out_of_CHECKS(self):
+        import inspect
+
+        defined = set(name for name, obj in vars(doctor).items()
+                      if name.startswith("check_") and inspect.isfunction(obj)
+                      and obj.__module__ == doctor.__name__)
+        registered = set(fn.__name__ for _, fn in doctor.CHECKS)
+
+        self.assertTrue(defined, "no check_* functions found - has the naming changed?")
+        self.assertEqual(sorted(defined - registered), [],
+                         "check_* function(s) defined in core/doctor.py but absent from CHECKS, "
+                         "so --doctor never runs them and reports the deployment healthy without "
+                         "having looked")
+
+    def test_every_registered_entry_is_callable_and_labelled(self):
+        for entry in doctor.CHECKS:
+            self.assertEqual(len(entry), 2, "CHECKS entries are (label, function): %r" % (entry,))
+            label, fn = entry
+            self.assertTrue(label and isinstance(label, str), "a check needs a label: %r" % (entry,))
+            self.assertTrue(callable(fn), "%r is not callable" % (fn,))
+
+    def test_a_check_returning_nothing_reads_as_healthy_and_exits_zero(self):
+        # run() treats an empty finding list as "ok", so a check that silently returns [] on an
+        # error path is indistinguishable from a passing one. Pin the contract it relies on.
+        import io as _io
+        saved = doctor.CHECKS
+        doctor.CHECKS = (("always clean", lambda: []),)
+        try:
+            buf = _io.StringIO()
+            self.assertEqual(doctor.run(out=buf), 0)
+            self.assertIn("no problems found", buf.getvalue())
+        finally:
+            doctor.CHECKS = saved
+
+    def test_a_failing_check_exits_nonzero(self):
+        import io as _io
+        saved = doctor.CHECKS
+        doctor.CHECKS = (("broken", lambda: [(doctor.FAIL, "wrong")]),)
+        try:
+            buf = _io.StringIO()
+            self.assertEqual(doctor.run(out=buf), 1,
+                             "--doctor must exit non-zero on a FAIL, or a script that gates on it "
+                             "cannot tell a healthy deployment from a broken one")
+            self.assertIn("problem(s)", buf.getvalue())
+        finally:
+            doctor.CHECKS = saved
+
+    def test_a_warning_alone_still_exits_zero(self):
+        import io as _io
+        saved = doctor.CHECKS
+        doctor.CHECKS = (("noisy", lambda: [(doctor.WARN, "hmm")]),)
+        try:
+            buf = _io.StringIO()
+            self.assertEqual(doctor.run(out=buf), 0, "a WARN is not a failure")
+            self.assertIn("warning(s)", buf.getvalue())
+        finally:
+            doctor.CHECKS = saved
+
+
+if __name__ == "__main__":
+    unittest.main()

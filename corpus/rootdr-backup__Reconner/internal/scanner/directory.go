@@ -1,0 +1,1410 @@
+package scanner
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"path"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/recon-platform/internal/config"
+	"github.com/recon-platform/internal/database"
+	"github.com/recon-platform/internal/tools"
+	"github.com/recon-platform/pkg/logger"
+)
+
+type DirScanner struct {
+	db     *database.DB
+	exec   *tools.Executor
+	cfg    *config.Config
+	logger *logger.Logger
+}
+
+func NewDirScanner(db *database.DB, exec *tools.Executor, cfg *config.Config, log *logger.Logger) *DirScanner {
+	return &DirScanner{db: db, exec: exec, cfg: cfg, logger: log}
+}
+
+var dirHTTPClient = &http.Client{
+	Transport: sharedHTTPTransport,
+	Timeout:   8 * time.Second,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 3 {
+			return http.ErrUseLastResponse
+		}
+		// Content discovery must never follow a target-controlled redirect onto a
+		// different host. The original 3xx is still returned and recorded, but no
+		// out-of-scope request is sent.
+		if len(via) > 0 && !strings.EqualFold(req.URL.Hostname(), via[0].URL.Hostname()) {
+			return http.ErrUseLastResponse
+		}
+		return nil
+	},
+}
+
+// soft404 captures how a host responds to a guaranteed-nonexistent path so we
+// can recognise (and discard) catch-all 200 pages during content discovery.
+type soft404 struct {
+	active      bool
+	statusCode  int
+	bodyLen     int
+	noise       int    // observed size wobble of the catch-all across probes
+	contentType string // catch-all's Content-Type family (html/json/…)
+	title       string // catch-all's <title>, if any
+}
+
+// matches reports whether a response looks like the soft-404 baseline — i.e. the
+// host's catch-all page rather than a real discovered resource. Classification
+// now uses THREE signals, not just length:
+//  1. Identical <title>: an SPA/custom error page that echoes the same shell for
+//     every route matches by title regardless of body length (the length check
+//     alone missed these — a top false-positive source for dir/backup discovery).
+//  2. Length similarity, but ONLY within the same Content-Type family, so a real
+//     file (application/zip, sql, json) is never discarded just for happening to
+//     match the HTML shell's size.
+func (b soft404) matches(status int, body []byte, contentType string) bool {
+	if !b.active || status != b.statusCode {
+		return false
+	}
+	if b.title != "" {
+		candidateTitle := extractTitle(string(body))
+		if candidateTitle == b.title {
+			return true // same catch-all shell, any length
+		}
+		if candidateTitle != "" {
+			return false // a different explicit title is a strong real-page signal
+		}
+	}
+	if b.contentType != "" && contentType != "" && ctFamily(b.contentType) != ctFamily(contentType) {
+		return false // different content type → genuine content, keep it
+	}
+	tol := b.bodyLen / 20
+	if tol < 128 {
+		tol = 128
+	}
+	// A dynamic catch-all (timestamps, rotating content) wobbles in size between
+	// requests. Widen the tolerance to cover TWICE the observed wobble so those
+	// varying catch-all pages are still recognised and discarded instead of being
+	// reported as discovered files (a content-discovery false positive).
+	if b.noise*2 > tol {
+		tol = b.noise * 2
+	}
+	d := len(body) - b.bodyLen
+	if d < 0 {
+		d = -d
+	}
+	return d <= tol
+}
+
+// ctFamily maps a Content-Type to a coarse family for same-kind comparison.
+func ctFamily(ct string) string {
+	ct = strings.ToLower(ct)
+	switch {
+	case strings.Contains(ct, "html"):
+		return "html"
+	case strings.Contains(ct, "json"):
+		return "json"
+	case strings.Contains(ct, "xml"):
+		return "xml"
+	case strings.Contains(ct, "javascript"), strings.Contains(ct, "ecmascript"):
+		return "js"
+	case strings.Contains(ct, "text/"):
+		return "text"
+	default:
+		return "other"
+	}
+}
+
+// soft404Baseline probes a couple of random paths and, if the host returns 200
+// for them, records that as the catch-all baseline. Package-level (not a
+// DirScanner method) because it touches no DirScanner state — shared with
+// Historical network-result rows use the same finding shape.
+func soft404Baseline(ctx context.Context, base string) soft404 {
+	return soft404BaselineRanged(ctx, base, "")
+}
+
+// soft404BaselineRanged behaves exactly like soft404Baseline, but issues the
+// probe with the SAME Range header the real candidate requests will use, when
+// rangeHeader is non-empty. This matters for any caller whose actual
+// candidate requests send Range (currently only scanBackupCandidatesWithCorpus,
+// which sends "Range: bytes=0-262143"): a baseline captured WITHOUT that
+// header comes back as status 200, but a Range-honoring server (nginx,
+// Apache, most CDNs — very common) answers a Ranged candidate request with
+// 206. soft404.matches short-circuits on any status mismatch
+// (!b.active || status != b.statusCode), so a 200-captured baseline can NEVER
+// match a 206 candidate response — silently disabling the entire soft-404/
+// catch-all rejection for that host, on exactly the servers content
+// discovery runs against most often. Every other caller passes "" and gets
+// byte-identical behavior to the original implementation.
+func soft404BaselineRanged(ctx context.Context, base, rangeHeader string) soft404 {
+	probes := []string{"/x9k2j7q1zNope404check", "/this_should_not_exist_" + uuid.New().String()[:8]}
+	out := soft404{}
+	var lens []int
+	for _, p := range probes {
+		req, err := http.NewRequestWithContext(ctx, "GET", base+p, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (compatible)")
+		if rangeHeader != "" {
+			req.Header.Set("Range", rangeHeader)
+		}
+		resp, err := dirHTTPClient.Do(req)
+		if err != nil {
+			continue
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+		resp.Body.Close()
+		// Only a 200 to a bogus path is a soft-404 (a proper 404/403 is fine). A
+		// Ranged request additionally accepts 206: a server that honors Range
+		// answers a bogus-but-otherwise-servable path with 206, and the real
+		// candidate requests below will get 206 for the SAME reason — the
+		// baseline must be captured at whichever status this exact request
+		// shape actually produces, or matches() can never fire for it.
+		if resp.StatusCode == 200 || (rangeHeader != "" && resp.StatusCode == http.StatusPartialContent) {
+			lens = append(lens, len(body))
+			out = soft404{
+				active: true, statusCode: resp.StatusCode, bodyLen: len(body),
+				contentType: resp.Header.Get("Content-Type"), title: extractTitle(string(body)),
+			}
+		}
+	}
+	// Both bogus probes answered 200 → measure the catch-all's own size wobble and
+	// anchor the baseline at the LARGER sample, so `matches` tolerates a dynamic
+	// catch-all instead of leaking its varying pages as findings.
+	if len(lens) >= 2 {
+		mn, mx := lens[0], lens[0]
+		for _, l := range lens {
+			if l < mn {
+				mn = l
+			}
+			if l > mx {
+				mx = l
+			}
+		}
+		out.bodyLen = mx
+		out.noise = mx - mn
+	}
+	return out
+}
+
+// dirDiscoveryHostCap returns the per-scan host cap for content-discovery
+// (dir/backup/open-redirect) — configurable, and now effectively unbounded by
+// default (300000): the operator decides whether a scan this wide is worth the
+// time, not a silent built-in ceiling that drops the tail of a large target
+// with only a log warning to show it. Set dir_discovery_max_hosts explicitly
+// for a real cap.
+func (s *DirScanner) dirDiscoveryHostCap() int {
+	if s.cfg != nil && s.cfg.DirDiscoveryMaxHosts > 0 {
+		return s.cfg.DirDiscoveryMaxHosts
+	}
+	return 300000
+}
+
+func (s *DirScanner) directoryHostConcurrency() int {
+	if s.cfg != nil && s.cfg.Workers.DirectoryDiscovery > 0 {
+		return s.cfg.Workers.DirectoryDiscovery
+	}
+	return 1
+}
+
+// directoryToolThreads derives per-process concurrency from the deployment's
+// total HTTP budget and the number of hosts that may run simultaneously. The old
+// fixed dirsearch -t 60 multiplied into hundreds/thousands of requests, causing
+// WAF bans and starving sibling modules (which then looked like false negatives).
+func (s *DirScanner) directoryToolThreads() int {
+	rate, hostWorkers := 150, s.directoryHostConcurrency()
+	if s.cfg != nil && s.cfg.Limits.HTTPRateLimit > 0 {
+		rate = s.cfg.Limits.HTTPRateLimit
+	}
+	// Reserve half the configured request budget for other modules and for
+	// response bursts; threads are an in-flight bound, not an exact RPS value.
+	threads := (rate / 2) / hostWorkers
+	if threads < 1 {
+		threads = 1
+	}
+	if threads > 20 {
+		threads = 20
+	}
+	return threads
+}
+
+func (s *DirScanner) builtinProbeConcurrency() int {
+	rate := 150
+	if s.cfg != nil && s.cfg.Limits.HTTPRateLimit > 0 {
+		rate = s.cfg.Limits.HTTPRateLimit
+	}
+	workers := rate / 10
+	if workers < 4 {
+		workers = 4
+	}
+	if workers > 20 {
+		workers = 20
+	}
+	return workers
+}
+
+func (s *DirScanner) directoryValidationWorkers() int {
+	workers := s.directoryToolThreads() / 4
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > 4 {
+		workers = 4
+	}
+	return workers
+}
+
+func isDirectoryFindingStatus(status int) bool {
+	return (status >= 200 && status <= 399) || status == 401 || status == 403 || status == 405
+}
+
+func sameDirectoryServiceHost(serviceURL, foundURL string) bool {
+	service, err := url.Parse(strings.TrimSpace(serviceURL))
+	if err != nil || service.Hostname() == "" {
+		return false
+	}
+	found, err := url.Parse(strings.TrimSpace(foundURL))
+	return err == nil && (found.Scheme == "http" || found.Scheme == "https") && found.Hostname() != "" && strings.EqualFold(service.Hostname(), found.Hostname())
+}
+
+// externalDirectoryRevalidator keeps tool stdout flowing while a small worker
+// pool re-fetches reported hits through Reconner's soft-404/status classifier.
+// Doing the GET inline in the stdout callback serialized every hit and could
+// back-pressure the tool until its per-host deadline, silently dropping the tail.
+func (s *DirScanner) externalDirectoryRevalidator(ctx context.Context, targetID, svcURL string, baseline soft404) (func(string), func()) {
+	jobs := make(chan string, 32)
+	var wg sync.WaitGroup
+	var seen sync.Map
+	for i := 0; i < s.directoryValidationWorkers(); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for foundURL := range jobs {
+				s.probeAndStore(ctx, targetID, foundURL, baseline)
+			}
+		}()
+	}
+	submit := func(foundURL string) {
+		if !sameDirectoryServiceHost(svcURL, foundURL) || !urlHostInScope(ctx, foundURL) {
+			return
+		}
+		if _, loaded := seen.LoadOrStore(foundURL, struct{}{}); loaded {
+			return
+		}
+		select {
+		case jobs <- foundURL:
+		case <-ctx.Done():
+		}
+	}
+	finish := func() {
+		close(jobs)
+		wg.Wait()
+	}
+	return submit, finish
+}
+
+// loadHTTPServices returns the capped host list plus how many alive hosts
+// existed in total, so callers can tell the operator when the cap actually
+// dropped hosts instead of staying silent about it.
+func (s *DirScanner) loadHTTPServices(ctx context.Context, targetID string) (services []string, totalAlive int) {
+	_ = s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM http_services
+		WHERE target_id = ? AND status_code BETWEEN 200 AND 403 AND COALESCE(source,'probe') = 'probe'
+	`, targetID).Scan(&totalAlive)
+
+	hostCap := s.dirDiscoveryHostCap()
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT url FROM http_services
+		WHERE target_id = ? AND status_code BETWEEN 200 AND 403 AND COALESCE(source,'probe') = 'probe'
+		ORDER BY url LIMIT ?
+	`, targetID, hostCap)
+	if err != nil {
+		return nil, totalAlive
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var u string
+		if err := rows.Scan(&u); err == nil {
+			services = append(services, u)
+		}
+	}
+	// Per-asset host scope
+	if hostScopeSet(ctx) != nil {
+		kept := services[:0]
+		for _, u := range services {
+			if urlHostInScope(ctx, u) {
+				kept = append(kept, u)
+			}
+		}
+		services = kept
+	}
+	return services, totalAlive
+}
+
+func (s *DirScanner) Run(ctx context.Context, targetID string, logFn LogFunc) error {
+	logFn("info", "dir_discovery", "Starting directory discovery...")
+	s.classifyStoredServicePanels(ctx, targetID)
+
+	services, totalAlive := s.loadHTTPServices(ctx, targetID)
+	if len(services) == 0 {
+		logFn("info", "dir_discovery", "No HTTP services to scan")
+		return nil
+	}
+	if totalAlive > len(services) {
+		logFn("warn", "dir_discovery", fmt.Sprintf(
+			"host cap hit: scanning %d of %d alive hosts (content-discovery is memory-heavy) — raise dir_discovery_max_hosts in config.json to cover the rest",
+			len(services), totalAlive))
+	}
+	adaptiveWords := buildAdaptiveWordlist(ctx, s.db, s.cfg, targetID, nil)
+	corpusDir := ""
+	if s.cfg != nil {
+		corpusDir = s.cfg.WordlistsDir
+	}
+	probePaths := LoadCorpus(corpusDir, "directory", builtinWordlist)
+	probePaths = append(probePaths, adaptiveDirectoryPaths(adaptiveWords, 128)...)
+	probePaths = uniquePaths(probePaths)
+
+	// ALWAYS run the built-in prober: it's fast, bounded, and guarantees the
+	// Directory section is populated even if dirsearch/feroxbuster are missing
+	// or their output format changed between versions (the old code only fell
+	// back to built-in when NO tool was installed, so a dirsearch whose output
+	// we couldn't parse left the section permanently empty).
+	sem := make(chan struct{}, s.builtinProbeConcurrency())
+	var wg sync.WaitGroup
+	var found atomic.Int64
+	baselines := make(map[string]soft404, len(services))
+	var baselinesMu sync.Mutex
+	logFn("info", "dir_discovery", fmt.Sprintf("Probing common paths on %d services...", len(services)))
+
+	// Hosts run their own soft-404 baseline + path probes CONCURRENTLY, bounded
+	// by directoryHostConcurrency() — previously a single sequential loop meant
+	// host N+1's baseline (up to a couple of blocking HTTP requests) could not
+	// even start until every one of host N's path-probe goroutines had been
+	// enqueued. On a large admitted host set (see dirDiscoveryHostCap, now
+	// effectively unbounded) that serial per-host startup, not the bounded sem
+	// below, was the real wall-clock bottleneck.
+	hostSem := make(chan struct{}, s.directoryHostConcurrency())
+	var hostWG sync.WaitGroup
+	for _, svcURL := range services {
+		if ctx.Err() != nil {
+			break
+		}
+		hostWG.Add(1)
+		hostSem <- struct{}{}
+		go func(svcURL string) {
+			defer hostWG.Done()
+			defer func() { <-hostSem }()
+			base := strings.TrimRight(svcURL, "/")
+			bl := soft404Baseline(ctx, base) // discard catch-all 200 pages
+			baselinesMu.Lock()
+			baselines[svcURL] = bl
+			baselinesMu.Unlock()
+			for _, path := range probePaths {
+				if ctx.Err() != nil {
+					return
+				}
+				wg.Add(1)
+				sem <- struct{}{}
+				go func(b, p string, baseline soft404) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					if s.probeAndStore(ctx, targetID, b+p, baseline) {
+						found.Add(1)
+					}
+				}(base, path, bl)
+			}
+		}(svcURL)
+	}
+	hostWG.Wait()
+	wg.Wait()
+	logFn("info", "dir_discovery", fmt.Sprintf("Built-in prober found %d paths", found.Load()))
+
+	// ADDITIONALLY use dirsearch or feroxbuster when present — deeper wordlists,
+	// more coverage. Their failure no longer matters: the built-in results stand.
+	if s.exec.IsToolAvailable("dirsearch") {
+		logFn("info", "dir_discovery", fmt.Sprintf("Augmenting with dirsearch on %d services...", len(services)))
+		dsem := make(chan struct{}, s.directoryHostConcurrency())
+		var dwg sync.WaitGroup
+		for _, svcURL := range services {
+			if ctx.Err() != nil {
+				break
+			}
+			dwg.Add(1)
+			dsem <- struct{}{}
+			go func(u string) {
+				defer dwg.Done()
+				defer func() { <-dsem }()
+				s.runDirsearch(ctx, targetID, u, baselines[u], logFn)
+			}(svcURL)
+		}
+		dwg.Wait()
+	} else if s.exec.IsToolAvailable("feroxbuster") {
+		logFn("info", "dir_discovery", fmt.Sprintf("Augmenting with feroxbuster on %d services...", len(services)))
+		// Previously fully sequential (no semaphore at all) — one host at a time,
+		// each waiting for the full feroxbuster run before the next even started.
+		fsem := make(chan struct{}, s.directoryHostConcurrency())
+		var fwg sync.WaitGroup
+		for _, svcURL := range services {
+			if ctx.Err() != nil {
+				break
+			}
+			fwg.Add(1)
+			fsem <- struct{}{}
+			go func(u string) {
+				defer fwg.Done()
+				defer func() { <-fsem }()
+				s.runFeroxbuster(ctx, targetID, u, baselines[u], logFn)
+			}(svcURL)
+		}
+		fwg.Wait()
+	} else {
+		logFn("info", "dir_discovery", "dirsearch/feroxbuster not installed — built-in prober only")
+	}
+
+	logFn("info", "dir_discovery", "Directory discovery complete")
+	return nil
+}
+
+func (s *DirScanner) runDirsearch(ctx context.Context, targetID, svcURL string, baseline soft404, logFn LogFunc) {
+	// dirsearch output format: [HH:MM:SS] STATUS - SIZE - /path
+	// or with full URL: [HH:MM:SS] STATUS - SIZE - https://host/path
+	base := strings.TrimRight(svcURL, "/")
+	// Hard per-service ceiling so one slow/huge host can't stall the whole module
+	// (an earlier --crawl + --max-time 300 with NO outer ceiling let a single
+	// host burn 5+ minutes, and 12 hosts serialised into ~16 min). This 150s wall
+	// plus dirsearch's own --max-time below is what makes it safe to re-enable
+	// --crawl/-r now: either one time-boxes the SAME worst case that regression
+	// hit, so recursion only makes better use of the existing budget — digging
+	// into a found directory instead of leaving it entirely unexplored — never a
+	// longer one. Cap each host and let the rest proceed.
+	dctx, dcancel := context.WithTimeout(ctx, 150*time.Second)
+	defer dcancel()
+	submitValidation, finishValidation := s.externalDirectoryRevalidator(dctx, targetID, svcURL, baseline)
+
+	callback := func(line string) {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "Target:") ||
+			strings.HasPrefix(line, "Error") || strings.HasPrefix(line, "[!]") ||
+			strings.HasPrefix(line, "[i]") || strings.HasPrefix(line, "Extensions:") ||
+			strings.HasPrefix(line, "Threads:") || strings.HasPrefix(line, "Wordlist:") ||
+			strings.HasPrefix(line, "Output:") || strings.HasPrefix(line, "Starting:") ||
+			strings.HasPrefix(line, "Task Completed") {
+			return
+		}
+		// Strip ANSI escape codes
+		for strings.Contains(line, "\x1b[") {
+			start := strings.Index(line, "\x1b[")
+			end := strings.IndexAny(line[start:], "ABCDEFGHJKSTfmnsulh")
+			if end < 0 {
+				break
+			}
+			line = line[:start] + line[start+end+1:]
+		}
+		// Format: [HH:MM:SS] 200 -   10KB - /path
+		parts := strings.Fields(line)
+		if len(parts) < 4 {
+			return
+		}
+		var statusCode int
+		fmt.Sscanf(parts[1], "%d", &statusCode)
+		if !isDirectoryFindingStatus(statusCode) {
+			return
+		}
+		pathOrURL := parts[len(parts)-1]
+		var foundURL string
+		if strings.HasPrefix(pathOrURL, "http") {
+			foundURL = pathOrURL
+		} else if strings.HasPrefix(pathOrURL, "/") {
+			foundURL = base + pathOrURL
+		} else {
+			return
+		}
+		// External tools have their own soft-404 heuristics, but their output is
+		// not authoritative. Re-fetch every reported hit through Reconner's shared
+		// baseline classifier before it is allowed into directory_findings.
+		submitValidation(foundURL)
+	}
+
+	corpusDir := ""
+	if s.cfg != nil {
+		corpusDir = s.cfg.WordlistsDir
+	}
+	extensions := LoadCorpus(corpusDir, "extensions", corpusSpecs["extensions"].defaults())
+	args := []string{
+		"-u", svcURL, "--no-color", "-q",
+		"-e", strings.Join(extensions, ","),
+		"-i", "200,204,301,302,307,401,403,405",
+		"--timeout", "6", "--full-url", "-t", strconv.Itoa(s.directoryToolThreads()), "--max-time", "120",
+		// Recurse into a found directory instead of only ever scanning one level
+		// deep — a flat single-pass dirsearch run never looks inside /admin/ or
+		// /api/v1/ once it's found, which is real missed coverage on exactly the
+		// paths most worth going deeper on. Bounded to depth 2 and to
+		// alive/redirecting status codes only (recursing into a 401/403 wastes
+		// requests for no extra coverage — there's nothing reachable to brute-
+		// force behind it). --crawl additionally mines new path candidates out of
+		// response bodies already fetched — no extra requests of its own, pure
+		// recall. Both are safe to re-enable now: the 150s outer ceiling above
+		// plus --max-time below already bound the worst case, so recursion only
+		// spends that SAME budget more thoroughly, never a longer one.
+		"-r", "-R", "2", "--recursion-status", "200,301,302", "--crawl",
+	}
+	args = append(args, ToolRequestIdentityArgs(ctx, "dirsearch")...)
+	err := s.exec.RunWithCallback(dctx, targetID, callback, "dirsearch", args...)
+	if err != nil && strings.Contains(err.Error(), "no such file or directory") {
+		// venv shebang/interpreter broken → fall back to python -m
+		pyArgs := append([]string{"-m", "dirsearch"}, args...)
+		err = s.exec.RunWithCallback(dctx, targetID, callback, "python3", pyArgs...)
+	}
+	finishValidation()
+	if err != nil && ctx.Err() == nil && dctx.Err() != context.DeadlineExceeded {
+		logFn("warn", "dir_discovery", fmt.Sprintf("dirsearch error for %s: %v", svcURL, err))
+	}
+}
+
+func (s *DirScanner) runFeroxbuster(ctx context.Context, targetID, svcURL string, baseline soft404, logFn LogFunc) {
+	// feroxbuster output: STATUS METHOD SIZE WORDS LINES URL
+	dctx, cancel := context.WithTimeout(ctx, 150*time.Second)
+	defer cancel()
+	submitValidation, finishValidation := s.externalDirectoryRevalidator(dctx, targetID, svcURL, baseline)
+	corpusDir := ""
+	if s.cfg != nil {
+		corpusDir = s.cfg.WordlistsDir
+	}
+	extensions := LoadCorpus(corpusDir, "extensions", corpusSpecs["extensions"].defaults())
+	args := []string{"-u", svcURL, "-q", "-t", strconv.Itoa(s.directoryToolThreads()), "--timeout", "8", "-x", strings.Join(extensions, ","), "--no-state"}
+	args = append(args, ToolRequestIdentityArgs(ctx, "feroxbuster")...)
+	err := s.exec.RunWithCallback(dctx, targetID, func(line string) {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ">") {
+			return
+		}
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			return
+		}
+		var statusCode int
+		fmt.Sscanf(parts[0], "%d", &statusCode)
+		if !isDirectoryFindingStatus(statusCode) {
+			return
+		}
+		foundURL := ""
+		for _, p := range parts {
+			if strings.HasPrefix(p, "http") {
+				foundURL = p
+				break
+			}
+		}
+		if foundURL != "" {
+			submitValidation(foundURL)
+		}
+	}, "feroxbuster", args...)
+	finishValidation()
+	if err != nil && ctx.Err() == nil && dctx.Err() != context.DeadlineExceeded {
+		logFn("warn", "dir_discovery", fmt.Sprintf("feroxbuster error for %s: %v", svcURL, err))
+	}
+}
+
+func (s *DirScanner) probeAndStore(ctx context.Context, targetID, targetURL string, baseline soft404) bool {
+	req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+
+	resp, err := dirHTTPClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+
+	if !isDirectoryFindingStatus(resp.StatusCode) {
+		return false
+	}
+	// Discard soft-404 catch-all responses.
+	if baseline.matches(resp.StatusCode, body, resp.Header.Get("Content-Type")) {
+		return false
+	}
+
+	redirect := resp.Header.Get("Location")
+	if resp.Request != nil && resp.Request.URL != nil && resp.Request.URL.String() != targetURL {
+		redirect = resp.Request.URL.String()
+	}
+	stored := s.storeDirFinding(targetID, targetURL, resp.StatusCode, trueSize(resp, len(body)), redirect)
+	if stored {
+		s.storeAdminPanel(targetID, targetURL, resp.StatusCode, extractTitle(string(body)), body, redirect,
+			resp.Header.Get("Server")+" "+resp.Header.Get("X-Powered-By")+" "+redirect)
+	}
+	return stored
+}
+
+// realSize returns the TRUE resource size: the Content-Length header when the
+// server reports it, else the (possibly LimitReader-truncated) body length. Fixes
+// large files being recorded as the 64KB/256KB read cap.
+func realSize(resp *http.Response, bodyLen int) int {
+	if resp.ContentLength > 0 {
+		return int(resp.ContentLength)
+	}
+	if cl := resp.Header.Get("Content-Length"); cl != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(cl)); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return bodyLen
+}
+
+// maxMeasureBytes caps how much of a body we'll stream-count (protects memory/
+// bandwidth against an endless stream while still measuring real backup sizes).
+const maxMeasureBytes = 200 * 1024 * 1024
+
+// trueSize returns the real resource size even when the server uses chunked
+// transfer with NO Content-Length: it counts the bytes ALREADY read (alreadyRead)
+// plus the remainder streamed straight to io.Discard (never held in memory). This
+// is what fixes "every result shows 64KB" for large real files on chunked servers.
+func trueSize(resp *http.Response, alreadyRead int) int {
+	if resp.ContentLength > 0 {
+		return int(resp.ContentLength)
+	}
+	if cl := resp.Header.Get("Content-Length"); cl != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(cl)); err == nil && n >= 0 {
+			return n
+		}
+	}
+	// drain the rest, counting, up to a sane cap
+	n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, maxMeasureBytes))
+	return alreadyRead + int(n)
+}
+
+func (s *DirScanner) storeDirFinding(targetID, foundURL string, statusCode, contentLength int, redirectURL string) bool {
+	id := uuid.New().String()
+	_, err := s.db.Exec(`
+		INSERT INTO directory_findings (id, target_id, url, status_code, content_length, redirect_url)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(target_id, url) DO UPDATE SET
+			status_code = excluded.status_code,
+			content_length = excluded.content_length,
+			redirect_url = excluded.redirect_url
+	`, id, targetID, foundURL, statusCode, contentLength, redirectURL)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("Unable to persist validated directory finding", "url", foundURL, "error", err)
+		}
+		return false
+	}
+	return true
+}
+
+func (s *DirScanner) RunBackupDiscovery(ctx context.Context, targetID string, logFn LogFunc) error {
+	logFn("info", "backup_discovery", "Scanning for backup and sensitive files...")
+
+	services, totalAlive := s.loadHTTPServices(ctx, targetID)
+	if len(services) == 0 {
+		logFn("info", "backup_discovery", "No HTTP services found")
+		return nil
+	}
+	if totalAlive > len(services) {
+		logFn("warn", "backup_discovery", fmt.Sprintf(
+			"host cap hit: scanning %d of %d alive hosts — raise dir_discovery_max_hosts in config.json to cover the rest",
+			len(services), totalAlive))
+	}
+
+	var domain string
+	_ = s.db.QueryRowContext(ctx, `SELECT domain FROM targets WHERE id = ?`, targetID).Scan(&domain)
+
+	adaptiveWords := buildAdaptiveWordlist(ctx, s.db, s.cfg, targetID, nil)
+	corpusDir := ""
+	if s.cfg != nil {
+		corpusDir = s.cfg.WordlistsDir
+	}
+	patterns := LoadCorpus(corpusDir, "backup", backupPatterns)
+	found := scanBackupCandidatesWithCorpus(ctx, s.db, targetID, services, domain, patterns, s.cfg, adaptiveWords)
+	logFn("info", "backup_discovery", fmt.Sprintf("Backup discovery done. Found %d files.", found))
+	return nil
+}
+
+// scanBackupCandidates is the shared backup/config-file discovery core: soft-404
+// baselining, magic-byte confirmation, HTML/catch-all rejection, DB write, and
+// the high-severity vuln_findings promotion for a confirmed archive/dump. Used
+// by the web backup_discovery module. Legacy network-result rows may also refer
+// to this classification — a historical network target's discovered web
+// endpoints never flowed through this at all before (they live in
+// network_services, not http_services, so RunBackupDiscovery above never saw
+// them), which is the gap this shared extraction closes.
+func scanBackupCandidates(ctx context.Context, db *database.DB, targetID string, services []string, domain string, cfg *config.Config, adaptiveWords ...[]string) int {
+	return scanBackupCandidatesWithCorpus(ctx, db, targetID, services, domain, backupPatterns, cfg, adaptiveWords...)
+}
+
+// backupRangeHeader is sent on every real backup-candidate request AND on this
+// module's own soft-404 baseline probe (soft404BaselineRanged) — they must
+// stay identical, or the baseline's captured status (200 vs 206) can silently
+// stop matching the candidates' actual responses. See soft404BaselineRanged's
+// doc comment.
+const backupRangeHeader = "bytes=0-262143"
+
+// backupHostConcurrency reuses the same "how many hosts can run content-
+// discovery in parallel" budget as the dirsearch/feroxbuster augmentation
+// passes above (Workers.DirectoryDiscovery), so one config knob governs
+// host-level parallelism across every content-discovery stage.
+func backupHostConcurrency(cfg *config.Config) int {
+	if cfg != nil && cfg.Workers.DirectoryDiscovery > 0 {
+		return cfg.Workers.DirectoryDiscovery
+	}
+	return 6
+}
+
+// backupRequestConcurrency scales the fine-grained per-request throttle
+// (shared across however many hosts are running in parallel at once) with the
+// deployment's configured HTTP budget, the same way directoryToolThreads/
+// SQLiScanner.concurrency already do, instead of a flat 40 that stayed fixed
+// no matter how many hosts dir_discovery_max_hosts admits. rate*40/150
+// reproduces the historical flat 40 exactly at the default rate of 150, and
+// scales proportionally above/below it.
+func backupRequestConcurrency(cfg *config.Config) int {
+	rate := 150
+	if cfg != nil && cfg.Limits.HTTPRateLimit > 0 {
+		rate = cfg.Limits.HTTPRateLimit
+	}
+	c := rate * 40 / 150
+	if c < 20 {
+		c = 20
+	}
+	if c > 400 {
+		c = 400
+	}
+	return c
+}
+
+func scanBackupCandidatesWithCorpus(ctx context.Context, db *database.DB, targetID string, services []string, domain string, corpus []string, cfg *config.Config, adaptiveWords ...[]string) int {
+	var observedURLs []string
+	rows, err := db.QueryContext(ctx, `SELECT url FROM directory_findings WHERE target_id=?
+		UNION SELECT url FROM parameters WHERE target_id=? LIMIT 400`, targetID, targetID)
+	if err == nil {
+		for rows.Next() {
+			var raw string
+			if rows.Scan(&raw) == nil {
+				observedURLs = append(observedURLs, raw)
+			}
+		}
+		rows.Close()
+	}
+	// Order is part of discovery quality. Context-derived nested candidates and
+	// adaptive product names must run before the much larger generic cross-product;
+	// otherwise a phase deadline can expire before high-signal paths such as
+	// /back/.env are ever scheduled. Deduplication preserves the first (highest
+	// priority) occurrence, so this changes time-to-signal without dropping any
+	// candidate from the former plan.
+	patterns := generateNestedBackupCandidates(observedURLs)
+	// Brand words: the site's own domain/subdomain labels PLUS its highest-
+	// ranked adaptive vocabulary (product names, JS chunk names, API path
+	// segments — already mined by buildAdaptiveWordlist from exactly this
+	// target's own subdomains/JS/titles/parameters). Combined with real
+	// backup-naming patterns (generateBrandedBackupCandidates), this is what
+	// finds "acmecorp_backup.zip" — a bare wordlist never guesses the site's
+	// own name, and a bare domain-name guess never combines it with a backup
+	// word. Raised from the previous 24-word/4-extension adaptive-only budget.
+	brandWords := domainBrandNames(domain)
+	if len(adaptiveWords) > 0 {
+		patterns = append(patterns, generateAdaptiveBackupCandidates(adaptiveWords[0], 50)...)
+		top := adaptiveWords[0]
+		if len(top) > 10 {
+			top = top[:10]
+		}
+		brandWords = append(brandWords, top...)
+	}
+	patterns = append(patterns, generateBrandedBackupCandidates(brandWords, 12)...)
+	// Directory-prefixed brand/word archives (/backup/acme.zip, /db/db_2025.sql.gz)
+	// — the most common real layout, which every root-only generator misses. Pure
+	// recall win; still magic-byte confirmed, so no new false positives.
+	patterns = append(patterns, generateDirectoryBackupCandidates(brandWords, 1200)...)
+	patterns = append(patterns, corpus...)
+	patterns = append(patterns, generateBackupCandidates(domain)...)
+	patterns = uniquePaths(patterns)
+
+	// Scaled with the deployment's configured budget (see backupRequestConcurrency)
+	// instead of a flat 40 that stayed fixed no matter how many hosts
+	// dir_discovery_max_hosts admits.
+	sem := make(chan struct{}, backupRequestConcurrency(cfg))
+	var wg sync.WaitGroup
+	var found atomic.Int64
+
+	// Hosts run their own soft-404 baseline + pattern probing CONCURRENTLY,
+	// bounded by backupHostConcurrency — previously a single sequential loop
+	// meant host N+1's baseline (up to two blocking HTTP requests) could not
+	// even start until EVERY one of host N's pattern-probe goroutines had been
+	// enqueued. On a large admitted host set that serial per-host startup was
+	// the real reason this phase could take hours even with dozens of hosts
+	// capped out.
+	hostSem := make(chan struct{}, backupHostConcurrency(cfg))
+	var hostWG sync.WaitGroup
+	for _, svcURL := range services {
+		if ctx.Err() != nil {
+			break
+		}
+		hostWG.Add(1)
+		hostSem <- struct{}{}
+		go func(svcURL string) {
+			defer hostWG.Done()
+			defer func() { <-hostSem }()
+			base := strings.TrimRight(svcURL, "/")
+
+			// Soft-404 baseline: many sites (SPAs, custom error pages) return 200
+			// with the same page for ANY path. Establish what a bogus path looks
+			// like so we can discard those instead of reporting hundreds of fakes.
+			// Captured WITH the same Range header the candidate requests below use
+			// (backupRangeHeader) — see soft404BaselineRanged's doc comment for why
+			// a plain (un-Ranged) baseline would silently disable this entirely on
+			// any Range-honoring server.
+			bl := soft404BaselineRanged(ctx, base, backupRangeHeader)
+			var priorityWG sync.WaitGroup
+
+			for patternIndex, pattern := range patterns {
+				if ctx.Err() != nil {
+					return
+				}
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					return
+				}
+				isPriority := patternIndex < cap(sem)
+				wg.Add(1)
+				if isPriority {
+					priorityWG.Add(1)
+				}
+				go func(b, p string, base soft404, priority bool) {
+					defer wg.Done()
+					if priority {
+						defer priorityWG.Done()
+					}
+					defer func() { <-sem }()
+					targetURL := b + p
+					req, err := http.NewRequestWithContext(ctx, "GET", targetURL, nil)
+					if err != nil {
+						return
+					}
+					req.Header.Set("User-Agent", "Mozilla/5.0 (compatible)")
+					// Backup validation only needs the leading bytes (magic signatures,
+					// SQL markers, env/config evidence). Asking for a bounded range avoids
+					// downloading multi-gigabyte dumps while still accepting servers that
+					// ignore Range and answer 200. Must stay in sync with the baseline
+					// probe above (backupRangeHeader) — see soft404BaselineRanged.
+					req.Header.Set("Range", backupRangeHeader)
+					resp, err := dirHTTPClient.Do(req)
+					if err != nil {
+						return
+					}
+					defer resp.Body.Close()
+					body, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+
+					// Reject the SPA / catch-all: a real backup/config file
+					// (.json/.yml/.bak/.env/.sql/.config…) is NEVER served as an HTML
+					// page. Many hosts return index.html (200, text/html) for ANY path,
+					// producing dozens of identical fake "backups". If the body looks
+					// like HTML, it's the catch-all, not a config file.
+					ct := strings.ToLower(resp.Header.Get("Content-Type"))
+					if strings.Contains(ct, "text/html") || looksLikeHTML(body) {
+						return
+					}
+					// Reject a WAF/edge block or challenge answering the candidate
+					// request. Most vendor block pages are HTML (already caught above),
+					// but some return a non-HTML (JSON/plain-text) challenge for
+					// non-browser-shaped requests — exactly what a .sql/.zip/.env-style
+					// path looks like — which would otherwise reach the loose per-type
+					// bar below (e.g. "backup"/"log_file" only require len>=16) and be
+					// misreported as a confirmed backup. This module had NO WAF
+					// awareness at all before, unlike every injection detector.
+					if looksLikeBlockPage(resp.StatusCode, string(body)) {
+						return
+					}
+
+					if (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) &&
+						!base.matches(resp.StatusCode, body, resp.Header.Get("Content-Type")) {
+						magic := checkMagicBytes(body)
+						fileType := detectFileType(p, body)
+
+						// Reject noisy non-secrets: a real backup/secret is either
+						// magic-byte-confirmed (archive/DB dump) OR a genuinely
+						// sensitive type (.sql/.env/.bak/.git/.log/.config). A plain
+						// non-HTML 200 (JSON API, JS/CSS, image, generic xml/yaml) is
+						// NOT a backup — skip it to kill the false positives.
+						if !credibleSensitiveBackup(fileType, body, magic) {
+							return
+						}
+						if magic != "" {
+							fileType = magic + " (confirmed)"
+						}
+						size := backupResponseSize(resp, len(body))
+						id := uuid.New().String()
+						result, err := db.Exec(`
+						INSERT INTO backup_findings (id, target_id, url, status_code, content_length, file_type)
+						VALUES (?, ?, ?, ?, ?, ?)
+						ON CONFLICT(target_id, url) DO NOTHING
+					`, id, targetID, targetURL, resp.StatusCode, size, fileType)
+						if err != nil {
+							return
+						}
+						inserted, _ := result.RowsAffected()
+						if inserted == 0 {
+							return
+						}
+						found.Add(1)
+						if magic != "" {
+							storeExposedBackup(db, targetID, targetURL, magic, size)
+						}
+					}
+				}(base, pattern, bl, isPriority)
+
+				// Do not let the large generic corpus race ahead of the first
+				// high-signal batch. The batch itself remains fully parallel; this
+				// barrier only makes its time-to-signal priority deterministic.
+				if patternIndex == cap(sem)-1 {
+					priorityWG.Wait()
+				}
+			}
+		}(svcURL)
+	}
+
+	hostWG.Wait()
+	wg.Wait()
+	return int(found.Load())
+}
+
+// backupResponseSize reports the full object size when the server supplies it,
+// without draining a large/chunked response merely to count bytes. For a 206,
+// Content-Length is the slice length, while Content-Range carries the real size.
+// When neither is known, the validated prefix is an honest lower bound.
+func backupResponseSize(resp *http.Response, observed int) int {
+	if resp == nil {
+		return observed
+	}
+	if raw := strings.TrimSpace(resp.Header.Get("Content-Range")); raw != "" {
+		if slash := strings.LastIndexByte(raw, '/'); slash >= 0 && slash+1 < len(raw) {
+			if total, err := strconv.ParseInt(strings.TrimSpace(raw[slash+1:]), 10, 64); err == nil && total >= 0 {
+				return int(total)
+			}
+		}
+	}
+	if resp.StatusCode != http.StatusPartialContent && resp.ContentLength >= 0 {
+		return int(resp.ContentLength)
+	}
+	return observed
+}
+
+// storeExposedBackup raises a high-severity finding for a magic-byte-CONFIRMED
+// backup/dump so it shows up in the vulnerabilities list and the report with a
+// ready PoC (a downloadable production backup is a real, high-impact issue).
+// Package-level (not a DirScanner method) — shared with scanBackupCandidates.
+func storeExposedBackup(db *database.DB, targetID, url, fileType string, size int) {
+	evidence := fmt.Sprintf("Confirmed %s backup/dump downloadable (%d bytes) — verified by file signature, not just status/size.", fileType, size)
+	_, _ = RecordDetectorObservation(context.Background(), db, DetectorObservation{
+		TargetID: targetID, Type: "exposed_backup", Subtype: fileType, Severity: "high",
+		URL: url, Method: "GET", Location: "response", Evidence: evidence,
+		Source: "directory", DetectionMethod: "magic-bytes", Confidence: 95,
+		Priority: 380, Verdict: VerifyVerified,
+	})
+}
+
+func (s *DirScanner) RunOpenRedirectDiscovery(ctx context.Context, targetID string, logFn LogFunc) error {
+	logFn("info", "open_redirect", "Scanning for open redirects...")
+
+	limit := 150
+	if s.cfg != nil {
+		limit = s.cfg.URLLimit()
+	}
+	// Route by tokenized name OR URL-shaped value, keep unfamiliar fallbacks, and
+	// preserve the real method/body/auth/sibling request contract. The historical
+	// SQL LIKE prefilter silently dropped opaque URL-valued names and every POST or
+	// JSON redirect sink before the verifier saw them.
+	items := loadRoutedInsertionPoints(ctx, s.db, targetID, ClassRedirect, limit, 32)
+	auth := loadAuthHeaders(ctx, s.db, targetID)
+	corpusDir := ""
+	if s.cfg != nil {
+		corpusDir = s.cfg.WordlistsDir
+	}
+	payloads := LoadCorpus(corpusDir, "redirect", openRedirectPayloads)
+
+	logFn("info", "open_redirect", fmt.Sprintf("Testing %d potential redirect parameters...", len(items)))
+
+	sem := make(chan struct{}, 10)
+	var wg sync.WaitGroup
+	var found atomic.Int64
+
+	for _, item := range items {
+		if ctx.Err() != nil {
+			break
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(ip insertionPoint) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			if res, ok := checkOpenRedirectPointWithPayloads(ctx, ip, auth, payloads); ok {
+				id := uuid.New().String()
+				verified := 0
+				status := StatusCandidate
+				if res.class == redirectExternal {
+					verified = 1
+					status = StatusFinding
+					found.Add(1)
+				}
+				desc := fmt.Sprintf("%s -> %s", res.testURL, res.finalLoc)
+				_, _ = s.db.Exec(`
+					INSERT INTO open_redirect_findings (id, target_id, url, redirect_to, parameter, verified, status, provenance)
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+					ON CONFLICT(target_id, url) DO UPDATE SET
+						redirect_to = excluded.redirect_to,
+						verified = excluded.verified,
+						status = excluded.status,
+						provenance = excluded.provenance
+				`, id, targetID, ip.URL, desc, ip.Param, verified, status, res.chain)
+			}
+		}(item)
+	}
+	wg.Wait()
+	logFn("info", "open_redirect", fmt.Sprintf("Open redirect scan done. Found %d verified redirects.", found.Load()))
+	return nil
+}
+
+// looksLikeHTML reports whether a body is an HTML document — used to reject the
+// SPA/catch-all page that many hosts return for every path. It looks only for
+// HTML markers (not a bare '<'), so real XML backups (which start with <?xml)
+// are not mistaken for HTML.
+func looksLikeHTML(body []byte) bool {
+	n := len(body)
+	if n > 2048 {
+		n = 2048
+	}
+	head := strings.ToLower(strings.TrimSpace(string(body[:n])))
+	for _, m := range []string{"<!doctype html", "<html", "<head", "<body", "<title", "<meta", "<script"} {
+		if strings.Contains(head, m) {
+			return true
+		}
+	}
+	return false
+}
+
+func detectFileType(path string, body []byte) string {
+	lower := strings.ToLower(path)
+	base := pathpkgBase(lower)
+	switch {
+	case strings.HasSuffix(lower, ".sql"):
+		return "sql_dump"
+	case strings.HasSuffix(lower, ".zip") || strings.HasSuffix(lower, ".tar") || strings.HasSuffix(lower, ".gz") || strings.HasSuffix(lower, ".rar"):
+		return "archive"
+	case base == ".env" || strings.HasPrefix(base, ".env.") || strings.HasPrefix(base, "env."):
+		return "env_file"
+	case strings.HasSuffix(lower, ".git") || strings.Contains(lower, ".git/"):
+		return "git_repo"
+	case strings.HasSuffix(lower, ".bak") || strings.HasSuffix(lower, ".backup") || strings.HasSuffix(lower, ".old"):
+		return "backup"
+	case strings.HasSuffix(lower, ".log"):
+		return "log_file"
+	case strings.HasSuffix(lower, ".conf") || strings.HasSuffix(lower, ".config") || strings.HasSuffix(lower, ".cfg"):
+		return "config"
+	case strings.HasSuffix(lower, ".xml"):
+		return "xml"
+	case strings.HasSuffix(lower, ".json"):
+		return "json"
+	case strings.HasSuffix(lower, ".yaml") || strings.HasSuffix(lower, ".yml"):
+		return "yaml"
+	default:
+		if len(body) >= 4 {
+			if body[0] == 0x50 && body[1] == 0x4B {
+				return "archive"
+			}
+		}
+		return "unknown"
+	}
+}
+
+// pathpkgBase is kept tiny so detectFileType's path parameter can retain its
+// long-standing name without shadowing the imported path package at call sites.
+func pathpkgBase(value string) string { return path.Base(value) }
+
+// credibleSensitiveBackup validates content as well as a suggestive filename.
+// This both admits short, real secrets such as /back/.env and rejects a generic
+// text/JSON catch-all that happens to answer 200 for a sensitive-looking path.
+func credibleSensitiveBackup(fileType string, body []byte, magic string) bool {
+	if magic != "" {
+		return true
+	}
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return false
+	}
+	// A high-confidence, vendor-specific secret signature in the body is
+	// credible regardless of the requested path's extension. Without this, a
+	// genuine leaked secret dump shaped as .json/.yaml/.xml/.txt/no-extension
+	// (detectFileType classifies these as "json"/"yaml"/"xml"/"unknown", none
+	// of which the switch below has a case for — it falls to default:false)
+	// could NEVER become a finding no matter what it actually contained. That
+	// was a real false negative: backupPatterns/backup_magic.go already send
+	// requests for /secrets.json, /credentials.json, /aws.json, /gcp.json,
+	// /serviceaccount.json, /kubeconfig, /id_rsa, /server.key, /secrets.yml,
+	// /config/credentials.yml.enc and more, but their responses could never be
+	// promoted regardless of content. Requiring an actual credential-shaped
+	// match (not just "it parses as JSON") keeps the "any 200 = backup" false
+	// positive this function exists to kill: an ordinary API response is never
+	// mistaken for a secret dump merely for being JSON.
+	if len(trimmed) >= 16 && bodyMatchesHighConfidenceSecret(body) {
+		return true
+	}
+	switch fileType {
+	case "env_file":
+		return looksLikeEnvContent(trimmed)
+	case "git_repo":
+		lower := strings.ToLower(trimmed)
+		return strings.HasPrefix(trimmed, "ref: refs/") || strings.Contains(lower, "repositoryformatversion") ||
+			(len(trimmed) >= 40 && len(trimmed) <= 128 && isHexString(strings.Fields(trimmed)[0]))
+	case "sql_dump", "archive":
+		// Archives and SQL dumps require their signature/SQL markers, represented
+		// by magic above. An extension alone is too weak to become a finding.
+		return false
+	case "config":
+		lower := strings.ToLower(trimmed)
+		return len(trimmed) >= 8 && (strings.Contains(trimmed, "=") || strings.Contains(trimmed, ":") ||
+			strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") || strings.Contains(lower, "<configuration"))
+	case "backup", "log_file":
+		return len(trimmed) >= 16
+	default:
+		return false
+	}
+}
+
+// bodyMatchesHighConfidenceSecret reports whether body contains a high- or
+// critical-severity secret signature from the shared vendor-specific corpus
+// (js_scanner.go's jsPatterns + secret_patterns.go's extraSecretPatterns) —
+// the same low-FP pattern set the JS/exposure scanners already use to flag a
+// leaked credential. Used here to validate a JSON/YAML/XML/unknown-extension
+// backup candidate by ACTUAL CONTENT rather than trusting a suggestive path
+// alone: info/medium-severity patterns (bare endpoint URLs, config var names,
+// generic bearer mentions) are deliberately excluded, since those are common
+// in ordinary application responses and would reintroduce the "any 200 =
+// backup" false positive this module exists to kill.
+func bodyMatchesHighConfidenceSecret(body []byte) bool {
+	for _, p := range jsPatterns {
+		if p.Severity != "high" && p.Severity != "critical" {
+			continue
+		}
+		if p.Pattern.Match(body) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeEnvContent(body string) bool {
+	assignments, highSignal := 0, false
+	for i, raw := range strings.Split(body, "\n") {
+		if i >= 80 {
+			break
+		}
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		key, _, ok := strings.Cut(line, "=")
+		key = strings.TrimSpace(key)
+		if !ok || key == "" || !validEnvKey(key) {
+			continue
+		}
+		assignments++
+		upper := strings.ToUpper(key)
+		for _, marker := range []string{"PASSWORD", "PASSWD", "SECRET", "TOKEN", "API_KEY", "APP_KEY", "DATABASE_URL", "DB_", "AWS_", "PRIVATE_KEY"} {
+			if strings.Contains(upper, marker) {
+				highSignal = true
+				break
+			}
+		}
+	}
+	return highSignal || assignments >= 2
+}
+
+func validEnvKey(value string) bool {
+	for i, r := range value {
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || r == '_' || (i > 0 && r >= '0' && r <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isHexString(value string) bool {
+	for _, r := range value {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return value != ""
+}
+
+var builtinWordlist = func() []string {
+	paths := []string{
+		"/admin", "/admin/", "/administrator", "/login", "/wp-admin", "/wp-login.php",
+		"/dashboard", "/panel", "/manage", "/management", "/backend",
+		"/api", "/api/v1", "/api/v2", "/api/v3", "/graphql", "/swagger", "/swagger-ui",
+		"/swagger.json", "/openapi.json", "/api-docs",
+		"/.env", "/.env.local", "/.env.production", "/.env.backup",
+		"/.git", "/.git/HEAD", "/.git/config", "/.svn", "/.svn/entries",
+		"/config", "/config.php", "/config.json", "/config.yml", "/config.yaml",
+		"/backup", "/backup.zip", "/backup.sql", "/backup.tar.gz",
+		"/db.sql", "/database.sql", "/dump.sql",
+		"/phpinfo.php", "/info.php", "/test.php", "/debug.php",
+		"/robots.txt", "/sitemap.xml", "/security.txt", "/.well-known/security.txt",
+		"/crossdomain.xml", "/clientaccesspolicy.xml",
+		"/server-status", "/server-info", "/_profiler", "/actuator", "/actuator/health",
+		"/actuator/env", "/actuator/mappings", "/metrics", "/health",
+		"/console", "/phpmyadmin", "/adminer", "/adminer.php",
+		"/wp-content/uploads", "/uploads", "/files", "/static", "/assets",
+		"/logs", "/log", "/error_log", "/access_log",
+		"/readme.txt", "/readme.md", "/CHANGELOG.md", "/CHANGELOG.txt",
+		"/.DS_Store", "/Thumbs.db",
+		"/composer.json", "/package.json", "/yarn.lock", "/package-lock.json",
+		"/Gemfile", "/requirements.txt",
+		// ── extended high-signal surface (admin panels, APIs, dashboards) ──
+		"/admin/login", "/admin/index.php", "/admin.php", "/administrator/index.php",
+		"/user/login", "/users/sign_in", "/auth/login", "/account/login", "/signin",
+		"/cms", "/cpanel", "/webadmin", "/siteadmin", "/adminpanel", "/admin-console",
+		"/portal", "/portal/", "/secure", "/internal", "/private", "/staff", "/staff/",
+		"/api/v1/", "/api/v2/", "/api/docs", "/api/swagger", "/api/graphql",
+		"/graphiql", "/playground", "/altair", "/v1", "/v2", "/rest", "/soap", "/wsdl",
+		"/swagger-ui.html", "/swagger-ui/index.html", "/swagger/index.html", "/redoc",
+		"/actuator/beans", "/actuator/configprops", "/actuator/heapdump", "/actuator/threaddump",
+		"/actuator/loggers", "/actuator/httptrace", "/actuator/prometheus", "/actuator/metrics",
+		"/env", "/debug", "/debug/pprof/", "/debug/vars", "/status", "/stats", "/trace", "/traces",
+		"/telescope", "/horizon", "/_ignition/health-check", "/nova", "/laravel-websockets",
+		"/rails/info/properties", "/sidekiq", "/flower", "/rq", "/bull",
+		// framework / build leaks
+		"/.git/logs/HEAD", "/.git/index", "/.gitignore", "/.hg", "/.bzr",
+		"/webpack.config.js", "/vite.config.js", "/gulpfile.js", "/Gruntfile.js",
+		"/tsconfig.json", "/.babelrc", "/.eslintrc", "/.prettierrc", "/nuxt.config.js", "/next.config.js",
+		"/main.js.map", "/app.js.map", "/bundle.js.map", "/index.js.map",
+		// storage / uploads / exports
+		"/storage", "/storage/logs", "/tmp", "/temp", "/cache", "/data", "/media",
+		"/export", "/exports", "/download", "/downloads", "/reports", "/invoices",
+		"/wp-json", "/wp-json/wp/v2/users", "/xmlrpc.php", "/wp-content/debug.log",
+		// devops / infra panels
+		"/grafana", "/kibana", "/prometheus", "/consul", "/vault", "/rabbitmq", "/traefik",
+		"/kubelet", "/metrics/", "/healthz", "/readyz", "/livez", "/version", "/actuator/",
+		"/jenkins", "/gitlab", "/gitea", "/sonar", "/nexus", "/artifactory", "/harbor",
+		"/.well-known/openid-configuration", "/.well-known/oauth-authorization-server",
+		"/oauth/authorize", "/oauth/token", "/saml/metadata", "/sso",
+	}
+	seen := make(map[string]bool)
+	unique := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if !seen[p] {
+			seen[p] = true
+			unique = append(unique, p)
+		}
+	}
+	return unique
+}()
+
+var backupPatterns = []string{
+	"/.env", "/.env.local", "/.env.backup", "/.env.old", "/.env.bak",
+	"/.env.production", "/.env.staging", "/.env.development",
+	"/.git/HEAD", "/.git/config", "/.git/COMMIT_EDITMSG",
+	"/.svn/entries", "/.svn/format",
+	"/backup.zip", "/backup.tar.gz", "/backup.sql", "/backup.sql.gz",
+	"/db.sql", "/db.sql.gz", "/database.sql", "/database.sql.gz",
+	"/dump.sql", "/site.sql", "/data.sql",
+	"/config.php.bak", "/config.php.old", "/config.bak", "/config.old",
+	"/wp-config.php.bak", "/wp-config.bak",
+	"/web.config.bak", "/web.config.old",
+	"/application.properties.bak", "/application.yml.bak",
+	"/composer.json", "/composer.lock",
+	"/package.json", "/package-lock.json", "/yarn.lock",
+	"/Gemfile", "/Gemfile.lock",
+	"/requirements.txt", "/Pipfile", "/Pipfile.lock",
+	"/id_rsa", "/id_dsa", "/.ssh/id_rsa", "/.ssh/authorized_keys",
+	"/server.key", "/private.key", "/private.pem",
+	"/phpinfo.php", "/info.php", "/test.php",
+	"/_phpinfo.php", "/php-info.php",
+	"/logs/error.log", "/logs/access.log", "/var/log/error.log",
+	"/.DS_Store",
+	"/crossdomain.xml", "/clientaccesspolicy.xml",
+	"/swagger.json", "/swagger.yaml", "/openapi.json", "/openapi.yaml",
+	"/api-docs", "/api-docs.json",
+	// extended sensitive/config/backup surface
+	"/.env.dev", "/.env.test", "/.env.example", "/env.js", "/config.js.map",
+	"/.aws/credentials", "/.aws/config", "/.npmrc", "/.dockercfg", "/.docker/config.json",
+	"/docker-compose.yml", "/docker-compose.yaml", "/Dockerfile", "/.dockerignore",
+	"/.gitlab-ci.yml", "/.github/workflows/", "/.travis.yml", "/circle.yml", "/.circleci/config.yml",
+	"/settings.py", "/local_settings.py", "/wp-config.php", "/configuration.php",
+	"/config.inc.php", "/database.yml", "/secrets.yml", "/credentials.yml",
+	"/.htpasswd", "/.htaccess", "/nginx.conf", "/httpd.conf",
+	"/server-status", "/server-info", "/.well-known/security.txt",
+	"/actuator", "/actuator/health", "/actuator/env", "/actuator/heapdump", "/actuator/mappings",
+	"/.vscode/settings.json", "/.idea/workspace.xml",
+	"/backup.tar", "/www.zip", "/site.zip", "/web.zip", "/public.zip", "/backup.rar",
+	"/dump.rdb", "/.bash_history", "/.ssh/known_hosts",
+	"/phpunit.xml", "/composer.phar", "/.terraform/terraform.tfstate", "/terraform.tfstate",
+	"/.env.bak", "/config.json.bak", "/appsettings.json", "/appsettings.Development.json",
+	"/web.config",
+	// ── extended secret/backup/config surface (high-signal for bug bounty) ──
+	// env & secret variants
+	"/.env.prod", "/.env.production.local", "/.env.local.php", "/.environment", "/env.bak",
+	"/.env.save", "/.env~", "/.env.swp", "/.env.default", "/.envrc",
+	// cloud & IaC state / creds
+	"/terraform.tfstate.backup", "/.terraform.lock.hcl", "/ansible.cfg", "/hosts.ini",
+	"/kubeconfig", "/.kube/config", "/.gcloud/credentials.db", "/gcloud/credentials.json",
+	"/serviceaccount.json", "/service-account.json", "/firebase.json", "/.firebaserc",
+	"/cloud-config.yml", "/user-data", "/meta-data",
+	// git/vcs deep leaks
+	"/.git/refs/heads/master", "/.git/refs/heads/main", "/.git/packed-refs",
+	"/.git/logs/refs/heads/master", "/.gitconfig", "/.git-credentials",
+	// DB dumps / archives (more extensions & names)
+	"/backup.7z", "/backup.bak", "/backup.old", "/backup/db.sql", "/sql.sql",
+	"/mysql.sql", "/users.sql", "/prod.sql", "/staging.sql", "/backup-latest.sql",
+	"/www.tar.gz", "/html.tar.gz", "/app.tar.gz", "/release.tar.gz", "/source.zip", "/src.zip",
+	"/archive.zip", "/old.zip", "/new.zip", "/test.zip", "/upload.zip", "/files.zip",
+	// language/framework configs & secrets
+	"/wp-config.php.save", "/wp-config.php~", "/wp-config.php.txt", "/wp-config.old.php",
+	"/config/database.yml", "/config/secrets.yml", "/config/master.key", "/config/credentials.yml.enc",
+	"/.rails-secret", "/settings.local.py", "/config.dev.js", "/config.prod.js",
+	"/parameters.yml", "/app/etc/env.php", "/sites/default/settings.php",
+	// keys & certs
+	"/id_ecdsa", "/id_ed25519", "/.ssh/id_ed25519", "/server.pem", "/cert.pem", "/key.pem",
+	"/ssl.key", "/ssl.crt", "/certificate.pfx", "/keystore.jks", "/.pypirc",
+	// logs & debug dumps
+	"/debug.log", "/laravel.log", "/storage/logs/laravel.log", "/npm-debug.log",
+	"/error.log", "/access.log", "/app.log", "/production.log", "/development.log",
+	// CI/CD & container extras
+	"/Jenkinsfile", "/.drone.yml", "/bitbucket-pipelines.yml", "/azure-pipelines.yml",
+	"/docker-compose.override.yml", "/docker-compose.prod.yml", "/.env.docker",
+	// misc high-value
+	"/.well-known/apple-app-site-association", "/graphql.schema.json", "/schema.graphql",
+	"/backup.json", "/users.json", "/data.json", "/secrets.json", "/credentials.json",
+	"/aws.json", "/gcp.json", "/.mysql_history", "/.psql_history", "/.rediscli_history",
+	// robots.txt / sitemap.xml are normal public files — NOT backups/sensitive.
+	// ── CMS/framework AUTOMATED-BACKUP-PLUGIN paths ──────────────────────────
+	// These are where a well-known backup plugin/tool writes its OWN dumps by
+	// default — high-precision (a hit here all but names the plugin) and
+	// completely missing before: a generic wordlist never guesses a plugin's
+	// own storage convention, only its author's docs do.
+	// WordPress: UpdraftPlus, Duplicator, All-in-One WP Migration, BackWPup.
+	"/wp-content/uploads/backupbuddy_backups/", "/wp-content/updraft/",
+	"/wp-content/uploads/updraft/", "/wp-content/backup-db/",
+	"/wp-content/plugins/duplicator/", "/wp-content/backups-dup-lite/",
+	"/wp-content/ai1wm-backups/", "/wp-content/uploads/backwpup-", "/wp-snapshots/",
+	"/wp-content/wp-clone/", "/wp-content/uploads/wpvividbackups/",
+	// Joomla: Akeeba Backup (the de facto standard Joomla backup extension).
+	"/administrator/backups/", "/administrator/components/com_akeeba/backup/",
+	// Drupal: Backup and Migrate module.
+	"/sites/default/files/backup_migrate/", "/sites/default/files/backup_migrate/scheduled/",
+	// Magento.
+	"/var/backups/", "/media/backup/", "/var/export/",
+	// cPanel/Plesk-style automated full-account/domain archive naming.
+	"/backup/cpmove-backup.tar.gz", "/backups/cpmove-backup.tar.gz",
+}

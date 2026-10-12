@@ -1,0 +1,754 @@
+//! Probes and identifies available eBPF features supported by the host kernel.
+
+use std::{
+    ffi::CStr,
+    io, mem,
+    os::fd::{AsFd as _, AsRawFd as _},
+    ptr,
+};
+
+pub use aya_obj::btf::BtfFeature;
+use aya_obj::{
+    btf::{Btf, BtfKind},
+    generated::{
+        BPF_CALL, BPF_EXIT, BPF_F_MMAPABLE, BPF_F_NO_PREALLOC, BPF_JMP, bpf_attr,
+        bpf_cgroup_storage_key, bpf_cmd, bpf_func_id, bpf_insn_array_value, bpf_map_type,
+        bpf_prog_info,
+    },
+};
+use libc::{E2BIG, EBADF, EINVAL};
+
+use super::{
+    SyscallError, UProbeMultiFeature, bpf_map_create, bpf_prog_load, bpf_raw_tracepoint_open,
+    new_insn, probe_bpf_global_data, probe_bpf_name, probe_btf, probe_btf_datasec,
+    probe_btf_datasec_zero, probe_btf_decl_tag, probe_btf_enum64, probe_btf_float, probe_btf_func,
+    probe_btf_func_global, probe_btf_type_tag, probe_perf_link, probe_prog_id,
+    probe_uprobe_multi_link, unit_sys_bpf, with_prog_insns, with_trivial_prog,
+};
+use crate::{
+    MockableFd,
+    maps::MapType,
+    programs::{LsmAttachType, ProgramError, ProgramType},
+    util::page_size,
+};
+
+/// A BPF helper function.
+#[doc(alias = "bpf_func_id")]
+pub type BpfHelper = bpf_func_id;
+
+/// Whether the host kernel supports names for BPF programs and maps.
+///
+/// This function performs a new kernel probe on every call.
+/// `Ok(false)` is returned only when the kernel gives the expected response for an unsupported
+/// feature. Permission errors and other unexpected probe failures are returned as errors.
+///
+/// # Errors
+///
+/// Returns an I/O error if support cannot be determined.
+pub fn is_bpf_name_supported() -> io::Result<bool> {
+    probe_bpf_name()
+}
+
+/// Whether the host kernel supports attaching perf events using BPF links.
+///
+/// This function performs a new kernel probe on every call.
+/// `Ok(false)` is returned only when the kernel gives the expected response for an unsupported
+/// feature. Permission errors and other unexpected probe failures are returned as errors.
+///
+/// # Errors
+///
+/// Returns an I/O error if support cannot be determined.
+pub fn is_perf_link_supported() -> io::Result<bool> {
+    probe_perf_link()
+}
+
+/// Whether the host kernel supports the requested [`UProbeMultiFeature`].
+///
+/// [`UProbeMultiFeature::LinkCreation`] checks only multi-uprobe link creation. It can therefore
+/// report support on kernels with the initial, thread-scoped PID filtering behavior.
+///
+/// [`UProbeMultiFeature::ProcessScopedPidFilter`] additionally checks for the fix that makes a PID
+/// select the entire process. See the [kernel fix][kernel-fix] and [libbpf's probe][libbpf-probe].
+/// Callers that attach across all processes do not depend on this behavior and can query only
+/// [`UProbeMultiFeature::LinkCreation`].
+///
+/// This interface is intended for callers that must choose between regular and multi-uprobe
+/// programs before loading them, including callers that generate eBPF bytecode dynamically. Aya
+/// cannot make that choice because the required PID-filtering semantics depend on the eventual
+/// attachment scope. Callers should query the capability required by their intended scope and
+/// apply their own fallback policy.
+///
+/// [kernel-fix]: https://github.com/torvalds/linux/commit/46ba0e49b
+/// [libbpf-probe]: https://github.com/libbpf/libbpf/blob/f5dcbae73/src/features.c#L397-L424
+///
+/// The result is not cached; this function performs a new kernel probe on every call.
+/// `Ok(false)` is returned only when the kernel gives the expected response for an unsupported
+/// requested capability. Permission errors and other unexpected probe failures are returned as
+/// errors.
+///
+/// # Errors
+///
+/// Returns an I/O error if support cannot be determined.
+pub fn is_uprobe_multi_supported(feature: UProbeMultiFeature) -> io::Result<bool> {
+    probe_uprobe_multi_link(feature)
+}
+
+/// Whether the host kernel supports BPF global data.
+///
+/// This function performs a new kernel probe on every call.
+/// `Ok(false)` is returned only when the kernel gives the expected response for an unsupported
+/// feature. Permission errors and other unexpected probe failures are returned as errors.
+///
+/// # Errors
+///
+/// Returns an I/O error if support cannot be determined.
+pub fn is_bpf_global_data_supported() -> io::Result<bool> {
+    probe_bpf_global_data()
+}
+
+/// Whether CPU map values support program IDs.
+///
+/// This function performs a new kernel probe on every call.
+/// `Ok(false)` is returned only when the kernel gives the expected response for an unsupported
+/// feature. Permission errors and other unexpected probe failures are returned as errors.
+///
+/// # Errors
+///
+/// Returns an I/O error if support cannot be determined.
+pub fn is_cpumap_prog_id_supported() -> io::Result<bool> {
+    probe_prog_id(bpf_map_type::BPF_MAP_TYPE_CPUMAP)
+}
+
+/// Whether device map and device map hash values support program IDs.
+///
+/// This function performs a new kernel probe on every call.
+/// `Ok(false)` is returned only when the kernel gives the expected response for an unsupported
+/// feature. Permission errors and other unexpected probe failures are returned as errors.
+///
+/// # Errors
+///
+/// Returns an I/O error if support cannot be determined.
+pub fn is_devmap_prog_id_supported() -> io::Result<bool> {
+    probe_prog_id(bpf_map_type::BPF_MAP_TYPE_DEVMAP)
+}
+
+/// Whether the host kernel supports BTF.
+///
+/// This function performs a new kernel probe on every call.
+/// `Ok(false)` is returned only when the kernel gives the expected response for an unsupported
+/// feature. Permission errors and other unexpected probe failures are returned as errors.
+///
+/// # Errors
+///
+/// Returns an I/O error if support cannot be determined.
+pub fn is_btf_supported() -> io::Result<bool> {
+    probe_btf()
+}
+
+/// Whether the host kernel supports the given [`BtfFeature`].
+///
+/// This function performs a new kernel probe on every call.
+/// `Ok(false)` is returned only when the kernel gives the expected response for an unsupported
+/// feature. Permission errors and other unexpected probe failures are returned as errors.
+///
+/// # Errors
+///
+/// Returns an I/O error if support cannot be determined.
+pub fn is_btf_feature_supported(feature: BtfFeature) -> io::Result<bool> {
+    match feature {
+        BtfFeature::Func => probe_btf_func(),
+        BtfFeature::FuncGlobal => probe_btf_func_global(),
+        BtfFeature::DataSec => probe_btf_datasec(),
+        BtfFeature::DataSecZero => probe_btf_datasec_zero(),
+        BtfFeature::Float => probe_btf_float(),
+        BtfFeature::DeclTag => probe_btf_decl_tag(),
+        BtfFeature::TypeTag => probe_btf_type_tag(),
+        BtfFeature::Enum64 => probe_btf_enum64(),
+    }
+}
+
+/// Whether the host kernel supports the [`BpfHelper`] for the [`ProgramType`].
+///
+/// Helper availability is program-type specific. This probes whether the
+/// `(program_type, helper)` pair is supported by the current environment.
+/// `Ok(false)` means the pair is unavailable; it does not distinguish whether
+/// the helper is absent entirely, unsupported for the program type, or disabled
+/// by the current kernel configuration.
+/// This follows libbpf's probe strategy by loading a minimal program that calls
+/// the requested helper and inspecting verifier output for unknown-helper
+/// diagnostics.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use aya::{programs::ProgramType, sys::{BpfHelper, is_helper_supported}};
+/// #
+/// match is_helper_supported(ProgramType::Xdp, BpfHelper::BPF_FUNC_redirect) {
+///     Ok(true) => println!("bpf_redirect supported from XDP"),
+///     Ok(false) => println!("bpf_redirect not supported from XDP"),
+///     Err(err) => println!("unexpected error while probing: {:?}", err),
+/// }
+/// ```
+///
+/// # Errors
+///
+/// Returns [`ProgramError::SyscallError`] if probing fails before support can
+/// be determined.
+/// Returns [`ProgramError::UnexpectedProgramType`] for [`ProgramType::Tracing`],
+/// [`ProgramType::Extension`], [`ProgramType::Lsm`], and
+/// [`ProgramType::StructOps`], which require a real attach or BTF target.
+pub fn is_helper_supported(
+    program_type: ProgramType,
+    helper: BpfHelper,
+) -> Result<bool, ProgramError> {
+    if program_type == ProgramType::Unspecified {
+        return Ok(false);
+    }
+
+    // These program types require a real attach or BTF target, so a minimal
+    // helper-call program cannot probe their helper availability reliably.
+    // https://github.com/libbpf/libbpf/blob/f5dcbae73/src/libbpf_probes.c#L434-L442
+    if matches!(
+        program_type,
+        ProgramType::Tracing
+            | ProgramType::Extension
+            | ProgramType::Lsm(_)
+            | ProgramType::StructOps
+    ) {
+        return Err(ProgramError::UnexpectedProgramType);
+    }
+
+    let call = (BPF_JMP | BPF_CALL) as u8;
+    let exit = (BPF_JMP | BPF_EXIT) as u8;
+    let insns = [
+        new_insn(call, 0, 0, 0, helper as i32),
+        new_insn(exit, 0, 0, 0, 0),
+    ];
+    // 4096 bytes is enough for this probe and matches libbpf's helper probe.
+    // https://github.com/libbpf/libbpf/blob/f5dcbae73/src/libbpf_probes.c#L420-L428
+    let mut verifier_log = [0u8; 4096];
+
+    with_prog_insns(program_type, &insns, |attr| {
+        // SAFETY: union access
+        let u = unsafe { &mut attr.__bindgen_anon_3 };
+        u.log_buf = verifier_log.as_mut_ptr().expose_provenance() as u64;
+        u.log_level = 1;
+        u.log_size = verifier_log.len() as u32;
+        match bpf_prog_load(attr).map(|_: MockableFd| ()) {
+            Ok(()) => Ok(true),
+            Err(io_error) => {
+                // https://github.com/libbpf/libbpf/blob/f5dcbae73/src/libbpf_probes.c#L452-L466
+                const UNSUPPORTED_HELPER_DIAGNOSTICS: &[&[u8]] = &[
+                    b"invalid func ",
+                    b"unknown func ",
+                    b"program of this type cannot use helper ",
+                ];
+                let verifier_log = CStr::from_bytes_until_nul(&verifier_log)
+                    .map_or(verifier_log.as_slice(), CStr::to_bytes);
+
+                if verifier_log.is_empty() {
+                    return match io_error.raw_os_error() {
+                        // With a valid probe attr, EINVAL means the program type is unsupported.
+                        Some(EINVAL) => Ok(false),
+                        // An empty verifier log means the load failed before reaching the
+                        // verifier. In this path, `E2BIG` from `bpf_check_uarg_tail_zero()`
+                        // indicates that the kernel detected non-zero `bpf_attr` fields it does
+                        // not know about before verifier output could be produced.
+                        Some(E2BIG) => Ok(false),
+                        _ => Err(ProgramError::SyscallError(SyscallError {
+                            call: "bpf_prog_load",
+                            io_error,
+                        })),
+                    };
+                }
+
+                if UNSUPPORTED_HELPER_DIAGNOSTICS.iter().any(|diagnostic| {
+                    verifier_log
+                        .windows(diagnostic.len())
+                        .any(|w| w == *diagnostic)
+                }) {
+                    return Ok(false);
+                }
+
+                // Other verifier failures mean the helper was recognized; assume support.
+                Ok(true)
+            }
+        }
+    })
+}
+
+/// Whether the host kernel supports the [`ProgramType`].
+///
+/// # Examples
+///
+/// ```no_run
+/// # use aya::{programs::ProgramType, sys::is_program_supported};
+/// #
+/// match is_program_supported(ProgramType::Xdp) {
+///     Ok(true) => println!("XDP supported :)"),
+///     Ok(false) => println!("XDP not supported :("),
+///     Err(err) => println!("unexpected error while probing: {:?}", err),
+/// }
+/// ```
+///
+/// # Errors
+///
+/// Returns [`ProgramError::SyscallError`] if a syscall fails with an unexpected
+/// error, or [`ProgramError::Btf`] for BTF related errors.
+///
+/// Certain errors are expected and handled internally; only unanticipated
+/// failures during probing will result in these errors.
+pub fn is_program_supported(program_type: ProgramType) -> Result<bool, ProgramError> {
+    if program_type == ProgramType::Unspecified {
+        return Ok(false);
+    }
+
+    // Verifier log is used in tracing, extension, and lsm to detect support if loading fails due
+    // to unset `attach_btf_id`. A valid `attach_btf_id` is required for a successful load, but is
+    // left unset if the hook functions cannot be found in the BTF.
+    //
+    // If the program types are supported, but the field is unset, then the following message[0]
+    // is emitted to the verifier log:
+    // `Tracing programs must provide btf_id\nprocessed 0 insns (limit 1000000) max_states_per_insn 0 total_states 0 peak_states 0 mark_read 0\n\0`
+    //
+    // Otherwise, if the program types are not supported, then the verifier log will be empty.
+    //
+    // [0] https://github.com/torvalds/linux/blob/d5226fa6d/kernel/bpf/verifier.c#L9535
+    let mut verifier_log = matches!(
+        program_type,
+        ProgramType::Tracing | ProgramType::Extension | ProgramType::Lsm(_)
+    )
+    .then_some([0u8; 256]);
+
+    // Both tracing and lsm types require a valid `attach_btf_id` to load successfully. However, if
+    // the symbols cannot be found in the BTF, then leave the field unset/0.
+    //
+    // The extension type also requires an `attach_btf_id`, but we intentionally leave it unset
+    // since a successful load requires additional setup with a separate BTF-backed program.
+    //
+    // When `attach_btf_id` is unset, then loading will fail and so we examine verifier log for the
+    // expected message.
+    let attach_btf_id = match program_type {
+        // `bpf_fentry_test1` symbol from:
+        // https://github.com/torvalds/linux/blob/d5226fa6d/net/bpf/test_run.c#L112
+        ProgramType::Tracing => Some("bpf_fentry_test1"),
+        // `bpf_lsm_bpf` symbol from:
+        // - https://github.com/torvalds/linux/blob/3d77e6a88/include/linux/lsm_hook_defs.h#L364
+        // - or https://github.com/torvalds/linux/blob/f40ddce88/kernel/bpf/bpf_lsm.c#L135 on later versions
+        ProgramType::Lsm(_) => Some("bpf_lsm_bpf"),
+        _ => None,
+    }
+    .map(|func_name| {
+        Btf::from_sys_fs()
+            .and_then(|btf| btf.id_by_type_name_kind(func_name, BtfKind::Func))
+            .unwrap_or(0)
+    });
+
+    with_trivial_prog(program_type, |attr| {
+        // SAFETY: union access
+        let u = unsafe { &mut attr.__bindgen_anon_3 };
+
+        if let Some(attach_btf_id) = attach_btf_id {
+            u.attach_btf_id = attach_btf_id;
+        }
+        // If loading fails for tracing, extension, and lsm types due to unset `attach_btf_id`,
+        // then we defer to verifier log to verify whether type is supported.
+        if let Some(verifier_log) = verifier_log.as_mut() {
+            u.log_buf = verifier_log.as_mut_ptr().expose_provenance() as u64;
+            u.log_level = 1;
+            u.log_size = verifier_log.len() as u32;
+        }
+
+        match bpf_prog_load(attr) {
+            Err(io_error) => match io_error.raw_os_error() {
+                // Loading may fail for some types (namely tracing, extension, lsm, & struct_ops), so we
+                // perform additional examination on the OS error and/or verifier logs.
+                //
+                // For most types, `EINVAL` typically indicates it is not supported.
+                // However, further examination is required for tracing, extension, and lsm.
+                Some(EINVAL) => {
+                    // At this point for tracing, extension, and lsm, loading failed due to unset
+                    // `attach_btf_id`, so we examine verifier log for the target message. The
+                    // message originated from `check_attach_btf_id()`[0] in v5.5 to v5.9, then
+                    // moved to `bpf_check_attach_target()`[1] in v5.10 and onward.
+                    //
+                    // If target message is present in the logs, then loading process has reached
+                    // up to the verifier section, which indicates that the kernel is at least
+                    // aware of the program type variants.
+                    //
+                    // If the verifier log is empty, then it was immediately rejected by the
+                    // kernel, meaning the types are not supported.
+                    //
+                    // [0] https://github.com/torvalds/linux/blob/d5226fa6d/kernel/bpf/verifier.c#L9535
+                    // [1] https://github.com/torvalds/linux/blob/bbf5c9790/kernel/bpf/verifier.c#L10849
+                    let supported = matches!(
+                        verifier_log,
+                        Some(verifier_log) if verifier_log.starts_with(b"Tracing programs must provide btf_id")
+                    );
+                    Ok(supported)
+                }
+                // `E2BIG` from `bpf_check_uarg_tail_zero()`[0] indicates that the kernel detected
+                // non-zero fields in `bpf_attr` that does not exist at its current version.
+                //
+                // [0] https://github.com/torvalds/linux/blob/94710cac0/kernel/bpf/syscall.c#L71
+                Some(E2BIG) => Ok(false),
+                // `ENOTSUPP` from `check_struct_ops_btf_id()`[0] indicates that it reached the
+                // verifier section, meaning the kernel is at least aware of the type's existence.
+                //
+                // Otherwise, it will produce `EINVAL`, meaning the type is immediately rejected
+                // and does not exist.
+                //
+                // [0] https://github.com/torvalds/linux/blob/7111951b8/kernel/bpf/verifier.c#L9740
+                Some(524) if program_type == ProgramType::StructOps => Ok(true),
+                _ => Err(ProgramError::SyscallError(SyscallError {
+                    call: "bpf_prog_load",
+                    io_error,
+                })),
+            },
+            Ok(prog_fd) => {
+                // Some kernels can load tracing and LSM programs but cannot attach BPF
+                // trampolines: `bpf_raw_tracepoint_open` routes them to
+                // `bpf_tracing_prog_attach()`, and trampoline registration can fail with
+                // `-ENOTSUPP`. Probe attach support explicitly. This is notably seen on arm64
+                // kernels before 6.4.
+                //
+                // https://github.com/torvalds/linux/blob/457391b03/kernel/bpf/syscall.c#L3319-L3333
+                // https://github.com/torvalds/linux/blob/457391b03/kernel/bpf/trampoline.c#L234-L237
+                //
+                // h/t to https://www.exein.io/blog/exploring-bpf-lsm-support-on-aarch64-with-ftrace.
+                //
+                // The same test for cGroup LSM programs would require attaching to a real cgroup,
+                // which is more involved and not possible in the general case.
+                if matches!(
+                    program_type,
+                    ProgramType::Tracing | ProgramType::Lsm(LsmAttachType::Mac)
+                ) {
+                    match bpf_raw_tracepoint_open(None, prog_fd.as_fd()) {
+                        Ok(_) => Ok(true),
+                        Err(io_error) => match io_error.raw_os_error() {
+                            Some(524) => Ok(false),
+                            _ => Err(ProgramError::SyscallError(SyscallError {
+                                call: "bpf_raw_tracepoint_open",
+                                io_error,
+                            })),
+                        },
+                    }
+                } else {
+                    Ok(true)
+                }
+            }
+        }
+    })
+}
+
+/// Whether the host kernel supports the [`MapType`].
+///
+/// # Examples
+///
+/// ```no_run
+/// # use aya::{maps::MapType, sys::is_map_supported};
+/// #
+/// match is_map_supported(MapType::HashOfMaps) {
+///     Ok(true) => println!("hash_of_maps supported :)"),
+///     Ok(false) => println!("hash_of_maps not supported :("),
+///     Err(err) => println!("unexpected error while probing: {:?}", err),
+/// }
+/// ```
+///
+/// # Errors
+///
+/// Returns [`SyscallError`] if kernel probing fails with an unexpected error.
+///
+/// Note that certain errors are expected and handled internally; only
+/// unanticipated failures during probing will result in this error.
+pub fn is_map_supported(map_type: MapType) -> Result<bool, SyscallError> {
+    // Each `bpf_map_ops` struct contains their own `.map_alloc()` & `.map_alloc_check()` that does
+    // field validation on map_create.
+    let u32_size = size_of::<u32>() as u32;
+    let u64_size = size_of::<u64>() as u32;
+    let (key_size, value_size, max_entries) = match map_type {
+        MapType::Unspecified => return Ok(false),
+        MapType::Hash                   // https://github.com/torvalds/linux/blob/bfa76d495/kernel/bpf/hashtab.c#L44-L55
+        | MapType::PerCpuHash           // https://github.com/torvalds/linux/blob/2dcd0af56/kernel/bpf/hashtab.c#L132-L145
+        | MapType::LruHash              // https://github.com/torvalds/linux/blob/c470abd4f/kernel/bpf/hashtab.c#L240-L253
+        | MapType::LruPerCpuHash        // https://github.com/torvalds/linux/blob/c470abd4f/kernel/bpf/hashtab.c#L240-L253
+            => (1, 1, 1),
+        MapType::Array                  // https://github.com/torvalds/linux/blob/bfa76d495/kernel/bpf/arraymap.c#L30-L33
+        | MapType::PerCpuArray          // https://github.com/torvalds/linux/blob/2dcd0af56/kernel/bpf/arraymap.c#L54-L57
+            => (u32_size, 1, 1),
+        MapType::ProgramArray           // https://github.com/torvalds/linux/blob/64291f7db/kernel/bpf/arraymap.c#L153-L159
+        | MapType::PerfEventArray       // https://github.com/torvalds/linux/blob/6a13feb9c/kernel/bpf/arraymap.c#L153-L159
+        | MapType::CgroupArray          // https://github.com/torvalds/linux/blob/c8d2bc9bc/kernel/bpf/arraymap.c#L304-L310
+        | MapType::ArrayOfMaps          // https://github.com/torvalds/linux/blob/6f7da2904/kernel/bpf/arraymap.c#L310-L316
+        | MapType::DevMap               // https://github.com/torvalds/linux/blob/bebc6082d/kernel/bpf/devmap.c#L84-L87
+        | MapType::SockMap              // https://github.com/torvalds/linux/blob/bebc6082d/kernel/bpf/sockmap.c#L509-L512
+        | MapType::CpuMap               // https://github.com/torvalds/linux/blob/d8a5b8056/kernel/bpf/cpumap.c#L88-L91
+        | MapType::XskMap               // https://github.com/torvalds/linux/blob/94710cac0/kernel/bpf/xskmap.c#L27-L30
+        | MapType::ReuseportSockArray   // https://github.com/torvalds/linux/blob/8fe28cb58/kernel/bpf/reuseport_array.c#L40-L47
+        | MapType::DevMapHash           // https://github.com/torvalds/linux/blob/219d54332/kernel/bpf/devmap.c#L104-L112
+            => (u32_size, u32_size, 1),
+        MapType::StackTrace             // https://github.com/torvalds/linux/blob/2dcd0af56/kernel/bpf/stackmap.c#L63-L70
+            => (u32_size, u64_size, 1),
+        MapType::LpmTrie                // https://github.com/torvalds/linux/blob/a351e9b9f/kernel/bpf/lpm_trie.c#L397-L424
+            => (u64_size, 1, 1),
+        MapType::HashOfMaps             // https://github.com/torvalds/linux/blob/6f7da2904/kernel/bpf/hashtab.c#L1210-L1223
+        | MapType::SockHash             // https://github.com/torvalds/linux/blob/94710cac0/kernel/bpf/sockmap.c#L2128-L2137
+            => (1, u32_size, 1),
+        MapType::CgroupStorage          // https://github.com/torvalds/linux/blob/84df9525b/kernel/bpf/local_storage.c#L195-L210
+        | MapType::PerCpuCgroupStorage  // https://github.com/torvalds/linux/blob/8fe28cb58/kernel/bpf/local_storage.c#L262-L277
+            => (size_of::<bpf_cgroup_storage_key>() as u32, 1, 0),
+        MapType::Queue                  // https://github.com/torvalds/linux/blob/8fe28cb58/kernel/bpf/queue_stack_maps.c#L47-L65
+        | MapType::Stack                // https://github.com/torvalds/linux/blob/8fe28cb58/kernel/bpf/queue_stack_maps.c#L47-L65
+        | MapType::BloomFilter          // https://github.com/torvalds/linux/blob/df0cc57e0/kernel/bpf/bloom_filter.c#L85-L102
+            => (0, 1, 1),
+        MapType::SkStorage              // https://github.com/torvalds/linux/blob/0ecfebd2b/net/core/bpf_sk_storage.c#L602-L608
+        | MapType::InodeStorage         // https://github.com/torvalds/linux/blob/2c85ebc57/kernel/bpf/bpf_local_storage.c#L522-L530
+        | MapType::TaskStorage          // https://github.com/torvalds/linux/blob/f40ddce88/kernel/bpf/bpf_local_storage.c#L524-L532
+        | MapType::CgrpStorage          // https://github.com/torvalds/linux/blob/c9c3395d5/kernel/bpf/bpf_local_storage.c#L536-L544
+            => (size_of::<libc::c_int>() as u32, 1, 0),
+        MapType::StructOps              // https://github.com/torvalds/linux/blob/7111951b8/kernel/bpf/bpf_struct_ops.c#L534-L561
+            => (u32_size, 0, 1),
+        MapType::RingBuf                // https://github.com/torvalds/linux/blob/bcf876870/kernel/bpf/ringbuf.c#L150-L162
+        | MapType::UserRingBuf          // https://github.com/torvalds/linux/blob/830b3c68c/kernel/bpf/ringbuf.c#L183-L193
+        // `max_entries` is required to be multiple of kernel page size & power of 2:
+        // https://github.com/torvalds/linux/blob/bcf876870/kernel/bpf/ringbuf.c#L159-L162
+            => (0, 0, page_size() as u32),
+        MapType::Arena                  // https://github.com/torvalds/linux/blob/a38297e3f/kernel/bpf/arena.c#L101-L106
+            => (0, 0, 1),
+        MapType::InsnArray              // https://github.com/torvalds/linux/blob/05f7e89ab/kernel/bpf/bpf_insn_array.c#L26-L32
+            => (u32_size, size_of::<bpf_insn_array_value>() as u32, 1),
+    };
+
+    // SAFETY: all-zero byte-pattern valid for `bpf_attr`
+    let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
+    // SAFETY: union access
+    let u = unsafe { &mut attr.__bindgen_anon_1 };
+    u.map_type = map_type as u32;
+    u.key_size = key_size;
+    u.value_size = value_size;
+    u.max_entries = max_entries;
+
+    // Ensure that fd doesn't get dropped due to scoping for *_of_maps type.
+    let inner_map_fd: MockableFd;
+    match map_type {
+        // lpm_trie is required to not be pre-alloced[0].
+        //
+        // https://github.com/torvalds/linux/blob/a351e9b9f/kernel/bpf/lpm_trie.c#L417-L424
+        MapType::LpmTrie => u.map_flags = BPF_F_NO_PREALLOC,
+        // For these types, we aim to intentionally trigger `EBADF` by supplying invalid btf attach
+        // data to verify the map type's existence. Otherwise, negative support will produce
+        // `EINVAL` instead.
+        MapType::SkStorage
+        | MapType::InodeStorage
+        | MapType::TaskStorage
+        | MapType::CgrpStorage => {
+            // These types are required to not be pre-alloced:
+            // - sk_storage: https://github.com/torvalds/linux/blob/0ecfebd2b/net/core/bpf_sk_storage.c#L602-L608
+            // - inode_storage: https://github.com/torvalds/linux/blob/2c85ebc57/kernel/bpf/bpf_local_storage.c#L522-L530
+            // - task_storage: https://github.com/torvalds/linux/blob/f40ddce88/kernel/bpf/bpf_local_storage.c#L524-L532
+            // - cgrp_storage: https://github.com/torvalds/linux/blob/c9c3395d5/kernel/bpf/bpf_local_storage.c#L536-L544
+            u.map_flags = BPF_F_NO_PREALLOC;
+            // Intentionally trigger `EBADF` from `btf_get_by_fd()`[0].
+            //
+            // [0] https://github.com/torvalds/linux/blob/0ecfebd2b/kernel/bpf/btf.c#L3420-L3433
+            u.btf_fd = u32::MAX;
+            u.btf_key_type_id = 1;
+            u.btf_value_type_id = 1;
+        }
+        MapType::ArrayOfMaps | MapType::HashOfMaps => {
+            // SAFETY: all-zero byte-pattern valid for `bpf_attr`
+            let mut attr_map = unsafe { mem::zeroed::<bpf_attr>() };
+            // SAFETY: union access
+            let u_map = unsafe { &mut attr_map.__bindgen_anon_1 };
+            u_map.map_type = bpf_map_type::BPF_MAP_TYPE_HASH as u32;
+            u_map.key_size = 1;
+            u_map.value_size = 1;
+            u_map.max_entries = 1;
+            inner_map_fd = bpf_map_create(&mut attr_map).map_err(|io_error| SyscallError {
+                call: "bpf_map_create",
+                io_error,
+            })?;
+
+            u.inner_map_fd = inner_map_fd.as_raw_fd() as u32;
+        }
+        // We aim to intentionally trigger `ENOTSUPP` by setting an invalid, non-zero
+        // `btf_vmlinux_value_type_id`. Negative support produce `EINVAL` instead.
+        MapType::StructOps => u.btf_vmlinux_value_type_id = 1,
+        // arena is required to be mmapable[0].
+        //
+        // [0] https://github.com/torvalds/linux/blob/a38297e3f/kernel/bpf/arena.c#L101-L106
+        MapType::Arena => u.map_flags = BPF_F_MMAPABLE,
+        _ => {}
+    }
+
+    // BPF_MAP_CREATE returns a new file descriptor.
+    let io_error = match bpf_map_create(&mut attr) {
+        Ok(_fd) => return Ok(true),
+        Err(io_error) => io_error,
+    };
+
+    // sk_storage, struct_ops, inode_storage, task_storage, & cgrp_storage requires further
+    // examination to verify support.
+    match io_error.raw_os_error() {
+        Some(EINVAL) => Ok(false),
+        // These types use fields that may not exist at the kernel's current version. Supplying
+        // `bpf_attr` fields unknown to the kernel triggers `E2BIG` from `bpf_check_uarg_tail_zero()`[0].
+        //
+        // [0] https://github.com/torvalds/linux/blob/94710cac0/kernel/bpf/syscall.c#L86-L97
+        Some(E2BIG)
+            if matches!(
+                map_type,
+                MapType::SkStorage
+                    | MapType::StructOps
+                    | MapType::InodeStorage
+                    | MapType::TaskStorage
+                    | MapType::CgrpStorage
+            ) =>
+        {
+            Ok(false)
+        }
+        // For these types, `EBADF` from `btf_get_by_fd()`[0] indicates that map_create advanced
+        // far enough in the validation to recognize the type before being rejected.
+        //
+        // Otherwise, negative support produces `EINVAL`, meaning it was immediately rejected.
+        //
+        // [0] https://github.com/torvalds/linux/blob/0ecfebd2b/kernel/bpf/btf.c#L3420-L3433
+        Some(EBADF)
+            if matches!(
+                map_type,
+                MapType::SkStorage
+                    | MapType::InodeStorage
+                    | MapType::TaskStorage
+                    | MapType::CgrpStorage
+            ) =>
+        {
+            Ok(true)
+        }
+        // `ENOTSUPP` from `bpf_struct_ops_map_alloc()`[0] indicates that map_create advanced far
+        // enough in the validation to recognize the type before being rejected.
+        //
+        // Otherwise, negative support produces `EINVAL`, meaning it was immediately rejected.
+        //
+        // [0] https://github.com/torvalds/linux/blob/7111951b8/kernel/bpf/bpf_struct_ops.c#L542-L561
+        Some(524) if map_type == MapType::StructOps => Ok(true),
+        _ => Err(SyscallError {
+            call: "bpf_map_create",
+            io_error,
+        }),
+    }
+}
+
+/// Whether `nr_map_ids` & `map_ids` fields in `bpf_prog_info` are supported.
+pub(crate) fn is_prog_info_map_ids_supported() -> Result<bool, ProgramError> {
+    let fd = with_trivial_prog(ProgramType::SocketFilter, |attr| {
+        bpf_prog_load(attr).map_err(|io_error| {
+            ProgramError::SyscallError(SyscallError {
+                call: "bpf_prog_load",
+                io_error,
+            })
+        })
+    })?;
+    // SAFETY: all-zero byte-pattern valid for `bpf_prog_info`
+    let mut info = unsafe { mem::zeroed::<bpf_prog_info>() };
+    info.nr_map_ids = 1;
+
+    probe_bpf_info(fd, info).map_err(ProgramError::from)
+}
+
+/// Tests whether `bpf_prog_info.gpl_compatible` field is supported.
+pub(crate) fn is_prog_info_license_supported() -> Result<bool, ProgramError> {
+    let fd = with_trivial_prog(ProgramType::SocketFilter, |attr| {
+        bpf_prog_load(attr).map_err(|io_error| {
+            ProgramError::SyscallError(SyscallError {
+                call: "bpf_prog_load",
+                io_error,
+            })
+        })
+    })?;
+    // SAFETY: all-zero byte-pattern valid for `bpf_prog_info`
+    let mut info = unsafe { mem::zeroed::<bpf_prog_info>() };
+    info.set_gpl_compatible(1);
+
+    probe_bpf_info(fd, info).map_err(ProgramError::from)
+}
+
+/// Probes program and map info.
+fn probe_bpf_info<T>(fd: MockableFd, mut info: T) -> Result<bool, SyscallError> {
+    // SAFETY: all-zero byte-pattern valid for `bpf_attr`
+    let mut attr = unsafe { mem::zeroed::<bpf_attr>() };
+    attr.info.bpf_fd = fd.as_raw_fd() as u32;
+    attr.info.info_len = size_of_val(&info) as u32;
+    attr.info.info = ptr::from_mut(&mut info).expose_provenance() as u64;
+
+    let io_error = match unit_sys_bpf(bpf_cmd::BPF_OBJ_GET_INFO_BY_FD, &mut attr) {
+        Ok(()) => return Ok(true),
+        Err(io_error) => io_error,
+    };
+    match io_error.raw_os_error() {
+        // `E2BIG` from `bpf_check_uarg_tail_zero()`
+        Some(E2BIG) => Ok(false),
+        _ => Err(SyscallError {
+            call: "bpf_obj_get_info_by_fd",
+            io_error,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use rstest::rstest;
+
+    use super::*;
+    use crate::sys::{Syscall, override_syscall};
+
+    // Syscall overrides are function pointers, so they cannot capture a local counter.
+    thread_local! {
+        static PROBE_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[test]
+    fn public_feature_probe_runs_on_every_call() {
+        PROBE_CALLS.set(0);
+        override_syscall(|_: Syscall<'_>| {
+            PROBE_CALLS.set(PROBE_CALLS.get() + 1);
+            Ok(MockableFd::mock_signed_fd().into())
+        });
+
+        assert!(is_bpf_name_supported().unwrap());
+        assert!(is_bpf_name_supported().unwrap());
+        assert_eq!(PROBE_CALLS.get(), 2);
+    }
+
+    #[rstest]
+    #[case::map_ids(is_prog_info_map_ids_supported)]
+    #[case::license(is_prog_info_license_supported)]
+    fn prog_info_probe_allows_kernel_writeback(#[case] probe: fn() -> Result<bool, ProgramError>) {
+        override_syscall(|call| match call {
+            Syscall::Ebpf {
+                cmd: bpf_cmd::BPF_PROG_LOAD,
+                ..
+            } => Ok(MockableFd::mock_signed_fd().into()),
+            Syscall::Ebpf {
+                cmd: bpf_cmd::BPF_OBJ_GET_INFO_BY_FD,
+                attr,
+            } => {
+                // SAFETY: union access.
+                let attr = unsafe { attr.info };
+                assert_eq!(attr.info_len, size_of::<bpf_prog_info>() as u32);
+                // Reborrow mutably so Miri checks the output pointer's write permission.
+                // Recovering a pointer alone does not grant that permission.
+                // SAFETY: the syscall receives a writable, aligned bpf_prog_info buffer.
+                let info = unsafe {
+                    &mut *ptr::with_exposed_provenance_mut::<bpf_prog_info>(attr.info as usize)
+                };
+                info.id = 42;
+                Ok(0)
+            }
+            unexpected => panic!("unexpected syscall: {unexpected:?}"),
+        });
+
+        assert!(probe().unwrap());
+    }
+}

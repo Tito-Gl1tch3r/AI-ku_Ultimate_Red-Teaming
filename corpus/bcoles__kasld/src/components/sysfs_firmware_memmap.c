@@ -1,0 +1,160 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Read physical memory map from /sys/firmware/memmap/. Each entry has
+// start, end, and type attributes. Entries of type "System RAM" give
+// the physical DRAM ranges reported by the firmware (E820 on x86, EFI
+// memory map on UEFI systems).
+//
+// All attributes are world-readable (0444). The lowest non-zero "System RAM"
+// start address and highest end address are emitted as physical DRAM range
+// hints. Entries with start = 0 are skipped: physical address 0 is trivially
+// known and carries no KASLR information regardless of architecture.
+//
+// Layout:
+//   /sys/firmware/memmap/0/start  -> "0x0"
+//   /sys/firmware/memmap/0/end    -> "0x9e7ff"
+//   /sys/firmware/memmap/0/type   -> "System RAM"
+//
+// Leak primitive:
+//   Data leaked:      physical memory map (firmware-reported RAM regions)
+//   Kernel subsystem: drivers/firmware — /sys/firmware/memmap/*/start,end,type
+//   Data structure:   firmware memory map entries (E820 on x86, EFI memmap)
+//   Address type:     physical (DRAM)
+//   Method:           parsed (sysfs text files)
+//   Status:           unfixed (information exposure by design)
+//   Access check:     none (world-readable sysfs attribute)
+//   Source:
+//   https://elixir.bootlin.com/linux/v6.12/source/drivers/firmware/memmap.c
+//
+// Mitigations:
+//   CONFIG_FIRMWARE_MEMMAP=n removes the sysfs entries entirely.
+//   x86-only (not available on ARM/RISC-V). The files are world-readable
+//   (0444); no runtime sysctl can restrict access. On x86_64
+//   (decoupled), physical addresses cannot derive the virtual text base.
+//
+// Requires:
+// - CONFIG_FIRMWARE_MEMMAP (common on x86 distros; not available on
+//   ARM/RISC-V)
+//
+// References:
+// https://elixir.bootlin.com/linux/v6.12/source/drivers/firmware/memmap.c
+// https://www.kernel.org/doc/Documentation/ABI/testing/sysfs-firmware-memmap
+// ---
+// <bcoles@gmail.com>
+
+#include "include/kasld/api.h"
+#include "include/kasld/cli.h"
+#include <dirent.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+KASLD_EXPLAIN(
+    "Reads the firmware-provided physical memory map from "
+    "/sys/firmware/memmap/*/start and /sys/firmware/memmap/*/end. These "
+    "world-readable files expose E820 or EFI memory map entries; only "
+    "'System RAM' entries are used, yielding the lowest RAM start and "
+    "highest RAM end as physical DRAM bounds. Entries starting at "
+    "address 0 are skipped (trivially known; no KASLR information). "
+    "x86 only; requires CONFIG_FIRMWARE_MEMMAP.");
+
+KASLD_META("method:parsed\n"
+           "phase:inference\n"
+           "discloses:physical\n"
+           "source:files\n"
+           "config:CONFIG_FIRMWARE_MEMMAP\n");
+
+int main(void) {
+  const char *base = "/sys/firmware/memmap";
+  DIR *d;
+  struct dirent *ent;
+  char path[512];
+  char buf[256];
+  unsigned long lo = ~0ul, hi = 0;
+  int count = 0, incomplete = 0;
+
+  kasld_info("searching %s for System RAM entries ...", base);
+
+  d = kasld_opendir(base);
+  if (!d) {
+    kasld_errno("opendir");
+    return (errno == EACCES || errno == EPERM) ? KASLD_EXIT_NOPERM
+                                               : KASLD_EXIT_UNAVAILABLE;
+  }
+
+  while ((ent = readdir(d)) != NULL) {
+    /* entries are numbered directories: 0, 1, 2, ... */
+    if (ent->d_name[0] == '.')
+      continue;
+
+    /* read type */
+    snprintf(path, sizeof(path), "%s/%s/type", base, ent->d_name);
+    if (kasld_read_file_line(path, buf, sizeof(buf)) < 0)
+      continue;
+
+    if (strcmp(buf, "System RAM") != 0)
+      continue;
+
+    /* read start */
+    snprintf(path, sizeof(path), "%s/%s/start", base, ent->d_name);
+    if (kasld_read_file_line(path, buf, sizeof(buf)) < 0)
+      continue;
+
+    unsigned long start;
+    const char *se;
+    if (!kasld_addr_parse(buf, 16, &start, &se) || !start) {
+      if (kasld_addr_refused_wide(buf, se))
+        incomplete = 1;
+      continue;
+    }
+
+    /* read end */
+    snprintf(path, sizeof(path), "%s/%s/end", base, ent->d_name);
+    if (kasld_read_file_line(path, buf, sizeof(buf)) < 0)
+      continue;
+
+    unsigned long end;
+    const char *ee;
+    if (!kasld_addr_parse(buf, 16, &end, &ee)) {
+      if (kasld_addr_refused_wide(buf, ee))
+        incomplete = 1;
+      continue;
+    }
+
+    /* track lowest start and highest end across System RAM entries */
+    if (start < lo)
+      lo = start;
+    if (end > hi)
+      hi = end;
+
+    count++;
+  }
+  closedir(d);
+
+  if (!count) {
+    kasld_err("no System RAM entries found in %s", base);
+    return 0;
+  }
+
+  kasld_info("firmware memmap: %d System RAM entries", count);
+
+  kasld_info("lowest System RAM start:  0x%016lx", lo);
+  /* An entry this build cannot represent lies above every entry it can, so hi
+   * would understate the top of RAM — and the range's top is consumed as an
+   * upper bound. Fall back to the base alone, which a dropped high entry
+   * cannot raise. */
+  if (incomplete)
+    kasld_err("a System RAM entry is wider than this build's word; "
+              "publishing the base only");
+  if (hi && hi != lo && !incomplete) {
+    kasld_info("highest System RAM end:   0x%016lx", hi);
+    /* Both edges known: one bounded range (validated lo <= hi at the source).
+     */
+    kasld_result_range(KASLD_TYPE_PHYS, REGION_RAM, lo, hi, NULL, CONF_PARSED);
+  } else {
+    kasld_result_base(KASLD_TYPE_PHYS, REGION_RAM, lo, NULL, CONF_PARSED);
+  }
+
+  return 0;
+}

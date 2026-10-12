@@ -1,0 +1,170 @@
+package org.pac4j.core.engine;
+
+import lombok.ToString;
+import lombok.extern.slf4j.Slf4j;
+import lombok.val;
+import org.pac4j.core.client.Client;
+import org.pac4j.core.config.Config;
+import org.pac4j.core.context.CallContext;
+import org.pac4j.core.context.FrameworkParameters;
+import org.pac4j.core.context.HttpConstants;
+import org.pac4j.core.exception.http.HttpAction;
+import org.pac4j.core.exception.http.NoContentAction;
+import org.pac4j.core.util.HttpActionHelper;
+import org.pac4j.core.util.Pac4jConstants;
+
+import java.util.Objects;
+import java.util.regex.Pattern;
+
+import static org.pac4j.core.util.CommonHelper.assertNotBlank;
+import static org.pac4j.core.util.CommonHelper.assertNotNull;
+
+/**
+ * Default logout logic.
+ *
+ * @author Jerome Leleu
+ * @since 1.9.0
+ */
+@ToString(callSuper = true)
+@Slf4j
+public class DefaultLogoutLogic extends AbstractExceptionAwareLogic implements LogoutLogic {
+
+    /** Constant <code>INSTANCE</code> */
+    public static final LogoutLogic INSTANCE = new DefaultLogoutLogic();
+
+    /** {@inheritDoc} */
+    @Override
+    public Object perform(final Config config, final String defaultUrl, final String inputLogoutUrlPattern, final Boolean inputLocalLogout,
+                          final Boolean inputDestroySession, final Boolean inputCentralLogout, final FrameworkParameters parameters) {
+
+        LOGGER.debug("=== LOGOUT ===");
+
+        // checks
+        val ctx = buildContext(config, parameters);
+        val webContext = ctx.webContext();
+        val httpActionAdapter = config.getHttpActionAdapter();
+        assertNotNull("httpActionAdapter", httpActionAdapter);
+
+        HttpAction action;
+        try {
+            val sessionStore = ctx.sessionStore();
+
+            // default values
+            final String logoutUrlPattern;
+            logoutUrlPattern = Objects.requireNonNullElse(inputLogoutUrlPattern, Pac4jConstants.DEFAULT_LOGOUT_URL_PATTERN_VALUE);
+            val localLogout = inputLocalLogout == null || inputLocalLogout;
+            val destroySession = inputDestroySession != null && inputDestroySession;
+            val centralLogout = inputCentralLogout != null && inputCentralLogout;
+
+            assertNotBlank(Pac4jConstants.LOGOUT_URL_PATTERN, logoutUrlPattern);
+            val configClients = config.getClients();
+            assertNotNull("configClients", configClients);
+
+            // logic
+            val manager = ctx.profileManagerFactory().apply(webContext, sessionStore);
+            manager.setConfig(config);
+            val profiles = manager.getProfiles();
+
+            // compute redirection URL
+            val url = webContext.getRequestParameter(Pac4jConstants.URL);
+            var redirectUrl = defaultUrl;
+            if (url.isPresent() && isUrlAllowedForRedirect(url.get(), logoutUrlPattern)) {
+                redirectUrl = url.get();
+            }
+            LOGGER.debug("redirectUrl: {}", redirectUrl);
+            if (redirectUrl != null) {
+                action = HttpActionHelper.buildRedirectUrlAction(webContext, redirectUrl);
+            } else {
+                action = NoContentAction.INSTANCE;
+            }
+
+            // local logout if requested or multiple profiles
+            if (localLogout || profiles.size() > 1) {
+                LOGGER.debug("Performing application logout");
+                manager.removeProfiles();
+                String sessionId = null;
+                if (sessionStore != null) {
+                    sessionId = sessionStore.getSessionId(webContext, false).orElse(null);
+                    if (destroySession) {
+                        val removed = sessionStore.destroySession(webContext);
+                        if (!removed) {
+                            LOGGER.error("Unable to destroy the web session. The session store may not support this feature");
+                        }
+                    }
+                } else {
+                    LOGGER.error("No session store available for this web context");
+                }
+                val sessionLogoutHandler = config.getSessionLogoutHandler();
+                if (sessionLogoutHandler != null && sessionId != null) {
+                    sessionLogoutHandler.cleanRecord(sessionId);
+                }
+            }
+
+            // central logout
+            if (centralLogout) {
+                LOGGER.debug("Performing central logout");
+                for (val profile : profiles) {
+                    LOGGER.debug("Profile: {}", profile);
+                    val clientName = profile.getClientName();
+                    if (clientName != null) {
+                        val client = configClients.findClient(clientName);
+                        if (client.isPresent()) {
+                            String targetUrl = null;
+                            if (redirectUrl != null) {
+                                redirectUrl = enhanceRedirectUrl(ctx, config, client.get(), redirectUrl);
+                                if (redirectUrl.startsWith(HttpConstants.SCHEME_HTTP) ||
+                                    redirectUrl.startsWith(HttpConstants.SCHEME_HTTPS)) {
+                                    targetUrl = redirectUrl;
+                                }
+                            }
+                            val logoutAction =
+                                client.get().getLogoutAction(ctx, profile, targetUrl);
+                            LOGGER.debug("Logout action: {}", logoutAction);
+                            if (logoutAction.isPresent()) {
+                                action = logoutAction.get();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+        } catch (final RuntimeException e) {
+            return handleException(e, httpActionAdapter, webContext);
+        }
+
+        return httpActionAdapter.adapt(action, webContext);
+    }
+
+    /**
+     * Whether the requested url can be used as a redirection: it must match the logout url pattern and must not
+     * contain any backslash, control character or space.
+     *
+     * @param url the requested url
+     * @param logoutUrlPattern the logout url pattern
+     * @return whether the url can be used as a redirection
+     */
+    protected boolean isUrlAllowedForRedirect(final String url, final String logoutUrlPattern) {
+        for (int i = 0; i < url.length(); i++) {
+            final char c = url.charAt(i);
+            if (c == '\\' || c <= ' ' || c == 0x7F) {
+                LOGGER.warn("Rejected URL containing a backslash, a control character or a space: {}", url);
+                return false;
+            }
+        }
+        return Pattern.matches(logoutUrlPattern, url);
+    }
+
+    /**
+     * <p>enhanceRedirectUrl.</p>
+     *
+     * @param ctx a {@link CallContext} object
+     * @param config a {@link Config} object
+     * @param client a {@link Client} object
+     * @param redirectUrl a {@link String} object
+     * @return a {@link String} object
+     */
+    protected String enhanceRedirectUrl(final CallContext ctx, final Config config, final Client client, final String redirectUrl) {
+        return redirectUrl;
+    }
+}

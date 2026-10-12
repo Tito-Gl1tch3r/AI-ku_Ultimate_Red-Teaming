@@ -1,0 +1,429 @@
+# coding: utf-8
+"""End-to-end test for core/log.start_logd -- the UDP receiver that a CENTRAL server uses to collect
+events from remote sensors (multi-sensor / air-gapped deployments: sensors set LOG_SERVER=<server>).
+Wire format is "<epoch_sec> <event...>" (regular, epoch prefix) OR a quoted-localtime line (naive, no
+prefix). A bug here means remote sensor events silently never land on the server -- exactly the
+"something is off across sensors" symptom. Boots the real UDP server on localhost and verifies both
+formats write the event to the correct day's log file. Skips cleanly if it can't bind."""
+import os
+import sys
+import time
+import socket
+import tempfile
+import threading
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import core.log as L
+from core.settings import config, TIME_FORMAT
+
+SEC = 1700000000                                   # fixed epoch -> deterministic day-log filename
+_lt = time.localtime(SEC)
+DATELOG = "%d-%02d-%02d.log" % (_lt.tm_year, _lt.tm_mon, _lt.tm_mday)
+LOCALTIME = time.strftime(TIME_FORMAT, _lt) + ".000000"
+
+
+def _free_udp_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
+
+
+class TestLogd(unittest.TestCase):
+    started = False
+    port = None
+    tmp = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="mt_logd_")
+        config.LOG_DIR = cls.tmp
+        config.SHOW_DEBUG = False
+        cls.port = _free_udp_port()
+        cls.threads_before = threading.active_count()
+        try:
+            L.start_logd(address="127.0.0.1", port=cls.port, join=False)   # daemon thread
+            time.sleep(0.5)
+            cls.started = True
+        except EnvironmentError as ex:
+            # ONLY a bind/permission failure is a legitimate skip (sandbox, port in use). Any other
+            # exception is a bug in core/log.py, and skipping on it means the suite goes green on a
+            # server that cannot start - which is how a NameError in start_logd() passed as "OK
+            # (skipped=4)" while this very change was being written.
+            cls._skip = "could not bind: %s" % ex
+
+    def setUp(self):
+        if not type(self).started:
+            self.skipTest(getattr(type(self), "_skip", "logd not started"))
+
+    def _send(self, payload):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.sendto(payload, ("127.0.0.1", self.port))
+        s.close()
+
+    def _wait_for(self, needle, timeout=5.0):
+        path = os.path.join(self.tmp, DATELOG)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if os.path.isfile(path):
+                with open(path, "rb") as f:
+                    data = f.read()
+                if needle in data:
+                    return data
+            time.sleep(0.05)
+        return b""
+
+    def test_regular_format_epoch_prefixed(self):
+        # "<sec> <event>" -> the server strips the epoch prefix and writes the event to <sec>'s day log
+        event = '"%s" sensorX 10.0.0.5 4444 66.66.66.66 80 TCP IP 66.66.66.66 "malware (x)" (ref)\n' % LOCALTIME
+        self._send(("%d %s" % (SEC, event)).encode("utf-8"))
+        data = self._wait_for(b"66.66.66.66")
+        self.assertIn(b"66.66.66.66", data, "remote sensor event must land in the server's day log")
+        self.assertIn(b"sensorX", data)
+        self.assertNotIn(b"%d %d" % (SEC, SEC), data)     # epoch prefix stripped, not doubled into the line
+
+    def test_naive_format_quoted_localtime(self):
+        # no epoch prefix: line starts with a quoted localtime; server derives the day from it
+        line = '"%s" sensorY 10.0.0.9 5555 5.5.5.5 443 TCP IP 5.5.5.5 "badnet (y)" (ref2)\n' % LOCALTIME
+        self._send(line.encode("utf-8"))
+        data = self._wait_for(b"5.5.5.5")
+        self.assertIn(b"5.5.5.5", data, "naive-format (prefixless) event must also be stored")
+        self.assertIn(b"sensorY", data)
+
+    def test_embedded_newline_cannot_forge_extra_records(self):
+        # This listener is unauthenticated by protocol design - a sensor just sends a datagram. The
+        # handler wrote the payload to the day log byte for byte, so anyone able to reach the port
+        # could put '\n' in the middle of one datagram and append arbitrary extra "events": evidence
+        # tampering in an IDS, and the forged lines are indistinguishable to /events and /fail2ban.
+        # One datagram is one record; interior newlines are collapsed, not honoured.
+        real = '"%s" sensorFORGE 10.0.0.11 1111 7.7.7.7 80 TCP IP 7.7.7.7 "real (f)" (ref)' % LOCALTIME
+        forged = '"%s" sensorFORGE 10.0.0.12 2222 8.8.4.4 80 TCP IP 8.8.4.4 "forged (f)" (ref)' % LOCALTIME
+        self._send(("%d %s\n%s\n" % (SEC, real, forged)).encode("utf-8"))
+        data = self._wait_for(b"sensorFORGE")
+        self.assertIn(b"sensorFORGE", data, "positive control: the datagram was accepted and stored")
+        self.assertEqual(len([_ for _ in data.splitlines() if b"sensorFORGE" in _]), 1,
+                         "one datagram must produce exactly one log record, not two")
+
+    def test_garbage_datagram_ignored(self):
+        # malformed input must not crash the server thread (later valid events must still be stored)
+        self._send(b"\xff\xfe not a valid event at all")
+        self._send(b"")
+        event = '"%s" sensorZ 10.0.0.7 111 9.9.9.9 53 UDP IP 9.9.9.9 "x (z)" (r)\n' % LOCALTIME
+        self._send(("%d %s" % (SEC, event)).encode("utf-8"))
+        self.assertIn(b"sensorZ", self._wait_for(b"sensorZ"), "server must survive garbage and keep storing")
+
+    def test_a_heartbeat_is_recorded_and_never_reaches_the_event_log(self):
+        # Exactly what sensor/src/output.rs:heartbeat_payload() puts on the wire.
+        sec = int(time.time())
+        self._send(b"%d !HB probe-alpha 3.4 4242" % sec)
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            found = [_ for _ in L.sensor_status() if _["sensor"] == "probe-alpha"]
+            if found:
+                break
+            time.sleep(0.05)
+        self.assertTrue(found, "a heartbeat datagram left no trace in the sensor status")
+        self.assertEqual(found[0]["version"], "3.4")
+        self.assertEqual(found[0]["uptime"], 4242)
+        self.assertEqual(found[0]["address"], "127.0.0.1")
+        self.assertGreaterEqual(found[0]["last_seen"], sec)
+
+        # Liveness is not a detection: in the log it would show up in /events, /counts and /fail2ban.
+        self.assertNotIn(b"!HB", self._wait_for(b"probe-alpha", timeout=1.0))
+
+    def test_an_event_is_not_mistaken_for_a_heartbeat(self):
+        event = '"%s" sensorHB 10.0.0.5 4444 3.3.3.3 80 TCP IP 3.3.3.3 "malware (x)" (ref)\n' % LOCALTIME
+        self._send(("%d %s" % (SEC, event)).encode("utf-8"))
+        self.assertIn(b"3.3.3.3", self._wait_for(b"3.3.3.3"), "an event stopped being written once heartbeats existed")
+        self.assertEqual([], [_ for _ in L.sensor_status() if _["sensor"] == "sensorHB"])
+
+    def test_a_forged_sensor_name_cannot_carry_markup_or_grow_without_bound(self):
+        # Without LOG_SERVER_SECRET anything that can reach the port may invent sensors, and the
+        # names end up in a JSON document the dashboard renders.
+        self._send(b"%d !HB <img/src=x> 3.4 1" % int(time.time()))
+        time.sleep(0.3)
+        for status in L.sensor_status():
+            self.assertNotIn("<", status["sensor"])
+            self.assertLessEqual(len(status["sensor"]), L.MAX_SENSOR_FIELD)
+
+        for i in range(L.MAX_SENSOR_STATUS + 50):
+            L.heartbeat_event(b"0 !HB flood%d 3.4 1" % i, "10.0.0.1")
+        self.assertLessEqual(len(L.sensor_status()), L.MAX_SENSOR_STATUS,
+                             "an unauthenticated flood of invented names grew the status table without bound")
+
+
+class TestIntakeShape(unittest.TestCase):
+    """The receiver used to be a ThreadingUDPServer, so each event cost a fresh THREAD - and because the
+    thread was fresh, get_event_log_handle()'s thread-local fd cache always missed, so each event also cost an
+    open() and a close(). Paced against the real server, that capped clean intake at 5,000 events/s (23.9%
+    loss at 10,000/s); one sequential loop with a cached handle holds 20,000/s with no loss.
+
+    Rates are not asserted here - that would be flaky on a shared runner. What is asserted is the SHAPE that
+    produced them: N datagrams must cost ONE open() of the day's log, not N. Counting the opens is the only
+    assertion that discriminates. Three that do NOT, all tried first and all passing against the OLD design:
+    a 200-datagram burst arriving intact (200 fit in the socket buffer either way), the thread count after the
+    burst (per-datagram threads are already gone by then) and the open-descriptor count (reuse=False closed
+    each one, so the answer was zero). A test that cannot fail is not a test."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not TestLogd.started:                     # this class sorts BEFORE TestLogd, so start it here
+            TestLogd.setUpClass()
+
+    def setUp(self):
+        if not TestLogd.started:
+            self.skipTest(getattr(TestLogd, "_skip", "logd not started"))
+
+    def test_a_burst_costs_one_open_not_one_per_datagram(self):
+        path = os.path.join(TestLogd.tmp, DATELOG)
+        payload = b'%d "burst" h 10.0.0.1 1 2.2.2.2 2 TCP IP 2.2.2.2 "m" (s)' % SEC
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        sock.sendto(payload, ("127.0.0.1", TestLogd.port))       # warm the day's handle first
+        self._wait_for_lines(path, 1)
+
+        opens = []
+        real_open = L.os.open
+
+        def counting_open(*args, **kwargs):
+            if isinstance(args[0], str) and args[0].endswith(".log"):
+                opens.append(args[0])
+            return real_open(*args, **kwargs)
+
+        before = self._count_lines(path)
+        L.os.open = counting_open
+        try:
+            for _ in range(200):
+                sock.sendto(payload, ("127.0.0.1", TestLogd.port))
+            self._wait_for_lines(path, before + 200)
+        finally:
+            L.os.open = real_open
+            sock.close()
+
+        self.assertEqual(self._count_lines(path) - before, 200, "datagrams were dropped in a 200-packet burst")
+        self.assertLessEqual(len(opens), 1,
+                             "the event-log handle is reopened per datagram (%d opens for 200 events)" % len(opens))
+
+    def _count_lines(self, path):
+        if not os.path.isfile(path):
+            return 0
+        with open(path, "rb") as f:
+            return sum(1 for _ in f)
+
+    def _wait_for_lines(self, path, target, timeout=10.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._count_lines(path) >= target:
+                return True
+            time.sleep(0.05)
+        return False
+
+
+def _today_log():
+    """The day-log filename for now.
+
+    The tests above pin a fixed 2023 epoch so the filename is deterministic. The signed tests
+    cannot: LOG_SERVER_SECRET bounds replay by the timestamp inside the payload, so an event has
+    to carry a CURRENT one to be accepted at all, and it therefore lands in today's file.
+    """
+    lt = time.localtime()
+    return "%d-%02d-%02d.log" % (lt.tm_year, lt.tm_mon, lt.tm_mday)
+
+
+class TestLogServerSecret(unittest.TestCase):
+    """LOG_SERVER_SECRET authenticates the event datagrams.
+
+    The listener is otherwise open by protocol design: anything that can reach the port can append
+    to the log an operator reasons from, and that /events, /counts and /fail2ban parse. Forged
+    detections are evidence tampering, which is worse for an IDS than being read.
+
+    These drive the real receiver over a real socket, because the property that matters is what the
+    listener WRITES, not what a helper returns.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="mt_logd_sec_")
+        cls.started = False
+        config.LOG_DIR = cls.tmp
+        config.SHOW_DEBUG = False
+        config.LOG_SERVER_SECRET = "unit-test-secret"
+        cls.port = _free_udp_port()
+        try:
+            L.start_logd(address="127.0.0.1", port=cls.port, join=False)
+            time.sleep(0.5)
+            cls.started = True
+        except EnvironmentError as ex:
+            cls._skip = "could not bind: %s" % ex
+
+    @classmethod
+    def tearDownClass(cls):
+        config.LOG_SERVER_SECRET = None
+
+    def setUp(self):
+        if not type(self).started:
+            self.skipTest(getattr(type(self), "_skip", "logd not started"))
+
+    def _send(self, payload):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.sendto(payload, ("127.0.0.1", self.port))
+        s.close()
+
+    def _log(self, settle=0.6):
+        time.sleep(settle)
+        path = os.path.join(self.tmp, _today_log())
+        if not os.path.isfile(path):
+            return b""
+        with open(path, "rb") as f:
+            return f.read()
+
+    def _event(self, marker):
+        sec = int(time.time())
+        return ("%d \"%s\" box 10.0.0.5 4421 8.8.8.8 53 UDP DNS %s \"malware (x)\" (static)\n"
+                % (sec, time.strftime(TIME_FORMAT) + ".000000", marker)).encode("utf8")
+
+    def test_a_signed_event_is_recorded(self):
+        payload = self._event("signed-ok.example")
+        self._send(L.mts_sign(config.LOG_SERVER_SECRET, payload))
+        self.assertIn(b"signed-ok.example", self._log(),
+                      "a correctly signed event was not written")
+
+    def test_an_unsigned_event_is_dropped(self):
+        # This is the hole: before the secret existed, this datagram was accepted from anyone.
+        self._send(self._event("unsigned-forgery.example"))
+        self.assertNotIn(b"unsigned-forgery.example", self._log(),
+                         "an unauthenticated datagram was written to the event log")
+
+    def test_a_wrong_secret_is_dropped(self):
+        payload = self._event("wrong-key.example")
+        self._send(L.mts_sign("not-the-secret", payload))
+        self.assertNotIn(b"wrong-key.example", self._log(),
+                         "a datagram signed with the wrong key was accepted")
+
+    def test_a_tampered_payload_is_dropped(self):
+        # The MAC stays valid-looking; the event under it is edited in flight.
+        signed = L.mts_sign(config.LOG_SERVER_SECRET, self._event("tamper-src.example"))
+        tampered = signed.replace(b"tamper-src.example", b"tamper-dst.example")
+        self.assertNotEqual(signed, tampered, "the test did not actually modify the payload")
+        self._send(tampered)
+        self.assertNotIn(b"tamper-dst.example", self._log(),
+                         "an edited payload passed verification")
+
+    def test_the_window_is_configurable(self):
+        # The failure this guards is total - a skewed sensor loses EVERY event - so an operator who
+        # cannot keep a fleet synchronised has to be able to widen it, or switch it off with 0.
+        old = int(time.time()) - 4000
+        payload = ("%d \"%s\" box 10.0.0.5 1 8.8.8.8 53 UDP DNS widened-window.example \"m (x)\" (static)\n"
+                   % (old, time.strftime(TIME_FORMAT) + ".000000")).encode("utf8")
+        self.assertIsNone(L.mts_open(config.LOG_SERVER_SECRET, L.mts_sign(config.LOG_SERVER_SECRET, payload)),
+                          "4000s should be outside the 900s default")
+        config.LOG_SERVER_SKEW = 7200
+        try:
+            self.assertIsNotNone(L.mts_open(config.LOG_SERVER_SECRET, L.mts_sign(config.LOG_SERVER_SECRET, payload)),
+                                 "a widened window did not take effect")
+            config.LOG_SERVER_SKEW = 0
+            ancient = ("%d \"%s\" box 10.0.0.5 1 8.8.8.8 53 UDP DNS no-window.example \"m (x)\" (static)\n"
+                       % (int(time.time()) - 10 ** 7, time.strftime(TIME_FORMAT) + ".000000")).encode("utf8")
+            self.assertIsNotNone(L.mts_open(config.LOG_SERVER_SECRET, L.mts_sign(config.LOG_SERVER_SECRET, ancient)),
+                                 "0 should disable the window entirely")
+        finally:
+            config.LOG_SERVER_SKEW = None
+
+    def test_a_timezone_difference_is_not_skew(self):
+        # The signed field is an epoch second, so a sensor and a server in different zones agree on
+        # it exactly. Signing under one TZ and verifying under another must change nothing.
+        payload = self._event("across-timezones.example")
+        signed = L.mts_sign(config.LOG_SERVER_SECRET, payload)
+        before = os.environ.get("TZ")
+        try:
+            os.environ["TZ"] = "Asia/Tokyo"; time.tzset()
+            tokyo = L.mts_open(config.LOG_SERVER_SECRET, signed)
+            os.environ["TZ"] = "Pacific/Kiritimati"; time.tzset()
+            kiritimati = L.mts_open(config.LOG_SERVER_SECRET, signed)
+            self.assertEqual(tokyo, payload, "a signed event was refused under one timezone")
+            self.assertEqual(kiritimati, payload, "a signed event was refused under another")
+        finally:
+            if before is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = before
+            time.tzset()
+
+    def test_a_signed_heartbeat_is_accepted_and_an_unsigned_one_is_not(self):
+        # A heartbeat leads with the epoch second precisely so mts_open() will verify it: a
+        # sensor whose liveness datagrams are silently refused looks dead, which is the one
+        # conclusion this feature must never reach by accident.
+        self._send(L.mts_sign(config.LOG_SERVER_SECRET, b"%d !HB signed-probe 3.4 7" % int(time.time())))
+        self._send(b"%d !HB unsigned-probe 3.4 7" % int(time.time()))
+        time.sleep(0.6)
+
+        names = [_["sensor"] for _ in L.sensor_status()]
+        self.assertIn("signed-probe", names, "a correctly signed heartbeat was refused")
+        self.assertNotIn("unsigned-probe", names, "an unauthenticated sensor could invent itself")
+        self.assertNotIn(b"!HB", self._log(), "a heartbeat was written to the event log")
+
+    def test_a_stale_datagram_is_dropped(self):
+        # Replay is bounded by the timestamp the payload is signed with.
+        old = int(time.time()) - (L.LOG_SERVER_SKEW + 60)
+        payload = ("%d \"%s\" box 10.0.0.5 1 8.8.8.8 53 UDP DNS stale-replay.example \"m (x)\" (static)\n"
+                   % (old, time.strftime(TIME_FORMAT) + ".000000")).encode("utf8")
+        self._send(L.mts_sign(config.LOG_SERVER_SECRET, payload))
+        self.assertNotIn(b"stale-replay.example", self._log(),
+                         "a datagram older than the accepted window was replayed in")
+
+
+class TestLogServerSecretUnset(unittest.TestCase):
+    """With no secret configured, nothing changes for an existing deployment.
+
+    Including the upgrade-ordering case: a sensor that already has the secret, pointed at a server
+    that does not yet, must still get its events recorded rather than writing "MTS1 <mac> ..." into
+    the log as though the framing were part of the event.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="mt_logd_plain_")
+        cls.started = False
+        config.LOG_DIR = cls.tmp
+        config.SHOW_DEBUG = False
+        config.LOG_SERVER_SECRET = None
+        cls.port = _free_udp_port()
+        try:
+            L.start_logd(address="127.0.0.1", port=cls.port, join=False)
+            time.sleep(0.5)
+            cls.started = True
+        except EnvironmentError as ex:
+            cls._skip = "could not bind: %s" % ex
+
+    def setUp(self):
+        if not type(self).started:
+            self.skipTest(getattr(type(self), "_skip", "logd not started"))
+
+    def _send_and_read(self, payload, settle=0.6):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.sendto(payload, ("127.0.0.1", self.port))
+        s.close()
+        time.sleep(settle)
+        path = os.path.join(self.tmp, _today_log())
+        if not os.path.isfile(path):
+            return b""
+        with open(path, "rb") as f:
+            return f.read()
+
+    def test_an_unsigned_event_still_works(self):
+        sec = int(time.time())
+        payload = ("%d \"%s\" box 10.0.0.5 1 8.8.8.8 53 UDP DNS plain-mode.example \"m (x)\" (static)\n"
+                   % (sec, time.strftime(TIME_FORMAT) + ".000000")).encode("utf8")
+        self.assertIn(b"plain-mode.example", self._send_and_read(payload),
+                      "an unsigned datagram stopped working when no secret is configured")
+
+    def test_a_signed_event_has_its_framing_stripped(self):
+        sec = int(time.time())
+        payload = ("%d \"%s\" box 10.0.0.5 1 8.8.8.8 53 UDP DNS half-upgraded.example \"m (x)\" (static)\n"
+                   % (sec, time.strftime(TIME_FORMAT) + ".000000")).encode("utf8")
+        data = self._send_and_read(L.mts_sign("some-secret", payload))
+        self.assertIn(b"half-upgraded.example", data, "a signed event was lost against a server with no secret")
+        self.assertNotIn(b"MTS1", data, "the framing was written into the event log as if it were data")
+
+
+if __name__ == "__main__":
+    unittest.main()

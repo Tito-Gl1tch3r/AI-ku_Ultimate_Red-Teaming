@@ -1,0 +1,933 @@
+package scanner
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/recon-platform/internal/config"
+	"github.com/recon-platform/internal/database"
+	"github.com/recon-platform/pkg/logger"
+)
+
+// DASTScanner is Reconner's native, context-aware DAST engine — the layer that
+// finds the class of bugs template matchers (nuclei) structurally miss:
+// context-dependent injection where the RIGHT payload depends on WHERE the input
+// lands. Instead of firing a fixed payload and grepping, it works per insertion
+// point in three disciplined steps:
+//
+//  1. BASELINE — a benign nonce, to know the parameter's normal reflection/errors.
+//  2. PROBE + CLASSIFY — one reflection probe (marker + breakout chars) reused
+//     from the XSS context engine tells us the exact context (HTML text / quoted
+//     attr / unquoted attr / JS string / JS expr) and which breakout chars
+//     survived UNENCODED there.
+//  3. CONTEXT-AWARE CONFIRM (differential) — for a markup context it injects a
+//     brand-new benign ELEMENT built for that exact context and confirms the raw
+//     element survived in the response (deterministic HTML-injection proof, near
+//     zero FP). A safely-encoded reflection is explicitly REJECTED. In the same
+//     pass a broken-quote differential (error appears only AFTER the quote, not in
+//     baseline) raises an error-based SQLi candidate for sqlmap to PROVE.
+//
+// Everything flows into the unified candidate pipeline — the engine never
+// self-confirms SQLi (sqlmap does) and reuses the shared HTTP/insertion/context
+// primitives (no parallel engines).
+type DASTScanner struct {
+	db        *database.DB
+	cfg       *config.Config
+	logger    *logger.Logger
+	broadcast BroadcastFunc
+}
+
+// xssBrowserBudget belongs to one Run/RunXSS invocation. The scheduler reuses a
+// DASTScanner across tasks, so keeping this counter on DASTScanner let one scan
+// reset or consume another concurrent scan's allowance.
+type xssBrowserBudget struct{ remaining atomic.Int64 }
+
+func newXSSBrowserBudget(limit int64) *xssBrowserBudget {
+	b := &xssBrowserBudget{}
+	b.remaining.Store(limit)
+	return b
+}
+
+func (b *xssBrowserBudget) take() bool {
+	if b == nil {
+		return false
+	}
+	for {
+		remaining := b.remaining.Load()
+		if remaining <= 0 {
+			return false
+		}
+		if b.remaining.CompareAndSwap(remaining, remaining-1) {
+			return true
+		}
+	}
+}
+
+func NewDASTScanner(db *database.DB, cfg *config.Config, log *logger.Logger, broadcast BroadcastFunc) *DASTScanner {
+	return &DASTScanner{db: db, cfg: cfg, logger: log, broadcast: broadcast}
+}
+
+var dastClient = &http.Client{
+	Transport: sharedHTTPTransport,
+	Timeout:   15 * time.Second,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
+// unique, collision-resistant markers.
+const (
+	dastNonce     = "rcnb3axz9" // benign baseline value
+	dastElement   = "rcnq2z"    // the injected new-element name we confirm raw
+	dastMaxPoints = 600         // hard cap on insertion points per run
+	dastWorkers   = 12          // concurrent insertion points
+
+	// dastBrowserBudget caps how many SPECULATIVE browser escalations run per
+	// scan: the script-resource check (reflected into a JS/JSONP response, not
+	// yet breakout-confirmed) and the DOM/SPA canary (no raw-HTML reflection at
+	// all — every non-reflected param gets a speculative navigation). Both test
+	// candidates with NO prior breakout signal, so bounding their volume is a
+	// real tradeoff, not a correctness requirement. It must NEVER be consumed by
+	// proveExecutingXSS's main confirmation attempt: that path only runs after a
+	// real breakout signal already survived (a.Executable), so a shared counter
+	// meant a scan with a few thousand raw-reflected candidates silently
+	// exhausted the ENTIRE scan's browser allowance on the confirmed-signal path
+	// alone — every candidate after that fell to the browserless ladder, which
+	// can mark "Inconclusive" but, per this system's own no-finding-without-proof
+	// design, can never produce a CONFIRMED finding. On a large multi-asset scan
+	// (thousands of parameters) that meant only roughly the first ~150
+	// already-signaled candidates could ever become real findings, no matter how
+	// many more genuinely vulnerable ones followed. Raised from 150, then from
+	// 1000 — now effectively unbounded for any real target, so the operator
+	// decides whether a scan this wide is worth the wall-clock time, not a
+	// silent built-in ceiling. It only governs genuinely speculative
+	// navigations (no prior signal), never the confirmed-signal path above.
+	dastBrowserBudget = 20000
+)
+
+// Run drives the DAST engine across the target's insertion points.
+// Run is the combined DAST engine: context-aware reflected XSS + error-based
+// SQLi candidate registration over every insertion point.
+func (s *DASTScanner) Run(ctx context.Context, targetID string, logFn LogFunc) error {
+	return s.run(ctx, targetID, logFn, false)
+}
+
+// RunXSS is the standalone XSS objective: the SAME deep context-aware reflected-
+// XSS engine (HTML-text / quoted+unquoted attribute / single- & double-quote /
+// JS-string / CSS / URL-sink contexts, multi-reflection, breakout-confirmed) but
+// WITHOUT the error-based SQLi candidate side-channel — so selecting XSS alone
+// produces XSS findings only and nothing else.
+func (s *DASTScanner) RunXSS(ctx context.Context, targetID string, logFn LogFunc) error {
+	return s.run(ctx, targetID, logFn, true)
+}
+
+func (s *DASTScanner) run(ctx context.Context, targetID string, logFn LogFunc, xssOnly bool) error {
+	if !xssOnly && s.cfg != nil && !s.cfg.EnableDAST {
+		return nil
+	}
+	label := "dast"
+	if xssOnly {
+		label = "xss"
+	}
+	pointLimit := dastMaxPoints
+	if xssOnly && s.cfg != nil {
+		pointLimit = s.cfg.URLLimit()
+	}
+	points := loadInsertionPoints(ctx, s.db, targetID, pointLimit)
+	if xssOnly {
+		points = loadXSSInsertionPoints(ctx, s.db, targetID, pointLimit)
+	}
+	// Reflective request HEADERS are a whole source class the parameter table
+	// never captures: Referer / X-Forwarded-Host / User-Agent and friends are
+	// frequently echoed unencoded into an HTML response (error pages, "you came
+	// from" banners, debug footers). Inject the same context-aware probe into them
+	// and confirm through the identical breakout proof — so it finds a real class
+	// of reflected XSS with ZERO new false-positive path. Bounded to the alive
+	// roots so it never multiplies the request budget unreasonably.
+	points = append(points, s.xssHeaderInsertionPoints(ctx, targetID)...)
+	RecordCoverage(ctx, CoverageDiscovered, int64(len(points)))
+	RecordCoverage(ctx, CoverageEligible, int64(len(points)))
+	auth := loadAuthHeaders(ctx, s.db, targetID)
+	// Create a per-run headless-browser budget. Params whose reflection is NOT
+	// visible in raw HTML (client-rendered / SPA / DOM sinks) are escalated to a real
+	// browser — but only up to this many, so a huge target can't stall in the browser.
+	browserBudget := newXSSBrowserBudget(dastBrowserBudget)
+	if len(points) == 0 {
+		logFn("info", label, "No parameter insertion points to test; continuing with page-level DOM XSS verification.")
+	} else {
+		logFn("info", label, fmt.Sprintf("Context-aware reflected-XSS analysis over %d insertion point(s)...", len(points)))
+	}
+
+	var xssConfirmed, xssRejected, sqliCand int64
+	sem := make(chan struct{}, dastWorkers)
+	var wg sync.WaitGroup
+
+pointLoop:
+	for _, ip := range points {
+		if ctx.Err() != nil {
+			break
+		}
+		if ip.Param == "" {
+			continue
+		}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			break pointLoop
+		}
+		wg.Add(1)
+		go func(ip insertionPoint) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			RecordCoverage(ctx, CoverageAttempted, 1)
+			res := s.testPoint(ctx, targetID, ip, auth, xssOnly, browserBudget)
+			atomic.AddInt64(&xssConfirmed, int64(res.xssConfirmed))
+			atomic.AddInt64(&xssRejected, int64(res.xssRejected))
+			atomic.AddInt64(&sqliCand, int64(res.sqliCand))
+		}(ip)
+	}
+	wg.Wait()
+
+	// Promote static DOM-XSS leads to PROVEN findings: drive a real browser to place
+	// an executing payload in each page's location.hash / a query param and confirm
+	// it actually runs. This is nonce-backed alert('reconner') execution evidence,
+	// not a static grep.
+	if ctx.Err() == nil {
+		VerifyDOMXSSOnPages(ctx, s.db, targetID, logFn)
+	}
+
+	if xssOnly {
+		logFn("warn", label, fmt.Sprintf("XSS analysis done. XSS confirmed=%d, encoded-reflections rejected=%d.", xssConfirmed, xssRejected))
+	} else {
+		logFn("warn", label, fmt.Sprintf(
+			"DAST done. XSS confirmed=%d, encoded-reflections rejected=%d, error-based SQLi candidates=%d.",
+			xssConfirmed, xssRejected, sqliCand))
+	}
+	return ctx.Err()
+}
+
+type dastOutcome struct {
+	xssConfirmed int
+	xssRejected  int
+	sqliCand     int
+}
+
+func (s *DASTScanner) testPoint(ctx context.Context, targetID string, ip insertionPoint, auth map[string]string, xssOnly bool, browserBudget *xssBrowserBudget) dastOutcome {
+	var out dastOutcome
+	if ctx.Err() != nil {
+		return out
+	}
+
+	// 1) baseline — normal behaviour of this parameter. A per-request value avoids
+	// cache/collision artifacts from the historical fixed nonce.
+	baselineNonce := newXSSToken("rcnbase")
+	baseline, _ := sendInjected(ctx, dastClient, ip, baselineNonce, auth)
+
+	// 2) reflection probe + context classification (reused XSS context engine).
+	probeMarker := newXSSToken("rcnctx")
+	probe := sendInjectedResponse(ctx, dastClient, ip, xssProbeFor(probeMarker), auth)
+	analyses := analyzeReflectionProbes(probe.Body, probeMarker, xssProbeSuffix)
+	a := ReflectionAnalysis{Context: CtxNone}
+	if len(analyses) > 0 {
+		a = analyses[0]
+	}
+	// A reflected payload only executes when the browser renders the response as
+	// HTML. Input echoed into application/json (or any declared non-HTML type) is
+	// inert even when '"<> survive raw — the classic reflected-XSS false positive
+	// (e.g. an API endpoint reflecting a `clientId` into its JSON body). Decide the
+	// HTML-sink question ONCE, here, from the probe's own Content-Type.
+	probeHTMLSink := browserRendersResponse(probe.Status, probe.ContentType, probe.Body, probe.NoSniff)
+	// A WAF/edge block on the XSS-shaped probe payload only proves that THIS
+	// payload was blocked — it says nothing about whether a differently-shaped
+	// SQLi probe (sent independently below) would also be blocked. The old code
+	// returned immediately here, which silently skipped the SQL-error
+	// differential check further down for every insertion point where the XSS
+	// probe alone tripped a WAF, even though many WAFs allow-list or don't
+	// pattern-match on a single quote the way they do on `<script>`-shaped
+	// input. Continue to the SQLi check instead of returning early.
+	xssProbeBlocked := looksLikeBlockPage(probe.Status, probe.Body)
+	if xssProbeBlocked {
+		c := s.xssCandidate(targetID, ip, a.Context, "XSS probe reached a WAF/edge block page; application behavior is unknown")
+		c.Payload = xssProbeFor(probeMarker)
+		_, _ = RecordCandidateResult(ctx, s.db, c, VerifyResult{
+			Verdict: VerifyInconclusive, Confidence: ConfCandidateLo, Method: "dast-waf",
+			Reason: fmt.Sprintf("WAF/edge block or challenge during XSS probe (HTTP %d)", probe.Status),
+		}, FindingMeta{Actor: "dast"})
+	}
+	if a.Reflected && !xssProbeBlocked {
+		switch {
+		case !probeHTMLSink && scriptLikeContentType(probe.ContentType):
+			// JavaScript/ECMAScript responses are inert on a top-level navigation,
+			// but become executable when the endpoint is embedded as <script src>.
+			// JSONP and reflected JS endpoints were therefore a real false-negative:
+			// the old MIME gate rejected them before testing the browser's script
+			// resource execution path. Only Chromium can prove this class faithfully
+			// because it applies MIME/nosniff/CORS/resource-loading semantics itself.
+			if b := getXSSBrowser(); b != nil && browserBudget.take() {
+				if pl, ok := b.ConfirmScriptResource(ctx, ip, auth); ok {
+					s.confirmXSS(ctx, targetID, ip, "script_resource", pl, "browser", 99)
+					out.xssConfirmed++
+					break
+				}
+			}
+			c := s.xssCandidate(targetID, ip, "script_resource", "input is reflected in a JavaScript resource; external-script execution requires runtime proof")
+			c.Payload = xssProbeFor(probeMarker)
+			_, _ = RecordCandidateResult(ctx, s.db, c, VerifyResult{
+				Verdict: VerifyInconclusive, Confidence: ConfCandidateLo, Method: "dast-script-resource",
+				Reason: "reflected JavaScript/JSONP resource found, but executable script-resource loading was not proven",
+			}, FindingMeta{Actor: "dast"})
+		case a.Executable && !probeHTMLSink:
+			// Reflected with breakout chars surviving, but the response is not an HTML
+			// document → a browser will not execute it. Record as provably-not-a-bug.
+			c := s.xssCandidate(targetID, ip, a.Context, "reflected into non-HTML ("+ctLabel(probe.ContentType)+") response — a browser will not render/execute it")
+			_, _ = RecordCandidateResult(ctx, s.db, c, VerifyResult{Verdict: VerifyRejected,
+				Method: "dast-context", Reason: "non-rendered response: " + ctLabel(probe.ContentType)}, FindingMeta{Actor: "dast"})
+			out.xssRejected++
+		case a.Encoded && !a.Executable:
+			// Reflected but safely output-encoded → NOT executable. Record the
+			// REJECTED candidate so it's provably-not-a-bug, never a finding.
+			c := s.xssCandidate(targetID, ip, a.Context, "reflected but HTML-encoded — not executable")
+			_, _ = RecordCandidateResult(ctx, s.db, c, VerifyResult{Verdict: VerifyRejected,
+				Method: "dast-context", Reason: "required breakout characters encoded in " + a.Context}, FindingMeta{Actor: "dast"})
+			out.xssRejected++
+		case a.Executable:
+			confirmed := false
+			proofAttempted := false
+			proofPayload, proofMethod := "", ""
+			proofConfidence := ConfCandidateLo
+			proofExecuted := false
+			tryExecutionProof := func() {
+				if proofAttempted {
+					return
+				}
+				proofAttempted = true
+				proofPayload, proofMethod, proofConfidence, proofExecuted = s.proveExecutingXSS(ctx, ip, a, analyses, auth, baseline)
+			}
+			// A URL attribute controlled from its first byte does not need a quote
+			// breakout: javascript: is itself the execution primitive. The benign
+			// marker-tag confirm below cannot prove this class, so send it directly
+			// to Chromium (which activates javascript: links) instead of silently
+			// leaving every scheme-only sink inconclusive.
+			if getXSSBrowser() != nil || (a.Context == CtxURL && a.URLScheme) {
+				tryExecutionProof()
+				if proofExecuted {
+					s.confirmXSS(ctx, targetID, ip, a.Context, proofPayload, proofMethod, proofConfidence)
+					out.xssConfirmed++
+					confirmed = true
+				}
+			}
+			// 3) context-aware differential confirm. First the markup contexts
+			// (HTML text / quoted / unquoted attr) whose new-element injection is
+			// deterministically provable. If that isn't applicable, try the
+			// <script>-breakout: a reflection sitting inside a <script> block whose
+			// angle brackets survive RAW can close </script> and inject a new HTML
+			// element — a deterministic, browserless proof of an executable XSS that
+			// a JS-context reflection would otherwise leave merely "inconclusive".
+			payload, needle, confirmable := dastConfirm(a)
+			if !confirmable {
+				payload, needle, confirmable = jsScriptBreakout(a)
+			}
+			if confirmable && !confirmed {
+				confResp := sendInjectedResponse(ctx, dastClient, ip, payload, auth)
+				// Two hard FP gates before an XSS is CONFIRMED:
+				//  (1) the response must actually be rendered as HTML — a payload
+				//      reflected into a CSS/JS/JSON/plain response never executes;
+				//  (2) the injected element must appear as a GENUINE start tag in HTML
+				//      text (htmlTagInjected), not merely as raw characters sitting
+				//      inside a quoted attribute value or a <script>/<style> body — that
+				//      is reflection, not markup injection. Together these kill the two
+				//      dominant reflected-XSS false-positive classes (static-asset
+				//      version params and tracking params echoed into a quoted attr/URL).
+				if browserRendersResponse(confResp.Status, confResp.ContentType, confResp.Body, confResp.NoSniff) &&
+					htmlTagInjected(confResp.Body, dastElement) &&
+					!strings.Contains(baseline, needle) {
+					// HTML injection is proven. Now find a payload the app does NOT
+					// filter, so the reported PoC actually executes (the dominant
+					// "reflected markup but no execution" gap): use browser proof when
+					// available; only its absence permits the short candidate ladder.
+					tryExecutionProof()
+					if proofExecuted {
+						s.confirmXSS(ctx, targetID, ip, a.Context, proofPayload, proofMethod, proofConfidence)
+						out.xssConfirmed++
+						confirmed = true
+					}
+				}
+			}
+			// executable context but not deterministically confirmable here (e.g. a
+			// JS string whose quote survives but whose angle brackets are encoded, so
+			// only an in-JS breakout works) — strong candidate, left for browser/
+			// manual proof (never auto-reported as a finding).
+			if !confirmed {
+				note := "breakout/injection signal survived, but executable JavaScript was not proven"
+				c := s.xssCandidate(targetID, ip, a.Context, note)
+				method := "dast-context"
+				reason := "no runtime or CSP-valid executable payload proof"
+				confidence := ConfCandidateLo
+				if proofPayload != "" {
+					c.Payload = proofPayload
+					c.DetectionMethod += "/" + proofMethod
+					confidence = proofConfidence
+					c.Confidence = proofConfidence
+					method = "dast-" + proofMethod
+					reason = "Chromium was unavailable; a bounded existing payload candidate survived the parsed response and CSP checks, but runtime execution remains unproven"
+					c.Evidence = note + ". Candidate payload: " + proofPayload
+				} else if confirmable {
+					// The context-aware breakout payload was built and sent (it just
+					// didn't clear the CONFIRMED bar above) — still the concrete,
+					// reproducible input a reviewer needs, so surface it rather than
+					// leaving the finding without a repro payload.
+					c.Payload = payload
+					c.Evidence = note + ". Candidate payload: " + payload
+				} else {
+					// Nothing context-specific was buildable; the reflected probe itself
+					// is still the minimal reproduction of the raw breakout signal.
+					c.Payload = xssProbeFor(probeMarker)
+				}
+				_, _ = RecordCandidateResult(ctx, s.db, c, VerifyResult{Verdict: VerifyInconclusive,
+					Confidence: confidence, Method: method, Reason: reason}, FindingMeta{Actor: "dast"})
+			}
+		}
+	} else if probeHTMLSink && xssOnly && !xssProbeBlocked {
+		// SPA / DOM XSS: the probe is NOT reflected in the raw HTML, but the response
+		// IS an HTML document — the classic client-rendered app where the reflection is
+		// written into the DOM by JavaScript after load (invisible to the raw-HTML
+		// parser, which is why mature JS sites looked "0 reflected / 0 XSS"). Escalate
+		// to a real headless browser, bounded by the per-scan budget, and confirm
+		// actual execution. Only for the standalone XSS objective so a full combined
+		// scan isn't slowed by browser navigations on every non-reflected param.
+		if b := getXSSBrowser(); b != nil {
+			cachedReflected, cached := cachedDOMReflection(domReflectKey(ip, auth))
+			// A cached negative from param_reflection costs no browser navigation
+			// here and therefore must not consume the limited escalation budget.
+			if (!cached || cachedReflected) && browserBudget.take() {
+				// One inert rendered-DOM canary eliminates parameters that are not
+				// consumed client-side. The old path immediately sprayed the complete
+				// browser payload ladder (up to ~20 serialized navigations) at every
+				// raw-negative HTML parameter, even after reflection scanning had
+				// already shown it was inert.
+				// Visible DOM reflection alone is not a reason to spray payloads:
+				// textContent/innerText are deliberately safe and used heavily by SPAs.
+				// Escalate only when the canary actually reached an instrumented HTML,
+				// code or scriptable-URL sink. Reflection inventory still records plain
+				// rendered text through the param_reflection module.
+				if b.DOMReflectsInsertion(ctx, ip, auth) && b.RuntimeTrace(ip, auth) != "" {
+					if pl, ok := b.ConfirmInsertion(ctx, ip, auth); ok {
+						s.confirmXSS(ctx, targetID, ip, "dom", pl, "browser", 99, b.RuntimeTrace(ip, auth))
+						out.xssConfirmed++
+					}
+				}
+			}
+		}
+	}
+
+	// SQLi error-based differential: a DB error that appears only AFTER a broken
+	// quote (and NOT in the baseline) is a strong error-based SQLi signal. We do
+	// NOT self-confirm — we register a candidate for the sqlmap verifier to PROVE.
+	// Skipped when running as the standalone XSS objective, so an XSS-only scan
+	// never registers a SQLi candidate.
+	if !xssOnly && ctx.Err() == nil {
+		quoteBody, _ := sendInjected(ctx, dastClient, ip, dastNonce+"'", auth)
+		if sqlErrorAppeared(baseline, quoteBody) {
+			c := VulnerabilityCandidate{
+				TargetID: targetID, Type: "sqli", Subtype: "error-based",
+				URL: ip.URL, Method: ip.Method, Parameter: ip.Param, Location: locOf(ip),
+				Payload: "'", DetectionSource: "dast", DetectionMethod: "error-diff",
+				Severity: "high", Confidence: 80, Status: CandDetected,
+				Evidence: "SQL error signature appeared only after a broken-quote injection (absent in baseline) at parameter " + ip.Param,
+			}
+			_, _ = RecordCandidateDetection(ctx, s.db, c, FindingMeta{Actor: "dast"})
+			out.sqliCand++
+		}
+	}
+	return out
+}
+
+// dastConfirm returns the context-specific payload that injects a NEW benign
+// element plus the raw needle to confirm, for the markup contexts we can prove
+// deterministically without a browser. JS contexts return confirmable=false.
+func dastConfirm(a ReflectionAnalysis) (payload, needle string, confirmable bool) {
+	el := "<" + dastElement + ">"
+	switch a.Context {
+	case CtxHTMLText:
+		return el, el, true
+	case CtxQuotedAttr, CtxURL:
+		if a.Context == CtxURL && a.URLScheme && a.Quote == 0 {
+			return "", "", false
+		}
+		// Break out of the ACTUAL opening quote (single- vs double-quoted attrs and
+		// href/src URL sinks alike), close the tag, inject a fresh element. The
+		// re-inject + htmlTagInjected gate below still proves it materialised.
+		q := `"`
+		if a.Quote == '\'' {
+			q = "'"
+		}
+		return q + `>` + el, el, true
+	case CtxUnquotedAttr:
+		return `>` + el, el, true
+	case CtxCSS:
+		// Close the <style> element, then inject a new element into HTML text.
+		return `</style>` + el, el, true
+	case CtxComment:
+		// Close the HTML comment, then inject a new element into HTML text.
+		return `-->` + el, el, true
+	case CtxRCDATA, CtxRAWTEXT:
+		// Close the raw-text element (</textarea> etc.), then a fresh element.
+		return a.CloseTag + el, el, true
+	case CtxSrcDoc:
+		// The live element exists in the nested srcdoc Document, not in the outer
+		// response tree parsed by htmlTagInjected. Only Chromium can prove it.
+		return "", "", false
+	default:
+		return "", "", false
+	}
+}
+
+// jsScriptBreakout returns a deterministic <script>-breakout confirm for a
+// reflection that landed inside a <script> block. If BOTH angle brackets survived
+// UNENCODED, closing the script element (`</script>`) and injecting a brand-new
+// raw element proves full HTML injection — a real, executable reflected XSS even
+// though the input sits in JavaScript. When the angle brackets are encoded the
+// breakout cannot form, so it stays non-confirmable (a browser-level in-JS proof
+// would be required) and returns confirmable=false.
+func jsScriptBreakout(a ReflectionAnalysis) (payload, needle string, confirmable bool) {
+	if a.Context != CtxJSString && a.Context != CtxJSExpr {
+		return "", "", false
+	}
+	if strings.Contains(a.Surviving, "<") && strings.Contains(a.Surviving, ">") {
+		el := "<" + dastElement + ">"
+		return "</script>" + el, el, true
+	}
+	return "", "", false
+}
+
+// htmlishResponse reports whether a response body would be parsed as HTML by a
+// browser. Injected markup is only executable in an HTML (or XHTML) document;
+// reflected into text/css, application/javascript, application/json, text/plain,
+// an image, a font, etc. it is inert. When the Content-Type is absent we only
+// trust it as HTML if the body actually carries an HTML signature, so a
+// header-less static asset can't masquerade as a page.
+func htmlishResponse(contentType, body string) bool {
+	ct := strings.ToLower(strings.TrimSpace(contentType))
+	if strings.HasPrefix(ct, "text/html") || strings.Contains(ct, "application/xhtml") {
+		return true
+	}
+	if ct != "" {
+		// A declared, non-HTML content type is never an HTML sink.
+		return false
+	}
+	low := strings.ToLower(body)
+	return strings.Contains(low, "<!doctype html") || strings.Contains(low, "<html")
+}
+
+// ctLabel returns a short, human-readable label for a Content-Type used in
+// evidence/reasons — the media type without parameters, or "no Content-Type".
+func ctLabel(contentType string) string {
+	ct := strings.TrimSpace(contentType)
+	if ct == "" {
+		return "no Content-Type"
+	}
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = strings.TrimSpace(ct[:i])
+	}
+	return strings.ToLower(ct)
+}
+
+// browserRendersAsHTML reports whether a top-level navigation to this response
+// would be parsed as an HTML document by the browser — the precondition for any
+// reflected payload to execute at all. It is stricter than htmlishResponse in
+// exactly one way: when the server sends X-Content-Type-Options: nosniff, MIME
+// sniffing is forbidden, so a response that is only "HTML-ish" by body signature
+// (blank/absent Content-Type) is NOT rendered as HTML and cannot execute markup.
+//
+// A response that DECLARES a non-HTML type — application/json above all: user
+// input echoed into a JSON API body is the single most common reflected-XSS
+// false positive — is never an HTML sink, with or without nosniff. Even when the
+// breakout characters ('"<>) survive raw in the JSON, a browser navigating to
+// `Content-Type: application/json` renders/downloads text, never a document, so
+// the alert() cannot fire. (This is exactly the ably.com clientId reflection:
+// JSON body + nosniff → reflected, but inert.)
+func browserRendersAsHTML(contentType, body string, nosniff bool) bool {
+	ct := strings.ToLower(strings.TrimSpace(contentType))
+	activeSVG := strings.Contains(ct, "image/svg+xml") ||
+		((strings.Contains(ct, "application/xml") || strings.HasPrefix(ct, "text/xml")) &&
+			strings.Contains(strings.ToLower(body), "<svg"))
+	if nosniff {
+		return strings.HasPrefix(ct, "text/html") || strings.Contains(ct, "application/xhtml") || activeSVG
+	}
+	if activeSVG {
+		return true
+	}
+	return htmlishResponse(contentType, body)
+}
+
+// scriptLikeContentType identifies responses a browser may execute when loaded
+// as a classic external script. These are deliberately NOT classified as HTML:
+// top-level navigation renders their source, while a <script src> consumer runs
+// it. Keeping this separate avoids both the old false-negative and JSON-as-XSS
+// false positives.
+func scriptLikeContentType(contentType string) bool {
+	ct := strings.ToLower(strings.TrimSpace(contentType))
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = strings.TrimSpace(ct[:i])
+	}
+	switch ct {
+	case "application/javascript", "application/ecmascript", "text/javascript",
+		"text/ecmascript", "application/x-javascript", "text/jscript":
+		return true
+	default:
+		return strings.HasSuffix(ct, "+javascript")
+	}
+}
+
+// browserRendersResponse adds HTTP navigation semantics to the MIME decision.
+// Browsers do not render redirect bodies, 204/205 responses, or 304 responses as
+// a document, even when those bodies contain HTML-looking attacker input.
+func browserRendersResponse(status int, contentType, body string, nosniff bool) bool {
+	if status >= 300 && status < 400 {
+		return false
+	}
+	if status == http.StatusNoContent || status == http.StatusResetContent || status == http.StatusNotModified || status < 200 {
+		return false
+	}
+	return browserRendersAsHTML(contentType, body, nosniff)
+}
+
+// looksLikeBlockPage reports whether an HTTP response is a WAF/edge block or
+// challenge page rather than the real application response. It shares its
+// vendor-specific signature list (wafBlockBodySignatures, waf.go) with
+// looksLikeWAFBlock instead of keeping a second, separate list: an earlier
+// version of this function matched generic words like "forbidden", "captcha",
+// "waf" and "security policy" on their own, which fired on ordinary legitimate
+// application 401/403/429/503 error pages that happen to use one of those words
+// (e.g. "Sorry, you are forbidden from viewing this resource") — a real,
+// silent false-negative source across nearly every detector that calls this
+// function (XSS, SQLi, SSRF, SSTI, XXE, CSTI, NoSQLi, cache poisoning), since a
+// genuine app error page was mistaken for a security-intermediary block and its
+// signal was discarded. A vendor-specific phrase (a Cloudflare Ray ID, a
+// ModSecurity/Sucuri/Incapsula banner, a bot-challenge script) is what actually
+// distinguishes a WAF/edge block from the application's own response.
+func looksLikeBlockPage(status int, body string) bool {
+	// 406 is deliberately NOT auto-blocked here — see looksLikeWAFBlock
+	// (waf.go): it is a normal, spec-compliant "Not Acceptable" status plenty
+	// of ordinary REST APIs return for reasons that have nothing to do with a
+	// WAF. A genuine F5 ASM 406 block is still caught below via its
+	// distinctive body text, in wafBlockBodySignatures.
+	if status == 429 {
+		return true
+	}
+	if body == "" {
+		return false
+	}
+	low := strings.ToLower(body)
+	sig := false
+	for _, s := range wafBlockBodySignatures {
+		if strings.Contains(low, s) {
+			sig = true
+			break
+		}
+	}
+	if !sig {
+		return false
+	}
+	switch status {
+	case 403, 503, 401:
+		return true
+	}
+	// Any other status (including 200) with a vendor signature is a block only
+	// when the body is small (a block/challenge template), not a large real page
+	// that happens to mention a vendor name in prose.
+	return len(body) < 4096
+}
+
+// htmlTagInjected reports whether an element named `name` occurs in `body` as a
+// GENUINE start tag in HTML text — NOT inside a quoted attribute value, NOT inside
+// another tag's attribute area, and NOT inside <script>/<style> raw-text. It is
+// the deterministic, browserless proof that a reflected payload actually CREATED a
+// new element (real markup injection / XSS), as opposed to its characters merely
+// appearing raw somewhere in the response. This distinguishes a true breakout
+// (`...>`<name>`) from a reflection that stayed trapped inside `content="...<name>"`.
+// exploitExample renders the real executable payload that matches HOW the XSS was
+// proven, so the report shows a working exploit rather than a generic template. A
+// <script>-breakout proof reports the breakout exploit; everything else uses the
+// canonical per-context payload.
+func exploitExample(ctxName, injected string) string {
+	if strings.HasPrefix(injected, "</script>") {
+		return "</script><svg onload=alert(document.domain)>"
+	}
+	return contextPayload(ctxName)
+}
+
+// proveExecutingXSS promotes an XSS only after a real browser observes our random
+// execution nonce. The raw-response ladder is useful for choosing a likely PoC,
+// but is deliberately NOT proof: an HTML serializer, inert template, noscript
+// branch, CSP edge case or parser difference can all make executable-looking
+// markup non-executing. This distinction is what keeps reflected HTML injection
+// out of the confirmed-XSS bucket.
+func (s *DASTScanner) proveExecutingXSS(ctx context.Context, ip insertionPoint, a ReflectionAnalysis, analyses []ReflectionAnalysis, auth map[string]string, baseline string) (payload, proof string, confidence int, executed bool) {
+	// Real-browser execution is the only promotion path, so run it first. The old
+	// order sprayed the complete raw-response ladder (often 30+ requests) and then
+	// performed the browser proof that actually decided the verdict.
+	//
+	// Deliberately UNGATED by dastBrowserBudget: this function only runs after a
+	// real breakout signal already survived (a.Executable) — the candidate is
+	// already strongly signaled, not a speculative probe. It used to share the
+	// same counter as the DOM/SPA canary escalation, which has NO prior signal
+	// (every non-reflected param gets a speculative navigation); on a large
+	// multi-asset scan with thousands of already-signaled candidates, that
+	// shared counter silently exhausted the scan's ENTIRE browser allowance on
+	// roughly the first ~150 candidates processed, with no relation to how many
+	// were actually confirmed. Every candidate after that fell to the
+	// browserless ladder below, which can mark "Inconclusive" but — per this
+	// system's no-finding-without-proof design — can never produce a CONFIRMED
+	// finding, no matter how real the vulnerability was. The single shared tab
+	// (navGate in xss_browser.go) already serializes actual browser work to one
+	// navigation at a time, so removing this cap only lets the scan spend more
+	// wall-clock time proving real signals, never more concurrent load.
+	if b := getXSSBrowser(); b != nil {
+		var custom []string
+		if s.cfg != nil {
+			custom = CustomCorpus(s.cfg.WordlistsDir, "xss")
+		}
+		if pl, ok := b.ConfirmInsertionWithAnalysesAndTemplates(ctx, ip, auth, analyses, custom); ok {
+			return pl, "browser", 99, true
+		}
+		// The browser tried and didn't confirm (filtered payload, CSP, a context
+		// it can't drive) — fall through to the browserless ladder below instead
+		// of abandoning the candidate outright.
+	}
+
+	// Reached when Chromium is unavailable, OR a live browser attempt didn't
+	// confirm. This branch used to ALSO be reached once the (now-removed) shared
+	// budget ran dry on a large target — the deterministic, WAF-tamper-aware
+	// browserless ladder below is a strictly-better fallback than giving up, but
+	// it still can never promote past "Inconclusive".
+	const fallbackLimit = 10
+	for i, p := range buildExecPayloads(a) {
+		if i >= fallbackLimit || ctx.Err() != nil {
+			break
+		}
+		if pl, method, ok := s.tryBrowserlessExecPayload(ctx, ip, auth, baseline, p); ok {
+			return pl, method, 85, false
+		}
+	}
+	return "", "inconclusive", ConfCandidateLo, false
+}
+
+// tryBrowserlessExecPayload sends one executing-ladder payload and, only when
+// the PLAIN attempt was actually blocked by a WAF/edge (not merely filtered by
+// the app itself — no amount of request-encoding trickery fixes that), retries
+// with WAF-bypass encodings that spell the same JavaScript differently on the
+// wire. Returns the payload that survived and a proof-method label.
+func (s *DASTScanner) tryBrowserlessExecPayload(ctx context.Context, ip insertionPoint, auth map[string]string, baseline string, p xssExecPayload) (string, string, bool) {
+	r := sendInjectedResponse(ctx, dastClient, ip, p.Payload, auth)
+	if browserRendersResponse(r.Status, r.ContentType, r.Body, r.NoSniff) &&
+		cspAllowsInlineScript(r.CSP) && execPayloadSurvived(r.Body, p) &&
+		!execPayloadSurvived(baseline, p) {
+		return p.Payload, "differential-candidate", true
+	}
+	if !looksLikeBlockPage(r.Status, r.Body) {
+		return "", "", false
+	}
+	for _, tp := range xssWAFTamperVariants(p) {
+		if ctx.Err() != nil {
+			break
+		}
+		tr := sendInjectedResponse(ctx, dastClient, ip, tp.Payload, auth)
+		if !looksLikeBlockPage(tr.Status, tr.Body) &&
+			browserRendersResponse(tr.Status, tr.ContentType, tr.Body, tr.NoSniff) &&
+			cspAllowsInlineScript(tr.CSP) && execPayloadSurvived(tr.Body, tp) &&
+			!execPayloadSurvived(baseline, tp) {
+			return tp.Payload, "differential-candidate-waf-bypass", true
+		}
+	}
+	return "", "", false
+}
+
+// cspAllowsInlineScript reports whether response CSP permits the inline event/
+// script vectors used by the browserless ladder. A formed <svg onload> is HTML
+// injection, but under a nonce/hash-only CSP it is not executable XSS. Runtime
+// browser proof can still confirm a CSP bypass independently.
+func cspAllowsInlineScript(csp string) bool {
+	csp = strings.ToLower(strings.TrimSpace(csp))
+	if csp == "" {
+		return true
+	}
+	var sourceList string
+	for _, directive := range strings.Split(csp, ";") {
+		fields := strings.Fields(strings.TrimSpace(directive))
+		if len(fields) == 0 {
+			continue
+		}
+		name := fields[0]
+		if name == "script-src-elem" {
+			sourceList = strings.Join(fields[1:], " ")
+			break
+		}
+		if name == "script-src" || (name == "default-src" && sourceList == "") {
+			sourceList = strings.Join(fields[1:], " ")
+		}
+	}
+	if sourceList == "" {
+		return true
+	}
+	return strings.Contains(sourceList, "'unsafe-inline'")
+}
+
+// xssCandidate builds a reflected-XSS candidate for the insertion point.
+func (s *DASTScanner) xssCandidate(targetID string, ip insertionPoint, ctxName, note string) VulnerabilityCandidate {
+	return VulnerabilityCandidate{
+		TargetID: targetID,
+		Type:     "xss", Subtype: "reflected", URL: ip.URL, Method: ip.Method,
+		Parameter: ip.Param, Location: locOf(ip), DetectionSource: "dast",
+		DetectionMethod: "context:" + ctxName, Severity: "high",
+		Confidence: 70, Status: CandDetected, Evidence: note,
+	}
+}
+
+// confirmXSS records a CONFIRMED reflected-XSS candidate + a finding. Callers may
+// invoke it only for a browser-observed nonce; browserless differential evidence
+// remains a candidate and never reaches this method.
+func (s *DASTScanner) confirmXSS(ctx context.Context, targetID string, ip insertionPoint, ctxName, execPayload, proof string, confidence int, runtimeTrace ...string) {
+	if ctx.Err() != nil || strings.TrimSpace(execPayload) == "" ||
+		(proof != "browser" && proof != "browser+differential") {
+		return
+	}
+	var how string
+	switch proof {
+	case "browser", "browser+differential":
+		how = "EXECUTION CONFIRMED in a real headless browser (JavaScript changed document.title to our random nonce and showed alert('reconner'); the reported PoC is the exact proof payload)"
+	default:
+		how = "EXECUTION CONFIRMED in a real headless browser using a random document.title nonce"
+	}
+	ev := fmt.Sprintf("Reflected XSS in %s context at parameter %q. %s. Working payload: %s",
+		ctxName, ip.Param, how, execPayload)
+	if len(runtimeTrace) > 0 && strings.TrimSpace(runtimeTrace[0]) != "" {
+		ev += ". Runtime DOM trace: attacker-controlled canary reached " + strings.TrimSpace(runtimeTrace[0])
+	}
+	c := VulnerabilityCandidate{
+		TargetID: targetID, Type: "xss", Subtype: "reflected", URL: ip.URL,
+		Method: ip.Method, Parameter: ip.Param, Location: locOf(ip),
+		Payload: execPayload, DetectionSource: "dast",
+		DetectionMethod: "context:" + ctxName + "/" + proof, Severity: "high",
+		Confidence: confidence, Evidence: ev,
+	}
+	candidateID, _ := RecordCandidateResult(ctx, s.db, c, VerifyResult{
+		Verdict: VerifyVerified, Confidence: confidence, Evidence: ev, Method: "dast-" + proof,
+	}, FindingMeta{Actor: "dast"})
+	if candidateID != "" {
+		s.captureXSSScreenshot(targetID, candidateID, xssReproURL(ip, execPayload))
+	}
+}
+
+// xssReproURL builds the URL a screenshot should navigate to so the captured
+// picture actually shows the payload firing, not just the plain page. Only
+// the common, unambiguous case (a query-string GET parameter) is worth
+// reconstructing here — body/JSON/path-based reflections would need the
+// original request's full method/body replayed, which a single GET
+// navigation can't reproduce anyway, so those fall back to the bare page URL
+// (still useful triage context even without the payload visibly firing).
+func xssReproURL(ip insertionPoint, payload string) string {
+	loc := insertionLocation(ip)
+	if (loc == "query" || loc == "") && strings.ToUpper(ip.Method) == "GET" {
+		return injectParam(ip.URL, ip.Param, payload)
+	}
+	return ip.URL
+}
+
+// captureXSSScreenshot takes a visual proof shot of a CONFIRMED (browser-
+// executed) XSS — this is the "verified PoC" case: a real headless browser
+// already ran the payload to reach this point, so a picture of the result
+// (the alert dialog, the DOM change) is the single fastest way for a triager
+// to assess it, far faster than reading raw evidence text. Fire-and-forget:
+// a failed capture must never affect the already-recorded finding.
+//
+// RecordCandidateResult returns the CANDIDATE's id, not the vuln_findings
+// row's id (upsertFindingProjection mints its own, separate UUID for that
+// table) — the candidates row's finding_id column is the link between them,
+// populated by the time that call returns, so it's resolved here rather than
+// writing screenshot_id onto the wrong table's primary key.
+func (s *DASTScanner) captureXSSScreenshot(targetID, candidateID, rawURL string) {
+	go func() {
+		var findingID string
+		if err := s.db.QueryRow(`SELECT COALESCE(finding_id,'') FROM candidates WHERE id=?`, candidateID).Scan(&findingID); err != nil || findingID == "" {
+			return
+		}
+		shotID := captureScreenshot(context.Background(), s.db, s.cfg, targetID, rawURL)
+		if shotID == "" {
+			return
+		}
+		_, _ = s.db.Exec(`UPDATE vuln_findings SET screenshot_id=? WHERE id=?`, shotID, findingID)
+	}()
+}
+
+// sqlErrorAppeared reports whether a SQL error signature is present in the
+// post-injection body but NOT in the baseline (differential → not a static error).
+func sqlErrorAppeared(baseline, injected string) bool {
+	for _, re := range sqlErrorSignatures {
+		if re.MatchString(injected) && !re.MatchString(baseline) {
+			return true
+		}
+	}
+	return false
+}
+
+// locOf maps an insertion point to a candidate location string.
+func locOf(ip insertionPoint) string {
+	return insertionLocation(ip)
+}
+
+// xssReflectiveHeaders are request headers an application most often echoes back
+// into an HTML response. Each becomes a header insertion point for the reflected-
+// XSS engine. (Host is deliberately excluded — the host-header-injection module
+// owns it, and mutating Host breaks routing on vhosted targets.)
+var xssReflectiveHeaders = []string{
+	"Referer", "User-Agent", "X-Forwarded-Host", "X-Forwarded-For",
+	"X-Forwarded-Proto", "X-Forwarded-Server", "X-Host", "X-Original-URL",
+	"X-Rewrite-URL", "X-Api-Version", "True-Client-IP", "X-Real-IP",
+	"Origin", "Accept-Language", "X-Requested-With",
+}
+
+// xssHeaderInsertionPoints builds header insertion points over the target's alive
+// roots so the reflected-XSS engine also tests header reflection. Bounded: a small
+// set of roots × the reflective header list, deduped per host.
+func (s *DASTScanner) xssHeaderInsertionPoints(ctx context.Context, targetID string) []insertionPoint {
+	const rootCap = 40
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT url FROM http_services
+		WHERE target_id = ? AND status_code BETWEEN 200 AND 403
+		  AND COALESCE(source,'probe') IN ('probe','seed')
+		ORDER BY LENGTH(url) ASC LIMIT ?`, targetID, rootCap)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []insertionPoint
+	seenHost := map[string]bool{}
+	for rows.Next() {
+		var u string
+		if rows.Scan(&u) != nil || strings.TrimSpace(u) == "" {
+			continue
+		}
+		if !urlHostInScope(ctx, u) || !urlInEndpointScope(ctx, u) {
+			continue
+		}
+		// One representative URL per host keeps header testing bounded; header
+		// reflection is a host-level behaviour, not a per-path one.
+		h := hostOf(u)
+		if h == "" || seenHost[h] {
+			continue
+		}
+		seenHost[h] = true
+		for _, hdr := range xssReflectiveHeaders {
+			out = append(out, insertionPoint{
+				URL: u, Param: hdr, Value: "", Method: http.MethodGet, Location: "header",
+			})
+		}
+	}
+	return out
+}

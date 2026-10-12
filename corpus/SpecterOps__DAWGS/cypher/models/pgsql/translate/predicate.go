@@ -1,0 +1,275 @@
+package translate
+
+import (
+	"fmt"
+
+	"github.com/specterops/dawgs/cypher/models"
+	"github.com/specterops/dawgs/cypher/models/cypher"
+	"github.com/specterops/dawgs/cypher/models/pgsql"
+	"github.com/specterops/dawgs/cypher/models/pgsql/optimize"
+	"github.com/specterops/dawgs/graph"
+)
+
+func (s *Translator) preparePatternPredicate(predicate *cypher.PatternPredicate) error {
+	currentQueryPart := s.query.CurrentPart()
+
+	// Stash the match pattern
+	currentQueryPart.StashCurrentPattern()
+
+	// All pattern predicates must be relationship patterns
+	newPatternPart := currentQueryPart.currentPattern.NewPart()
+	newPatternPart.IsTraversal = true
+	if target, hasTarget := s.patternPredicateTargets[predicate]; hasTarget {
+		newPatternPart.Target = target
+		newPatternPart.HasTarget = true
+	}
+
+	return nil
+}
+
+func (s *Translator) buildOptimizedRelationshipExistPredicate(part *PatternPart, traversalStep *TraversalStep) (pgsql.Expression, error) {
+	var whereClause pgsql.Expression
+	if traversalStep.LeftNodeBound && traversalStep.RightNodeBound {
+		// Pair-wise bounds on the directionless relationship
+		whereClause = pgsql.NewBinaryExpression(
+			pgsql.NewParenthetical(
+				pgsql.NewBinaryExpression(
+					pgsql.NewBinaryExpression(
+						pgsql.CompoundIdentifier{traversalStep.Edge.Identifier, pgsql.ColumnStartID},
+						pgsql.OperatorEquals,
+						pgsql.CompoundIdentifier{traversalStep.LeftNode.Identifier, pgsql.ColumnID},
+					),
+					pgsql.OperatorAnd,
+					pgsql.NewBinaryExpression(
+						pgsql.CompoundIdentifier{traversalStep.Edge.Identifier, pgsql.ColumnEndID},
+						pgsql.OperatorEquals,
+						pgsql.CompoundIdentifier{traversalStep.RightNode.Identifier, pgsql.ColumnID},
+					),
+				),
+			),
+			pgsql.OperatorOr,
+			pgsql.NewParenthetical(
+				pgsql.NewBinaryExpression(
+					pgsql.NewBinaryExpression(
+						pgsql.CompoundIdentifier{traversalStep.Edge.Identifier, pgsql.ColumnStartID},
+						pgsql.OperatorEquals,
+						pgsql.CompoundIdentifier{traversalStep.RightNode.Identifier, pgsql.ColumnID},
+					),
+					pgsql.OperatorAnd,
+					pgsql.NewBinaryExpression(
+						pgsql.CompoundIdentifier{traversalStep.Edge.Identifier, pgsql.ColumnEndID},
+						pgsql.OperatorEquals,
+						pgsql.CompoundIdentifier{traversalStep.LeftNode.Identifier, pgsql.ColumnID},
+					),
+				),
+			),
+		)
+	} else if traversalStep.RightNodeBound {
+		whereClause = pgsql.NewBinaryExpression(
+			pgsql.NewBinaryExpression(
+				pgsql.CompoundIdentifier{traversalStep.Edge.Identifier, pgsql.ColumnStartID},
+				pgsql.OperatorEquals,
+				pgsql.CompoundIdentifier{traversalStep.RightNode.Identifier, pgsql.ColumnID},
+			),
+			pgsql.OperatorOr,
+			pgsql.NewBinaryExpression(
+				pgsql.CompoundIdentifier{traversalStep.Edge.Identifier, pgsql.ColumnEndID},
+				pgsql.OperatorEquals,
+				pgsql.CompoundIdentifier{traversalStep.RightNode.Identifier, pgsql.ColumnID},
+			),
+		)
+	} else if traversalStep.LeftNodeBound {
+		whereClause = pgsql.NewBinaryExpression(
+			pgsql.NewBinaryExpression(
+				pgsql.CompoundIdentifier{traversalStep.Edge.Identifier, pgsql.ColumnStartID},
+				pgsql.OperatorEquals,
+				pgsql.CompoundIdentifier{traversalStep.LeftNode.Identifier, pgsql.ColumnID},
+			),
+			pgsql.OperatorOr,
+			pgsql.NewBinaryExpression(
+				pgsql.CompoundIdentifier{traversalStep.Edge.Identifier, pgsql.ColumnEndID},
+				pgsql.OperatorEquals,
+				pgsql.CompoundIdentifier{traversalStep.LeftNode.Identifier, pgsql.ColumnID},
+			),
+		)
+	} else {
+		// Neither side of the traversal is bound, so this becomes a "select everything from edges"
+		whereClause = nil
+	}
+
+	// Pull edge constraints in to the exists check
+	if constraint, err := s.treeTranslator.ConsumeConstraintsFromVisibleSet(pgsql.AsIdentifierSet(traversalStep.Edge.Identifier)); err != nil {
+		return nil, err
+	} else {
+		whereClause = pgsql.OptionalAnd(constraint.Expression, pgsql.OptionalParenthetical(whereClause))
+	}
+
+	if err := RewriteFrameBindings(s.scope, whereClause); err != nil {
+		return nil, err
+	}
+
+	// explain analyze select * from node n0 where not exists(select 1 from edge e0 where e0.start_id = n0.id or e0.end_id = n0.id);
+	return pgsql.ExistsExpression{
+		Subquery: pgsql.Subquery{
+			Query: pgsql.Query{
+				Body: pgsql.Select{
+					Projection: []pgsql.SelectItem{
+						pgsql.NewLiteral(1, pgsql.Int),
+					},
+					From: []pgsql.FromClause{
+						{
+							Source: pgsql.TableReference{
+								Name:    pgsql.CompoundIdentifier{pgsql.TableEdge},
+								Binding: models.OptionalValue(traversalStep.Edge.Identifier),
+							},
+						},
+					},
+					Where: whereClause,
+				},
+			},
+		},
+	}, nil
+}
+
+func (s *Translator) translatePatternPredicate() error {
+	var (
+		currentQueryPart = s.query.CurrentPart()
+		patternPredicate = currentQueryPart.ConsumeCurrentPattern()
+		predicateFuture  = pgsql.NewFuture[*Pattern](patternPredicate, pgsql.Boolean)
+	)
+
+	// Restore the previous match pattern as the current match pattern
+	currentQueryPart.RestoreStashedPattern()
+
+	if numPatternParts := len(patternPredicate.Parts); numPatternParts < 1 || numPatternParts > 1 {
+		return fmt.Errorf("expected exactly one pattern part for pattern predicate but found: %d", numPatternParts)
+	}
+
+	// Push this as an expression for rendering constraints
+	s.treeTranslator.PushOperand(predicateFuture)
+
+	// Track this as a predicate to revisit while rendering the patterns
+	currentQueryPart.AddPatternPredicateFuture(predicateFuture)
+	return nil
+}
+
+func (s *Translator) usePatternPredicateExistencePlacement(patternPart *PatternPart, traversalStep *TraversalStep) (bool, error) {
+	if patternPart == nil || !patternPart.HasTarget || traversalStep == nil || traversalStep.Direction != graph.DirectionBoth {
+		return false, nil
+	}
+
+	decision, hasDecision := s.patternPredicateDecisions[patternPart.Target.TraversalStep(0)]
+	if !hasDecision || decision.Mode != optimize.PatternPredicatePlacementExistence {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+// buildPatternPredicates is used by translateMatch to resolve deferred pattern predicate
+// futures collected for the current MATCH/OPTIONAL MATCH query part's WHERE expressions
+func (s *Translator) buildPatternPredicates() error {
+	for _, predicateFuture := range s.query.CurrentPart().patternPredicates {
+		var (
+			lastFrame *Frame
+
+			patternPart = predicateFuture.Data.Parts[0]
+			subQuery    = pgsql.Query{
+				CommonTableExpressions: &pgsql.With{},
+			}
+		)
+
+		if len(patternPart.TraversalSteps) == 1 {
+			traversalStep := patternPart.TraversalSteps[0]
+			if useExistencePlacement, err := s.usePatternPredicateExistencePlacement(patternPart, traversalStep); err != nil {
+				return err
+			} else if useExistencePlacement {
+				if predicateExpression, err := s.buildOptimizedRelationshipExistPredicate(patternPart, traversalStep); err != nil {
+					return err
+				} else {
+					predicateFuture.SyntaxNode = predicateExpression
+					s.recordLowering(optimize.LoweringPredicatePlacement)
+				}
+
+				continue
+			}
+		}
+
+		// The root step of a pattern predicate is evaluated per outer row. Comma-joining the enclosing
+		// query part's frame would re-scan the outer CTE and decorrelate the predicate, so suppress it.
+		if len(patternPart.TraversalSteps) > 0 {
+			patternPart.TraversalSteps[0].OmitPreviousFrameSource = true
+		}
+
+		if err := s.translateTraversalPatternPart(patternPart, true, true); err != nil {
+			return err
+		}
+
+		for idx, traversalStep := range patternPart.TraversalSteps {
+			if traversalStep.Expansion != nil {
+				return fmt.Errorf("expansion in pattern predicate not supported")
+			}
+
+			if idx > 0 {
+				if traversalStepQuery, err := s.buildTraversalPatternStep(traversalStep.Frame, traversalStep); err != nil {
+					return err
+				} else {
+					subQuery.AddCTE(pgsql.CommonTableExpression{
+						Alias: pgsql.TableAlias{
+							Name: traversalStep.Frame.Binding.Identifier,
+						},
+						Query: traversalStepQuery,
+					})
+				}
+			} else {
+				var (
+					traversalStepQuery pgsql.Query
+					err                error
+				)
+				if traversalStep.LeftNodeBound || traversalStep.RightNodeBound {
+					traversalStepQuery, err = s.buildTraversalPatternRootWithOuterCorrelation(traversalStep.Frame, traversalStep)
+				} else {
+					traversalStepQuery, err = s.buildTraversalPatternRoot(traversalStep.Frame, traversalStep)
+				}
+
+				if err != nil {
+					return err
+				} else {
+					subQuery.AddCTE(pgsql.CommonTableExpression{
+						Alias: pgsql.TableAlias{
+							Name: traversalStep.Frame.Binding.Identifier,
+						},
+						Query: traversalStepQuery,
+					})
+				}
+			}
+
+			lastFrame = traversalStep.Frame
+		}
+
+		subQuery.Body = pgsql.Select{
+			Projection: pgsql.Projection{
+				pgsql.NewBinaryExpression(
+					pgsql.FunctionCall{
+						Function:   pgsql.FunctionCount,
+						Parameters: []pgsql.Expression{pgsql.WildcardIdentifier},
+					},
+					pgsql.OperatorGreaterThan,
+					pgsql.NewLiteral(0, pgsql.Int),
+				),
+			},
+
+			From: []pgsql.FromClause{{
+				Source: pgsql.TableReference{
+					Name: pgsql.CompoundIdentifier{lastFrame.Binding.Identifier},
+				},
+			}},
+		}
+
+		predicateFuture.SyntaxNode = pgsql.Subquery{
+			Query: subQuery,
+		}
+	}
+
+	return nil
+}

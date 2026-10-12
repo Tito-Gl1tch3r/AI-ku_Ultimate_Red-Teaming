@@ -1,0 +1,120 @@
+/**
+ * Forensics++ (ForensicsPP.com)
+ * Local-first browser forensics workbench
+ *
+ * Copyright (c) 2026 DyNooob. All rights reserved.
+ * Author: DyNooob
+ * Website: https://www.forensicspp.com
+ * Platform: DigiForensics.cn
+ * Project: https://github.com/DyNooob/ForensicsPP
+ *
+ * Forensics++ is an open-source, browser-side toolkit for CTF/MISC,
+ * lightweight forensic triage, encoding/decoding, metadata inspection,
+ * hashes, archive parsing, and local analysis.
+ *
+ * Do not use this project for unauthorized access, intrusion,
+ * privacy infringement, or unlawful activity.
+ *
+ * Released under the MIT License.
+ * Full source code: https://github.com/DyNooob/ForensicsPP
+ */
+
+import { defineConfig, type Plugin } from "vite";
+import react from "@vitejs/plugin-react";
+import { viteSingleFile } from "vite-plugin-singlefile";
+import { execSync } from "node:child_process";
+
+// Build identity (commit hash + branch) for the Preview notice. Computed at
+// build time so a forensic examiner can tell exactly which build is running.
+// Falls back to "dev" when git is unavailable (e.g. sandboxed/standalone build).
+function readBuildInfo(): { hash: string; branch: string } {
+  try {
+    const hash = execSync("git rev-parse --short HEAD").toString().trim();
+    const branch = execSync("git rev-parse --abbrev-ref HEAD").toString().trim();
+    return { hash: hash || "unknown", branch: branch || "unknown" };
+  } catch {
+    return { hash: "dev", branch: "dev" };
+  }
+}
+const buildInfo = readBuildInfo();
+
+const copyrightBanner = `/*!
+ * Forensics++ (ForensicsPP.com)
+ * Copyright (c) 2026 DyNooob. All rights reserved.
+ * Author: DyNooob | Website: https://www.forensicspp.com | Platform: DigiForensics.cn
+ * Project: https://github.com/DyNooob/ForensicsPP
+ * Licensed under the MIT License. Use only for lawful and authorized purposes.
+ */`;
+
+function copyrightCssPlugin(): Plugin {
+  return {
+    name: "forensicspp-copyright-css",
+    enforce: "post",
+    generateBundle(_options, bundle) {
+      for (const output of Object.values(bundle)) {
+        if (output.type !== "asset" || !/^assets\/index-.*\.css$/.test(output.fileName)) continue;
+        const source = typeof output.source === "string" ? output.source : new TextDecoder().decode(output.source);
+        output.source = `${copyrightBanner}\n${source}`;
+      }
+    }
+  };
+}
+
+// Opt-in standalone build (SINGLE_FILE=1). Inlines the main-thread app
+// JS/CSS into a single index.html, but Web Workers (per-tool analyzers) are
+// still emitted as separate *.worker-*.js files. Browsers refuse to load
+// Workers from file:// (origin "null"), so worker-backed forensic tools
+// require serving over HTTP (npm run preview or any static server). This is
+// an offline distribution, NOT a single self-contained file.
+// vite-plugin-singlefile forces inlineDynamicImports=true, which conflicts
+// with manualChunks, so we drop manualChunks in this mode. The default
+// `npm run build` stays multi-chunk and is unaffected.
+const singleFileBuild = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.SINGLE_FILE === "1";
+
+export default defineConfig({
+  // Web build uses root-absolute asset URLs so the SPA fallback (Nginx
+  // `try_files ... /index.html`) and any /tools/<slug>/ deep-link boot the
+  // app correctly from a sub-path. The standalone build inlines everything
+  // (SINGLE_FILE=1) and keeps relative "./" so file:// works offline.
+  base: singleFileBuild ? "./" : "/",
+  define: {
+    "import.meta.env.VITE_BUILD_HASH": JSON.stringify(buildInfo.hash),
+    "import.meta.env.VITE_BUILD_BRANCH": JSON.stringify(buildInfo.branch),
+    // Mirrors the build-time preview flag so the runtime (routeAdapter.isPreview,
+    // the Preview banner, and the belt-and-suspenders noindex effect) agrees
+    // with the build mode. Missing before — the banner silently never showed.
+    "import.meta.env.VITE_PREVIEW": JSON.stringify(process.env.VITE_PREVIEW === "1" || process.env.VITE_PREVIEW === "true" ? "1" : "0")
+  },
+  plugins: [react(), copyrightCssPlugin(), ...(singleFileBuild ? [viteSingleFile()] : [])],
+  build: {
+    target: "es2022",
+    rollupOptions: {
+      output: {
+        banner: copyrightBanner,
+        ...(!singleFileBuild && {
+          manualChunks(id: string) {
+            if (id.includes("node_modules/react") || id.includes("node_modules/react-dom")) return "vendor-react";
+            if (id.includes("node_modules/antd") || id.includes("node_modules/@ant-design") || id.includes("node_modules/rc-")) return "vendor-antd";
+            if (id.includes("node_modules/crypto-js") || id.includes("node_modules/bcryptjs")) return "vendor-crypto";
+            if (id.includes("node_modules/exifr")) return "vendor-exifr";
+            if (id.includes("node_modules/jsqr")) return "vendor-jsqr";
+            if (id.includes("node_modules/fflate")) return "vendor-fflate";
+            if (id.includes("node_modules/postal-mime")) return "vendor-email";
+            if (id.includes("node_modules/sql-formatter") || id.includes("node_modules/sql.js")) return "vendor-sql";
+          }
+        })
+      }
+    }
+  },
+  worker: {
+    format: "es",
+    rollupOptions: {
+      output: {
+        banner: copyrightBanner
+      }
+    }
+  },
+  server: {
+    port: 5173
+  }
+});

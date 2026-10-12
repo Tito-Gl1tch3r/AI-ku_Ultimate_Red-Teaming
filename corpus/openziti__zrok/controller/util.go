@@ -1,0 +1,181 @@
+package controller
+
+import (
+	"fmt"
+	"net"
+	"net/http"
+	"strings"
+	"unicode"
+
+	errors2 "github.com/go-openapi/errors"
+	"github.com/jaevor/go-nanoid"
+	"github.com/jmoiron/sqlx"
+	"github.com/michaelquigley/df/dl"
+	"github.com/openziti/zrok/v2/controller/config"
+	"github.com/openziti/zrok/v2/controller/store"
+	"github.com/openziti/zrok/v2/rest_model_zrok"
+	"github.com/openziti/zrok/v2/util"
+	"github.com/pkg/errors"
+)
+
+type zrokAuthenticator struct {
+	cfg *config.Config
+}
+
+func newZrokAuthenticator(cfg *config.Config) *zrokAuthenticator {
+	return &zrokAuthenticator{cfg}
+}
+
+func (za *zrokAuthenticator) authenticate(token string) (*rest_model_zrok.Principal, error) {
+	trx, err := str.Begin()
+	if err != nil {
+		dl.Errorf("error starting transaction for '%v': %v", token, err)
+		return nil, err
+	}
+	defer func() { _ = trx.Rollback() }()
+
+	if a, err := str.FindAccountWithToken(token, trx); err == nil {
+		principal := &rest_model_zrok.Principal{
+			ID:        int64(a.Id),
+			Token:     a.Token,
+			Email:     a.Email,
+			Limitless: a.Limitless,
+		}
+		return principal, nil
+	} else {
+		// check for admin secret
+		if cfg.Admin != nil {
+			for _, secret := range cfg.Admin.Secrets {
+				if token == secret {
+					principal := &rest_model_zrok.Principal{
+						ID:    int64(-1),
+						Admin: true,
+					}
+					return principal, nil
+				}
+			}
+		}
+
+		// no match
+		dl.Warnf("invalid api key '%v'", token)
+		return nil, errors2.New(401, "invalid api key")
+	}
+}
+
+func createShareToken() (string, error) {
+	gen, err := nanoid.CustomASCII("abcdefghijklmnopqrstuvwxyz0123456789", 12)
+	if err != nil {
+		return "", err
+	}
+	return gen(), nil
+}
+
+func CreateToken() (string, error) {
+	gen, err := nanoid.CustomASCII("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", 12)
+	if err != nil {
+		return "", err
+	}
+	return gen(), nil
+}
+
+func realRemoteAddress(req *http.Request) string {
+	ip, _, err := net.SplitHostPort(req.RemoteAddr)
+	if err != nil {
+		ip = req.RemoteAddr
+	}
+	fwdAddress := req.Header.Get("X-Forwarded-For")
+	if fwdAddress != "" {
+		ip = fwdAddress
+
+		ips := strings.Split(fwdAddress, ", ")
+		if len(ips) > 1 {
+			ip = ips[0]
+		}
+	}
+	return ip
+}
+
+func validatePassword(cfg *config.Config, password string) error {
+	if len(password) < 8 {
+		return fmt.Errorf("password length: expected (8), got (%d)", len(password))
+	}
+	if !hasCapital(password) {
+		return fmt.Errorf("password requires capital, found none")
+	}
+	if !hasNumeric(password) {
+		return fmt.Errorf("password requires numeric, found none")
+	}
+	if !strings.ContainsAny(password, "!@#$%^&*()_+-=[]{};':\"\\|,.<>") {
+		return fmt.Errorf("password requires special character, found none")
+	}
+	return nil
+}
+
+func hasCapital(check string) bool {
+	for _, c := range check {
+		if unicode.IsUpper(c) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasNumeric(check string) bool {
+	for _, c := range check {
+		if unicode.IsDigit(c) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildFrontendEndpointsForShare retrieves names for a share and builds frontend endpoints
+// from those names. Falls back to the deprecated FrontendEndpoint field if no names are
+// mapped (for backwards compatibility).
+// buildFrontendEndpointsForShare returns the share's frontend endpoints from its names. a store error is
+// returned rather than logged past: on postgresql it has aborted the caller's transaction.
+func buildFrontendEndpointsForShare(shareId int, shareToken string, deprecatedEndpoint *string, trx *sqlx.Tx) ([]string, error) {
+	// retrieve names for this share using the new mapping table
+	shareNames, err := str.FindNamesForShare(shareId, trx)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error finding names for share '%v'", shareToken)
+	}
+
+	// build frontend endpoints from the names
+	var frontendEndpoints []string
+	for _, sn := range shareNames {
+		endpoint := util.NameInNamespace(sn.Name.Name, sn.NamespaceName)
+		frontendEndpoints = append(frontendEndpoints, endpoint)
+	}
+
+	// fallback to deprecated field if no names are mapped (for backwards compatibility)
+	if len(frontendEndpoints) == 0 && deprecatedEndpoint != nil {
+		frontendEndpoints = []string{*deprecatedEndpoint}
+	}
+
+	return frontendEndpoints, nil
+}
+
+// isAccountLimited checks if an account has an active bandwidth limit restriction.
+// returns true if the account is currently limited, false otherwise.
+func isAccountLimited(accountId int, trx *sqlx.Tx) (bool, error) {
+	// check if journal is empty first to avoid unnecessary queries
+	jEmpty, err := str.IsBandwidthLimitJournalEmpty(accountId, trx)
+	if err != nil {
+		return false, err
+	}
+
+	// if journal is empty, account is not limited
+	if jEmpty {
+		return false, nil
+	}
+
+	// retrieve the latest journal entry
+	je, err := str.FindLatestBandwidthLimitJournal(accountId, trx)
+	if err != nil {
+		return false, err
+	}
+
+	// account is limited if latest entry exists and action is "limit"
+	return je != nil && je.Action == store.LimitLimitAction, nil
+}

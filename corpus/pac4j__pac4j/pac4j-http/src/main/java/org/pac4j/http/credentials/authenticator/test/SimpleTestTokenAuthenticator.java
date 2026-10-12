@@ -1,0 +1,40 @@
+package org.pac4j.http.credentials.authenticator.test;
+
+import lombok.val;
+import org.apache.commons.lang3.StringUtils;
+import org.pac4j.core.context.CallContext;
+import org.pac4j.core.credentials.Credentials;
+import org.pac4j.core.credentials.TokenCredentials;
+import org.pac4j.core.credentials.authenticator.Authenticator;
+import org.pac4j.core.exception.CredentialsException;
+import org.pac4j.core.profile.CommonProfile;
+import org.pac4j.core.profile.UserProfile;
+
+import java.util.Optional;
+
+/**
+ * This class is a simple test authenticator: token must not be blank.
+ *
+ * @author Jerome Leleu
+ * @since 1.8.0
+ */
+public class SimpleTestTokenAuthenticator implements Authenticator {
+
+    /** {@inheritDoc} */
+    @Override
+    public Optional<Credentials> validate(final CallContext ctx, final Credentials cred) {
+        if (cred == null) {
+            throw new CredentialsException("credentials must not be null");
+        }
+        val credentials = (TokenCredentials) cred;
+        if (StringUtils.isBlank(credentials.getToken())) {
+            throw new CredentialsException("token must not be blank");
+        }
+        val token = credentials.getToken();
+        UserProfile profile = new CommonProfile();
+        profile.setId(token);
+        credentials.setUserProfile(profile);
+
+        return Optional.of(credentials);
+    }
+}

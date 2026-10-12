@@ -1,0 +1,471 @@
+//! Process scanning: enumerate running processes, deduplicate by SHA256, and
+//! scan each unique executable through the litmus model.
+
+use std::collections::HashMap;
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
+
+use crate::OutputFormat;
+use crate::engine::{Progress, ScanConfig, ScanResult, ScanSummary};
+use crate::explain::ShapImportance;
+use crate::model::{Classification, Model};
+use crate::output;
+
+/// A group of processes sharing the same executable binary (by SHA256).
+struct ProcessGroup {
+    /// Canonical path to the executable.
+    path: PathBuf,
+    /// All PIDs running this binary.
+    pids: Vec<u32>,
+    /// Whether the binary was deleted from disk.
+    deleted: bool,
+    /// Precomputed SHA256 hex digest.
+    sha256: String,
+}
+
+/// Rizin's size gate for a live-process scan.
+///
+/// Unlike a filesystem scan (where we want every architecture and tolerate
+/// minutes of deep analysis), `ps` is interactive and dominated by a few giant
+/// signed apps (Electron/Bun binaries can be 100–215 MB). Two caps keep it
+/// responsive without changing verdicts materially: this gate skips Rizin on
+/// the giants entirely, and native-arch-only analysis never pays full `aaa` on
+/// a universal binary's non-host slice, which never runs here.
+const PS_RIZIN_MAX_BYTES: usize = 100 * 1024 * 1024;
+
+/// Compute SHA256 of a file, reading from the given path.
+fn sha256_file(path: &std::path::Path) -> Result<String> {
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Run a process scan: enumerate, deduplicate, classify.
+pub fn run(config: &ScanConfig) -> Result<ScanSummary> {
+    // Warm cleave's YARA engine + capability mapper off the rayon pool before
+    // any scan fires rayon work. See `run_scan_paths` for why this matters.
+    crate::engine::prefetch_cleave_resources();
+
+    let scan_start = Instant::now();
+    let is_terminal = matches!(config.format(), OutputFormat::Terminal);
+
+    // Enumerate processes.
+    let proc_result = proclist::enumerate().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let perm_denied = proc_result.stats.permission_denied;
+
+    // Warn about permission-denied processes.
+    if perm_denied > 0 && !is_root() {
+        eprintln!(
+            " \x1b[38;2;255;175;55m\u{26A0}\x1b[0m  \x1b[38;2;180;180;180mSkipping {} processes due to insufficient permissions — re-run as root for full coverage\x1b[0m\n",
+            perm_denied,
+        );
+    }
+
+    if proc_result.entries.is_empty() {
+        let summary = ScanSummary {
+            total_files: 0,
+            hostile: 0,
+            suspicious: 0,
+            benign: 0,
+            errors: 0,
+            duration_ms: crate::duration_ms(scan_start.elapsed()),
+        };
+        if is_terminal {
+            output::print_summary(&summary);
+        }
+        return Ok(summary);
+    }
+
+    // Group by exe_path → (pids, deleted).
+    let mut by_path: HashMap<PathBuf, (Vec<u32>, bool)> = HashMap::new();
+    for entry in &proc_result.entries {
+        let (pids, deleted) = by_path
+            .entry(entry.exe_path.clone())
+            .or_insert_with(|| (Vec::new(), entry.deleted));
+        pids.push(entry.pid);
+        // If any entry says deleted, mark it.
+        if entry.deleted {
+            *deleted = true;
+        }
+    }
+
+    // Deduplicate by SHA256.
+    let mut by_sha: HashMap<String, ProcessGroup> = HashMap::new();
+    let mut hash_errors = 0u32;
+
+    for (path, (pids, deleted)) in by_path {
+        let hash = if deleted && !path.exists() {
+            // Try reading via /proc on Linux.
+            #[cfg(target_os = "linux")]
+            {
+                match sha256_file(std::path::Path::new(&format!("/proc/{}/exe", pids[0]))) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        tracing::warn!(
+                            "cannot hash deleted binary {} (pid {}): {e}",
+                            path.display(),
+                            pids[0],
+                        );
+                        hash_errors += 1;
+                        continue;
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                tracing::warn!("cannot hash deleted binary: {}", path.display());
+                hash_errors += 1;
+                continue;
+            }
+        } else {
+            match sha256_file(&path) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!("cannot hash {}: {e}", path.display());
+                    hash_errors += 1;
+                    continue;
+                }
+            }
+        };
+
+        let group = by_sha.entry(hash.clone()).or_insert_with(|| ProcessGroup {
+            path,
+            pids: Vec::new(),
+            deleted: false,
+            sha256: hash,
+        });
+        group.pids.extend(pids);
+        group.deleted |= deleted;
+    }
+
+    let mut groups: Vec<ProcessGroup> = by_sha.into_values().collect();
+    // Optional cap for fast iteration / benchmarking: `SCAN_PS_LIMIT=N` scans
+    // only the first N unique binaries. Sorted by path first so the chosen
+    // subset is stable across runs (modulo which processes are alive at the
+    // time), which keeps before/after timings comparable. Unset = scan all.
+    if let Some(limit) = std::env::var("SCAN_PS_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        groups.sort_by(|a, b| a.path.cmp(&b.path));
+        groups.truncate(limit);
+        tracing::info!(
+            limit,
+            kept = groups.len(),
+            "SCAN_PS_LIMIT active — scanning first {limit} unique binaries (path-sorted)"
+        );
+    }
+    let groups = groups;
+    let total = u32::try_from(groups.len()).unwrap_or(u32::MAX);
+
+    if is_terminal {
+        // Detection rules already resident in memory — no extra loading.
+        // `prefetch_cleave_resources` above has fully built the YARA engine and
+        // capability mapper; the bloom signatures were loaded with the config.
+        output::print_banner(crate::engine::detection_counts(config));
+    }
+
+    // Load model and scan each unique binary.
+    let model = Model::load(config.model_dir(), config.thresholds(), config.level())?;
+    let shap = ShapImportance::load(config.model_dir())?;
+    let cancellation = crate::interrupt::arm("Interrupted — finishing current process…");
+    cleave::set_compact_member_retention(true); // compact projection only
+    let mut cleave_opts = cleave::AnalysisOptions {
+        slow_rule_ms: config.slow_rule_ms(),
+        cancellation: Some(Arc::clone(&cancellation)),
+        // The ps-only caps (see `PS_RIZIN_MAX_BYTES`) are per analysis, so the
+        // file scan `scan sys` runs next keeps the defaults.
+        rizin_timeout: crate::engine::rizin_timeout(),
+        rizin_max_bytes: Some(PS_RIZIN_MAX_BYTES),
+        rizin_native_arch_only: true,
+        ..Default::default()
+    };
+    crate::engine::add_zip_passwords(&mut cleave_opts, config.zip_passwords());
+    let stdout = Mutex::new(std::io::stdout());
+
+    let progress = if is_terminal && total > 1 {
+        Some(Progress::new(total))
+    } else {
+        None
+    };
+
+    let hostile = AtomicU32::new(0);
+    let suspicious = AtomicU32::new(0);
+    let benign = AtomicU32::new(0);
+    let errors = AtomicU32::new(hash_errors);
+
+    // Map each scan path back to its process group for PID annotation. Deleted
+    // binaries that aren't scannable are counted as errors here and omitted.
+    let mut scan_paths: Vec<PathBuf> = Vec::with_capacity(groups.len());
+    let mut by_scan_path: HashMap<PathBuf, &ProcessGroup> = HashMap::with_capacity(groups.len());
+    for group in &groups {
+        // Known-good/known-bad short-circuit by the executable's sha256: a
+        // known-good binary is skipped here (and counted benign) unless it was
+        // created/changed/modified within the last 48h, in which case it is
+        // scanned on its own merits; known-bad and conflicted are flagged but
+        // still analyzed below.
+        if let Some(lookup) = config.bloom()
+            && let Some(digest) = burton::parse_sha256_hex(&group.sha256)
+            && let Some(summary) =
+                crate::engine::bloom_gate_fresh(config, &group.path, lookup.decide_sha256(&digest))
+        {
+            benign.fetch_add(summary.benign, Ordering::Relaxed);
+            if let Some(p) = &progress {
+                p.increment();
+            }
+            continue;
+        }
+
+        let scan_path = if group.deleted && !group.path.exists() {
+            // On Linux, try scanning via /proc/pid/exe.
+            #[cfg(target_os = "linux")]
+            {
+                PathBuf::from(format!("/proc/{}/exe", group.pids[0]))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                tracing::warn!(
+                    "deleted binary not scannable: {} (pids: {:?})",
+                    group.path.display(),
+                    group.pids
+                );
+                errors.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        } else {
+            group.path.clone()
+        };
+        by_scan_path.insert(scan_path.clone(), group);
+        scan_paths.push(scan_path);
+    }
+
+    // Analyze the unique binaries through cleave's batch API: it loads the
+    // CapabilityMapper + YARA engine once and fans the files out across a single
+    // rayon pass. A hand-rolled `par_iter` over the single-file `analyze_file`
+    // instead nests rayon inside rayon — each file's inner parallelism multiplied
+    // by the outer fan-out oversubscribed the pool and ran *slower* than serial
+    // (measured: 2.8× util, 3× the CPU). Verdict order in the output stream is
+    // now completion order, which JSON/terminal consumers already tolerate.
+    let analyze = |scan_path: &std::path::Path, result: Result<cleave::AnalysisReport>| {
+        let Some(group) = by_scan_path.get(scan_path) else {
+            return;
+        };
+        let report = match result {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("error analyzing {}: {e}", group.path.display());
+                errors.fetch_add(1, Ordering::Relaxed);
+                if let Some(p) = &progress {
+                    p.increment();
+                }
+                return;
+            }
+        };
+
+        if let Some(p) = &progress {
+            p.increment();
+        }
+
+        match build_result(
+            report,
+            group,
+            &model,
+            shap.as_ref(),
+            config,
+            Some(cancellation.as_ref()),
+        ) {
+            Ok(result) => {
+                match result.classification {
+                    Classification::Hostile => hostile.fetch_add(1, Ordering::Relaxed),
+                    Classification::Suspicious => suspicious.fetch_add(1, Ordering::Relaxed),
+                    Classification::Benign => benign.fetch_add(1, Ordering::Relaxed),
+                };
+                // JSON, tiny, and interpret are machine/LLM payload formats:
+                // they emit every scanned process — `--show` gates only the
+                // terminal view.
+                if matches!(
+                    config.format(),
+                    OutputFormat::Json | OutputFormat::Tiny | OutputFormat::Interpret
+                ) || config.filter().shows(&result.classification)
+                {
+                    let print = || {
+                        emit_result(
+                            &result,
+                            config,
+                            &group.pids,
+                            group.deleted,
+                            progress.is_some(),
+                            &stdout,
+                        );
+                    };
+                    if let Some(p) = &progress {
+                        p.around_result(print);
+                    } else {
+                        print();
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("error processing {}: {e}", group.path.display());
+                errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    };
+
+    cleave::scan_files(&scan_paths, &cleave_opts, |event| {
+        if let cleave::ScanEvent::File { path, result } = event {
+            analyze(&path, *result);
+        }
+    })?;
+
+    let hostile = hostile.load(Ordering::Relaxed);
+    let suspicious = suspicious.load(Ordering::Relaxed);
+    let benign = benign.load(Ordering::Relaxed);
+    let errors = errors.load(Ordering::Relaxed);
+
+    let summary = ScanSummary {
+        total_files: total,
+        hostile,
+        suspicious,
+        benign,
+        errors,
+        duration_ms: crate::duration_ms(scan_start.elapsed()),
+    };
+
+    if is_terminal {
+        // Collapse the progress bar straight into the verdict: when a bar is
+        // live it sits on its own line below the banner, so clear it and write
+        // the one-line summary in its place. The finished scan then shows just
+        // the banner and this line — no intermediate "files in" line, no
+        // separator, no trailing blank.
+        let line = output::summary_status_line(&summary);
+        if let Some(p) = &progress {
+            p.quiesce(); // stop the heartbeat before we claim the bar's line
+            eprint!("\r\x1b[2K {line}\n");
+            let _ = std::io::stderr().flush();
+        } else {
+            eprintln!(" {line}");
+        }
+    }
+
+    Ok(summary)
+}
+
+/// Build a ScanResult from a cleave report, injecting pids and deleted state.
+fn build_result(
+    report: cleave::AnalysisReport,
+    group: &ProcessGroup,
+    model: &Model,
+    shap: Option<&ShapImportance>,
+    config: &ScanConfig,
+    cancellation: Option<&AtomicBool>,
+) -> Result<ScanResult> {
+    let display_path = group.path.as_path();
+    // The bloom flag for a known-bad/conflicted process image, re-derived from the
+    // executable's sha256 (known-good is short-circuited before we ever scan, so it
+    // never reaches here). Drives the inline 🚩/🏴 in the terminal header.
+    let bloom_mark = config
+        .bloom()
+        .and_then(|lk| burton::parse_sha256_hex(&group.sha256).map(|d| lk.decide_sha256(&d)))
+        .and_then(crate::output::BloomMark::from_decision);
+    let label = display_path.display().to_string();
+    let cr = crate::engine::classify_report(
+        report,
+        crate::engine::ClassifyRequest {
+            shap,
+            cancellation,
+            tiny_opts: crate::engine::tiny_opts_for(config),
+            interpret: config.interpret(),
+            fetch: config.fetch_policy(),
+            zip_passwords: config.zip_passwords(),
+            needs: crate::engine::OutputNeeds {
+                // Matching scan's `--format interpret`: the live LLM query's user
+                // message, byte-for-byte, without the system prompt.
+                llm_view: matches!(config.format(), OutputFormat::Interpret),
+                fetch_progress: false, // machine-readable output; no live fetch log
+                render_context: matches!(
+                    config.format(),
+                    OutputFormat::Tiny | OutputFormat::Interpret
+                ),
+                // `--show=all` with JSON: list every member of an archive-backed image.
+                list_all_members: config.filter().is_all()
+                    && matches!(config.format(), OutputFormat::Json),
+                deps_for_upload: false, // ps has no hopper renewal
+            },
+            bloom_mark,
+            ..crate::engine::ClassifyRequest::new(&label, display_path, model)
+        },
+    )?;
+    let is_json = matches!(config.format(), OutputFormat::Json);
+
+    let mut result = cr.into_scan_result(label, model, is_json);
+    result.pids = Some(group.pids.clone());
+    result.deleted = group.deleted.then_some(true);
+    result.sha256.clone_from(&group.sha256);
+    result.bloom_mark = bloom_mark;
+    Ok(result)
+}
+
+/// Emit a single result with PID annotations.
+fn emit_result(
+    r: &ScanResult,
+    config: &ScanConfig,
+    pids: &[u32],
+    deleted: bool,
+    has_progress: bool,
+    stdout: &Mutex<std::io::Stdout>,
+) {
+    match config.format() {
+        OutputFormat::Terminal => {
+            output::print_ps_result(r, pids, deleted, has_progress, config.extra());
+        }
+        OutputFormat::Json => {
+            let envelope = r.envelope_ref();
+            let Ok(mut out) = stdout.lock() else {
+                return;
+            };
+            if let Err(e) = serde_json::to_writer(&mut *out, &envelope) {
+                tracing::error!(path = %r.path, "failed to serialize scan result: {e}");
+                return;
+            }
+            let _ = out.write_all(b"\n");
+        }
+        OutputFormat::Tiny => {
+            let Ok(mut out) = stdout.lock() else {
+                return;
+            };
+            if let Err(e) = crate::engine::write_tiny(&mut *out, r) {
+                tracing::error!(path = %r.path, "failed to write scan result: {e}");
+            }
+        }
+        // The LLM payload verbatim — no verdict line, no PID annotations.
+        OutputFormat::Interpret => {
+            let Ok(mut out) = stdout.lock() else {
+                return;
+            };
+            let _ = out.write_all(r.rendered_context.as_bytes());
+        }
+    }
+}
+
+/// Check if running as root/admin.
+fn is_root() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid() is a trivial syscall with no preconditions.
+        unsafe { libc::getuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false // Conservative: always show the warning on non-unix
+    }
+}

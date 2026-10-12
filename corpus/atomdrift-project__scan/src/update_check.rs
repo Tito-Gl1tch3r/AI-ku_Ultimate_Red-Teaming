@@ -1,0 +1,173 @@
+//! Release-update notifier.
+//!
+//! On first run and at most once every 24 hours, litmus fetches a small static
+//! TOML manifest (`litmus.toml`) and prints a one-line notice when a newer
+//! release exists. The fetch is a plain GET of a static file; the only thing it
+//! says about this install is its User-Agent, `scan/<version>`. A fresh result
+//! is cached locally so subsequent runs print the notice without touching the
+//! network at all.
+//!
+//! The opt-out is honored everywhere: pass `--no-update-check` or set
+//! `SCAN_NO_UPDATE_CHECK` to disable the notice. The base URL is overridable
+//! via `SCAN_UPDATE_URL` (primarily for testing against a local server).
+
+use crate::update_manifest::{self, Manifest};
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Default location of the hosted manifests.
+const DEFAULT_BASE_URL: &str = "https://atomdrift.org/updates/";
+/// Minimum interval between network checks for the notice.
+const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
+/// Whole-request budget for a manifest fetch. Short on purpose: the check must
+/// never noticeably delay a command, and an offline host should fail fast.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The URL of manifest `name` under `base`.
+fn manifest_url(base: &str, name: &str) -> String {
+    let sep = if base.ends_with('/') { "" } else { "/" };
+    format!("{base}{sep}{name}")
+}
+
+/// Fetch and parse a manifest over HTTPS.
+fn fetch(url: &str) -> Result<Manifest> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(FETCH_TIMEOUT)
+        .connect_timeout(FETCH_TIMEOUT)
+        .user_agent(concat!("scan/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("building update-check HTTP client")?;
+    let text = client
+        .get(url)
+        .send()
+        .with_context(|| format!("fetching {url}"))?
+        .error_for_status()
+        .with_context(|| format!("{url} returned an error status"))?
+        .text()
+        .context("reading manifest body")?;
+    Manifest::parse(&text)
+}
+
+/// On-disk record of the last notice check (successful or failed).
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Cache {
+    /// Unix time the manifest was last fetched.
+    checked_unix: u64,
+    /// `latest` field from that fetch.
+    latest: String,
+    /// `url` field from that fetch, if any.
+    #[serde(default)]
+    url: Option<String>,
+}
+
+/// Path to the notice cache (`<cache_dir>/atomdrift/scan/update-check.toml`).
+fn cache_path() -> Option<PathBuf> {
+    Some(
+        dirs::cache_dir()?
+            .join("atomdrift")
+            .join("scan")
+            .join("update-check.toml"),
+    )
+}
+
+/// Current Unix time in seconds (0 if the clock predates the epoch).
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Persist the notice cache (best-effort; failures are non-fatal).
+fn write_cache(cache: &Cache) {
+    let Some(path) = cache_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(text) = toml::to_string(cache) {
+        let _ = std::fs::write(&path, text);
+    }
+}
+
+/// Print the one-line notice, but only when `latest` is genuinely newer.
+fn notify(latest: &str, url: Option<&str>, installed: &str) {
+    if !update_manifest::is_newer(latest, installed) {
+        return;
+    }
+    // Both strings come off the network: a tampered manifest must not drive
+    // the terminal.
+    let latest = crate::output::tty_text(latest);
+    match url.map(crate::output::tty_text) {
+        Some(url) => {
+            eprintln!("update available: Atomdrift Scan {latest} (you have {installed}) — {url}");
+        }
+        None => eprintln!("update available: Atomdrift Scan {latest} (you have {installed})"),
+    }
+}
+
+/// Run the update notice for an interactive command.
+///
+/// A fresh (<24h) cache is used without any network access. Otherwise the
+/// manifest is fetched once (bounded by `FETCH_TIMEOUT`), the cache is
+/// refreshed, and a notice is printed if a newer release exists. Any network or
+/// parse failure is logged at debug level and otherwise ignored — the check is
+/// strictly best-effort and never blocks or fails a command.
+pub fn maybe_notify(disabled_by_flag: bool) {
+    if disabled_by_flag || std::env::var_os("SCAN_NO_UPDATE_CHECK").is_some() {
+        return;
+    }
+    let installed = env!("CARGO_PKG_VERSION");
+    // Any read or parse error is equivalent to a missing cache.
+    let cached = cache_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| toml::from_str::<Cache>(&text).ok());
+
+    // A fresh stamp (a recent success *or* a recent failed attempt) is used
+    // without any network access.
+    if let Some(cache) = &cached
+        && now_unix().saturating_sub(cache.checked_unix) < CHECK_INTERVAL_SECS
+    {
+        notify(&cache.latest, cache.url.as_deref(), installed);
+        return;
+    }
+
+    let base = std::env::var("SCAN_UPDATE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned());
+    let cache = match fetch(&manifest_url(&base, "litmus.toml")) {
+        Ok(manifest) => Cache {
+            checked_unix: now_unix(),
+            latest: manifest.latest,
+            url: manifest.url,
+        },
+        Err(e) => {
+            tracing::debug!(error = %format!("{e:#}"), "update check skipped");
+            // Stamp the failed attempt so an unreachable manifest doesn't
+            // trigger a network call on every run. Preserve any previously
+            // known `latest` so a transient failure still shows the last notice.
+            Cache {
+                checked_unix: now_unix(),
+                ..cached.unwrap_or_default()
+            }
+        }
+    };
+    write_cache(&cache);
+    notify(&cache.latest, cache.url.as_deref(), installed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_url_joins_with_or_without_a_trailing_slash() {
+        assert_eq!(
+            manifest_url("https://example.test/u/", "litmus.toml"),
+            "https://example.test/u/litmus.toml"
+        );
+        assert_eq!(
+            manifest_url("https://example.test/u", "cleave.toml"),
+            "https://example.test/u/cleave.toml"
+        );
+    }
+}

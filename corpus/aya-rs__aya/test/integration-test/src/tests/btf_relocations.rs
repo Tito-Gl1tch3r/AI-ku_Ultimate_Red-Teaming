@@ -1,0 +1,159 @@
+use std::{
+    error::Error as _,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
+
+use assert_matches::assert_matches;
+use aya::{
+    Ebpf, EbpfError, EbpfLoader, Endianness,
+    maps::Array,
+    programs::{UProbe, uprobe::UProbeScope},
+};
+use aya_obj::btf::Btf;
+use rstest::rstest;
+
+#[rstest]
+#[case(
+    crate::ENUM_SIGNED_32_RELOC_BPF,
+    crate::ENUM_SIGNED_32_RELOC_BTF,
+    -0x7BBBBBBBi32 as u64
+)]
+#[case(
+    crate::ENUM_SIGNED_32_CHECKED_VARIANTS_RELOC_BPF,
+    crate::ENUM_SIGNED_32_CHECKED_VARIANTS_RELOC_BTF,
+    -0x7BBBBBBBi32 as u64
+)]
+#[case(
+    crate::ENUM_SIGNED_64_RELOC_BPF,
+    crate::ENUM_SIGNED_64_RELOC_BTF,
+    -0xCCCCCCCDDDDDDDDi64 as u64
+)]
+#[case(
+    crate::ENUM_SIGNED_64_CHECKED_VARIANTS_RELOC_BPF,
+    crate::ENUM_SIGNED_64_CHECKED_VARIANTS_RELOC_BTF,
+    -0xCCCCCCCDDDDDDDi64 as u64
+)]
+#[case(
+    crate::ENUM_UNSIGNED_32_RELOC_BPF,
+    crate::ENUM_UNSIGNED_32_RELOC_BTF,
+    0xBBBBBBBB
+)]
+#[case(
+    crate::ENUM_UNSIGNED_32_CHECKED_VARIANTS_RELOC_BPF,
+    crate::ENUM_UNSIGNED_32_CHECKED_VARIANTS_RELOC_BTF,
+    0xBBBBBBBB
+)]
+#[case(
+    crate::ENUM_UNSIGNED_64_RELOC_BPF,
+    crate::ENUM_UNSIGNED_64_RELOC_BTF,
+    0xCCCCCCCCDDDDDDDD
+)]
+#[case(
+    crate::ENUM_UNSIGNED_64_CHECKED_VARIANTS_RELOC_BPF,
+    crate::ENUM_UNSIGNED_64_CHECKED_VARIANTS_RELOC_BTF,
+    0xCCCCCCCCDDDDDDDD
+)]
+#[case(crate::FIELD_RELOC_BPF, crate::FIELD_RELOC_BTF, 1)]
+#[case(crate::FLEX_ARRAY_RELOC_BPF, crate::FLEX_ARRAY_RELOC_BTF, 24)]
+#[case::target_fixed_array(
+    crate::TARGET_FIXED_ARRAY_RELOC_BPF,
+    crate::TARGET_FIXED_ARRAY_RELOC_BTF,
+    0
+)]
+#[case::target_nonfinal_zero_array(
+    crate::TARGET_NONFINAL_ZERO_ARRAY_RELOC_BPF,
+    crate::TARGET_NONFINAL_ZERO_ARRAY_RELOC_BTF,
+    0
+)]
+#[case(crate::POINTER_RELOC_BPF, crate::POINTER_RELOC_BTF, 21)]
+#[case(crate::STRUCT_FLAVORS_RELOC_BPF, crate::STRUCT_FLAVORS_RELOC_BTF, 2)]
+#[test_attr(test_log::test)]
+fn relocation_tests(#[case] bpf: &[u8], #[case] btf: &[u8], #[case] expected: u64) {
+    let btf = Btf::parse(btf, Endianness::default()).unwrap();
+
+    let bpf = EbpfLoader::new().btf(&btf).load(bpf).unwrap();
+
+    assert_relocation(bpf, expected);
+}
+
+#[rstest]
+#[case::nonfinal_zero_array(
+    crate::NONFINAL_ZERO_ARRAY_RELOC_BPF,
+    "invalid access string `0:0:1` at `relocated_nonfinal_zero_array.args`: array index out of bounds (index 1, length 0)"
+)]
+#[case::nested_array_bounds(
+    crate::NESTED_ARRAY_BOUNDS_RELOC_BPF,
+    "invalid access string `0:0:0:0:0:1` at `relocated_nested_array.rows[0].args`: array index out of bounds (index 1, length 1)"
+)]
+#[test_attr(test_log::test)]
+fn array_out_of_bounds(#[case] bpf: &[u8], #[case] expected: &str) {
+    // Local access validation fails before target matching.
+    let btf = Btf::new();
+    let error = EbpfLoader::new().btf(&btf).load(bpf).unwrap_err();
+    let error = assert_matches!(error, EbpfError::BtfRelocationError(error) => error);
+    assert_eq!(error.source().unwrap().to_string(), expected);
+}
+
+#[test_log::test]
+fn lazy_btf_source_is_cached() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let source_calls = Arc::clone(&calls);
+    let mut loader = EbpfLoader::new();
+    loader.btf_source(move |parse| {
+        source_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(parse(crate::FIELD_RELOC_BTF)?)
+    });
+
+    let bpf = loader.load(crate::FIELD_RELOC_BPF).unwrap();
+    let _second_bpf = loader.load(crate::FIELD_RELOC_BPF).unwrap();
+
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_relocation(bpf, 1);
+}
+
+#[test_log::test]
+fn btf_source_is_not_called_when_unneeded() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let source_calls = Arc::clone(&calls);
+    let mut loader = EbpfLoader::new();
+    loader.btf_source(move |parse| {
+        source_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(parse(crate::FIELD_RELOC_BTF)?)
+    });
+
+    // RINGBUF_BTF contains BTF map definitions but no CO-RE relocations or typed ksyms. If that
+    // changes, replace it with an object that does not require target BTF.
+    let _bpf = loader.load(crate::RINGBUF_BTF).unwrap();
+
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+}
+
+fn assert_relocation(mut bpf: Ebpf, expected: u64) {
+    let program: &mut UProbe = bpf.program_mut("program").unwrap().try_into().unwrap();
+    program.load().unwrap();
+    program
+        .attach(
+            ["trigger_btf_relocations_program"],
+            "/proc/self/exe",
+            UProbeScope::AllProcesses,
+        )
+        .unwrap();
+
+    let mut output_map: Array<_, u64> = bpf.take_map("output_map").unwrap().try_into().unwrap();
+    let key = 0;
+    // Require the program to write the result, including when the expected value is zero.
+    output_map.set(key, &!expected, 0).unwrap();
+
+    trigger_btf_relocations_program();
+
+    assert_eq!(output_map.get(&key, 0).unwrap(), expected)
+}
+
+#[unsafe(no_mangle)]
+#[inline(never)]
+extern "C" fn trigger_btf_relocations_program() {
+    core::hint::black_box(trigger_btf_relocations_program);
+}

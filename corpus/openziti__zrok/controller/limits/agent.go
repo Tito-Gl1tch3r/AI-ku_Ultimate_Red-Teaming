@@ -1,0 +1,630 @@
+package limits
+
+import (
+	"context"
+	"fmt"
+	"reflect"
+	"sync/atomic"
+	"time"
+
+	"github.com/jmoiron/sqlx"
+	"github.com/michaelquigley/df/dl"
+	"github.com/openziti/zrok/v2/controller/automation"
+	"github.com/openziti/zrok/v2/controller/emailUi"
+	"github.com/openziti/zrok/v2/controller/metrics"
+	"github.com/openziti/zrok/v2/controller/store"
+	"github.com/openziti/zrok/v2/sdk/golang/sdk"
+	"github.com/openziti/zrok/v2/util"
+	"github.com/pkg/errors"
+)
+
+type Agent struct {
+	cfg            *Config
+	ifx            bandwidthReader
+	zCfg           *automation.Config
+	newZiti        func() (*automation.ZitiAutomation, error)
+	str            *store.Store
+	queue          chan *metrics.Usage
+	warningActions []AccountAction
+	limitActions   []AccountAction
+	relaxActions   []AccountAction
+	close          chan struct{}
+	join           chan struct{}
+	ctx            context.Context
+	cancel         context.CancelFunc
+	droppedEvents  atomic.Uint64
+}
+
+type bandwidthReader interface {
+	totalRxTxForAccount(context.Context, int64, time.Duration) (int64, int64, error)
+	totalRxTxForEnvironment(context.Context, int64, time.Duration) (int64, int64, error)
+	totalRxTxForShare(context.Context, string, time.Duration) (int64, int64, error)
+}
+
+func NewAgent(cfg *Config, ifxCfg *metrics.InfluxConfig, zCfg *automation.Config, emailCfg *emailUi.Config, str *store.Store) (*Agent, error) {
+	newZiti := func() (*automation.ZitiAutomation, error) { return automation.NewZitiAutomation(zCfg) }
+	ctx, cancel := context.WithCancel(context.Background())
+	a := &Agent{
+		cfg:            cfg,
+		ifx:            newInfluxReader(ifxCfg, cfg.QueryTimeout),
+		zCfg:           zCfg,
+		newZiti:        newZiti,
+		str:            str,
+		queue:          make(chan *metrics.Usage, 1024),
+		warningActions: []AccountAction{newWarningAction(emailCfg, str)},
+		limitActions:   []AccountAction{newLimitAction(str, newZiti)},
+		relaxActions:   []AccountAction{newRelaxAction(str, newZiti)},
+		close:          make(chan struct{}),
+		join:           make(chan struct{}),
+		ctx:            ctx,
+		cancel:         cancel,
+	}
+	return a, nil
+}
+
+func (a *Agent) setZitiFactory(factory func() (*automation.ZitiAutomation, error)) {
+	a.newZiti = factory
+	a.limitActions = []AccountAction{newLimitAction(a.str, factory)}
+	a.relaxActions = []AccountAction{newRelaxAction(a.str, factory)}
+}
+
+func (a *Agent) Start() {
+	go a.run()
+}
+
+// Stop cancels the agent's context first, so an influx query in flight returns and the run loop can see
+// the close.
+func (a *Agent) Stop() {
+	a.cancel()
+	close(a.close)
+	<-a.join
+}
+
+func (a *Agent) CanCreateEnvironment(acctId int, trx *sqlx.Tx) (bool, error) {
+	if a.cfg.Enforcing {
+		if err := a.str.LimitCheckLock(acctId, trx); err != nil {
+			return false, err
+		}
+
+		ul, err := a.getUserLimits(acctId, trx)
+		if err != nil {
+			return false, err
+		}
+
+		if ul.resource.GetEnvironments() > store.Unlimited {
+			envs, err := a.str.FindEnvironmentsForAccount(acctId, trx)
+			if err != nil {
+				return false, err
+			}
+			if len(envs)+1 > ul.resource.GetEnvironments() {
+				return false, nil
+			}
+		}
+	}
+
+	return true, nil
+}
+
+func (a *Agent) CanCreateShare(acctId, envId int, reserved, uniqueName bool, _ sdk.ShareMode, backendMode sdk.BackendMode, trx *sqlx.Tx) (bool, error) {
+	if a.cfg.Enforcing {
+		if err := a.str.LimitCheckLock(acctId, trx); err != nil {
+			return false, err
+		}
+
+		ul, err := a.getUserLimits(acctId, trx)
+		if err != nil {
+			return false, err
+		}
+
+		if scopedBwc, found := ul.scopes[backendMode]; found {
+			latestScopedJe, err := a.isBandwidthClassLimitedForAccount(acctId, scopedBwc, trx)
+			if err != nil {
+				return false, err
+			}
+			if latestScopedJe != nil {
+				return false, nil
+			}
+		} else {
+			for _, bwc := range ul.bandwidth {
+				latestJe, err := a.isBandwidthClassLimitedForAccount(acctId, bwc, trx)
+				if err != nil {
+					return false, err
+				}
+				if latestJe != nil {
+					return false, nil
+				}
+			}
+		}
+
+		rc := ul.resource
+		if scopeRc, found := ul.scopes[backendMode]; found {
+			rc = scopeRc
+		}
+		if rc.GetShares() > store.Unlimited || (reserved && rc.GetReservedShares() > store.Unlimited) || (reserved && uniqueName && rc.GetUniqueNames() > store.Unlimited) {
+			envs, err := a.str.FindEnvironmentsForAccount(acctId, trx)
+			if err != nil {
+				return false, err
+			}
+			total := 0
+			for i := range envs {
+				shrs, err := a.str.FindSharesForEnvironment(envs[i].Id, trx)
+				if err != nil {
+					return false, errors.Wrapf(err, "unable to find shares for environment '%v'", envs[i].ZId)
+				}
+				total += len(shrs)
+
+				if rc.GetShares() > store.Unlimited && total+1 > rc.GetShares() {
+					dl.Debugf("account '#%d', environment '%d' over shares limit '%d'", acctId, envId, a.cfg.Shares)
+					return false, nil
+				}
+			}
+		}
+	}
+	return true, nil
+}
+
+func (a *Agent) CanReserveName(acctId int, trx *sqlx.Tx) (bool, error) {
+	if a.cfg.Enforcing {
+		if err := a.str.LimitCheckLock(acctId, trx); err != nil {
+			return false, err
+		}
+
+		ul, err := a.getUserLimits(acctId, trx)
+		if err != nil {
+			return false, err
+		}
+
+		rc := ul.resource
+		if rc.GetUniqueNames() > store.Unlimited || rc.GetReservedShares() > store.Unlimited {
+			names, err := a.str.FindNamesForAccount(acctId, trx)
+			if err != nil {
+				return false, err
+			}
+
+			reservedNames := 0
+			for _, name := range names {
+				if name.Reserved {
+					reservedNames++
+				}
+			}
+
+			if rc.GetUniqueNames() > store.Unlimited && reservedNames+1 > rc.GetUniqueNames() {
+				dl.Debugf("account '#%d' over unique names limit '%d'", acctId, rc.GetUniqueNames())
+				return false, nil
+			}
+			if rc.GetReservedShares() > store.Unlimited && reservedNames+1 > rc.GetReservedShares() {
+				dl.Debugf("account '#%d' over reserved shares limit '%d'", acctId, rc.GetReservedShares())
+				return false, nil
+			}
+		}
+	}
+	return true, nil
+}
+
+func (a *Agent) CanAccessShare(shrId int, trx *sqlx.Tx) (bool, error) {
+	if a.cfg.Enforcing {
+		shr, err := a.str.GetShare(shrId, trx)
+		if err != nil {
+			return false, err
+		}
+		env, err := a.str.GetEnvironment(shr.EnvironmentId, trx)
+		if err != nil {
+			return false, err
+		}
+		if env.AccountId != nil {
+			if err := a.str.LimitCheckLock(*env.AccountId, trx); err != nil {
+				return false, err
+			}
+
+			ul, err := a.getUserLimits(*env.AccountId, trx)
+			if err != nil {
+				return false, err
+			}
+
+			if scopedBwc, found := ul.scopes[sdk.BackendMode(shr.BackendMode)]; found {
+				latestScopedJe, err := a.isBandwidthClassLimitedForAccount(*env.AccountId, scopedBwc, trx)
+				if err != nil {
+					return false, err
+				}
+				if latestScopedJe != nil {
+					return false, nil
+				}
+			} else {
+				for _, bwc := range ul.bandwidth {
+					latestJe, err := a.isBandwidthClassLimitedForAccount(*env.AccountId, bwc, trx)
+					if err != nil {
+						return false, err
+					}
+					if latestJe != nil {
+						return false, nil
+					}
+				}
+			}
+
+			rc := ul.resource
+			if scopeRc, found := ul.scopes[sdk.BackendMode(shr.BackendMode)]; found {
+				rc = scopeRc
+			}
+			if rc.GetShareFrontends() > store.Unlimited {
+				fes, err := a.str.FindFrontendsForPrivateShare(shr.Id, trx)
+				if err != nil {
+					return false, err
+				}
+				if len(fes)+1 > rc.GetShareFrontends() {
+					dl.Infof("account '#%d' over frontends per share limit '%d'", *env.AccountId, rc.GetShareFrontends())
+					return false, nil
+				}
+			}
+		} else {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (a *Agent) Handle(u *metrics.Usage) error {
+	return a.HandleContext(context.Background(), u)
+}
+
+func (a *Agent) HandleContext(ctx context.Context, u *metrics.Usage) error {
+	dl.Debugf("handling: %v", u)
+	timeout := 3 * time.Second
+	if a.cfg != nil && a.cfg.HandoffTimeout > 0 {
+		timeout = a.cfg.HandoffTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case a.queue <- u:
+		return nil
+	case <-timer.C:
+	case <-a.close:
+	case <-ctx.Done():
+	}
+	a.droppedEvents.Add(1)
+	dl.Warnf("dropped limits handoff for share '%v'; usage is recorded in InfluxDB", u.ShareToken)
+	return nil
+}
+
+func (a *Agent) DroppedEvents() uint64 { return a.droppedEvents.Load() }
+
+func (a *Agent) run() {
+	dl.Info("started")
+	defer dl.Info("stopped")
+
+	lastCycle := time.Now()
+mainLoop:
+	for {
+		select {
+		case usage := <-a.queue:
+			if usage.ShareToken != "" {
+				if err := a.enforceSafely(usage); err != nil {
+					dl.Errorf("error running enforcement: %v", err)
+				}
+				if time.Since(lastCycle) > a.cfg.Cycle {
+					if err := a.relax(); err != nil {
+						dl.Errorf("error running relax cycle: %v", err)
+					}
+					lastCycle = time.Now()
+				}
+			} else {
+				dl.Debugf("not enforcing for usage with no share token: %v", usage.String())
+			}
+
+		case <-time.After(a.cfg.Cycle):
+			if err := a.relax(); err != nil {
+				dl.Errorf("error running relax cycle: %v", err)
+			}
+			lastCycle = time.Now()
+
+		case <-a.close:
+			close(a.join)
+			break mainLoop
+		}
+	}
+}
+
+func (a *Agent) enforceSafely(usage *metrics.Usage) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = errors.Errorf("panic enforcing usage for account '#%d': %v", usage.AccountId, recovered)
+		}
+	}()
+	return a.enforce(usage)
+}
+
+func (a *Agent) enforce(u *metrics.Usage) error {
+	trx, err := a.str.Begin()
+	if err != nil {
+		return errors.Wrap(err, "error starting transaction")
+	}
+	defer func() { _ = trx.Rollback() }()
+
+	acct, err := a.str.GetAccount(int(u.AccountId), trx)
+	if err != nil {
+		return err
+	}
+	if acct.Limitless {
+		return nil
+	}
+
+	shr, err := a.str.FindShareWithTokenEvenIfDeleted(u.ShareToken, trx)
+	if err != nil {
+		return err
+	}
+
+	ul, err := a.getUserLimits(int(u.AccountId), trx)
+	if err != nil {
+		return err
+	}
+
+	exceededBwc, rxBytes, txBytes, err := a.anyBandwidthLimitExceeded(acct, u, ul.toBandwidthArray(sdk.BackendMode(shr.BackendMode)))
+	if err != nil {
+		return errors.Wrap(err, "error checking limit classes")
+	}
+
+	if exceededBwc != nil {
+		latestJe, err := a.isBandwidthClassLimitedForAccount(int(u.AccountId), exceededBwc, trx)
+		if err != nil {
+			return err
+		}
+		if latestJe == nil {
+			je := &store.BandwidthLimitJournalEntry{
+				AccountId: int(u.AccountId),
+				RxBytes:   rxBytes,
+				TxBytes:   txBytes,
+				Action:    exceededBwc.GetLimitAction(),
+			}
+			if !exceededBwc.IsGlobal() {
+				lcId := exceededBwc.GetLimitClassId()
+				je.LimitClassId = &lcId
+			}
+			if _, err := a.str.CreateBandwidthLimitJournalEntry(je, trx); err != nil {
+				return err
+			}
+			acct, err := a.str.GetAccount(int(u.AccountId), trx)
+			if err != nil {
+				return err
+			}
+			switch exceededBwc.GetLimitAction() {
+			case store.LimitLimitAction:
+				for _, limitAction := range a.limitActions {
+					if err := limitAction.HandleAccount(acct, rxBytes, txBytes, exceededBwc, ul, trx); err != nil {
+						return errors.Wrapf(err, "%v", reflect.TypeOf(limitAction).String())
+					}
+				}
+
+			case store.WarningLimitAction:
+				for _, warningAction := range a.warningActions {
+					if err := warningAction.HandleAccount(acct, rxBytes, txBytes, exceededBwc, ul, trx); err != nil {
+						return errors.Wrapf(err, "%v", reflect.TypeOf(warningAction).String())
+					}
+				}
+			}
+			if err := trx.Commit(); err != nil {
+				return err
+			}
+		} else {
+			dl.Debugf("limit '%v' already applied for '%v' (at: %v)", exceededBwc, acct.Email, latestJe.CreatedAt)
+		}
+	}
+
+	return nil
+}
+
+func (a *Agent) relax() error {
+	dl.Debug("relaxing")
+
+	trx, err := a.str.Begin()
+	if err != nil {
+		return errors.Wrap(err, "error starting transaction")
+	}
+	defer func() { _ = trx.Rollback() }()
+
+	commit := false
+
+	if bwjes, err := a.str.FindAllBandwidthLimitJournal(trx); err == nil {
+		accounts := make(map[int]*store.Account)
+		uls := make(map[int]*userLimits)
+		accountPeriods := make(map[int]map[int]*periodBwValues)
+
+		for _, bwje := range bwjes {
+			entryErr := func() (entryErr error) {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						account := fmt.Sprintf("#%d", bwje.AccountId)
+						if acct := accounts[bwje.AccountId]; acct != nil {
+							account = acct.Email
+						}
+						dl.Errorf("panic relaxing account '%v' (journal retained): %v", account, recovered)
+						entryErr = nil
+					}
+				}()
+				if _, found := accounts[bwje.AccountId]; !found {
+					if acct, err := a.str.GetAccount(bwje.AccountId, trx); err == nil {
+						accounts[bwje.AccountId] = acct
+						ul, err := a.getUserLimits(acct.Id, trx)
+						if err != nil {
+							return errors.Wrapf(err, "error getting user limits for '%v'", acct.Email)
+						}
+						uls[bwje.AccountId] = ul
+						accountPeriods[bwje.AccountId] = make(map[int]*periodBwValues)
+					} else {
+						return err
+					}
+				}
+
+				var bwc store.BandwidthClass
+				if bwje.LimitClassId == nil {
+					globalBwcs := newConfigBandwidthClasses(a.cfg.Bandwidth)
+					if bwje.Action == store.WarningLimitAction {
+						bwc = globalBwcs[0]
+					} else {
+						bwc = globalBwcs[1]
+					}
+				} else {
+					lc, err := a.str.GetLimitClass(*bwje.LimitClassId, trx)
+					if err != nil {
+						return err
+					}
+					bwc = lc
+				}
+
+				if periods, accountFound := accountPeriods[bwje.AccountId]; accountFound {
+					if _, periodFound := periods[bwc.GetPeriodMinutes()]; !periodFound {
+						rx, tx, err := a.ifx.totalRxTxForAccount(a.ctx, int64(bwje.AccountId), time.Duration(bwc.GetPeriodMinutes())*time.Minute)
+						if err != nil {
+							return err
+						}
+						periods[bwc.GetPeriodMinutes()] = &periodBwValues{rx: rx, tx: tx}
+						accountPeriods[bwje.AccountId] = periods
+					}
+				} else {
+					return errors.New("accountPeriods corrupted")
+				}
+
+				used := accountPeriods[bwje.AccountId][bwc.GetPeriodMinutes()]
+				if !a.transferBytesExceeded(used.rx, used.tx, bwc) {
+					if bwc.GetLimitAction() == store.LimitLimitAction {
+						dl.Infof("relaxing limit '%v' for '%v'", bwc.String(), accounts[bwje.AccountId].Email)
+						completed, err := a.relaxAccount(accounts[bwje.AccountId], bwje, used, bwc, uls[bwje.AccountId], trx)
+						if err != nil {
+							return err
+						}
+						if completed {
+							commit = true
+						}
+					} else {
+						dl.Infof("relaxing warning '%v' for '%v'", bwc.String(), accounts[bwje.AccountId].Email)
+						if err := a.deleteJournalEntry(bwje, trx); err != nil {
+							return err
+						}
+						commit = true
+					}
+				} else {
+					dl.Infof("'%v' still over limit: '%v' with rx: %v, tx: %v, total: %v", accounts[bwje.AccountId].Email, bwc, util.BytesToSize(used.rx), util.BytesToSize(used.tx), util.BytesToSize(used.rx+used.tx))
+				}
+				return nil
+			}()
+			if entryErr != nil {
+				return entryErr
+			}
+		}
+	} else {
+		return err
+	}
+
+	if commit {
+		if err := trx.Commit(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (a *Agent) relaxAccount(acct *store.Account, entry *store.BandwidthLimitJournalEntry, used *periodBwValues, bwc store.BandwidthClass, ul *userLimits, trx *sqlx.Tx) (bool, error) {
+	for _, action := range a.relaxActions {
+		if actionErr := action.HandleAccount(acct, used.rx, used.tx, bwc, ul, trx); actionErr != nil {
+			var storeErr storeRelaxError
+			if errors.As(actionErr, &storeErr) {
+				return false, actionErr
+			}
+			dl.Errorf("error relaxing account '%v' (journal retained): %v: %v", acct.Email, reflect.TypeOf(action), actionErr)
+			return false, nil
+		}
+	}
+	if err := a.deleteJournalEntry(entry, trx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (a *Agent) deleteJournalEntry(entry *store.BandwidthLimitJournalEntry, trx *sqlx.Tx) error {
+	if entry.LimitClassId == nil {
+		return a.str.DeleteBandwidthLimitJournalEntryForGlobal(entry.AccountId, trx)
+	}
+	return a.str.DeleteBandwidthLimitJournalEntryForLimitClass(entry.AccountId, *entry.LimitClassId, trx)
+}
+
+func (a *Agent) isBandwidthClassLimitedForAccount(acctId int, bwc store.BandwidthClass, trx *sqlx.Tx) (*store.BandwidthLimitJournalEntry, error) {
+	if bwc.IsGlobal() {
+		if empty, err := a.str.IsBandwidthLimitJournalEmptyForGlobal(acctId, trx); err == nil && !empty {
+			je, err := a.str.FindLatestBandwidthLimitJournalForGlobal(acctId, trx)
+			if err != nil {
+				return nil, err
+			}
+			if je.Action == bwc.GetLimitAction() {
+				dl.Debugf("account '#%d' over bandwidth for global bandwidth class '%v'", acctId, bwc)
+				return je, nil
+			}
+		} else if err != nil {
+			return nil, err
+		}
+	} else {
+		if empty, err := a.str.IsBandwidthLimitJournalEmptyForLimitClass(acctId, bwc.GetLimitClassId(), trx); err == nil && !empty {
+			je, err := a.str.FindLatestBandwidthLimitJournalForLimitClass(acctId, bwc.GetLimitClassId(), trx)
+			if err != nil {
+				return nil, err
+			}
+			if je.Action == bwc.GetLimitAction() {
+				dl.Debugf("account '#%d' over bandwidth for limit class '%v'", acctId, bwc)
+				return je, nil
+			}
+		} else if err != nil {
+			return nil, err
+		}
+	}
+	return nil, nil
+}
+
+func (a *Agent) anyBandwidthLimitExceeded(acct *store.Account, u *metrics.Usage, bwcs []store.BandwidthClass) (store.BandwidthClass, int64, int64, error) {
+	periodBw := make(map[int]periodBwValues)
+
+	var selectedLc store.BandwidthClass
+	var rxBytes int64
+	var txBytes int64
+
+	for _, bwc := range bwcs {
+		if _, found := periodBw[bwc.GetPeriodMinutes()]; !found {
+			rx, tx, err := a.ifx.totalRxTxForAccount(a.ctx, u.AccountId, time.Minute*time.Duration(bwc.GetPeriodMinutes()))
+			if err != nil {
+				return nil, 0, 0, errors.Wrapf(err, "error getting rx/tx for account '%v'", acct.Email)
+			}
+			periodBw[bwc.GetPeriodMinutes()] = periodBwValues{rx: rx, tx: tx}
+		}
+		period := periodBw[bwc.GetPeriodMinutes()]
+
+		if a.transferBytesExceeded(period.rx, period.tx, bwc) {
+			selectedLc = bwc
+			rxBytes = period.rx
+			txBytes = period.tx
+		} else {
+			dl.Debugf("'%v' limit ok '%v' with rx: %v, tx: %v, total: %v", acct.Email, bwc, util.BytesToSize(period.rx), util.BytesToSize(period.tx), util.BytesToSize(period.rx+period.tx))
+		}
+	}
+
+	if selectedLc != nil {
+		dl.Infof("'%v' exceeded limit '%v' with rx: %v, tx: %v, total: %v", acct.Email, selectedLc, util.BytesToSize(rxBytes), util.BytesToSize(txBytes), util.BytesToSize(rxBytes+txBytes))
+	}
+
+	return selectedLc, rxBytes, txBytes, nil
+}
+
+func (a *Agent) transferBytesExceeded(rx, tx int64, bwc store.BandwidthClass) bool {
+	if bwc.GetTxBytes() != store.Unlimited && tx >= bwc.GetTxBytes() {
+		return true
+	}
+	if bwc.GetRxBytes() != store.Unlimited && rx >= bwc.GetRxBytes() {
+		return true
+	}
+	if bwc.GetTotalBytes() != store.Unlimited && tx+rx >= bwc.GetTotalBytes() {
+		return true
+	}
+	return false
+}
+
+type periodBwValues struct {
+	rx int64
+	tx int64
+}

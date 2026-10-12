@@ -1,0 +1,135 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Search kernel log for driver component ops pointers.
+//
+// The `component_bind` and `__component_add` functions print ops functions
+// to the kernel log:
+//
+//   dev_dbg(master->parent, "binding %s (ops %ps)\n",
+//   dev_info(master->parent, "bound %s (ops %ps)\n",
+//   dev_err(master->parent, "failed to bind %s (ops %ps): %d\n",
+//   dev_dbg(dev, "adding component (ops %ps)\n", ops);
+//
+// The "%ps" printk format prints the symbol name; however, if kernel symbols
+// are disabled (CONFIG_KALLSYMS=n) then raw pointers are printed instead.
+//
+// Kernels may be compiled without debugging symbols to decrease the size of
+// the kernel image.
+//
+// Leak primitive:
+//   Data leaked:      kernel function pointers (driver component ops)
+//   Kernel subsystem: drivers/base/component — component_bind/__component_add
+//   Data structure:   struct component_ops function pointers
+//   Address type:     virtual (kernel text / module text)
+//   Method:           parsed (dmesg string)
+//   Status:           unfixed (requires CONFIG_KALLSYMS=n to leak raw pointers)
+//   Access check:     do_syslog() → check_syslog_permissions(); gated by
+//                     dmesg_restrict
+//   Source:
+//   https://elixir.bootlin.com/linux/v5.15.12/source/drivers/base/component.c
+//
+// Mitigations:
+//   CONFIG_KALLSYMS=y causes %ps to print symbol names instead of raw
+//   pointers. Access gated by dmesg_restrict (see dmesg.h for shared
+//   access gate details).
+//
+// Requires:
+// - kernel.dmesg_restrict = 0; or CAP_SYSLOG capabilities; or
+//   readable /var/log/dmesg.
+// - CONFIG_KALLSYMS=n
+//
+// References:
+// https://elixir.bootlin.com/linux/v5.15.12/source/drivers/base/component.c
+// https://cateee.net/lkddb/web-lkddb/KALLSYMS.html
+// https://www.kernel.org/doc/html/latest/core-api/printk-formats.html
+// ---
+// <bcoles@gmail.com>
+
+#define _GNU_SOURCE
+#include "include/dmesg.h"
+#include "include/kasld/api.h"
+#include "include/kasld/cli.h"
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+KASLD_EXPLAIN(
+    "Searches dmesg for raw function pointer values printed by the "
+    "driver component framework (ops 0x...). When CONFIG_KALLSYMS is "
+    "disabled, the %ps format prints raw pointers instead of symbolized "
+    "names. These pointers are kernel text or module virtual addresses. "
+    "Access is gated by dmesg_restrict.");
+
+KASLD_META("method:parsed\n"
+           "phase:inference\n"
+           "discloses:virtual\n"
+           "source:files\n"
+           "sysctl:dmesg_restrict>=1\n"
+           "bypass:CAP_SYSLOG\n"
+           "fallback:/var/log/dmesg\n");
+
+static const char *needle = " (ops 0x";
+
+/* A `%ps` pointer with CONFIG_KALLSYMS off is a function pointer, but nothing
+ * on the line says whose: kernel text and MODULE text both print this way, and
+ * the module band lies inside the admissible text window on every VMSPLIT arch
+ * and on ppc64. Carry each candidate's classification with it rather than
+ * assuming, and keep the lowest of those that are plausibly kernel image.
+ *
+ * A candidate that classifies outside the text family — an unambiguous module
+ * or direct-map address — is DROPPED, not reported: this component's claim is
+ * about the image, and the rest is someone else's evidence. An out-of-family
+ * module or direct-map address never moves the image base. */
+struct lowest {
+  unsigned long addr;
+  enum kasld_region region;
+};
+
+static int on_match(const char *line, void *ctx) {
+  struct lowest *lo = ctx;
+
+  const char *p = strstr(line, needle);
+  if (!p)
+    return 1;
+
+  unsigned long addr;
+  if (!kasld_addr_parse(p + strlen(needle), 16, &addr, NULL) || !addr)
+    return 1;
+
+  enum kasld_region r = kasld_addr_classify(addr);
+  if (r != REGION_KERNEL_TEXT && r != REGION_KERNEL_TEXT_BAND)
+    return 1;
+
+  if (!lo->addr || addr < lo->addr) {
+    lo->addr = addr;
+    lo->region = r;
+  }
+
+  return 1; /* keep scanning for lowest */
+}
+
+int main(void) {
+  struct lowest lo = {0, REGION_UNKNOWN};
+
+  kasld_info("searching dmesg for driver component ops pointers ...");
+  int ds = dmesg_search(" (ops 0x", on_match, &lo);
+
+  if (!lo.addr) {
+    if (ds < 0)
+      return KASLD_EXIT_NOPERM;
+    kasld_err("driver component ops pointers not found in dmesg");
+    return 0;
+  }
+
+  kasld_info("lowest leaked address: %lx (%s)", lo.addr,
+             kasld_region_wire(lo.region));
+  kasld_info("possible kernel base: %lx", kasld_floor_text_base(lo.addr));
+  /* The leaked address is a struct component_ops function pointer (driver
+   * bind/unbind); the specific symbol varies by driver, and on the arches whose
+   * windows overlap so does the region, which the tag carries. */
+  kasld_result_sample(KASLD_TYPE_VIRT, lo.region, lo.addr, NULL, CONF_PARSED);
+
+  return 0;
+}

@@ -1,0 +1,1173 @@
+//go:build !wasm && cgo && vectorscan
+
+package matcher
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"regexp"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/dlclark/regexp2"
+	"github.com/flier/gohs/hyperscan"
+	"github.com/praetorian-inc/titus/pkg/prefilter"
+	"github.com/praetorian-inc/titus/pkg/types"
+)
+
+// VectorscanMatcher implements Matcher using Intel Hyperscan/Vectorscan for
+// high-performance multi-pattern regex matching with SIMD acceleration.
+//
+// Performance Characteristics:
+// - Uses hardware SIMD instructions (AVX2/AVX-512) for parallel pattern matching
+// - Compiles all patterns into a single database for efficient multi-pattern matching
+// - 10-100x faster than pure Go regex implementations for large content
+// - Requires CGO and the Hyperscan/Vectorscan C library
+//
+// Thread Safety:
+// - The compiled database is immutable and safe for concurrent use
+// - Each goroutine needs its own scratch space (handled via a bounded pool)
+// - Match() is safe for concurrent calls from multiple goroutines
+type VectorscanMatcher struct {
+	rules       []*types.Rule
+	db          hyperscan.BlockDatabase
+	scratch     *hyperscan.Scratch
+	scratchPool chan *hyperscan.Scratch
+
+	// closeMu guards the scratch lifecycle. Readers are in-flight matches,
+	// the writer is Close, so Close cannot run while a match still holds a
+	// scratch or is about to clone one from the template.
+	closeMu      sync.RWMutex
+	closed       bool
+	prefilter    *prefilter.Prefilter
+	contextLines int
+
+	// Pattern ID to rule mapping (Hyperscan uses integer IDs)
+	patternToRule map[uint]*types.Rule
+
+	// Fallback regex cache for capture group extraction
+	// (Hyperscan doesn't support capture groups natively)
+	regexCache     map[string]*regexp2.Regexp
+	groupNameCache map[string][]string
+
+	// Hybrid approach: track which rules use Hyperscan vs regexp2 fallback
+	hsRules       []*types.Rule // Rules compiled into Hyperscan
+	fallbackRules []*types.Rule // Rules that require regexp2 fallback
+
+	warnf        func(string, ...any)
+	matchTimeout time.Duration // initial per-match timeout; 500ms by default
+
+	// retryMu protects retryJobs, retryDropped, and the cap check.
+	// retryJobs is written by matchFallbackRules (and the hot-path regexp2 pass
+	// in matchChunk) and drained single-threaded by DrainTimedOut after the main
+	// scan completes.
+	retryMu      sync.Mutex
+	retryJobs    []retryJob
+	retryDropped int // count of jobs dropped due to queue cap
+
+	// blacklistMu protects blacklist, which tracks per-rule timeout counts.
+	blacklistMu sync.Mutex
+	blacklist   map[string]int // ruleID → timeout count
+}
+
+// knownIncompatiblePatterns contains rule IDs that are known to be
+// incompatible with Hyperscan compilation. These patterns are automatically
+// routed to the regexp2 fallback without attempting Hyperscan compilation.
+// This optimization allows the fast path (single batch compilation) to succeed
+// immediately and avoids repeated failed compilation attempts.
+//
+// Note: np.azure.5, np.redis.1, np.redis.2 were previously incompatible due to
+// lookbehind/lookahead assertions. They have been rewritten to be Hyperscan-
+// compatible by moving the filtering logic to ignore_if_contains.
+var knownIncompatiblePatterns = map[string]bool{}
+
+// namedGroupRegex matches named capture group openings in both Python (?P<name>)
+// and .NET (?<name>) syntax. Used to convert them to non-capturing groups for
+// Hyperscan compatibility.
+var namedGroupRegex = regexp.MustCompile(`\(\?P?<[^>]+>`)
+
+type hyperscanPatternInfo struct {
+	rule    *types.Rule
+	pattern *hyperscan.Pattern
+	index   int
+}
+
+func prepareHyperscanPatterns(rules []*types.Rule) ([]hyperscanPatternInfo, []*types.Rule) {
+	allPatterns := make([]hyperscanPatternInfo, 0, len(rules))
+	knownFallbackRules := make([]*types.Rule, 0)
+
+	for i, currentRule := range rules {
+		if knownIncompatiblePatterns[currentRule.ID] {
+			knownFallbackRules = append(knownFallbackRules, currentRule)
+			continue
+		}
+
+		pattern := preprocessPatternForHyperscan(currentRule.Pattern)
+
+		var flags hyperscan.CompileFlag
+		if hasCaseInsensitive(currentRule.Pattern) {
+			flags |= hyperscan.Caseless
+		}
+		if hasDotAll(currentRule.Pattern) {
+			flags |= hyperscan.DotAll
+		}
+		if hasMultiline(currentRule.Pattern) {
+			flags |= hyperscan.MultiLine
+		}
+
+		compiledPattern := hyperscan.NewPattern(pattern, flags)
+		compiledPattern.Id = i
+		allPatterns = append(allPatterns, hyperscanPatternInfo{
+			rule:    currentRule,
+			pattern: compiledPattern,
+			index:   i,
+		})
+	}
+
+	return allPatterns, knownFallbackRules
+}
+
+// NewVectorscan creates a new Hyperscan/Vectorscan-based matcher.
+// This is the high-performance option requiring CGO and the Hyperscan library.
+//
+// Use this when:
+// - Maximum performance is required (10-100x faster than regexp2)
+// - CGO is available and acceptable
+// - Scanning large files or many files
+func NewVectorscan(rules []*types.Rule, contextLines int, warnf func(string, ...any)) (*VectorscanMatcher, error) {
+	return NewVectorscanWithTimeout(rules, contextLines, warnf, 5*time.Second)
+}
+
+// NewVectorscanWithTimeout creates a Vectorscan matcher with a configurable per-match
+// timeout for the regexp2 confirmation/fallback pass. Production callers should use
+// NewVectorscan, which applies the default 500ms timeout.
+func NewVectorscanWithTimeout(rules []*types.Rule, contextLines int, warnf func(string, ...any), matchTimeout time.Duration) (*VectorscanMatcher, error) {
+	if len(rules) == 0 {
+		return nil, fmt.Errorf("no rules provided")
+	}
+	if matchTimeout <= 0 {
+		matchTimeout = 5 * time.Second
+	}
+
+	m := &VectorscanMatcher{
+		rules:          rules,
+		contextLines:   contextLines,
+		patternToRule:  make(map[uint]*types.Rule),
+		regexCache:     make(map[string]*regexp2.Regexp),
+		groupNameCache: make(map[string][]string),
+		prefilter:      prefilter.New(rules),
+		warnf:          warnf,
+		matchTimeout:   matchTimeout,
+		blacklist:      make(map[string]int),
+	}
+
+	// Compile patterns into Hyperscan database
+	if err := m.compilePatterns(); err != nil {
+		return nil, fmt.Errorf("compile patterns: %w", err)
+	}
+
+	// Only initialize scratch space if we have a Hyperscan database
+	if m.db != nil {
+		scratch, err := hyperscan.NewScratch(m.db)
+		if err != nil {
+			_ = m.db.Close()
+			m.db = nil
+			return nil, fmt.Errorf("allocate scratch: %w", err)
+		}
+		m.scratch = scratch
+
+		// Initialize scratch pool for concurrent matching. A buffered channel
+		// rather than a sync.Pool: a scratch owns a C allocation that the Go GC
+		// cannot see, so a pool that may drop entries leaks one per drop.
+		//
+		// GOMAXPROCS sizes the pool for the number of callers that can actually
+		// be scanning at once. Callers can still outnumber it — `titus scan
+		// --workers` is user-set and defaults to NumCPU, which diverges from
+		// GOMAXPROCS under a container CPU quota — but that is a pool hit rate
+		// question, not a correctness one: acquireScratch clones on a miss and
+		// releaseScratch frees whatever will not fit.
+		m.scratchPool = make(chan *hyperscan.Scratch, runtime.GOMAXPROCS(0))
+	}
+
+	return m, nil
+}
+
+// compilePatterns compiles rule patterns using an optimized hybrid approach:
+// 1. Check each rule against knownIncompatiblePatterns and route to fallback immediately
+// 2. Attempt to compile remaining patterns at once (fast path)
+// 3. If that fails, use binary search to identify newly incompatible patterns
+// 4. Incompatible patterns use regexp2 fallback
+//
+// This optimization reduces compilation time from O(n) to O(1) in the common
+// case where all patterns are compatible, or O(log n) when a few are not.
+func (m *VectorscanMatcher) compilePatterns() error {
+	allPatterns, knownFallbackRules := prepareHyperscanPatterns(m.rules)
+
+	// Try to compile all patterns at once (fast path)
+	hsPatternList := make([]*hyperscan.Pattern, len(allPatterns))
+	for i, pi := range allPatterns {
+		hsPatternList[i] = pi.pattern
+	}
+
+	var hsPatterns []*hyperscan.Pattern
+	var hsRules []*types.Rule
+	var fallbackRules []*types.Rule
+	var discoveredFallbackRules []*types.Rule // Track which fallback rules were discovered (not known)
+	hsPatternToRule := make(map[uint]*types.Rule)
+
+	// Start with known incompatible patterns in fallback
+	fallbackRules = append(fallbackRules, knownFallbackRules...)
+
+	// Try to compile all patterns at once (fast path)
+	// If successful, we'll reuse this database instead of compiling again
+	var firstCompileDB hyperscan.BlockDatabase
+	firstCompileDB, err := loadOrCompileHyperscanDatabase(hsPatternList, m.warnf)
+	if err == nil {
+		// All patterns are compatible! Fast path - reuse this compilation
+		for _, pi := range allPatterns {
+			hsPatterns = append(hsPatterns, pi.pattern)
+			hsRules = append(hsRules, pi.rule)
+			hsPatternToRule[uint(pi.pattern.Id)] = pi.rule
+		}
+	} else {
+		// Some patterns are incompatible - use binary search to find them
+		incompatibleIndices := findIncompatiblePatterns(hsPatternList)
+		incompatibleSet := make(map[int]bool)
+		for _, idx := range incompatibleIndices {
+			incompatibleSet[idx] = true
+		}
+
+		// Separate compatible from incompatible
+		for _, pi := range allPatterns {
+			if incompatibleSet[pi.index] {
+				fallbackRules = append(fallbackRules, pi.rule)
+				discoveredFallbackRules = append(discoveredFallbackRules, pi.rule)
+			} else {
+				pi.pattern.Id = len(hsPatterns)
+				hsPatterns = append(hsPatterns, pi.pattern)
+				hsRules = append(hsRules, pi.rule)
+				hsPatternToRule[uint(len(hsPatterns)-1)] = pi.rule
+			}
+		}
+	}
+
+	// Build regex cache for ALL rules (needed for capture extraction and fallback)
+	for _, rule := range m.rules {
+		re, err := regexp2.Compile(rule.Pattern, regexp2.RE2|regexp2.Multiline)
+		if err != nil {
+			// Fallback to Perl-compatible mode
+			re, err = regexp2.Compile(rule.Pattern, regexp2.None)
+			if err != nil {
+				if firstCompileDB != nil {
+					_ = firstCompileDB.Close()
+				}
+				return fmt.Errorf("failed to compile pattern %q for rule %s: %w", rule.Pattern, rule.ID, err)
+			}
+		}
+		re.MatchTimeout = m.matchTimeout
+		m.regexCache[rule.Pattern] = re
+		m.groupNameCache[rule.Pattern] = re.GetGroupNames()
+	}
+
+	// Store which rules use which engine
+	m.hsRules = hsRules
+	m.fallbackRules = fallbackRules
+	m.patternToRule = hsPatternToRule
+
+	// Set the database - either reuse from fast path or compile incompatible subset
+	if len(hsPatterns) > 0 {
+		if firstCompileDB != nil {
+			// Fast path: reuse the first successful compilation
+			m.db = firstCompileDB
+		} else {
+			// Slow path: compile only the compatible patterns after binary search
+			db, err := loadOrCompileHyperscanDatabase(hsPatterns, m.warnf)
+			if err != nil {
+				return fmt.Errorf("compile database: %w", err)
+			}
+			m.db = db
+		}
+	}
+
+	// Print diagnostic info about pattern compilation
+	fmt.Fprintf(os.Stderr, "[vectorscan] %d/%d rules compiled for Hyperscan, %d rules use regexp2 fallback\n",
+		len(hsRules), len(m.rules), len(fallbackRules))
+
+	// Print which rules are using fallback (for debugging)
+	if len(knownFallbackRules) > 0 {
+		fmt.Fprintf(os.Stderr, "[vectorscan] Known incompatible patterns (skipped Hyperscan compilation):\n")
+		for _, rule := range knownFallbackRules {
+			fmt.Fprintf(os.Stderr, "[vectorscan]   - %s\n", rule.ID)
+		}
+	}
+	if len(discoveredFallbackRules) > 0 {
+		fmt.Fprintf(os.Stderr, "[vectorscan] Discovered incompatible patterns (found via binary search):\n")
+		for _, rule := range discoveredFallbackRules {
+			fmt.Fprintf(os.Stderr, "[vectorscan]   - %s (consider adding to knownIncompatiblePatterns)\n", rule.ID)
+		}
+	}
+
+	return nil
+}
+
+// findIncompatiblePatterns uses binary search to identify patterns that
+// cannot be compiled by Hyperscan. Returns the indices of incompatible patterns.
+func findIncompatiblePatterns(patterns []*hyperscan.Pattern) []int {
+	if len(patterns) == 0 {
+		return nil
+	}
+
+	// Try to compile all patterns
+	database, err := hyperscan.NewBlockDatabase(patterns...)
+	if err == nil {
+		_ = database.Close()
+		return nil // All patterns are compatible
+	}
+
+	// If only one pattern, it's the incompatible one
+	if len(patterns) == 1 {
+		return []int{patterns[0].Id}
+	}
+
+	// Split and recurse (binary search)
+	mid := len(patterns) / 2
+	left := patterns[:mid]
+	right := patterns[mid:]
+
+	incompatible := findIncompatiblePatterns(left)
+	incompatible = append(incompatible, findIncompatiblePatterns(right)...)
+
+	return incompatible
+}
+
+// preprocessPatternForHyperscan modifies a pattern for Hyperscan compatibility.
+// Hyperscan doesn't support extended mode ((?x)) or named capture groups so we strip/convert them.
+func preprocessPatternForHyperscan(pattern string) string {
+	// Strip extended mode if present
+	if hasExtendedMode(pattern) {
+		pattern = stripExtendedMode(pattern)
+	}
+
+	// Strip lookaround assertions ((?=...) (?!...) (?<=...) (?<!...)).
+	// Hyperscan does not support lookaround. Since Hyperscan is only an
+	// over-approximating prefilter and regexp2 keeps the FULL pattern (lookarounds
+	// included) for precise match + capture extraction, removing a lookaround here
+	// only widens the prefilter — it can never introduce a false negative or change
+	// a reported match — and it lets otherwise-incompatible rules join the single
+	// combined Hyperscan pass instead of a separate per-blob regexp2 fallback scan.
+	pattern = stripLookarounds(pattern)
+
+	// Remove inline flag modifiers (we set them via Hyperscan flags instead)
+	pattern = strings.ReplaceAll(pattern, "(?i)", "")
+	pattern = strings.ReplaceAll(pattern, "(?s)", "")
+	pattern = strings.ReplaceAll(pattern, "(?m)", "")
+
+	// Convert named capture groups to non-capturing groups.
+	// Hyperscan does not support named captures ((?P<name>...) or (?<name>...)).
+	// Since Hyperscan is only used as a prefilter and regexp2 handles actual
+	// capture extraction, converting to (?:...) preserves matching semantics.
+	pattern = namedGroupRegex.ReplaceAllString(pattern, "(?:")
+
+	return pattern
+}
+
+// lookaroundEnd returns the index just past the balanced ')' that closes the
+// group starting at runes[start] (which must be '('). It honours backslash
+// escapes and [...] character classes.
+//
+// If the group is unbalanced or truncated (malformed pattern), it returns
+// len(runes). In that case stripLookarounds drops the remainder of the pattern
+// from the lookaround start onward. This is safe: a malformed pattern would
+// fail Hyperscan compilation anyway (→ regexp2 fallback), and regexp2 always
+// uses the unmodified rule.Pattern for precise extraction, so no reported match
+// can change.
+func lookaroundEnd(runes []rune, start int) int {
+	depth := 0
+	inClass := false
+	for j := start; j < len(runes); {
+		c := runes[j]
+		if c == '\\' { // skip escaped char
+			j += 2
+			continue
+		}
+		if inClass {
+			if c == ']' {
+				inClass = false
+			}
+			j++
+			continue
+		}
+		switch c {
+		case '[':
+			inClass = true
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return j + 1
+			}
+		}
+		j++
+	}
+	return len(runes)
+}
+
+// stripLookarounds removes lookaround assertions ((?=...) (?!...) (?<=...) (?<!...)) and
+// their balanced contents from a pattern. Hyperscan does not support lookaround;
+// since Hyperscan is only an over-approximating prefilter (regexp2 keeps the full
+// pattern for precise extraction), removing a lookaround only widens the prefilter
+// and can never change a reported match.
+//
+// Malformed or unclosed lookaround: if lookaroundEnd cannot find the closing ')',
+// it returns len(runes) and the remainder of the pattern is dropped from the
+// lookaround start onward. This is safe for the same reason — such a pattern
+// would fail Hyperscan compilation (→ regexp2 fallback) regardless.
+func stripLookarounds(pattern string) string {
+	runes := []rune(pattern)
+	var b strings.Builder
+	for i := 0; i < len(runes); {
+		if runes[i] == '(' && i+2 < len(runes) && runes[i+1] == '?' {
+			look := runes[i+2] == '=' || runes[i+2] == '!' ||
+				(runes[i+2] == '<' && i+3 < len(runes) && (runes[i+3] == '=' || runes[i+3] == '!'))
+			if look {
+				i = lookaroundEnd(runes, i) // drop the entire lookaround group
+				continue
+			}
+		}
+		b.WriteRune(runes[i])
+		i++
+	}
+	return b.String()
+}
+
+// hasExtendedMode checks if pattern uses extended mode.
+func hasExtendedMode(pattern string) bool {
+	// Check for (?x), (?xi), (?xis), etc. at the start
+	pattern = strings.TrimSpace(pattern)
+	if len(pattern) < 4 {
+		return false
+	}
+	if pattern[0:2] != "(?" {
+		return false
+	}
+	// Find the closing )
+	closeIdx := strings.Index(pattern[2:], ")")
+	if closeIdx == -1 {
+		return false
+	}
+	flags := pattern[2 : 2+closeIdx]
+	return strings.Contains(flags, "x")
+}
+
+// hasCaseInsensitive checks if pattern uses case-insensitive mode.
+// Detects both (?i) and combined forms like (?xi), (?is), etc.
+func hasCaseInsensitive(pattern string) bool {
+	return hasFlag(pattern, 'i')
+}
+
+// hasDotAll checks if pattern uses dot-all mode.
+// Detects both (?s) and combined forms like (?xs), (?is), etc.
+func hasDotAll(pattern string) bool {
+	return hasFlag(pattern, 's')
+}
+
+// hasMultiline checks if pattern uses multiline mode.
+// Detects both (?m) and combined forms like (?xm), (?im), etc.
+func hasMultiline(pattern string) bool {
+	return hasFlag(pattern, 'm')
+}
+
+// hasFlag checks if a pattern contains the given flag character in any flag group.
+// It searches for (?...) groups anywhere in the pattern and checks if the flag is present.
+func hasFlag(pattern string, flag byte) bool {
+	for i := 0; i < len(pattern)-2; i++ {
+		if pattern[i] == '(' && pattern[i+1] == '?' {
+			// Found a flag group, extract flags until ')'
+			for j := i + 2; j < len(pattern); j++ {
+				c := pattern[j]
+				if c == ')' || c == ':' || c == '!' || c == '=' || c == '<' {
+					// End of flags (or start of non-capturing/lookahead/lookbehind group)
+					break
+				}
+				if c == flag {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// Match scans content against all loaded rules.
+func (m *VectorscanMatcher) Match(content []byte) ([]*types.Match, error) {
+	blobID := types.ComputeBlobID(content)
+	return m.MatchWithBlobID(content, blobID)
+}
+
+// MatchWithBlobID scans content with a known BlobID.
+func (m *VectorscanMatcher) MatchWithBlobID(content []byte, blobID types.BlobID) ([]*types.Match, error) {
+	result, err := m.MatchWithBlobIDAndOptions(content, blobID, DefaultOptions())
+	if err != nil {
+		return nil, err
+	}
+	return result.Matches, nil
+}
+
+// MatchWithBlobIDAndOptions scans content with options.
+func (m *VectorscanMatcher) MatchWithBlobIDAndOptions(content []byte, blobID types.BlobID, opts Options) (*MatchResult, error) {
+	// Check if chunking is needed for large files
+	chunkConfig := DefaultChunkConfig()
+	chunks := ChunkContent(content, chunkConfig)
+
+	// Single chunk: direct matching
+	if len(chunks) == 1 {
+		return m.matchChunk(content, blobID, opts)
+	}
+
+	// Large file: process chunks and merge results
+	return m.matchChunked(content, chunks, blobID, opts)
+}
+
+// errMatcherClosed is returned when a match starts after Close has run.
+var errMatcherClosed = errors.New("vectorscan: matcher is closed")
+
+// acquireScratch takes a scratch from the pool, cloning a new one when the
+// pool is empty. Every scratch handed out is either returned to the pool or
+// freed by releaseScratch, so none is ever dropped.
+func (m *VectorscanMatcher) acquireScratch() (*hyperscan.Scratch, error) {
+	select {
+	case s := <-m.scratchPool:
+		return s, nil
+	default:
+	}
+
+	s, err := m.scratch.Clone()
+	if err != nil {
+		return nil, fmt.Errorf("clone scratch space: %w", err)
+	}
+
+	return s, nil
+}
+
+// releaseScratch returns a scratch to the pool, or frees it outright when the
+// pool is full. hs_free_scratch is the only thing that releases the underlying
+// C allocation; dropping the Go pointer would leak it.
+func (m *VectorscanMatcher) releaseScratch(s *hyperscan.Scratch) {
+	select {
+	case m.scratchPool <- s:
+	default:
+		_ = s.Free()
+	}
+}
+
+// matchChunk performs matching on a single chunk of content.
+//
+// Hyperscan is used as a prefilter: its callback fires for every end position of a
+// match (since we do not use HS_FLAG_SOM_LEFTMOST, which would make 183/196 rules
+// incompatible). Rather than using the inaccurate (from=0, to=end) locations,
+// we collect only the *set* of matched rule IDs from Hyperscan and then use
+// regexp2 (already compiled in m.regexCache) to find the precise match locations.
+func (m *VectorscanMatcher) matchChunk(content []byte, blobID types.BlobID, opts Options) (*MatchResult, error) {
+	var scratch *hyperscan.Scratch
+
+	// Held for the whole match: Close frees the template scratch, drains the
+	// pool and nils the database, so every read of them below has to be inside
+	// the lock. Deferred first, so it unlocks after the scratch is released.
+	m.closeMu.RLock()
+	defer m.closeMu.RUnlock()
+
+	if m.closed {
+		return nil, errMatcherClosed
+	}
+
+	// Only get scratch from pool if we have a Hyperscan database
+	if m.db != nil {
+		s, err := m.acquireScratch()
+		if err != nil {
+			return nil, err
+		}
+		scratch = s
+
+		defer m.releaseScratch(scratch)
+	}
+
+	// Use Hyperscan only as a prefilter: collect the set of rule IDs that had any match.
+	// We deliberately ignore from/to because without SOM_LEFTMOST, from=0 for all matches
+	// and Hyperscan fires a callback for every valid end position (not just one per match).
+	matchedRuleIDs := make(map[uint]bool)
+	var mu sync.Mutex
+
+	handler := hyperscan.MatchHandler(func(id uint, from, to uint64, flags uint, context interface{}) error {
+		mu.Lock()
+		matchedRuleIDs[id] = true
+		mu.Unlock()
+		return nil
+	})
+
+	// Perform Hyperscan scan (only if we have Hyperscan-compiled patterns)
+	if m.db != nil {
+		if err := m.db.Scan(content, scratch, handler, nil); err != nil {
+			return nil, fmt.Errorf("hyperscan scan: %w", err)
+		}
+	}
+
+	// Process matches and extract captures
+	matches := make([]*types.Match, 0)
+	ruleStats := make(map[string]RuleStat)
+	dedup := NewDeduplicator()
+	contentRunes := []rune(string(content))
+
+	// For each Hyperscan-identified rule, use regexp2 to find precise match locations.
+	for ruleIdx := range matchedRuleIDs {
+		rule := m.patternToRule[ruleIdx]
+		if rule == nil {
+			continue
+		}
+
+		re := m.regexCache[rule.Pattern]
+		if re == nil {
+			continue
+		}
+
+		startTime := time.Now()
+		stat := RuleStat{
+			RuleID:   rule.ID,
+			Status:   RuleCompleted,
+			Matches:  0,
+			Duration: 0,
+			Error:    nil,
+		}
+
+		// Find all precise matches using regexp2
+		match, err := re.FindRunesMatch(contentRunes)
+		if err != nil {
+			if strings.Contains(err.Error(), "match timeout") {
+				// Queue for single-threaded retry; Hyperscan confirmed a match exists so
+				// dropping here would produce a false negative.
+				m.enqueueOrBlacklist(retryJob{content: content, blobID: blobID, rule: rule})
+			} else if m.warnf != nil {
+				m.warnf("[warn] rule %s regex error on blob %s (skipping rule for this blob): %v\n", rule.ID, blobID.Hex(), err)
+			}
+			stat.Duration = time.Since(startTime)
+			ruleStats[rule.ID] = stat
+			continue
+		}
+		lastEnd := -1
+		for match != nil {
+			start := match.Index
+			end := start + match.Length
+
+			// Prevent infinite loops on zero-length matches
+			if start <= lastEnd {
+				break
+			}
+
+			// Bounds check
+			if start < 0 || end > len(content) || start > end {
+				match, err = re.FindNextMatch(match)
+				if err != nil {
+					if strings.Contains(err.Error(), "match timeout") {
+						m.enqueueOrBlacklist(retryJob{content: content, blobID: blobID, rule: rule})
+					} else if m.warnf != nil {
+						m.warnf("[warn] rule %s regex error on blob %s (skipping rule for this blob): %v\n", rule.ID, blobID.Hex(), err)
+					}
+					break
+				}
+				continue
+			}
+
+			lastEnd = end
+
+			newMatch := m.buildMatchFromRegexp2(content, blobID, rule, match)
+
+			// Deduplicate
+			if !dedup.IsDuplicate(newMatch) {
+				dedup.Add(newMatch)
+				matches = append(matches, newMatch)
+				stat.Matches++
+			}
+
+			match, err = re.FindNextMatch(match)
+			if err != nil {
+				if strings.Contains(err.Error(), "match timeout") {
+					m.enqueueOrBlacklist(retryJob{content: content, blobID: blobID, rule: rule})
+				} else if m.warnf != nil {
+					m.warnf("[warn] rule %s regex error on blob %s (skipping rule for this blob): %v\n", rule.ID, blobID.Hex(), err)
+				}
+				break
+			}
+		}
+
+		stat.Duration = time.Since(startTime)
+		ruleStats[rule.ID] = stat
+	}
+
+	// Match fallback rules using regexp2
+	if len(m.fallbackRules) > 0 {
+		fallbackMatches := m.matchFallbackRules(content, blobID)
+		for _, match := range fallbackMatches {
+			if !dedup.IsDuplicate(match) {
+				dedup.Add(match)
+				matches = append(matches, match)
+			}
+		}
+	}
+
+	// Build summary
+	summary := ResultSummary{
+		TotalRules:     len(m.rules),
+		CompletedRules: len(ruleStats),
+		TimedOutRules:  0,
+		ErrorRules:     0,
+	}
+
+	return &MatchResult{
+		Matches:   matches,
+		RuleStats: ruleStats,
+		Summary:   summary,
+	}, nil
+}
+
+// matchChunked handles large files by processing chunks with overlap.
+func (m *VectorscanMatcher) matchChunked(content []byte, chunks []Chunk, blobID types.BlobID, opts Options) (*MatchResult, error) {
+	var allMatches []*types.Match
+	aggregatedStats := make(map[string]RuleStat)
+	crossChunkDedup := NewDeduplicator()
+	ruleSIDs := make(map[string]string, len(m.rules))
+	for _, r := range m.rules {
+		ruleSIDs[r.ID] = r.StructuralID
+	}
+
+	// Process chunks (could be parallelized in future)
+	for _, chunk := range chunks {
+		result, err := m.matchChunk(chunk.Content, blobID, opts)
+		if err != nil && !opts.Tolerant {
+			return nil, err
+		}
+
+		// Tolerant mode carries on past a failed chunk, and every error path in
+		// matchChunk returns a nil result, so drop the chunk rather than
+		// dereference it.
+		if result == nil {
+			continue
+		}
+
+		// Adjust match offsets to be relative to original file
+		for _, match := range result.Matches {
+			AdjustMatchOffset(match, chunk, ruleSIDs[match.RuleID])
+			// TODO: re-extract Snippet.Before/After from full content; first-chunk wins and can truncate context at a chunk boundary.
+
+			// Deduplicate across chunks
+			if !crossChunkDedup.IsDuplicate(match) {
+				crossChunkDedup.Add(match)
+				allMatches = append(allMatches, match)
+			}
+		}
+
+		// Merge stats
+		for ruleID, stat := range result.RuleStats {
+			existing, ok := aggregatedStats[ruleID]
+			if !ok || stat.Status > existing.Status {
+				aggregatedStats[ruleID] = stat
+			} else if stat.Status == existing.Status {
+				existing.Matches += stat.Matches
+				existing.Duration += stat.Duration
+				aggregatedStats[ruleID] = existing
+			}
+		}
+	}
+
+	// Build summary
+	summary := ResultSummary{
+		TotalRules:     len(m.rules),
+		CompletedRules: 0,
+		TimedOutRules:  0,
+		ErrorRules:     0,
+	}
+
+	for _, stat := range aggregatedStats {
+		switch stat.Status {
+		case RuleCompleted:
+			summary.CompletedRules++
+		case RuleTimedOut:
+			summary.TimedOutRules++
+		case RuleError:
+			summary.ErrorRules++
+		}
+	}
+
+	return &MatchResult{
+		Matches:   allMatches,
+		RuleStats: aggregatedStats,
+		Summary:   summary,
+	}, nil
+}
+
+// buildMatchFromRegexp2 constructs a types.Match from a regexp2 match result.
+// It extracts positional and named capture groups, context lines, and computes
+// the structural and finding IDs. This is the shared match-building logic used
+// by both matchChunk and matchFallbackRules.
+func (m *VectorscanMatcher) buildMatchFromRegexp2(
+	content []byte,
+	blobID types.BlobID,
+	rule *types.Rule,
+	re2match *regexp2.Match,
+) *types.Match {
+	// regexp2's Match.Index and Match.Length are rune-based, not byte-based.
+	// Convert to byte offsets for correct slicing.
+	matchedText := []byte(re2match.String())
+	start, end := runeSpanToByteSpan(content, re2match.Index, re2match.Length)
+
+	// Extract positional and named capture groups
+	groups, namedGroups := m.extractGroupsFromMatch(re2match, rule)
+
+	// Extract context
+	var before, after []byte
+	if m.contextLines > 0 {
+		before, after = ExtractContext(content, start, end, m.contextLines)
+	}
+
+	result := &types.Match{
+		BlobID:   blobID,
+		RuleID:   rule.ID,
+		RuleName: rule.Name,
+		Location: types.Location{
+			Offset: types.OffsetSpan{
+				Start: int64(start),
+				End:   int64(end),
+			},
+		},
+		Groups:      groups,
+		NamedGroups: namedGroups,
+		Snippet: types.Snippet{
+			Before:   before,
+			Matching: matchedText,
+			After:    after,
+		},
+	}
+	result.StructuralID = result.ComputeStructuralID(rule.StructuralID)
+	result.FindingID = types.ComputeFindingID(rule.StructuralID, groups)
+
+	return result
+}
+
+// extractGroupsFromMatch extracts positional and named capture groups from a regexp2 match.
+func (m *VectorscanMatcher) extractGroupsFromMatch(match *regexp2.Match, rule *types.Rule) ([][]byte, map[string][]byte) {
+	// Extract positional capture groups
+	var groups [][]byte
+	matchGroups := match.Groups()
+	for i := 1; i < len(matchGroups); i++ {
+		group := matchGroups[i]
+		if len(group.Captures) > 0 {
+			capture := group.Captures[0]
+			groups = append(groups, []byte(capture.String()))
+		}
+	}
+
+	// Extract named capture groups
+	namedGroups := make(map[string][]byte)
+	groupNames := m.groupNameCache[rule.Pattern]
+	for _, name := range groupNames {
+		if name == "" || (len(name) > 0 && name[0] >= '0' && name[0] <= '9') {
+			continue
+		}
+		group := match.GroupByName(name)
+		if group != nil && len(group.Captures) > 0 {
+			namedGroups[name] = []byte(group.Captures[0].String())
+		}
+	}
+
+	return groups, namedGroups
+}
+
+// matchFallbackRules uses regexp2 to match patterns that are incompatible with Hyperscan.
+// It applies prefiltering to only check patterns whose keywords are found in content.
+func (m *VectorscanMatcher) matchFallbackRules(content []byte, blobID types.BlobID) []*types.Match {
+	var matches []*types.Match
+	contentRunes := []rune(string(content))
+
+	// Use prefilter to determine which fallback rules might match
+	// This dramatically reduces the number of regex executions
+	candidateRules := m.prefilter.Filter(content)
+
+	// Build a set of candidate rule IDs for O(1) lookup
+	candidateSet := make(map[string]bool, len(candidateRules))
+	for _, r := range candidateRules {
+		candidateSet[r.ID] = true
+	}
+
+	for _, rule := range m.fallbackRules {
+		// Skip rules not in candidate set (keyword prefilter rejected them)
+		if !candidateSet[rule.ID] {
+			continue
+		}
+
+		re := m.regexCache[rule.Pattern]
+		if re == nil {
+			continue
+		}
+
+		// Find all matches for this rule
+		match, err := re.FindRunesMatch(contentRunes)
+		if err != nil {
+			if strings.Contains(err.Error(), "match timeout") {
+				// Queue for single-threaded retry by DrainTimedOut.
+				m.enqueueOrBlacklist(retryJob{content: content, blobID: blobID, rule: rule})
+			} else if m.warnf != nil {
+				m.warnf("[warn] rule %s regex error on blob %s (skipping rule for this blob): %v\n", rule.ID, blobID.Hex(), err)
+			}
+			continue
+		}
+		lastEnd := -1 // Track last match end to prevent infinite loops on zero-length matches
+		for match != nil {
+			start := match.Index
+			end := start + match.Length
+
+			// Prevent infinite loops on zero-length matches or matches at same position
+			if start <= lastEnd {
+				break
+			}
+
+			// Bounds check
+			if start < 0 || end > len(content) || start > end {
+				match, err = re.FindNextMatch(match)
+				if err != nil {
+					if strings.Contains(err.Error(), "match timeout") {
+						m.enqueueOrBlacklist(retryJob{content: content, blobID: blobID, rule: rule})
+					} else if m.warnf != nil {
+						m.warnf("[warn] rule %s regex error on blob %s (skipping rule for this blob): %v\n", rule.ID, blobID.Hex(), err)
+					}
+					break
+				}
+				continue
+			}
+
+			lastEnd = end
+
+			newMatch := m.buildMatchFromRegexp2(content, blobID, rule, match)
+			matches = append(matches, newMatch)
+
+			match, err = re.FindNextMatch(match)
+			if err != nil {
+				if strings.Contains(err.Error(), "match timeout") {
+					m.enqueueOrBlacklist(retryJob{content: content, blobID: blobID, rule: rule})
+				} else if m.warnf != nil {
+					m.warnf("[warn] rule %s regex error on blob %s (skipping rule for this blob): %v\n", rule.ID, blobID.Hex(), err)
+				}
+				break
+			}
+		}
+	}
+
+	return matches
+}
+
+// enqueueOrBlacklist applies the per-rule blacklist and queue-cap checks before
+// appending a retry job. Call this at every timeout site instead of directly
+// appending to retryJobs.
+//
+// See PortableRegexpMatcher.enqueueOrBlacklist for full behaviour documentation.
+func (m *VectorscanMatcher) enqueueOrBlacklist(j retryJob) {
+	m.blacklistMu.Lock()
+	m.blacklist[j.rule.ID]++
+	count := m.blacklist[j.rule.ID]
+	m.blacklistMu.Unlock()
+
+	if count == retryBlacklistThreshold {
+		if m.warnf != nil {
+			m.warnf("[warn] rule %s disabled after %d timeouts (likely catastrophic backtracking — skipping remaining blobs)\n",
+				j.rule.ID, retryBlacklistThreshold)
+		}
+		return
+	}
+	if count > retryBlacklistThreshold {
+		return
+	}
+
+	m.retryMu.Lock()
+	if len(m.retryJobs) < retryQueueCap {
+		m.retryJobs = append(m.retryJobs, j)
+	} else {
+		m.retryDropped++
+	}
+	m.retryMu.Unlock()
+}
+
+// DrainTimedOut replays any (content, blobID, rule) triples that timed out during
+// the main scan — either in matchFallbackRules (regexp2-only path for
+// Hyperscan-incompatible patterns such as np.azure.*) or in the hot-path regexp2
+// confirmation pass inside matchChunk. All timeouts are replayed single-threaded
+// with a 30-second timeout to avoid false drops caused by CPU-starvation.
+//
+// Call this once after the main scan has completed and feed the returned matches
+// through the same store pipeline as normal matches. Near-zero cost when no
+// timeouts occurred; overhead is proportional to the actual timeout count.
+func (m *VectorscanMatcher) DrainTimedOut() ([]*types.Match, error) {
+	m.retryMu.Lock()
+	jobs := m.retryJobs
+	m.retryJobs = nil
+	dropped := m.retryDropped
+	m.retryMu.Unlock()
+
+	if dropped > 0 {
+		if m.warnf != nil {
+			m.warnf("[warn] retry queue cap (%d) reached; %d (blob, rule) pairs were not retried\n",
+				retryQueueCap, dropped)
+		}
+	}
+
+	if len(jobs) == 0 {
+		return nil, nil
+	}
+
+	// Deduplicate: keep only one retry job per (blobID, rule.ID) pair.
+	seen := make(map[string]struct{})
+	deduped := jobs[:0]
+	for _, j := range jobs {
+		key := j.blobID.Hex() + "\x00" + j.rule.ID
+		if _, ok := seen[key]; !ok {
+			seen[key] = struct{}{}
+			deduped = append(deduped, j)
+		}
+	}
+	jobs = deduped
+
+	retryTimeout := 10 * m.matchTimeout
+	if retryTimeout > 30*time.Second {
+		retryTimeout = 30 * time.Second
+	}
+
+	var all []*types.Match
+	for _, j := range jobs {
+		re := m.regexCache[j.rule.Pattern]
+		if re == nil {
+			continue
+		}
+
+		// Temporarily raise timeout for the retry pass; use defer so it is
+		// always restored even if the work panics.
+		jobMatches := func() []*types.Match {
+			orig := re.MatchTimeout
+			re.MatchTimeout = retryTimeout
+			defer func() { re.MatchTimeout = orig }()
+
+			contentRunes := []rune(string(j.content))
+
+			match, err := re.FindRunesMatch(contentRunes)
+			if err != nil {
+				if strings.Contains(err.Error(), "match timeout") {
+					// Still times out with 30s: genuine catastrophic backtracking.
+					if m.warnf != nil {
+						m.warnf("[warn] rule %s regex timeout on blob %s (skipping rule for this blob)\n", j.rule.ID, j.blobID.Hex())
+					}
+				} else if m.warnf != nil {
+					m.warnf("[warn] rule %s regex error on blob %s (skipping rule for this blob): %v\n", j.rule.ID, j.blobID.Hex(), err)
+				}
+				return nil
+			}
+
+			var found []*types.Match
+			lastEnd := -1
+			for match != nil {
+				if match.Index <= lastEnd {
+					break
+				}
+				lastEnd = match.Index + match.Length
+				newMatch := m.buildMatchFromRegexp2(j.content, j.blobID, j.rule, match)
+				startLine, startCol := types.ComputeLineColumn(j.content, int(newMatch.Location.Offset.Start))
+				endLine, endCol := types.ComputeLineColumn(j.content, int(newMatch.Location.Offset.End))
+				newMatch.Location.Source.Start.Line = startLine
+				newMatch.Location.Source.Start.Column = startCol
+				newMatch.Location.Source.End.Line = endLine
+				newMatch.Location.Source.End.Column = endCol
+				found = append(found, newMatch)
+
+				match, err = re.FindNextMatch(match)
+				if err != nil {
+					if strings.Contains(err.Error(), "match timeout") {
+						if m.warnf != nil {
+							m.warnf("[warn] rule %s regex timeout on blob %s (skipping rule for this blob)\n", j.rule.ID, j.blobID.Hex())
+						}
+					} else if m.warnf != nil {
+						m.warnf("[warn] rule %s regex error on blob %s (skipping rule for this blob): %v\n", j.rule.ID, j.blobID.Hex(), err)
+					}
+					break
+				}
+			}
+			return found
+		}()
+
+		all = append(all, jobMatches...)
+	}
+
+	return all, nil
+}
+
+// Close releases all resources associated with the matcher.
+func (m *VectorscanMatcher) Close() error {
+	// Waits for in-flight matches, so no scratch can be returned to the pool
+	// after it has been drained, and no clone can come off a freed template.
+	m.closeMu.Lock()
+	defer m.closeMu.Unlock()
+
+	if m.closed {
+		return nil
+	}
+
+	m.closed = true
+
+	var closeErrors []error
+
+	// Drain the pool. Each pooled scratch holds a C allocation, so letting the
+	// channel go out of scope would leak every scratch still parked in it.
+	if m.scratchPool != nil {
+		for {
+			select {
+			case s := <-m.scratchPool:
+				if err := s.Free(); err != nil {
+					closeErrors = append(closeErrors, fmt.Errorf("free pooled scratch: %w", err))
+				}
+
+				continue
+			default:
+			}
+
+			break
+		}
+
+		m.scratchPool = nil
+	}
+
+	// Free template scratch
+	if m.scratch != nil {
+		if err := m.scratch.Free(); err != nil {
+			closeErrors = append(closeErrors, fmt.Errorf("free scratch: %w", err))
+		}
+		m.scratch = nil
+	}
+
+	if m.db != nil {
+		if err := m.db.Close(); err != nil {
+			closeErrors = append(closeErrors, fmt.Errorf("close database: %w", err))
+		}
+		m.db = nil
+	}
+
+	return errors.Join(closeErrors...)
+}
+
+// VectorscanAvailable returns true if vectorscan is available.
+// This is always true when this file is compiled (build tag satisfied).
+func VectorscanAvailable() bool {
+	return true
+}
+
+// VectorscanInfo returns information about the Hyperscan build.
+func VectorscanInfo() string {
+	version := hyperscan.Version()
+	return fmt.Sprintf("hyperscan %s (GOMAXPROCS=%d)", version, runtime.GOMAXPROCS(0))
+}

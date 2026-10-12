@@ -1,0 +1,514 @@
+/**
+ * RanAPI - Client library for Ran API
+ *
+ * Real-time events use Server-Sent Events (SSE). Commands and queries use REST.
+ *
+ * Usage:
+ * ```typescript
+ * import { ranAPI, connect, on } from '#lib/ran_api.js';
+ *
+ * // Connect to the SSE event stream
+ * await connect();
+ *
+ * // Subscribe to events
+ * on('armory-loaded', (data) => console.log('Armory:', data));
+ * on('ttp-executed', (data) => console.log('TTP executed:', data));
+ *
+ * // Use REST API methods
+ * const graph = await ranAPI.GetGraph();
+ * await ranAPI.ExecuteAction({ actionId: '...', targetId: '...' });
+ * ```
+ */
+import createClient from 'openapi-fetch';
+import type { components, paths } from '#lib/api/gen_types.js';
+import type {
+	Graph,
+	CampaignState,
+	TTP,
+	AttackFlow,
+	ExecuteActionCmd,
+	ExecutionRecordEntry,
+	K8sResource,
+	ScoredCandidate,
+	ScoringProfile,
+	ScoringProfileUpdate,
+	CalibrationResult,
+	PlanSummary,
+	KubetierCatalog,
+	UiConfig,
+	ActionResolution,
+	ActionResolutionRequest
+} from '#lib/api/index.js';
+
+export type BackendConnectionState = 'connecting' | 'connected' | 'disconnected';
+export type SseEvent = components['schemas']['SseEvent'];
+export type SseEventType = SseEvent['type'];
+type SseDataFor<K extends SseEventType> =
+	Extract<SseEvent, { type: K }> extends {
+		data: infer Data;
+	}
+		? Data
+		: never;
+export type SseEventMap = { [K in SseEventType]: SseDataFor<K> };
+
+type SseHandlerRegistration = {
+	handler: unknown;
+	invoke: (data: unknown) => void;
+};
+
+function isSseEnvelope(value: unknown): value is { type: string; data: unknown } {
+	return (
+		typeof value === 'object' &&
+		value !== null &&
+		'type' in value &&
+		typeof value.type === 'string' &&
+		'data' in value
+	);
+}
+
+const SSE_RECONNECT_FALLBACK_MS = 1_000;
+
+export class RanAPI {
+	eventSource?: EventSource;
+	private messageHandlers = new Map<SseEventType, Set<SseHandlerRegistration>>();
+	private sseEventListeners = new Set<SseEventType>(); // Track registered SSE event types
+	private pendingSSEEventTypes = new Set<SseEventType>(); // Event types waiting for SSE connection
+	private restClient = createClient<paths>({ baseUrl: '' }); // Use relative URLs
+	private connectionState: BackendConnectionState = 'connecting';
+	private connectionStateListeners = new Set<(state: BackendConnectionState) => void>();
+	private reconnectTimer?: ReturnType<typeof setTimeout>;
+	private reconnectEnabled = false;
+	private eventSourceUrl = '/events';
+	private initialConnectionPromise?: Promise<void>;
+	private resolveInitialConnection?: () => void;
+
+	connect(url?: string): Promise<void> {
+		this.reconnectEnabled = true;
+		this.eventSourceUrl = url ?? '/events';
+		if (this.eventSource?.readyState === EventSource.OPEN) return Promise.resolve();
+
+		if (!this.initialConnectionPromise) {
+			this.initialConnectionPromise = new Promise((resolve) => {
+				this.resolveInitialConnection = resolve;
+			});
+		}
+		if (!this.eventSource) this.connectSSE();
+		return this.initialConnectionPromise;
+	}
+
+	private connectSSE(): void {
+		this.clearReconnectTimer();
+		this.eventSource?.close();
+		this.sseEventListeners.clear();
+		console.info('Connecting to SSE at', this.eventSourceUrl);
+		const eventSource = new EventSource(this.eventSourceUrl);
+		this.eventSource = eventSource;
+
+		eventSource.onopen = () => {
+			if (this.eventSource !== eventSource) return;
+			this.clearReconnectTimer();
+			console.log('SSE connection established');
+			this.setConnectionState('connected');
+
+			// Every replacement EventSource needs its own named event listeners.
+			const eventTypes = new Set([...this.messageHandlers.keys(), ...this.pendingSSEEventTypes]);
+			eventTypes.forEach((type) => {
+				if (!this.sseEventListeners.has(type) && this.eventSource) {
+					this.sseEventListeners.add(type);
+					eventSource.addEventListener(type, (event: MessageEvent) => {
+						this.handleSSEMessage(event);
+					});
+				}
+			});
+			this.pendingSSEEventTypes.clear();
+
+			this.resolveInitialConnection?.();
+			this.resolveInitialConnection = undefined;
+			this.initialConnectionPromise = undefined;
+		};
+
+		eventSource.onmessage = (event) => {
+			console.info('Received SSE message:', event.data);
+			this.handleSSEMessage(event);
+		};
+
+		eventSource.onerror = (err) => {
+			if (this.eventSource !== eventSource) return;
+			console.error('SSE error:', err);
+			this.setConnectionState('disconnected');
+			this.scheduleReconnectFallback(eventSource);
+		};
+
+		// SSE events from the backend use named events, which are registered
+		// dynamically above and in on().
+	}
+
+	private scheduleReconnectFallback(eventSource: EventSource) {
+		this.clearReconnectTimer();
+		this.reconnectTimer = setTimeout(() => {
+			this.reconnectTimer = undefined;
+			if (
+				!this.reconnectEnabled ||
+				this.eventSource !== eventSource ||
+				eventSource.readyState === EventSource.OPEN
+			) {
+				return;
+			}
+			eventSource.close();
+			this.eventSource = undefined;
+			this.connectSSE();
+		}, SSE_RECONNECT_FALLBACK_MS);
+	}
+
+	private clearReconnectTimer() {
+		if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+		this.reconnectTimer = undefined;
+	}
+
+	getConnectionState(): BackendConnectionState {
+		return this.connectionState;
+	}
+
+	onConnectionStateChange(listener: (state: BackendConnectionState) => void): () => void {
+		this.connectionStateListeners.add(listener);
+		listener(this.connectionState);
+		return () => this.connectionStateListeners.delete(listener);
+	}
+
+	private setConnectionState(state: BackendConnectionState) {
+		if (this.connectionState === state) return;
+		this.connectionState = state;
+		for (const listener of this.connectionStateListeners) listener(state);
+	}
+
+	private handleSSEMessage(event: MessageEvent) {
+		let message: unknown;
+		try {
+			message = JSON.parse(event.data) as unknown;
+		} catch (err) {
+			console.error('Failed to parse SSE message:', err, event.data);
+			return;
+		}
+		if (!isSseEnvelope(message)) {
+			console.error('Invalid SSE message envelope:', message);
+			return;
+		}
+		const msgType = message.type as SseEventType;
+
+		// Call registered handler for events
+		const handlers = this.messageHandlers.get(msgType);
+		if (handlers && handlers.size > 0) {
+			for (const registration of handlers) {
+				try {
+					registration.invoke(message.data);
+				} catch (err) {
+					console.error('Error in SSE message handler for type:', msgType, err);
+				}
+			}
+		} else {
+			console.debug('Unhandled SSE event type:', msgType);
+		}
+	}
+
+	// Subscribe to push events (events not triggered by a request)
+	on<K extends SseEventType>(type: K, handler: (data: SseEventMap[K]) => void): () => void {
+		const handlers = this.messageHandlers.get(type) ?? new Set();
+		if (![...handlers].some((registration) => registration.handler === handler)) {
+			handlers.add({
+				handler,
+				invoke: (data) => handler(data as SseEventMap[K])
+			});
+		}
+		this.messageHandlers.set(type, handlers);
+		console.log(`Registered handler for event type: ${type}`);
+
+		if (
+			this.eventSource &&
+			this.eventSource.readyState === EventSource.OPEN &&
+			!this.sseEventListeners.has(type)
+		) {
+			// Connection is ready and open, register immediately
+			this.sseEventListeners.add(type);
+			this.eventSource.addEventListener(type, (event: MessageEvent) => {
+				this.handleSSEMessage(event);
+			});
+		} else {
+			// Connection not ready yet or already registered, add to pending to ensure it gets registered
+			if (!this.sseEventListeners.has(type)) {
+				this.pendingSSEEventTypes.add(type);
+				console.log(`SSE event listener queued for type: ${type} (will register on connection)`);
+			}
+		}
+		return () => this.off(type, handler);
+	}
+
+	off<K extends SseEventType>(type: K, handler?: (data: SseEventMap[K]) => void) {
+		if (!handler) {
+			this.messageHandlers.delete(type);
+			return;
+		}
+		const handlers = this.messageHandlers.get(type);
+		for (const registration of handlers ?? []) {
+			if (registration.handler === handler) handlers?.delete(registration);
+		}
+		if (handlers?.size === 0) this.messageHandlers.delete(type);
+
+		// Note: EventSource doesn't provide a way to remove specific event listeners
+		// The handler just won't be called anymore since we removed it from messageHandlers
+	}
+
+	disconnect() {
+		this.reconnectEnabled = false;
+		this.clearReconnectTimer();
+		if (this.eventSource) {
+			this.eventSource.close();
+			this.eventSource = undefined;
+		}
+		this.setConnectionState('disconnected');
+		this.messageHandlers.clear();
+		this.sseEventListeners.clear();
+		this.pendingSSEEventTypes.clear();
+	}
+
+	// REST API Methods (auto-generated from OpenAPI spec)
+	async GetGraph(): Promise<Graph> {
+		const { data, error } = await this.restClient.GET('/api/graph');
+		if (error) throw new Error('Failed to get graph');
+		return data;
+	}
+
+	async GetCampaignState(): Promise<CampaignState> {
+		const { data, error } = await this.restClient.GET('/api/campaign-state');
+		if (error) throw new Error('Failed to get campaign state');
+		return data;
+	}
+
+	async GetKubetierCatalog(): Promise<KubetierCatalog> {
+		const { data, error } = await this.restClient.GET('/api/kubetier');
+		if (error) throw new Error('Failed to get offline KubeTier catalog');
+		return data;
+	}
+
+	async GetArmory(targetId?: string): Promise<Array<TTP>> {
+		const { data, error } = await this.restClient.GET('/api/armory', {
+			params: { query: { targetId } }
+		});
+		if (error) throw new Error('Failed to get armory');
+		return data;
+	}
+
+	async GetActionResolution(
+		actionId: string,
+		targetId: string,
+		execSystemId?: string
+	): Promise<ActionResolution> {
+		const { data, error } = await this.restClient.GET('/api/armory/{actionId}/resolution', {
+			params: { path: { actionId }, query: { targetId, execSystemId } }
+		});
+		if (error) throw new Error(error.error || 'Failed to resolve action');
+		return data;
+	}
+
+	async ResolveAction(
+		actionId: string,
+		request: ActionResolutionRequest
+	): Promise<ActionResolution> {
+		const { data, error } = await this.restClient.POST('/api/armory/{actionId}/resolution', {
+			params: { path: { actionId } },
+			body: request
+		});
+		if (error) throw new Error(error.error || 'Failed to resolve action');
+		return data;
+	}
+
+	async GetApplicableTTPs(targetId: string): Promise<Array<TTP>> {
+		if (!targetId) {
+			console.warn('GetApplicableTTPs called with empty targetId');
+			return [];
+		}
+
+		const { data, error } = await this.restClient.GET('/api/applicable-ttps', {
+			params: { query: { targetId } }
+		});
+		console.log('Applicable TTPs data:', data, 'error:', error, 'for targetId:', targetId);
+		if (error) {
+			console.warn('Failed to get applicable TTPs', error);
+			return [];
+		}
+		return data;
+	}
+
+	async GetEligibleAuthIdentities(actionId: string, targetId: string) {
+		const { data, error } = await this.restClient.GET('/api/eligible-auth-identities', {
+			params: { query: { actionId, targetId } }
+		});
+		if (error) throw new Error(error.error || 'Failed to get eligible authentication identities');
+		return data;
+	}
+
+	async GetRecommendations(targetId?: string, limit?: number): Promise<Array<ScoredCandidate>> {
+		const query: { targetId?: string; limit?: number } = {};
+		if (targetId) query.targetId = targetId;
+		if (limit !== undefined) query.limit = limit;
+
+		const { data, error } = await this.restClient.GET('/api/recommendations', {
+			params: { query }
+		});
+		if (error) {
+			console.warn('Failed to get recommendations', error);
+			return [];
+		}
+		return data;
+	}
+
+	async GetScoringProfile(): Promise<ScoringProfile | null> {
+		const { data, error } = await this.restClient.GET('/api/scoring/profile');
+		if (error) {
+			console.warn('Failed to get scoring profile', error);
+			return null;
+		}
+		return data;
+	}
+
+	async UpdateScoringProfile(update: ScoringProfileUpdate): Promise<ScoringProfile | null> {
+		const { data, error } = await this.restClient.PUT('/api/scoring/profile', {
+			body: update
+		});
+		if (error) {
+			console.warn('Failed to update scoring profile', error);
+			return null;
+		}
+		return data;
+	}
+
+	async SaveScoringProfile(): Promise<ScoringProfile | null> {
+		const { data, error } = await this.restClient.POST('/api/scoring/profile/save');
+		if (error) {
+			console.warn('Failed to save scoring profile', error);
+			return null;
+		}
+		return data;
+	}
+
+	async ResetScoringProfile(): Promise<ScoringProfile | null> {
+		const { data, error } = await this.restClient.POST('/api/scoring/profile/reset');
+		if (error) {
+			console.warn('Failed to reset scoring profile', error);
+			return null;
+		}
+		return data;
+	}
+
+	/** Fit a profile from captured operator decisions. Returns the preview +
+	 * metrics, or null if calibration isn't possible yet (no decisions / disabled). */
+	async CalibrateScoring(): Promise<CalibrationResult | null> {
+		const { data, error } = await this.restClient.POST('/api/scoring/calibrate');
+		if (error) {
+			console.warn('Failed to calibrate scoring profile', error);
+			return null;
+		}
+		return data;
+	}
+
+	async GetFlow(): Promise<AttackFlow> {
+		const { data, error } = await this.restClient.GET('/api/flow');
+		if (error) throw new Error('Failed to get flow');
+		return data;
+	}
+
+	async GetExecutionRecords(): Promise<ExecutionRecordEntry[]> {
+		const { data, error } = await this.restClient.GET('/api/execution-records');
+		if (error) throw new Error('Failed to get execution records');
+		return data;
+	}
+
+	async ExecuteAction(cmd: ExecuteActionCmd) {
+		const { data, error } = await this.restClient.POST('/api/action/execute', {
+			body: cmd
+		});
+		if (error) throw new Error(error.error || 'Failed to execute action');
+		return data;
+	}
+
+	async ResetCampaign() {
+		const { data, error } = await this.restClient.POST('/api/campaign/reset');
+		if (error) throw new Error('Failed to reset campaign');
+		return data;
+	}
+
+	async GetRunningPods(namespace?: string): Promise<Array<K8sResource>> {
+		const { data, error } = await this.restClient.GET('/api/pods/running', {
+			params: { query: { namespace } }
+		});
+		if (error) throw new Error(error.error);
+		return data;
+	}
+
+	async GetUiConfig(): Promise<UiConfig> {
+		const { data } = await this.restClient.GET('/api/ui-config');
+		if (!data) throw new Error('Failed to load UI configuration');
+		return data;
+	}
+
+	async GetFileContent(path: string): Promise<{ path?: string; content?: string }> {
+		const { data, error } = await this.restClient.GET('/api/files', {
+			params: { query: { path } }
+		});
+		if (error) throw new Error(error.error);
+		return data;
+	}
+
+	async ListPlans(): Promise<Array<PlanSummary>> {
+		const { data, error } = await this.restClient.GET('/api/plans/available');
+		if (error) throw new Error(error.error || 'Failed to list plans');
+		return data;
+	}
+
+	async LoadPlan(filename: string): Promise<{ plan_id?: string }> {
+		const { data, error } = await this.restClient.POST('/api/plans/load', {
+			body: { filename }
+		});
+		if (error) throw new Error(error.error || 'Failed to load plan');
+		return data;
+	}
+
+	async ExportPlan(includeFailed = false, name?: string, description?: string): Promise<string> {
+		const { data, error } = await this.restClient.GET('/api/plans/export', {
+			params: { query: { include_failed: includeFailed, name, description } },
+			parseAs: 'text'
+		});
+		if (error) throw new Error('Failed to export plan');
+		return data;
+	}
+}
+
+// Singleton instance
+const ranAPI = new RanAPI();
+
+export function getRanAPI(): RanAPI {
+	return ranAPI;
+}
+
+// Export the singleton
+export { ranAPI };
+
+// Export bound functions for convenience
+export const connect = ranAPI.connect.bind(ranAPI);
+export const disconnect = ranAPI.disconnect.bind(ranAPI);
+export const on = ranAPI.on.bind(ranAPI);
+export const off = ranAPI.off.bind(ranAPI);
+export const GetGraph = ranAPI.GetGraph.bind(ranAPI);
+export const GetCampaignState = ranAPI.GetCampaignState.bind(ranAPI);
+export const GetKubetierCatalog = ranAPI.GetKubetierCatalog.bind(ranAPI);
+export const GetArmory = ranAPI.GetArmory.bind(ranAPI);
+export const GetActionResolution = ranAPI.GetActionResolution.bind(ranAPI);
+export const ResolveAction = ranAPI.ResolveAction.bind(ranAPI);
+export const GetApplicableTTPs = ranAPI.GetApplicableTTPs.bind(ranAPI);
+export const GetRecommendations = ranAPI.GetRecommendations.bind(ranAPI);
+export const GetFlow = ranAPI.GetFlow.bind(ranAPI);
+export const ExecuteAction = ranAPI.ExecuteAction.bind(ranAPI);
+export const ResetCampaign = ranAPI.ResetCampaign.bind(ranAPI);
+export const GetRunningPods = ranAPI.GetRunningPods.bind(ranAPI);
+export const GetUiConfig = ranAPI.GetUiConfig.bind(ranAPI);
+export const ListPlans = ranAPI.ListPlans.bind(ranAPI);
+export const LoadPlan = ranAPI.LoadPlan.bind(ranAPI);

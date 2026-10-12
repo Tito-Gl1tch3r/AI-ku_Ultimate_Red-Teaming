@@ -1,0 +1,535 @@
+import { useEffect, useRef, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { targets as targetsApi } from '../lib/api'
+import { Button, Input, Modal, Spinner, EmptyState, Badge } from '../components/ui'
+import { ScanModal } from '../components/targets/ScanModal'
+import { useUIStore } from '../store/ui'
+import { timeAgo, cn } from '../lib/utils'
+import { ws } from '../lib/websocket'
+import type { Target } from '../types'
+
+// filterKind remains for rendering legacy network projects. New v3 projects use
+// the supported web pipeline; old network rows stay visible for review/export.
+export default function Targets({ filterKind }: { filterKind?: 'web' | 'network' } = {}) {
+  const navigate = useNavigate()
+  const { addToast } = useUIStore()
+  const [targets, setTargets] = useState<Target[]>([])
+  const [loading, setLoading] = useState(true)
+  const [search, setSearch] = useState('')
+  const [priorityFilter, setPriorityFilter] = useState('')
+  const [statusFilter, setStatusFilter] = useState('')
+  const [createOpen, setCreateOpen] = useState(false)
+  const [quickScanOpen, setQuickScanOpen] = useState(false)
+  const [quickScanRaw, setQuickScanRaw] = useState('')
+  const [quickScanName, setQuickScanName] = useState('')
+  const [quickScanBusy, setQuickScanBusy] = useState(false)
+  const [scanTarget, setScanTarget] = useState<Target | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<Target | null>(null)
+  const [deleting, setDeleting] = useState(false)
+  const [form, setForm] = useState({ domain: '', name: '', description: '', tags: '', priority: 'medium', notes: '', exclude: '', scanUserAgent: '', scanHeaders: '' })
+  const [editTarget, setEditTarget] = useState<Target | null>(null)
+  const [sortBy, setSortBy] = useState('findings')
+  const [submitting, setSubmitting] = useState(false)
+  const fileRef = useRef<HTMLInputElement>(null)
+  const loadSeq = useRef(0)
+  // Multi-select state for bulk actions (checkbox per card + select-all).
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [selectMode, setSelectMode] = useState(false)
+  const [bulkOpen, setBulkOpen] = useState(false)
+  const [bulkDeleting, setBulkDeleting] = useState(false)
+
+  const load = async (q = search, background = false) => {
+    const seq = ++loadSeq.current
+    if (!background) setLoading(true)
+    try {
+      const p: Record<string, string> = {}
+      if (q) p.search = q
+      if (priorityFilter) p.priority = priorityFilter
+      if (statusFilter) p.status = statusFilter
+      const list = await targetsApi.list(p) || []
+      if (seq !== loadSeq.current) return
+      setTargets(list)
+      // Drop any selected ids that no longer exist after a reload.
+      setSelected(prev => {
+        const next = new Set<string>()
+        for (const t of list) if (prev.has(t.id)) next.add(t.id)
+        return next
+      })
+    } catch (e) {
+      if (seq === loadSeq.current) addToast('error', e instanceof Error ? e.message : 'Could not load projects')
+    } finally {
+      if (seq === loadSeq.current) setLoading(false)
+    }
+  }
+
+  useEffect(() => { setSelected(new Set()); setSelectMode(false) }, [])
+
+  // A target matches the Web view when it carries any web scope (kind 'web' or
+  // 'mixed'), the Network view when it carries any network scope ('network' or
+  // 'mixed'). Older rows may have no kind set — treat those as web so they never
+  // vanish from the default landing view. Undefined filterKind = combined view.
+  const matchesKind = (t: Target) => {
+    if (!filterKind) return true
+    const k = t.kind || 'web'
+    return filterKind === 'web' ? (k === 'web' || k === 'mixed') : (k === 'network' || k === 'mixed')
+  }
+  const kindTargets = targets.filter(matchesKind)
+
+  const toggleSelect = (id: string) => setSelected(prev => {
+    const next = new Set(prev)
+    if (next.has(id)) next.delete(id); else next.add(id)
+    return next
+  })
+  const allSelected = kindTargets.length > 0 && kindTargets.every(t => selected.has(t.id))
+  const toggleSelectAll = () => setSelected(allSelected ? new Set() : new Set(kindTargets.map(t => t.id)))
+
+  const handleBulkDelete = async () => {
+    if (selected.size === 0) return
+    setBulkDeleting(true)
+    try {
+      const res = await targetsApi.bulkDelete([...selected])
+      addToast('success', `Deleted ${res.deleted} target${res.deleted === 1 ? '' : 's'}${res.failed ? ` · ${res.failed} failed` : ''}`)
+      setBulkOpen(false)
+      setSelected(new Set())
+      setSelectMode(false)
+      load(search)
+    } catch {
+      addToast('error', 'Bulk delete failed')
+    } finally { setBulkDeleting(false) }
+  }
+
+  useEffect(() => {
+    const t = setTimeout(() => load(search), 300)
+    return () => clearTimeout(t)
+  }, [search, priorityFilter, statusFilter])
+
+  // Keep counts and statuses fresh while scans or monitor passes run. Event
+  // bursts are coalesced into one background request so the grid never flickers.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const refresh = () => {
+      if (timer) clearTimeout(timer)
+      timer = setTimeout(() => { void load(search, true) }, 250)
+    }
+    const offs = ['target_created', 'target_updated', 'target_deleted', 'task_started', 'task_finished']
+      .map(event => ws.on(event, refresh))
+    return () => {
+      if (timer) clearTimeout(timer)
+      offs.forEach(off => off())
+    }
+  }, [search, priorityFilter, statusFilter])
+
+  const emptyForm = { domain: '', name: '', description: '', tags: '', priority: 'medium', notes: '', exclude: '', scanUserAgent: '', scanHeaders: '' }
+
+  const openEdit = async (summary: Target) => {
+    try {
+      // Compliance headers may contain a private program token, so the list API
+      // deliberately omits them. Fetch only the selected target's full record.
+      const t = await targetsApi.get(summary.id)
+      setForm({
+        domain: t.domain, name: t.name || '', description: t.description || '',
+        tags: (t.tags || []).join(', '), priority: t.priority || 'medium',
+        notes: t.notes || '', exclude: t.exclude_scope || '',
+        scanUserAgent: t.scan_user_agent || '',
+        scanHeaders: Object.entries(t.scan_headers || {}).map(([k, v]) => `${k}: ${v}`).join('\n'),
+      })
+      setEditTarget(t)
+    } catch (e) {
+      addToast('error', e instanceof Error ? e.message : 'Could not load project settings')
+    }
+  }
+
+  const handleSubmit = async () => {
+    if (!form.domain.trim()) return
+    const scanHeaders: Record<string, string> = {}
+    for (const rawLine of form.scanHeaders.split('\n')) {
+      const line = rawLine.trim()
+      if (!line || line.startsWith('#')) continue
+      const colon = line.indexOf(':')
+      if (colon < 1 || !line.slice(colon + 1).trim()) {
+        addToast('error', `Invalid header line: ${line}`)
+        return
+      }
+      scanHeaders[line.slice(0, colon).trim()] = line.slice(colon + 1).trim()
+    }
+    setSubmitting(true)
+    const payload = {
+      name: form.name.trim(),
+      description: form.description,
+      tags: form.tags.split(',').map(t => t.trim()).filter(Boolean),
+      priority: form.priority,
+      notes: form.notes,
+      exclude_scope: form.exclude.trim(),
+      scan_user_agent: form.scanUserAgent.trim(),
+      scan_headers: scanHeaders,
+    }
+    try {
+      if (editTarget) {
+        const next = form.domain.trim()
+        await targetsApi.update(editTarget.id, {
+          ...payload,
+          ...(next !== editTarget.domain ? { domain: next } : {}),
+        })
+        addToast('success', `${form.name.trim() || form.domain.trim()} updated`)
+        setEditTarget(null)
+      } else {
+        await targetsApi.create({ ...payload, domain: form.domain.trim() })
+        const hostCount = form.domain.split(/[\s,;]+/).filter(Boolean).length
+        const addedLabel = form.name.trim() || (hostCount > 1 ? `${hostCount} targets` : form.domain.trim())
+        addToast('success', `${addedLabel} added`)
+        setCreateOpen(false)
+      }
+      setForm(emptyForm)
+      load(search)
+    } catch (e: unknown) {
+      addToast('error', e instanceof Error ? e.message : 'Failed')
+    } finally { setSubmitting(false) }
+  }
+
+  const handleDelete = async () => {
+    if (!deleteTarget) return
+    setDeleting(true)
+    try {
+      await targetsApi.delete(deleteTarget.id)
+      addToast('success', `${deleteTarget.domain} deleted`)
+      setDeleteTarget(null)
+      load(search)
+    } catch {
+      addToast('error', 'Failed to delete target')
+    } finally { setDeleting(false) }
+  }
+
+  const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    try {
+      const res = await targetsApi.importFile(file)
+      const skipped = (res.invalid || 0) + (res.duplicates || 0)
+      addToast(skipped ? 'info' : 'success', `Imported ${res.imported} of ${res.total}${skipped ? ` · ${res.invalid || 0} invalid · ${res.duplicates || 0} duplicate` : ''}`)
+      load(search)
+    } catch { addToast('error', 'Import failed') }
+    if (fileRef.current) fileRef.current.value = ''
+  }
+
+  const submitQuickScan = async () => {
+    if (!quickScanRaw.trim()) { addToast('error', 'Paste a raw HTTP request first'); return }
+    setQuickScanBusy(true)
+    try {
+      const res = await targetsApi.quickScan(quickScanRaw, quickScanName.trim() || undefined)
+      setQuickScanOpen(false); setQuickScanRaw(''); setQuickScanName('')
+      if (res.modules_queued > 0) {
+        addToast('success', `Project created · ${res.modules_queued} test${res.modules_queued === 1 ? '' : 's'} (${res.modules_detected.join(', ')}) running now`)
+      } else {
+        addToast('info', res.note || 'Project created, but no automated tests apply to this request')
+      }
+      navigate(`/targets/${res.target_id}`)
+    } catch (e) { addToast('error', e instanceof Error ? e.message : 'Quick scan failed') }
+    finally { setQuickScanBusy(false) }
+  }
+
+  const dot: Record<string, string> = {
+    idle: 'bg-text-muted',
+    pending: 'bg-series-3 animate-pulse',
+    running: 'bg-accent animate-pulse',
+    paused: 'bg-severity-medium',
+    finished: 'bg-severity-low',
+    failed: 'bg-severity-critical',
+  }
+
+  const prioRank: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1 }
+  const sortedTargets = [...kindTargets].sort((a, b) => {
+    const byName = () => (a.name || a.domain).localeCompare(b.name || b.domain) || a.id.localeCompare(b.id)
+    let result = 0
+    switch (sortBy) {
+      case 'findings':   result = (b.finding_count || 0) - (a.finding_count || 0); break
+      case 'subdomains': result = (b.subdomain_count || 0) - (a.subdomain_count || 0); break
+      case 'alive':      result = (b.alive_host_count || 0) - (a.alive_host_count || 0); break
+      case 'name':       return byName()
+      case 'priority':   result = (prioRank[b.priority] || 0) - (prioRank[a.priority] || 0); break
+      case 'status':     result = (a.scan_status || '').localeCompare(b.scan_status || ''); break
+      case 'last_scan':  result = (b.last_scan_at || '').localeCompare(a.last_scan_at || ''); break
+      case 'created':
+      default:           result = (b.created_at || '').localeCompare(a.created_at || '')
+    }
+    return result || byName()
+  })
+
+  return (
+    <div className="space-y-5">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+        <div>
+          <p className="page-kicker">Scope control</p>
+          <h1 className="mt-1 text-3xl font-semibold tracking-[-.04em]">
+            {filterKind === 'web' ? 'Web Projects' : filterKind === 'network' ? 'Network Projects' : 'Projects'}
+          </h1>
+          <p className="page-lede mt-1">
+            {kindTargets.length} project{kindTargets.length === 1 ? '' : 's'} · group domains, URLs, JavaScript files, IP-hosted web URLs, or a public bounty program
+          </p>
+        </div>
+        <div className="flex gap-2 flex-wrap">
+          {kindTargets.length > 0 && (
+            <Button size="sm" variant="ghost" onClick={() => { setSelectMode(m => !m); setSelected(new Set()) }}>
+              {selectMode ? 'Done' : 'Select'}
+            </Button>
+          )}
+          <Button size="sm" variant="ghost" onClick={() => fileRef.current?.click()}>Import</Button>
+          <Button size="sm" variant="ghost" onClick={() => setQuickScanOpen(true)}>⚡ Quick scan from request</Button>
+          <Button size="sm" variant="primary" onClick={() => setCreateOpen(true)}>+ New Project</Button>
+          <input ref={fileRef} type="file" accept=".txt,.csv" onChange={handleImport} className="hidden" />
+        </div>
+      </div>
+
+      <div className="card flex items-center gap-3 flex-wrap p-3">
+        <Input placeholder="Search…" value={search} onChange={e => setSearch(e.target.value)} className="sm:max-w-xs" />
+        <select value={priorityFilter} onChange={e => setPriorityFilter(e.target.value)} aria-label="Filter by priority"
+          className="bg-surface-alt border border-border rounded px-2 py-1.5 text-xs text-text-primary">
+          <option value="" className="bg-surface-3">All priorities</option>
+          {['critical', 'high', 'medium', 'low'].map(p => <option key={p} value={p} className="bg-surface-3 capitalize">{p}</option>)}
+        </select>
+        <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)} aria-label="Filter by scan status"
+          className="bg-surface-alt border border-border rounded px-2 py-1.5 text-xs text-text-primary">
+          <option value="" className="bg-surface-3">All statuses</option>
+          {['running', 'pending', 'paused', 'failed', 'idle'].map(s => <option key={s} value={s} className="bg-surface-3 capitalize">{s}</option>)}
+        </select>
+        {(search || priorityFilter || statusFilter) && <button className="text-[11px] text-accent hover:text-accent-hover" onClick={() => { setSearch(''); setPriorityFilter(''); setStatusFilter('') }}>Clear filters</button>}
+        <label className="flex items-center gap-1.5 text-xs text-text-muted">
+          Sort
+          <select value={sortBy} onChange={e => setSortBy(e.target.value)}
+            className="bg-surface-alt border border-border rounded px-2 py-1.5 text-xs text-text-primary">
+            <option value="findings" className="bg-surface-3">Findings</option>
+            <option value="subdomains" className="bg-surface-3">Subdomains</option>
+            <option value="alive" className="bg-surface-3">Alive hosts</option>
+            <option value="priority" className="bg-surface-3">Priority</option>
+            <option value="name" className="bg-surface-3">Name (A–Z)</option>
+            <option value="status" className="bg-surface-3">Scan status</option>
+            <option value="last_scan" className="bg-surface-3">Last scan</option>
+            <option value="created" className="bg-surface-3">Newest</option>
+          </select>
+        </label>
+        {selectMode && (
+          <div className="flex items-center gap-3 text-xs">
+            <label className="flex items-center gap-1.5 cursor-pointer text-text-secondary select-none">
+              <input type="checkbox" checked={allSelected} onChange={toggleSelectAll} className="accent-accent w-3.5 h-3.5" />
+              Select all
+            </label>
+            <span className="text-text-muted">{selected.size} selected</span>
+            <Button size="sm" variant="danger" disabled={selected.size === 0} onClick={() => setBulkOpen(true)}>
+              Delete selected
+            </Button>
+          </div>
+        )}
+      </div>
+
+      {loading
+        ? <div className="flex items-center justify-center h-48"><Spinner /></div>
+        : kindTargets.length === 0
+          ? <div className="card mt-2 min-h-[340px] grid place-items-center"><EmptyState
+              icon={<svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="1.5"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/><path d="M12 2v3M22 12h-3M12 22v-3M2 12h3"/></svg>}
+              title={filterKind === 'network' ? 'No legacy network projects' : 'Build your first attack surface'}
+              description={filterKind === 'web' ? 'Add a domain to start discovery, crawling, JavaScript analysis and verification.' : 'Create a project from a domain, URL, JavaScript file, or a public bounty program.'}
+              action={<Button variant="primary" onClick={() => setCreateOpen(true)}>+ Create first project</Button>}
+            /></div>
+          : (
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+              {sortedTargets.map(t => (
+                <div
+                  key={t.id}
+                  className={cn('card-hover p-4 cursor-pointer', selectMode && selected.has(t.id) && 'ring-1 ring-accent')}
+                  onClick={() => selectMode ? toggleSelect(t.id) : navigate(`/targets/${t.id}`)}
+                >
+                  <div className="flex items-start justify-between mb-3">
+                    <div className="flex items-center gap-2 min-w-0">
+                      {selectMode && (
+                        <input
+                          type="checkbox"
+                          checked={selected.has(t.id)}
+                          onChange={() => toggleSelect(t.id)}
+                          onClick={e => e.stopPropagation()}
+                          className="accent-accent w-3.5 h-3.5 shrink-0"
+                        />
+                      )}
+                      <span className={cn('w-2 h-2 rounded-full shrink-0', dot[t.scan_status] || 'bg-text-muted')} />
+                      <span className="text-sm font-semibold truncate" title={t.domain}>{t.name || t.domain}</span>
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <Button
+                        size="sm"
+                        variant="primary"
+                        onClick={e => { e.stopPropagation(); setScanTarget(t) }}
+                      >
+                        Scan
+                      </Button>
+                      <button
+                        onClick={e => { e.stopPropagation(); openEdit(t) }}
+                        className="p-1.5 rounded text-text-muted hover:text-accent hover:bg-accent/10 transition-colors"
+                        title="Edit target"
+                      >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                        </svg>
+                      </button>
+                      <button
+                        onClick={e => { e.stopPropagation(); setDeleteTarget(t) }}
+                        className="p-1.5 rounded text-text-muted hover:text-severity-critical hover:bg-severity-critical/10 transition-colors"
+                        title="Delete target"
+                      >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-2 mb-3 text-center">
+                    <div>
+                      <p className="text-lg font-semibold text-severity-low">{t.subdomain_count}</p>
+                      <p className="text-xs text-text-muted">Subdomains</p>
+                    </div>
+                    <div>
+                      <p className="text-lg font-semibold">{t.alive_host_count}</p>
+                      <p className="text-xs text-text-muted">Alive</p>
+                    </div>
+                    <div>
+                      <p className={cn('text-lg font-semibold', t.finding_count > 0 ? 'text-severity-high' : '')}>{t.finding_count}</p>
+                      <p className="text-xs text-text-muted">Findings</p>
+                    </div>
+                  </div>
+
+                  {t.tags.length > 0 && (
+                    <div className="flex flex-wrap gap-1 mb-2">
+                      {t.tags.map(tag => <Badge key={tag}>{tag}</Badge>)}
+                    </div>
+                  )}
+
+                  <div className="flex justify-between text-xs text-text-muted">
+                    <span className="capitalize">{t.scan_status}</span>
+                    <span>{t.last_scan_at ? timeAgo(t.last_scan_at) : 'Never scanned'}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+      {/* Quick scan from a raw request */}
+      <Modal open={quickScanOpen} onClose={() => { if (!quickScanBusy) setQuickScanOpen(false) }} title="Quick scan from raw request" width="md">
+        <div className="space-y-3">
+          <p className="text-xs text-text-muted">Paste one raw HTTP request (from Burp, browser devtools, or curl -v). Reconner creates a project scoped to this exact request, automatically identifies which vulnerability classes apply (XSS, SQLi, NoSQLi, SSRF, LFI, SSTI, IDOR, open redirect, CORS, file upload), and runs every applicable check immediately — no manual step-through.</p>
+          <Input label="Project name (optional)" placeholder="defaults to the method + path"
+            value={quickScanName} onChange={e => setQuickScanName(e.target.value)} disabled={quickScanBusy} />
+          <div>
+            <label className="label" htmlFor="quick-scan-raw">Raw HTTP request *</label>
+            <textarea id="quick-scan-raw" className="input resize-none font-mono text-xs" dir="ltr" rows={12} spellCheck={false}
+              placeholder={'GET /api/user?id=1 HTTP/1.1\nHost: app.example.com\nCookie: session=…\n\n'}
+              value={quickScanRaw} onChange={e => setQuickScanRaw(e.target.value)} disabled={quickScanBusy} />
+          </div>
+          <div className="rounded-lg border border-severity-medium/30 bg-severity-medium/5 p-3 text-[11px]">Only paste requests you are authorized to test. This immediately sends bounded active probes to the request's own host — the same active testing Guided Analyze performs after an explicit "run" confirmation.</div>
+          <div className="flex justify-end gap-2">
+            <Button variant="ghost" disabled={quickScanBusy} onClick={() => setQuickScanOpen(false)}>Cancel</Button>
+            <Button variant="primary" loading={quickScanBusy} disabled={quickScanBusy || !quickScanRaw.trim()} onClick={submitQuickScan}>Create project & run all applicable tests →</Button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Create / Edit Modal */}
+      <Modal open={createOpen || !!editTarget} onClose={() => { setCreateOpen(false); setEditTarget(null); setForm(emptyForm) }}
+        title={editTarget ? 'Edit Project' : 'Create Project'} width="md">
+        <div className="space-y-3">
+          {!editTarget && <button type="button" onClick={() => { setCreateOpen(false); navigate('/bounty-programs') }} className="w-full rounded-lg border border-accent/20 bg-accent/[.06] px-3 py-2 text-left text-xs text-accent hover:bg-accent/[.1]">Or choose a HackerOne / Bugcrowd program and import its current scope →</button>}
+          <Input label="Project name" placeholder="friendly label for this project (optional)"
+            value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} />
+          <div>
+            <label className="label" htmlFor="project-assets">Initial assets *</label>
+            <textarea id="project-assets" className="input resize-none font-mono text-xs" rows={5}
+							placeholder={"One asset per line — domains, URLs/pages, JS files, IP, CIDR, or IP range:\nexample.com\nhttps://app.example.com/account\n192.168.1.10\n192.168.1.0/24\n192.168.1.1-192.168.1.10"}
+              value={form.domain} onChange={e => setForm({ ...form, domain: e.target.value })} />
+            <p className="text-[10px] text-text-muted mt-1">
+							Reconner creates individually manageable web and network assets. A full URL stays a page seed; network assets accept a single IP, CIDR, or inclusive range such as <span className="font-mono">192.168.1.1-192.168.1.10</span>. Network modules appear only after choosing Network Scan.
+            </p>
+          </div>
+          <div>
+            <label className="label" htmlFor="project-exclude">Exclude (out of scope) — optional</label>
+            <textarea id="project-exclude" className="input resize-none font-mono text-xs" rows={2}
+              placeholder={"never scan these: dev.example.com, *.staging.example.com, 10.0.0.0/24, https://admin.example.com/"}
+              value={form.exclude} onChange={e => setForm({ ...form, exclude: e.target.value })} />
+            <p className="text-[10px] text-text-muted mt-1">
+              Excluded hosts/IPs/CIDRs/URLs are dropped before probing — nothing excluded is ever scanned or reported. Supports
+              <span className="font-mono"> *.wildcards</span> and CIDRs.
+            </p>
+          </div>
+          <div className="rounded-lg border border-border bg-surface-alt/40 p-3 space-y-3">
+            <div>
+              <p className="text-xs font-semibold">Bug-bounty request identity</p>
+              <p className="mt-0.5 text-[10px] text-text-muted">Applied only to this project's approved hosts, including monitoring and supported external tools.</p>
+            </div>
+            <Input label="User-Agent override" placeholder="Mozilla/5.0 … researcher-id / ywh-public"
+              value={form.scanUserAgent} onChange={e => setForm({ ...form, scanUserAgent: e.target.value })} />
+            <div>
+              <label className="label" htmlFor="project-headers">Custom HTTP headers — one per line</label>
+              <textarea id="project-headers" className="input resize-none font-mono text-xs" rows={3}
+                placeholder={"X-Bug-Bounty: researcher@example.com\nbb-client: BookBeatApp\nbb-device: api ywh"}
+                value={form.scanHeaders} onChange={e => setForm({ ...form, scanHeaders: e.target.value })} />
+            </div>
+          </div>
+          <Input label="Description" value={form.description} onChange={e => setForm({ ...form, description: e.target.value })} />
+          <Input label="Tags (comma separated)" placeholder="bug-bounty, prod" value={form.tags} onChange={e => setForm({ ...form, tags: e.target.value })} />
+          <div>
+            <label className="label" htmlFor="project-priority">Priority</label>
+            <select id="project-priority" className="input" value={form.priority} onChange={e => setForm({ ...form, priority: e.target.value })}>
+              {['low', 'medium', 'high', 'critical'].map(p => (
+                <option key={p} value={p} className="bg-surface-3 capitalize">{p}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="label" htmlFor="project-notes">Notes</label>
+            <textarea id="project-notes" className="input resize-none" rows={2} value={form.notes} onChange={e => setForm({ ...form, notes: e.target.value })} />
+          </div>
+          <div className="flex justify-end gap-2 pt-2 border-t border-border">
+            <Button variant="ghost" onClick={() => { setCreateOpen(false); setEditTarget(null); setForm(emptyForm) }}>Cancel</Button>
+            <Button variant="primary" loading={submitting} onClick={handleSubmit}>{editTarget ? 'Save changes' : 'Create'}</Button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Delete Confirm Modal */}
+      <Modal open={!!deleteTarget} onClose={() => setDeleteTarget(null)} title="Delete Project" width="sm">
+        <div className="space-y-4">
+          <p className="text-sm text-text-secondary">
+            Are you sure you want to delete <span className="font-semibold text-text-primary break-words" title={deleteTarget?.domain}>
+              {deleteTarget?.name || (deleteTarget && deleteTarget.domain.length > 60 ? deleteTarget.domain.slice(0, 60) + '…' : deleteTarget?.domain)}
+            </span>?
+            This will permanently remove all subdomains, findings, and scan data.
+          </p>
+          <div className="flex justify-end gap-2 pt-2 border-t border-border">
+            <Button variant="ghost" onClick={() => setDeleteTarget(null)}>Cancel</Button>
+            <Button variant="danger" loading={deleting} onClick={handleDelete}>Delete</Button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Bulk Delete Confirm Modal */}
+      <Modal open={bulkOpen} onClose={() => setBulkOpen(false)} title="Delete Selected Projects" width="sm">
+        <div className="space-y-4">
+          <p className="text-sm text-text-secondary">
+            Permanently delete <span className="font-semibold text-text-primary">{selected.size}</span> selected
+            target{selected.size === 1 ? '' : 's'} and all of their subdomains,
+            findings, and scan data? This cannot be undone.
+          </p>
+          <div className="flex justify-end gap-2 pt-2 border-t border-border">
+            <Button variant="ghost" onClick={() => setBulkOpen(false)}>Cancel</Button>
+            <Button variant="danger" loading={bulkDeleting} onClick={handleBulkDelete}>Delete {selected.size}</Button>
+          </div>
+        </div>
+      </Modal>
+
+      {scanTarget && (
+        <ScanModal
+          target={scanTarget}
+          open={true}
+          onClose={() => setScanTarget(null)}
+          onStarted={() => load()}
+        />
+      )}
+    </div>
+  )
+}

@@ -1,0 +1,337 @@
+// Copyright 2026 Praetorian Security, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package google provides unauthenticated Google Workspace account enumeration.
+// It is the single source of truth for the Google account-existence checks
+// (AccountChooser SSO detection and the GXLU Gmail probe), reused both by the
+// internal enum oracle plugin and by the "enum google" command. Unlike the
+// Teams enumerator, these checks are unauthenticated — there are no tokens,
+// credential stores, or refresh logic.
+package google
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/praetorian-inc/brutus/pkg/brutus"
+	"github.com/praetorian-inc/brutus/pkg/enum"
+)
+
+// Method identifies which oracle confirmed an account's existence.
+type Method string
+
+const (
+	// MethodWorkspaceSSO means existence was confirmed by the AccountChooser
+	// SSO/SAML redirect (a Workspace domain with SSO configured).
+	MethodWorkspaceSSO Method = "workspace-sso"
+	// MethodGmail means existence was confirmed by the GXLU Gmail probe
+	// (a Gmail-enabled account).
+	MethodGmail Method = "gmail"
+	// MethodNone means no oracle confirmed existence.
+	MethodNone Method = ""
+)
+
+// Result is the outcome of checking a single email. IdP is the SSO identity
+// provider host parsed from the AccountChooser redirect Location (workspace-sso
+// only; empty when only the SAML header was present or for gmail). IdP is
+// server-controlled and is NOT sanitized here; sanitization happens at the
+// output layer. There are no secrets in this flow, so Error carries the raw
+// transport error.
+type Result struct {
+	Email string
+	// First and Last are copied from the originating enum.Target when
+	// enumerating via EnumerateTargetsWith. They are empty when the address
+	// arrived through EnumerateWith, which takes bare addresses and so has no
+	// name to carry. This package never derives a name from the local part.
+	First  string
+	Last   string
+	Exists bool
+	Method Method
+	IdP    string
+	Error  error
+}
+
+const (
+	accountChooserBaseURLDefault = "https://accounts.google.com"
+	gxluBaseURLDefault           = "https://mail.google.com"
+)
+
+// Enumerator performs unauthenticated Google Workspace account enumeration via
+// the AccountChooser SSO redirect and the GXLU Gmail probe. It is safe for
+// concurrent use.
+type Enumerator struct {
+	httpClient *http.Client
+
+	// Base URLs for the two endpoints; defaults point at the real Google hosts
+	// and are overridable by tests (mirroring the teams Enumerator pattern).
+	accountChooserBaseURL string
+	gxluBaseURL           string
+}
+
+// NewEnumerator builds an Enumerator. The HTTP client is built via
+// brutus.NewHTTPClientWithProxy so the SOCKS5 --proxy flag works. The supplied
+// timeout is used directly as the per-request budget.
+func NewEnumerator(proxyURL string, timeout time.Duration) (*Enumerator, error) {
+	httpClient, err := brutus.NewHTTPClientWithProxy(timeout, nil, proxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("google enum: configuring HTTP client: %w", err)
+	}
+
+	// Providers' anti-automation reject Go's default "Go-http-client" User-Agent
+	// (the same failure the github enumerator hit). Inject a browser UA at the
+	// transport layer so every request — including the client clone in
+	// checkAccountChooser, which shares this transport — carries it.
+	httpClient.Transport = enum.WithUserAgent(httpClient.Transport)
+
+	return &Enumerator{
+		httpClient:            httpClient,
+		accountChooserBaseURL: accountChooserBaseURLDefault,
+		gxluBaseURL:           gxluBaseURLDefault,
+	}, nil
+}
+
+// client returns the per-run enum HTTP client when ctx carries one (set via
+// enum.WithHTTPClient for --proxy and connection pooling), otherwise the
+// Enumerator's own client.
+func (e *Enumerator) client(ctx context.Context) *http.Client {
+	if c := enum.HTTPClientFromContext(ctx); c != nil {
+		return c
+	}
+	return e.httpClient
+}
+
+// Enumerate looks up each email using a bounded worker pool, applying rate
+// limiting and jitter when rateLimit > 0. Results preserve input order. It is a
+// thin wrapper around EnumerateWith with no per-result callback.
+func (e *Enumerator) Enumerate(ctx context.Context, emails []string, threads int, rateLimit float64, jitter time.Duration) []Result {
+	return e.EnumerateWith(ctx, emails, threads, rateLimit, jitter, nil)
+}
+
+// EnumerateWith runs enumeration over bare addresses. It is a thin adapter over
+// EnumerateTargetsWith, which holds the single implementation: each address is
+// promoted to a nameless enum.Target. Because a bare address says nothing about
+// whose it is, every returned Result has empty First/Last — callers that know
+// the name behind an address should use EnumerateTargetsWith instead.
+//
+// The signature, ordering and callback semantics are unchanged; see
+// EnumerateTargetsWith for the callback contract.
+func (e *Enumerator) EnumerateWith(ctx context.Context, emails []string, threads int, rateLimit float64, jitter time.Duration, onResult func(Result)) []Result {
+	targets := make([]enum.Target, len(emails))
+	for i, email := range emails {
+		targets[i] = enum.Target{Email: email}
+	}
+	return e.EnumerateTargetsWith(ctx, targets, threads, rateLimit, jitter, onResult)
+}
+
+// newError builds the Result for failures the worker pool detects rather than
+// the probe: cancellation, a rate-limiter error, and panic recovery. google's
+// failure results carry no fields beyond the address and the error.
+func newError(email string, err error) Result {
+	return Result{Email: email, Error: err}
+}
+
+// worker returns the shared bounded worker pool configured for this
+// enumerator. It is a method (rather than inline in EnumerateTargetsWith) so
+// tests can assert the four hooks — in particular the Label that drives the
+// panic diagnostics, and newError's field shape — without running a pool.
+func (e *Enumerator) worker() enum.TargetWorker[Result] {
+	return enum.TargetWorker[Result]{
+		Label:     "google enum",
+		Check:     e.CheckAccount,
+		NewError:  newError,
+		StampName: func(r *Result, t enum.Target) { r.First, r.Last = t.First, t.Last },
+	}
+}
+
+// EnumerateTargetsWith runs enumeration with bounded concurrency over targets
+// that carry the name behind each address, and invokes onResult (if non-nil) for
+// each completed result, serialized so callers can print/stream safely. It
+// returns all results in input order.
+//
+// The name travels with the target rather than being recovered afterwards, so a
+// consumer of this package never has to reverse-derive a name from the local
+// part — a lossy guess for initial-based formats, where "jsmith" could be John,
+// James or Jane. Each Result is stamped with the name of the target that
+// produced it (never a neighboring target's).
+//
+// A name is a property of the address, not of the check outcome, so the stamp is
+// applied on every path: a completed check, context cancellation, a rate-limiter
+// error, cancellation during jitter, and panic recovery. A failed probe still
+// reports whose address failed. Targets without a name (operator-supplied
+// addresses) stay nameless; no name is ever invented.
+//
+// onResult is called under the same mutex that guards the results slice, so
+// callback invocations never interleave and never race the slice. The callback
+// must therefore be cheap and self-contained: it may write to an io.Writer or
+// update counters, but it must NOT call back into the Enumerator (doing so risks
+// deadlock and defeats the serialization guarantee).
+//
+// The pool itself is enum.TargetWorker; see its doc comment for the full contract.
+func (e *Enumerator) EnumerateTargetsWith(ctx context.Context, targets []enum.Target, threads int, rateLimit float64, jitter time.Duration, onResult func(Result)) []Result {
+	return e.worker().Run(ctx, targets, threads, rateLimit, jitter, onResult)
+}
+
+// CheckAccount checks whether a single Google account exists, trying the
+// AccountChooser SSO redirect first and falling back to the GXLU Gmail probe.
+// It never returns an error directly; transport failures are encoded in the
+// returned Result's Error field with Exists=false.
+func (e *Enumerator) CheckAccount(ctx context.Context, email string) Result {
+	res := Result{Email: email, Method: MethodNone}
+
+	// AccountChooser (primary) — detects Workspace accounts on SSO domains.
+	exists, idp, err := e.checkAccountChooser(ctx, email)
+	if err != nil {
+		res.Error = err
+		return res
+	}
+	if exists {
+		res.Exists = true
+		res.Method = MethodWorkspaceSSO
+		res.IdP = idp
+		return res
+	}
+
+	// GXLU (fallback) — detects Gmail-enabled accounts.
+	exists, err = e.checkGXLU(ctx, email)
+	if err != nil {
+		res.Error = err
+		return res
+	}
+	if exists {
+		res.Exists = true
+		res.Method = MethodGmail
+		return res
+	}
+
+	return res
+}
+
+// checkAccountChooser checks whether Google redirects to a SAML IdP for this
+// email. SSO-configured domains redirect valid accounts to their IdP; invalid
+// accounts redirect back to accounts.google.com/ServiceLogin. It returns the
+// IdP host (parsed from the redirect Location) when one is available.
+//
+// The shared proxied client follows redirects by default, so a per-request
+// clone with CheckRedirect=ErrUseLastResponse is used to inspect the 302
+// Location header while keeping the proxy transport.
+func (e *Enumerator) checkAccountChooser(ctx context.Context, email string) (federated bool, host string, err error) {
+	u := e.accountChooserBaseURL + "/AccountChooser?Email=" + url.QueryEscape(email) + "&continue=https://mail.google.com/mail/"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, http.NoBody)
+	if err != nil {
+		return false, "", fmt.Errorf("creating AccountChooser request: %w", err)
+	}
+
+	// Clone the proxied client so redirects are not followed (keeping the proxy
+	// transport); we need to inspect the 302 Location header.
+	client := *e.client(ctx)
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, "", fmt.Errorf("AccountChooser request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// (a) Definitive error statuses first: 302 back to ServiceLogin and 2xx are
+	// the normal paths; 429, 5xx, block pages, and other non-2xx are throttle/
+	// outage errors, not "does not exist". Validate the status BEFORE
+	// interpreting any existence signal so a throttled response that also
+	// carries a SAML/IdP header is never reported as an existing account.
+	if resp.StatusCode != http.StatusFound && (resp.StatusCode < 200 || resp.StatusCode >= 300) {
+		return false, "", fmt.Errorf("AccountChooser unexpected status: %d", resp.StatusCode)
+	}
+
+	// Drain so the connection can be reused; existence is determined by
+	// headers/status, not the body, so a body-read error is ignored here (a
+	// truncated/malformed body must not mask a valid SAML/IdP redirect).
+	_, _ = enum.ReadResponseBody(resp, 0)
+
+	// (b) Header-based existence signals are definitive and independent of the
+	// body.
+	location := resp.Header.Get("Location")
+
+	// A SAML redirect header is present only for valid accounts on SSO domains.
+	if resp.Header.Get("Google-Accounts-SAML") != "" {
+		return true, idpHost(location), nil
+	}
+
+	// A Location that redirects to a non-Google host is an IdP redirect.
+	if location != "" && !strings.Contains(location, "accounts.google.com") && !strings.Contains(location, "google.com/ServiceLogin") {
+		return true, idpHost(location), nil
+	}
+
+	return false, "", nil
+}
+
+// checkGXLU checks whether an email has a Gmail-enabled Google account.
+// GET {gxluBaseURL}/mail/gxlu?email=USER@DOMAIN — a GMAIL_AT cookie in the
+// response indicates the account exists. The default proxied client (which
+// follows redirects) is used as-is, since GXLU does not rely on inspecting a
+// redirect.
+func (e *Enumerator) checkGXLU(ctx context.Context, email string) (bool, error) {
+	gxluURL := e.gxluBaseURL + "/mail/gxlu?email=" + url.QueryEscape(email)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, gxluURL, http.NoBody)
+	if err != nil {
+		return false, fmt.Errorf("creating GXLU request: %w", err)
+	}
+
+	resp, err := e.client(ctx).Do(req)
+	if err != nil {
+		return false, fmt.Errorf("GXLU request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// (a) Definitive error statuses first: 2xx without GMAIL_AT is the normal
+	// negative path; 429, 5xx, block pages, and other non-2xx are throttle/
+	// outage errors, not "does not exist". Validate the status BEFORE
+	// interpreting the GMAIL_AT cookie so a throttled response that also carries
+	// the cookie is never reported as an existing account.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false, fmt.Errorf("GXLU unexpected status: %d", resp.StatusCode)
+	}
+
+	// Drain so the connection can be reused; existence is determined by the
+	// GMAIL_AT cookie / status, not the body, so a body-read error is ignored
+	// here (a truncated/malformed body must not mask a valid GMAIL_AT cookie).
+	_, _ = enum.ReadResponseBody(resp, 0)
+
+	// (b) Cookie-based existence signal (Set-Cookie header, independent of the
+	// body).
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == "GMAIL_AT" {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// idpHost parses the host out of a redirect Location URL, returning "" when the
+// location is empty or unparseable.
+func idpHost(location string) string {
+	if location == "" {
+		return ""
+	}
+	u, err := url.Parse(location)
+	if err != nil {
+		return ""
+	}
+	return u.Host
+}

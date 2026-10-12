@@ -1,0 +1,171 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Check kernel config for CONFIG_RELOCATABLE, CONFIG_RANDOMIZE_BASE,
+// and CONFIG_PAGE_OFFSET (32-bit vmsplit).
+//
+// Detection component; on 32-bit vmsplit arches also emits the parsed
+// CONFIG_PAGE_OFFSET as the page-offset base.
+//   Purpose: reads /boot/config-$(uname -r) to determine whether
+//   CONFIG_RANDOMIZE_BASE is set (KASLR compiled in) and what the
+//   32-bit vmsplit (CONFIG_PAGE_OFFSET) is. Readable when /boot is
+//   accessible (common on most distros).
+//
+// References:
+// https://lwn.net/Articles/444556/
+// https://cateee.net/lkddb/web-lkddb/RANDOMIZE_BASE.html
+// https://cateee.net/lkddb/web-lkddb/RELOCATABLE.html
+// https://cateee.net/lkddb/web-lkddb/PAGE_OFFSET.html
+// ---
+// <bcoles@gmail.com>
+
+#include "include/kasld/api.h"
+#include "include/kasld/bootconfig.h"
+#include "include/kasld/cli.h"
+#include "include/kconfig.h"
+#include "include/text_order.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+KASLD_EXPLAIN(
+    "Reads /boot/config-$(uname -r) to check whether CONFIG_RANDOMIZE_BASE "
+    "is set (KASLR compiled in) and determines the 32-bit vmsplit "
+    "(CONFIG_PAGE_OFFSET). Readable when /boot is accessible.");
+
+KASLD_META("method:detection\n"
+           "phase:inference\n"
+           "discloses:virtual\n"
+           "source:files\n");
+
+/* CONFIG_RANDOMIZE_BASE, answered in both directions from one read.
+ *
+ * kconfig_has_kaslr is a tri-state and each answer says something different, so
+ * none of them is the absence of another. 0 is the option explicitly unset: the
+ * binary was built without KASLR support entirely, so both placements use
+ * compile-time defaults, and virt_kaslr_disabled_pin / phys_kaslr_disabled_pin
+ * each gate by its arch macro plus window-containment to decide whether to pin.
+ * 1 is worth stating in its own right: the option selects compile-time sizes
+ * that hold whether or not the randomizer ran this boot, which is what
+ * module_base_execmem_window needs in order to know where the module region
+ * begins. -1 is a truncated or foreign config and asserts nothing. */
+static void emit_randomize_base(FILE *fp, enum kasld_confidence cfg_conf) {
+  switch (kconfig_has_kaslr(fp)) {
+  case 0:
+    kasld_info(
+        "Kernel appears to have been compiled without CONFIG_RANDOMIZE_BASE"
+        " (KASLR not compiled in)");
+    kasld_emit_scalar(SF_VIRT_KASLR_DISABLED, 1, cfg_conf);
+    kasld_emit_scalar(SF_PHYS_KASLR_DISABLED, 1, cfg_conf);
+    break;
+  case 1:
+    kasld_info("CONFIG_RANDOMIZE_BASE=y (KASLR compiled in)");
+    kasld_emit_scalar(SF_KASLR_COMPILED_IN, 1, cfg_conf);
+    break;
+  default:
+    break;
+  }
+}
+
+int main(void) {
+  int is_unkeyed = 0;
+  FILE *fp = kasld_open_boot_config(&is_unkeyed);
+  if (!fp) {
+    if (kasld_boot_config_denied) {
+      kasld_err("kernel config present but not readable");
+      return KASLD_EXIT_NOPERM;
+    }
+    kasld_err("could not find kernel config");
+    return KASLD_EXIT_UNAVAILABLE;
+  }
+
+  /* An unkeyed /boot/config carries no binding to the running kernel: it may be
+   * a leftover from another kernel or a rescue image. Its Kconfig answers drive
+   * guaranteed pins (the KASLR-disabled C_EQUALS pin, the PHYSICAL_START floor,
+   * the s390 layout discriminator, ...), so a stale file could exclude the true
+   * base from the guaranteed window. Demote every fact from that source below
+   * the guaranteed floor — it then shapes only the likely window. Release-keyed
+   * paths are bound to the running kernel and stay at CONF_PARSED. */
+  enum kasld_confidence cfg_conf = is_unkeyed ? CONF_HEURISTIC : CONF_PARSED;
+
+#if PAGE_OFFSET_FROM_CONFIG
+  /* Detect PAGE_OFFSET (32-bit vmsplit). CONFIG_PAGE_OFFSET equals the runtime
+   * page_offset only on PAGE_OFFSET_FROM_CONFIG arches (x86_32, arm32, ppc32);
+   * pinning Q_PAGE_OFFSET to it via page_offset_from_landmark's C_EQUALS would
+   * exclude the truth on arches whose CONFIG_PAGE_OFFSET differs from the
+   * running base.
+   * (The properly gated scalar path is bootconfig_facts ->
+   * page_offset_from_config.) */
+  unsigned long virt_page_offset = get_kconfig_page_offset(fp);
+  if (virt_page_offset) {
+    kasld_info("CONFIG_PAGE_OFFSET: %#lx", virt_page_offset);
+    kasld_result_base(KASLD_TYPE_VIRT, REGION_PAGE_OFFSET, virt_page_offset,
+                      NULL, cfg_conf);
+  }
+#endif
+
+  /* CONFIG_PHYSICAL_START (x86 LOAD_PHYSICAL_ADDR). The honest-top floors
+   * for Q_VIRT_IMAGE_BASE / Q_PHYS_IMAGE_BASE are *widened* to the smallest
+   * practical value (2 MiB, the minimum CONFIG_PHYSICAL_START alignment);
+   * when the real value is learnable, the physical_start_lower_bound rule
+   * raises the floor to the precise position at CONF_PARSED. */
+  unsigned long phys_start = get_kconfig_physical_start(fp);
+  if (phys_start) {
+    kasld_info("CONFIG_PHYSICAL_START: %#lx", phys_start);
+    kasld_emit_scalar(SF_PHYSICAL_START, phys_start, cfg_conf);
+  }
+
+  /* CONFIG_PHYSICAL_ALIGN — KASLR slot granularity on x86. boot_params
+   * exposes the same value at hdr.kernel_alignment; this is a fallback for
+   * systems where /sys/kernel/boot_params/data is unreadable. Both sources
+   * emit the same SF_PHYS_KERNEL_ALIGN scalar; boot_params_kaslr_align raises
+   * Q_VIRT_KASLR_ALIGN / Q_PHYS_KASLR_ALIGN regardless of source. */
+  unsigned long phys_align = get_kconfig_physical_align(fp);
+  if (phys_align) {
+    kasld_info("CONFIG_PHYSICAL_ALIGN: %#lx", phys_align);
+    kasld_emit_scalar(SF_PHYS_KERNEL_ALIGN, phys_align, cfg_conf);
+  }
+
+  emit_randomize_base(fp, cfg_conf);
+
+  /* CONFIG_KASAN=y forces the direct-map randomization off at runtime
+   * (kaslr_memory_enabled() = kaslr_enabled() && !IS_ENABLED(CONFIG_KASAN)), so
+   * page_offset / vmalloc / vmemmap stay at their compile-time defaults even
+   * with CONFIG_RANDOMIZE_MEMORY=y. Consumed by directmap_kaslr_disabled_pin.
+   */
+  /* Emitted either way, as in proc_config: a consumer asking whether the stack
+   * size is the small one needs the negative to be an answer. CONFIG_KMSAN
+   * sizes the same stacks on s390 and is read beside it. An unkeyed file
+   * carries cfg_conf below the sound floor, so a stale config's "not set"
+   * shapes only the likely window. */
+  {
+    int kasan = is_kconfig_set(fp, "CONFIG_KASAN") ? 1 : 0;
+    int kmsan = is_kconfig_set(fp, "CONFIG_KMSAN") ? 1 : 0;
+    if (kasan)
+      kasld_info("CONFIG_KASAN=y");
+    if (kmsan)
+      kasld_info("CONFIG_KMSAN=y");
+    kasld_emit_scalar(SF_KASAN_ENABLED, (unsigned long)kasan, cfg_conf);
+    kasld_emit_scalar(SF_KMSAN_ENABLED, (unsigned long)kmsan, cfg_conf);
+  }
+
+  /* Kernel-text function ordering (canonical / static-reorder / FG-KASLR) —
+   * gates whether a generic System.map can resolve symbols. See text_order.h.
+   */
+  emit_text_order_from_kconfig(fp, cfg_conf);
+
+  /* s390 image-base layout discriminator — see proc_config.c. CONFIG_S390=y
+   * with CONFIG_KERNEL_IMAGE_BASE present (value > 0) selects the modern high
+   * separate-kernel-mapping layout; absent (value 0) selects the older
+   * identity-mapped layout. Consumed by s390_image_base_from_config and by the
+   * module-band rules, which read the same answer. */
+  if (is_kconfig_set(fp, "CONFIG_S390")) {
+    unsigned long s390_image_base = get_kconfig_kernel_image_base(fp);
+    kasld_info("CONFIG_KERNEL_IMAGE_BASE: %#lx%s", s390_image_base,
+               s390_image_base ? "" : " (absent: identity-mapped layout)");
+    kasld_emit_scalar(SF_VIRT_KERNEL_IMAGE_BASE, s390_image_base, cfg_conf);
+  }
+
+  fclose(fp);
+
+  return 0;
+}

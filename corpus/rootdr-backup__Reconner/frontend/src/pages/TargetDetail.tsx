@@ -1,0 +1,1585 @@
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useParams, useNavigate } from 'react-router-dom'
+import { targets as targetsApi, findings as findingsApi, tasks as tasksApi, bounty as bountyApi } from '../lib/api'
+import { useUIStore } from '../store/ui'
+import { Badge, Button, Spinner, Empty, CopyButton, ErrorBoundary, SkeletonRows } from '../components/ui'
+import { ScanModal } from '../components/targets/ScanModal'
+import { EvidenceViewer } from '../components/targets/EvidenceViewer'
+import { LiveResults } from '../components/targets/LiveResults'
+import { ws } from '../lib/websocket'
+import { timeAgo, statusCodeColor, truncate, cn } from '../lib/utils'
+import type {
+  Target, Subdomain, HTTPService, JSFile, JSFinding, Parameter,
+  DirectoryFinding, AdminPanelFinding, BackupFinding, OpenRedirectFinding, NucleiFinding, VulnFinding, MonitoringChange, AttackPath, Task, IngramCamera, Asset, BountyScopeEvent, NetworkService
+} from '../types'
+
+const isScannableProjectAsset = (asset: Asset) =>
+	(asset.kind === 'web' && ['domain', 'wildcard', 'url', 'page', 'js', 'api'].includes(asset.asset_type || 'domain')) ||
+	(asset.kind === 'network' && ['ip', 'cidr'].includes(asset.asset_type || 'ip'))
+
+// Projects created from the WP Scanner page carry this tag (see WPScanner.tsx) —
+// the same signal used there to decide this is a WordPress project, reused here
+// to decide this project's detail page should show WordPress-specific tabs.
+const WP_TAG = 'wp-scanner'
+
+// Findings information architecture — a logical hierarchy instead of a flat row
+// of unrelated siblings. Assets = the discovered surface; Vulnerabilities = the
+// working area (Confirmed vs Needs-Review first, then by check type); Activity =
+// change monitoring.
+//
+// This layout is NOT one-size-fits-all: a pure network (IP/CIDR) project never
+// populates the web-crawl tabs (Hosts/Scripts/Parameters/Directories/Admin
+// panels/Open Redirects/JS-Secrets/Exposed Files — nothing in the network
+// pipeline writes to those tables), so showing them is empty clutter, not
+// information. A WordPress project additionally gets its own group for the
+// inventory/enumeration data (plugins, themes, core version, usernames,
+// endpoints) that wp_enum/wp_users/wp_endpoints record — those are confirmed
+// FACTS about the install, not "needs review" vulnerability candidates, so
+// they're pulled out of the generic Vulnerabilities tabs into a dedicated,
+// clearly-labeled place instead of being indistinguishable noise next to a
+// real XSS/SQLi candidate.
+const WEB_ASSET_TABS = [
+  { id: 'subdomains', label: 'Hosts', desc: 'Subdomains discovered for this project, with liveness, IP and page title.' },
+  { id: 'http', label: 'URLs', desc: 'Every HTTP(S) endpoint probed, with status code, title and response size.' },
+  { id: 'js', label: 'Scripts', desc: 'JavaScript files collected from the crawl.' },
+  { id: 'params', label: 'Parameters', desc: 'Request parameters discovered (query, form, JSON body) and whether they reflect.' },
+  { id: 'dirs', label: 'Directories', desc: 'Paths found via directory/content discovery.' },
+  { id: 'admin-panels', label: 'Admin & sensitive panels', desc: 'Login/admin panels and other sensitive management interfaces fingerprinted on the surface.' },
+]
+const VULN_TABS = [
+  { id: 'vulns', label: 'Confirmed', desc: 'Verified exploitable vulnerabilities — each with a reproduction PoC.' },
+  { id: 'candidates', label: 'Needs Review', desc: 'Lower-confidence signals that need a human look before being confirmed or dismissed.' },
+  { id: 'redirects', label: 'Open Redirects', desc: 'Confirmed open-redirect endpoints.' },
+  { id: 'nuclei', label: 'Nuclei', desc: 'Matches from the nuclei template engine (medium severity and up).' },
+  { id: 'js-findings', label: 'JS / Secrets', desc: 'Credentials, API keys and other secrets found in client-side JavaScript.' },
+  { id: 'backups', label: 'Exposed Files', desc: 'Publicly exposed backups, dumps and config files.' },
+]
+const WP_TABS = [
+  { id: 'wp-inventory', label: 'Plugins & Themes', desc: 'Core version, plugins and themes — each confirmed from the site’s own assets/readme, never guessed. Cross-check versions against CVE advisories.' },
+  { id: 'wp-users', label: 'Users', desc: 'Usernames WordPress itself discloses (REST users route, author-archive redirect, oembed) — pre-exploitation recon for targeted login/XML-RPC attacks.' },
+  { id: 'wp-endpoints', label: 'Endpoints', desc: 'Login page, REST API root, admin-ajax and XML-RPC — the surfaces every other WordPress check builds on.' },
+]
+export function tabGroupsFor(isNetwork: boolean, isWordPress: boolean) {
+  if (isNetwork) {
+    return [
+      { group: 'Assets', tabs: [{ id: 'network-services', label: 'Network services', desc: 'Every open port nmap/naabu verified, with service, product/version and banner.' }] },
+      { group: 'Vulnerabilities', tabs: VULN_TABS.filter(t => ['vulns', 'candidates', 'nuclei'].includes(t.id)) },
+      { group: 'Activity', tabs: [{ id: 'monitor', label: 'Changes', desc: 'Changes detected by automated monitoring re-scans.' }] },
+    ]
+  }
+  const groups = [
+    { group: 'Assets', tabs: WEB_ASSET_TABS },
+    ...(isWordPress ? [{ group: 'WordPress', tabs: WP_TABS }] : []),
+    { group: 'Vulnerabilities', tabs: VULN_TABS },
+    { group: 'Activity', tabs: [{ id: 'monitor', label: 'Changes', desc: 'Changes detected by automated monitoring re-scans.' }] },
+  ]
+  return groups
+}
+
+// WordPress inventory/recon facts recorded through the generic finding pipeline
+// (wp_enum/wp_users/wp_endpoints) — confirmed information about the install,
+// not vulnerability candidates, so they're broken out into the WordPress tabs
+// above instead of cluttering Confirmed/Needs Review.
+const WP_INVENTORY_TYPES = new Set(['wordpress_version', 'wordpress_plugin', 'wordpress_theme'])
+const WP_USER_TYPE = 'wordpress_user_enumeration'
+const WP_ENDPOINT_TYPES = new Set(['wordpress_login_panel', 'wordpress_rest_api', 'wordpress_admin_ajax', 'wordpress_xmlrpc_enabled'])
+const WP_NONVULN_TYPES = new Set([...WP_INVENTORY_TYPES, WP_USER_TYPE, ...WP_ENDPOINT_TYPES])
+
+// Rows rendered per page-window before the operator asks for more (item 3:
+// keeps deep-range result sets from mounting tens of thousands of DOM nodes).
+const PAGE = 200
+
+const severityColor: Record<string, string> = {
+  critical: 'text-severity-critical',
+  high: 'text-severity-high',
+  medium: 'text-severity-medium',
+  low: 'text-severity-low',
+  info: 'text-text-muted',
+}
+
+const LIFECYCLE_STYLE: Record<string, string> = {
+  CONFIRMED: 'text-severity-low border-severity-low/30 bg-severity-low/10',
+  VERIFIED: 'text-severity-low border-severity-low/30 bg-severity-low/10',
+  INCONCLUSIVE: 'text-severity-medium border-severity-medium/30 bg-severity-medium/10',
+  REJECTED: 'text-severity-critical border-severity-critical/30 bg-severity-critical/10',
+  DUPLICATE: 'text-text-muted border-white/10 bg-white/5',
+  DETECTED: 'text-text-secondary border-white/10 bg-white/5',
+  LEGACY: 'text-text-muted border-white/10 bg-white/5',
+}
+function LifecycleChip({ lifecycle }: { lifecycle: string }) {
+  const cls = LIFECYCLE_STYLE[lifecycle] || LIFECYCLE_STYLE.LEGACY
+  const label = lifecycle === 'LEGACY' ? 'unverified' : lifecycle.toLowerCase()
+  return (
+    <span className={cn('inline-block mt-0.5 px-1.5 py-0.5 rounded border text-[9px] font-semibold uppercase tracking-wide', cls)}
+      title="Lifecycle state (authoritative candidate state)">{label}</span>
+  )
+}
+
+// TriageBar — the per-finding False-Positive management control (section 3).
+// Records the operator's decision (Confirmed / False Positive / Accepted Risk);
+// a finding marked FP drops out of the working list on the next load.
+const TRIAGE_OPTS: { key: string; label: string; cls: string }[] = [
+  { key: 'confirmed', label: 'Confirm', cls: 'text-severity-low border-severity-low/40 bg-severity-low/10' },
+  { key: 'false_positive', label: 'False Positive', cls: 'text-severity-critical border-severity-critical/40 bg-severity-critical/10' },
+  { key: 'accepted_risk', label: 'Accept Risk', cls: 'text-severity-medium border-severity-medium/40 bg-severity-medium/10' },
+]
+function TriageBar({ targetId, finding, onDone }: { targetId: string; finding: VulnFinding; onDone: () => void }) {
+  const [busy, setBusy] = useState('')
+  const cur = finding.triage || ''
+  const set = async (t: string) => {
+    setBusy(t)
+    try { await findingsApi.setTriage(targetId, finding.id, t); onDone() } catch { /* toast handled globally */ } finally { setBusy('') }
+  }
+  return (
+    <div className="flex flex-wrap gap-1 mt-1.5" title="False-Positive triage">
+      {TRIAGE_OPTS.map(o => (
+        <button key={o.key} disabled={!!busy} onClick={() => set(o.key)}
+          className={cn('px-1.5 py-0.5 rounded border text-[10px] font-semibold transition-colors disabled:opacity-50',
+            cur === o.key ? o.cls : 'border-border text-text-muted hover:text-text-secondary')}>
+          {busy === o.key ? '…' : o.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+// Remediation guidance shown on every finding (section 4). Keyed by vuln type;
+// falls back to a generic message so no confirmed finding is left without advice.
+const REMEDIATION: Record<string, string> = {
+  xss: 'Contextually output-encode all user-controlled data at the sink (HTML/attribute/JS/URL). Prefer framework auto-escaping, add a strict Content-Security-Policy, and set HttpOnly on session cookies.',
+  dom_xss: 'Treat URL, window.name and postMessage data as untrusted. Avoid innerHTML/outerHTML/document.write/eval sinks; use textContent or a proven HTML sanitizer, validate message origins, and enforce a strict Content-Security-Policy.',
+  sqli: 'Use parameterized queries / prepared statements everywhere; never concatenate input into SQL. Apply least-privilege DB accounts and validate input types server-side.',
+  nosqli: 'Reject operator objects ($where/$ne/$regex) from user input; cast query values to the expected scalar type; use an allowlist for query fields.',
+  idor: 'Enforce a server-side authorization (ownership/ACL) check on EVERY object access, keyed to the authenticated principal — never trust the client-supplied object id. Prefer unguessable identifiers.',
+  bola: 'Enforce per-object ownership checks on every read and write; do not rely on the object id being unguessable alone.',
+  bfla: 'Enforce function-level authorization on every state-changing endpoint (roles/permissions), not just on the UI. Deny by default.',
+  ssrf: 'Validate and allowlist outbound destinations; resolve + pin the target IP and block private/link-local/metadata ranges; disable unused URL schemes and follow-redirects to internal hosts.',
+  open_redirect: 'Do not redirect to user-controlled absolute URLs; use a server-side allowlist of paths, or sign/validate the redirect target and force it same-origin.',
+  redirect: 'Use a server-side allowlist for redirect destinations and force same-origin; never reflect a raw user-supplied URL into Location.',
+  lfi: 'Never pass user input to filesystem APIs; use a fixed allowlist of files/ids, canonicalize + confine paths to a base directory, and reject traversal sequences.',
+  ssti: 'Never render user input as a template. Use logic-less templates or a sandboxed engine and pass data as bound variables, not template source.',
+  csti: 'Do not compile or interpolate user-controlled strings as client-side templates. Bind untrusted values as plain text and use framework escaping/sanitization.',
+  cmdi: 'Avoid shelling out with user input; use native APIs or an argument array with no shell, and validate against a strict allowlist.',
+  xxe: 'Disable external entity + DTD processing in the XML parser (FEATURE_SECURE_PROCESSING / disallow-doctype-decl).',
+  jwt: 'Pin the accepted algorithm server-side (reject "none"/alg confusion), verify the signature with a strong secret/key, and validate iss/aud/exp.',
+  crlf: 'Strip/encode CR and LF from any user input that reaches HTTP headers; use the framework header API rather than raw string concatenation.',
+  cache_poison: 'Do not reflect unkeyed request inputs into cacheable responses; include all response-affecting inputs in the cache key or mark responses no-store.',
+  cache_poisoning: 'Do not reflect unkeyed request inputs into shared-cacheable responses; include every response-affecting input in the cache key or mark the response private/no-store.',
+  takeover: 'Remove the dangling DNS record or reclaim the referenced third-party resource; monitor for dangling CNAMEs.',
+  api_data_exposure: 'Require authentication and object/property authorization before returning personal or secret data. Return only allowlisted fields needed by the client, apply no-store/private caching, rotate any exposed credentials, and remove sensitive values from unauthenticated responses.',
+}
+function remediationFor(t: string): string {
+  return REMEDIATION[String(t || '').toLowerCase()] ||
+    'Validate and authorize this request server-side, encode/parameterize untrusted input at every sink, and re-test after the fix.'
+}
+
+// Vuln classes whose vector is a single GET query-parameter — for these we can
+// assemble a one-click reproduction URL (parameter's value replaced by the
+// payload). XSS especially: clicking the link fires the payload in the browser.
+const GET_PARAM_VULNS = new Set([
+  'xss', 'sqli', 'lfi', 'ssti', 'csti', 'cmdi', 'ssrf', 'open_redirect', 'redirect',
+  'nosqli', 'idor', 'path_traversal', 'crlf', 'rfi', 'xxe',
+])
+
+// Some detectors (blind-boolean SQLi) record a compound payload of the form
+// "TRUE=<payload> | FALSE=<payload>" — a differential needs both sides and
+// can't be reproduced by a single GET, so a raw single-value URL param would
+// be nonsense. singleValuePayload extracts the one side that actually
+// demonstrates the anomaly (FALSE) for a one-click PoC; the full compound
+// string is still shown verbatim in the Payload field alongside it.
+export function singleValuePayload(payload: string): string {
+  const m = /^TRUE=(?:.*?) \| FALSE=(.*)$/s.exec(payload)
+  return m ? m[1] : payload
+}
+
+// buildPocUrl injects the payload into `param` on top of the finding's URL and
+// returns the fully-encoded reproduction URL — the exact request that triggered
+// the finding, ready to paste in a browser or curl. Returns null when the finding
+// isn't a GET-param class or the pieces needed to rebuild the request are missing.
+export function buildPocUrl(type: string, rawUrl: string, param?: string, payload?: string): string | null {
+  if (!rawUrl || !param || !payload) return null
+  const value = singleValuePayload(payload)
+  const normalizedType = String(type || '').toLowerCase()
+  if (normalizedType === 'dom_xss') {
+    if (param === 'dom:hash') return `${rawUrl.split('#', 1)[0]}#${value}`
+    if (param.startsWith('dom:') || param.startsWith('path:')) return null
+  } else if (!GET_PARAM_VULNS.has(normalizedType)) return null
+  try {
+    const u = new URL(rawUrl)
+    u.searchParams.set(param, value)
+    return u.toString()
+  } catch {
+    return null
+  }
+}
+
+// pocCurl returns a copy-paste curl one-liner that reproduces the finding.
+function pocCurl(url: string): string {
+  return `curl -sk '${String(url).replace(/'/g, `'\\''`)}'`
+}
+
+// NucleiAffected expands a collapsed nuclei finding into EVERY URL that template
+// matched, each with its own PoC (curl + raw request/response) — so the other
+// hits behind an "×N" badge are visible in the UI with proof, not only in the log.
+type AffectedRow = { matched_url: string; curl_command: string; request: string; response: string; created_at: string }
+function NucleiAffected({ targetId, templateId, count }: { targetId: string; templateId: string; count: number }) {
+  const [open, setOpen] = useState(false)
+  const [rows, setRows] = useState<AffectedRow[] | null>(null)
+  const [loading, setLoading] = useState(false)
+  const toggle = () => {
+    const next = !open
+    setOpen(next)
+    if (next && rows === null) {
+      setLoading(true)
+      findingsApi.nucleiAffected(targetId, templateId).then(setRows).catch(() => setRows([])).finally(() => setLoading(false))
+    }
+  }
+  return (
+    <div className="mt-0.5">
+      <button onClick={toggle} className="text-[10px] text-accent hover:underline select-none">
+        {open ? '▾' : '▸'} {count} matched URL(s) — show all with PoC
+      </button>
+      {open && (
+        <div className="mt-1 space-y-1.5 max-h-80 overflow-auto pr-1">
+          {loading && <p className="text-[10px] text-text-muted">Loading…</p>}
+          {rows?.map((a, i) => (
+            <div key={i} className="border-l border-white/10 pl-2">
+              <div className="flex items-start gap-1">
+                <a href={a.matched_url} target="_blank" rel="noreferrer"
+                  className="flex-1 font-mono text-[10px] text-accent break-all hover:underline">{a.matched_url}</a>
+                <CopyButton text={a.matched_url} />
+              </div>
+              {a.curl_command && (
+                <details className="mt-0.5">
+                  <summary className="cursor-pointer text-[10px] text-text-muted hover:text-text-secondary select-none">PoC</summary>
+                  <div className="flex items-start gap-1 mt-0.5">
+                    <pre className="flex-1 font-mono text-[10px] text-severity-medium whitespace-pre-wrap break-all bg-bg-secondary/50 p-1 rounded max-h-32 overflow-auto">{a.curl_command}</pre>
+                    <CopyButton text={a.curl_command} />
+                  </div>
+                  {(a.request || a.response) && (
+                    <details className="mt-0.5">
+                      <summary className="cursor-pointer text-[10px] text-text-muted select-none">Raw request/response</summary>
+                      {a.request && <pre className="mt-0.5 font-mono text-[10px] text-text-secondary whitespace-pre-wrap break-all bg-bg-secondary/50 p-1 rounded max-h-40 overflow-auto">{a.request}</pre>}
+                      {a.response && <pre className="mt-0.5 font-mono text-[10px] text-text-muted whitespace-pre-wrap break-all bg-bg-secondary/50 p-1 rounded max-h-40 overflow-auto">{a.response}</pre>}
+                    </details>
+                  )}
+                </details>
+              )}
+            </div>
+          ))}
+          {rows && rows.length === 0 && !loading && <p className="text-[10px] text-text-muted">No details stored.</p>}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function PanelAffected({ panel }: { panel: AdminPanelFinding }) {
+  const [open, setOpen] = useState(false)
+  const urls = panel.affected_urls || [panel.url]
+  return (
+    <div className="mt-1">
+      <button onClick={() => setOpen(v => !v)} className="text-[10px] text-accent hover:underline select-none">
+        {open ? '▾' : '▸'} {panel.affected_count || urls.length} matching panel URL(s)
+      </button>
+      {open && (
+        <div className="mt-1 space-y-1 max-h-64 overflow-auto pr-1">
+          {urls.map(u => (
+            <div key={u} className="flex items-start gap-1 border-l border-white/10 pl-2">
+              <a href={u} target="_blank" rel="noreferrer" className="flex-1 font-mono text-[10px] text-accent break-all hover:underline">{u}</a>
+              <CopyButton text={u} />
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ScreenshotThumb renders a small clickable preview for a captured browser
+// screenshot (admin panel, or a confirmed high-value finding like XSS with
+// real execution proof). Renders nothing when no screenshot was captured —
+// most findings never trigger a capture, so an empty state would be noise
+// repeated on every row.
+function ScreenshotThumb({ screenshotId }: { screenshotId?: string }) {
+  if (!screenshotId) return null
+  const src = `/screenshots/${screenshotId}`
+  return (
+    <a href={src} target="_blank" rel="noreferrer" className="block mt-1.5 w-28 border border-border rounded overflow-hidden bg-black hover:opacity-90 transition-opacity">
+      <img src={src} alt="screenshot" loading="lazy" className="w-full h-20 object-cover object-top" />
+    </a>
+  )
+}
+
+// groupVulnFindings collapses findings that are the SAME underlying issue
+// repeated across many URLs — the dominant clutter pattern for a systemic bug
+// (Host Header Injection) that a differential engine correctly re-confirms on
+// every endpoint of a host, since the root cause (how the app/proxy handles
+// that input) is host-wide, not per-URL. Only HOST_WIDE_VULN_TYPES collapse
+// across different URLs on the same host+parameter — everything else (SQLi,
+// XSS, SSRF, IDOR, ...) requires the exact same URL to group, since those
+// classes are frequently endpoint-specific: two different SQLi bugs on
+// /api/users?id= and /api/products?id= share a type and parameter name but
+// are NOT the same root cause, and must never read as "same issue, ignore
+// the second one" duplicates. All members stay reachable via the row's
+// expandable list either way, so no finding is hidden — only de-duplicated
+// visually, mirroring how nuclei's template-id grouping already works
+// elsewhere on this page.
+const HOST_WIDE_VULN_TYPES = new Set(['host_header_injection'])
+interface VulnGroup {
+  key: string
+  type: string
+  host: string
+  parameter: string
+  representative: VulnFinding
+  members: VulnFinding[]
+}
+function hostOfURL(raw: string): string {
+  try { return new URL(raw).host || raw } catch { return raw }
+}
+function groupVulnFindings(rows: VulnFinding[]): VulnGroup[] {
+  const order: string[] = []
+  const groups = new Map<string, VulnGroup>()
+  for (const v of rows) {
+    const scope = HOST_WIDE_VULN_TYPES.has(v.type) ? hostOfURL(v.url) : v.url
+    const key = `${v.type}\u0000${scope}\u0000${v.parameter || ''}`
+    let g = groups.get(key)
+    if (!g) {
+      g = { key, type: v.type, host: hostOfURL(v.url), parameter: v.parameter, representative: v, members: [] }
+      groups.set(key, g)
+      order.push(key)
+    }
+    g.members.push(v)
+    // Prefer a finding-status/higher-confidence member as the representative
+    // shown by default, so a confirmed instance isn't hidden behind a weaker one.
+    const better = (a: VulnFinding, b: VulnFinding) =>
+      (a.status === 'finding' ? 1 : 0) !== (b.status === 'finding' ? 1 : 0)
+        ? (a.status === 'finding' ? a : b)
+        : (a.confidence ?? 0) >= (b.confidence ?? 0) ? a : b
+    g.representative = better(g.representative, v)
+  }
+  return order.map(k => groups.get(k)!)
+}
+
+// VulnGroupMember renders one collapsed group's full member list, each with its
+// own link, evidence/PoC and independent triage controls — nothing about an
+// individual finding is lost by the grouping, it's just not shown by default.
+function VulnGroupMember({ targetId, v, onDone }: { targetId: string; v: VulnFinding; onDone: () => void }) {
+  const pocUrl = buildPocUrl(v.type, v.url, v.parameter, v.payload)
+  const reproUrl = pocUrl || v.url
+  return (
+    <div className="border-l border-white/10 pl-2 py-1">
+      <div className="flex items-start gap-1">
+        <a href={v.url} target="_blank" rel="noreferrer" className="flex-1 font-mono text-[10px] text-accent break-all hover:underline">{v.url}</a>
+        <CopyButton text={v.url} />
+      </div>
+      {pocUrl && (
+        <div className="flex items-center gap-1 mt-0.5">
+          <a href={pocUrl} target="_blank" rel="noreferrer" className="text-severity-high hover:underline text-[10px] font-mono font-semibold">Open PoC ↗</a>
+          <CopyButton text={pocUrl} />
+        </div>
+      )}
+      {v.evidence && (
+        <p className="text-[10px] text-text-muted mt-0.5" title={v.evidence}>{truncate(v.evidence, 100)}</p>
+      )}
+      <ScreenshotThumb screenshotId={v.screenshot_id} />
+      <details className="mt-0.5">
+        <summary className="cursor-pointer text-[10px] text-text-muted hover:text-text-secondary select-none">curl</summary>
+        <div className="flex items-start gap-1 mt-0.5">
+          <pre className="flex-1 font-mono text-[10px] text-text-secondary whitespace-pre-wrap break-all bg-bg-secondary/50 p-1 rounded">{pocCurl(reproUrl)}</pre>
+          <CopyButton text={pocCurl(reproUrl)} />
+        </div>
+      </details>
+      <TriageBar targetId={targetId} finding={v} onDone={onDone} />
+    </div>
+  )
+}
+
+function VulnGroupAffected({ targetId, group, onDone }: { targetId: string; group: VulnGroup; onDone: () => void }) {
+  const [open, setOpen] = useState(false)
+  const others = group.members.filter(m => m.id !== group.representative.id)
+  if (others.length === 0) return null
+  return (
+    <div className="mt-1">
+      <button onClick={() => setOpen(v => !v)} className="text-[10px] text-accent hover:underline select-none">
+        {open ? '▾' : '▸'} {others.length} more affected URL{others.length === 1 ? '' : 's'} — same root cause
+      </button>
+      {open && (
+        <div className="mt-1 space-y-1 max-h-80 overflow-auto pr-1">
+          {others.map(m => <VulnGroupMember key={m.id} targetId={targetId} v={m} onDone={onDone} />)}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ReportMenu — the single report entry point. The primary click opens the full
+// HTML report; the caret reveals the other export formats (Markdown, PDF) so the
+// action bar carries one button instead of three competing ones.
+function ReportMenu({ targetId }: { targetId: string }) {
+  const [open, setOpen] = useState(false)
+  useEffect(() => {
+    if (!open) return
+    const close = () => setOpen(false)
+    window.addEventListener('click', close)
+    return () => window.removeEventListener('click', close)
+  }, [open])
+  const base = `/api/targets/${targetId}`
+  const item = 'block px-3 py-2 text-xs text-text-secondary hover:text-text-primary hover:bg-white/5 transition-colors'
+  return (
+    <div className="relative" onClick={e => e.stopPropagation()}>
+      <div className="flex items-stretch">
+        <a href={`${base}/report.html`} target="_blank" rel="noreferrer"
+          className="btn-secondary text-sm rounded-r-none">Report</a>
+        <button onClick={() => setOpen(o => !o)} aria-label="Report export formats" title="Export formats"
+          className="btn-secondary text-sm px-2 rounded-l-none border-l border-black/30">▾</button>
+      </div>
+      {open && (
+        <div className="absolute right-0 mt-1 z-30 w-48 rounded-lg border border-border bg-surface-3 shadow-2xl overflow-hidden animate-fade-in">
+          <a href={`${base}/report.html`} target="_blank" rel="noreferrer" className={item}>Full report — HTML</a>
+          <a href={`${base}/report`} target="_blank" rel="noreferrer" className={item}>Export — Markdown</a>
+          <a href={`${base}/report.pdf`} target="_blank" rel="noreferrer" className={item}>Export — PDF</a>
+          <a href={`${base}/artifacts.zip`} className={item}>Download scan bundle — ZIP</a>
+        </div>
+      )}
+    </div>
+  )
+}
+
+export default function TargetDetail() {
+  const { id } = useParams<{ id: string }>()
+  const navigate = useNavigate()
+  const { addToast } = useUIStore()
+  const [target, setTarget] = useState<Target | null>(null)
+  const [tab, setTab] = useState('subdomains')
+  const [fpView, setFpView] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [tabLoading, setTabLoading] = useState(false)
+  const [data, setData] = useState<unknown[]>([])
+  // Deep IP-range scans can write thousands of rows to a single tab. Mounting
+  // every <tr> at once froze the page and blew out the layout, so we render an
+  // incremental window (PAGE at a time) and let the operator pull more on demand.
+  const [visibleCount, setVisibleCount] = useState(PAGE)
+  const [sort, setSort] = useState<{ key: 'size' | 'status' | 'severity' | null; dir: 'asc' | 'desc' }>({ key: null, dir: 'desc' })
+  // Status-class filter for the URLs tab: 'all' | '2' | '3' | '4' | '5' (2xx…5xx).
+  const [statusClass, setStatusClass] = useState<'all' | '2' | '3' | '4' | '5'>('all')
+  const [scanOpen, setScanOpen] = useState(false)
+  const [assets, setAssets] = useState<Asset[]>([])
+  const [scanAsset, setScanAsset] = useState<Asset | null>(null)
+  const [newAsset, setNewAsset] = useState('')
+  const [newAssetType, setNewAssetType] = useState('auto')
+  const [assetBusy, setAssetBusy] = useState(false)
+  const [scopeEvents, setScopeEvents] = useState<BountyScopeEvent[]>([])
+  const [eventBusy, setEventBusy] = useState<string | null>(null)
+  const [evidence, setEvidence] = useState<{ id: string; url: string; type: string } | null>(null)
+  const [isScanning, setIsScanning] = useState(false)
+  const [monitorSaving, setMonitorSaving] = useState(false)
+  const [paths, setPaths] = useState<AttackPath[]>([])
+  const [lastFailedTask, setLastFailedTask] = useState<Task | null>(null)
+  const [resuming, setResuming] = useState(false)
+  const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const findingRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    if (!id) return
+    targetsApi.get(id).then(t => {
+      setTarget(t)
+      setIsScanning(t.scan_status === 'running')
+      // Network/WordPress targets never populate the default 'subdomains' tab —
+      // land on the tab that actually carries their results.
+			if (t.kind === 'network') setTab('network-services')
+			else if ((t.tags || []).includes(WP_TAG)) setTab('wp-inventory')
+    }).catch(() => navigate('/targets')).finally(() => setLoading(false))
+    targetsApi.graph(id).then(g => setPaths(g.attack_paths || [])).catch(() => {})
+    loadAssets()
+    bountyApi.events(id).then(e => setScopeEvents(e || [])).catch(() => {})
+  }, [id])
+
+  const loadAssets = () => { if (id) targetsApi.assets(id).then(a => setAssets(a || [])).catch(() => {}) }
+  const addAsset = async () => {
+    const v = newAsset.trim()
+    if (!v || !id) return
+    setAssetBusy(true)
+    try { await targetsApi.addAsset(id, v, '', newAssetType === 'auto' ? undefined : newAssetType); setNewAsset(''); loadAssets(); addToast('success', 'Asset added') }
+    catch (e) { addToast('error', e instanceof Error ? e.message : 'Failed to add asset') }
+    finally { setAssetBusy(false) }
+  }
+
+  const resolveScopeEvent = async (event: BountyScopeEvent, decision: 'approve' | 'reject') => {
+    if (!id) return
+    setEventBusy(event.id)
+    try {
+      await bountyApi.resolveEvent(id, event.id, decision)
+      setScopeEvents(prev => prev.map(e => e.id === event.id ? { ...e, status: decision === 'approve' ? 'approved' : 'rejected' } : e))
+      loadAssets()
+      addToast('success', decision === 'approve' ? 'Scope change approved' : 'Scope change dismissed')
+    } catch (e) { addToast('error', e instanceof Error ? e.message : 'Could not resolve scope change') }
+    finally { setEventBusy(null) }
+  }
+  const removeAsset = async (a: Asset) => {
+    if (!id) return
+    try { await targetsApi.deleteAsset(id, a.id); loadAssets() } catch { addToast('error', 'Failed to delete asset') }
+  }
+  const renameAsset = async (a: Asset) => {
+    if (!id) return
+    const name = window.prompt('Asset name', a.name || '')
+    if (name === null) return
+    try { await targetsApi.updateAsset(id, a.id, { name }); loadAssets() } catch { addToast('error', 'Failed to rename') }
+  }
+
+  // A "failed" scan_status alone doesn't say WHY — the reason (e.g. a
+  // watchdog timeout on a large target) lives on the task row, not the
+  // target, and was previously never surfaced here at all.
+  useEffect(() => {
+    if (!id || target?.scan_status !== 'failed') { setLastFailedTask(null); return }
+    tasksApi.list({ target_id: id, limit: '1' })
+      .then(rows => setLastFailedTask(rows?.[0] || null))
+      .catch(() => {})
+  }, [id, target?.scan_status])
+
+  const canResumeLastTask = lastFailedTask &&
+    (lastFailedTask.status === 'failed' || lastFailedTask.status === 'cancelled') &&
+    (lastFailedTask.total || 0) > (lastFailedTask.completed_modules?.length || 0)
+
+  const resumeLastTask = async () => {
+    if (!lastFailedTask) return
+    setResuming(true)
+    try {
+      const newTask = await tasksApi.resume(lastFailedTask.id)
+      addToast('success', `Resumed — ${newTask.modules.length} module(s) remaining`)
+      setIsScanning(true)
+    } catch (e: unknown) {
+      addToast('error', e instanceof Error ? e.message : 'Failed to resume')
+    } finally {
+      setResuming(false)
+    }
+  }
+
+  // Auto-refresh tab data when a module finishes during a scan
+  useEffect(() => {
+    return ws.on('task_progress', (payload) => {
+      const p = payload as { target_id: string; current_module: string }
+      if (p.target_id !== id) return
+      // Reload the tab that just had data written to it
+      const moduleToTab: Record<string, string> = {
+        subdomain_enum: 'subdomains',
+        http_probe: 'http',
+        js_analysis: 'js',
+        param_discovery: 'params',
+        param_reflection: 'params',
+        dir_discovery: 'dirs',
+        backup_discovery: 'backups',
+        api_data_exposure: 'vulns',
+        open_redirect: 'redirects',
+        nuclei: 'nuclei',
+        vuln_scan: 'vulns',
+        monitor: 'monitor',
+        wp_enum: 'wp-inventory',
+        wp_users: 'wp-users',
+        wp_endpoints: 'wp-endpoints',
+        wp_config: 'vulns',
+        wp_backups: 'vulns',
+        wp_misconfig: 'vulns',
+        wp_credaudit: 'vulns',
+        wp_vulns: 'nuclei',
+        network: 'network-services',
+        network_nuclei_only: 'nuclei',
+        network_initial_access: 'vulns',
+      }
+      const targetTab = moduleToTab[p.current_module]
+      if (targetTab && targetTab === tab) {
+        // Only refresh current tab if it matches the module that just ran
+        if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current)
+        refreshTimerRef.current = setTimeout(() => {
+          loadTab(tab)
+          targetsApi.get(id!).then(t => { setTarget(t); setIsScanning(t.scan_status === 'running') }).catch(() => {})
+        }, 3000)
+      }
+    })
+  }, [id, tab])
+
+  // Findings must appear the instant a detector confirms them, not only when a
+  // module happens to finish — a prioritized scan can spend a long time inside
+  // one module group (running it asset by asset), so waiting for task_progress
+  // would leave the vulns tab stale for the whole phase. Every detector already
+  // broadcasts new_vuln_finding the moment it records a finding; debounce-reload
+  // so a burst of findings coalesces into one reload instead of one per finding.
+  useEffect(() => {
+    if (tab !== 'vulns' && tab !== 'candidates') return
+    return ws.on('new_vuln_finding', (payload) => {
+      const p = payload as { target_id: string }
+      if (p.target_id !== id) return
+      if (findingRefreshTimerRef.current) clearTimeout(findingRefreshTimerRef.current)
+      findingRefreshTimerRef.current = setTimeout(() => loadTab(tab), 1200)
+    })
+  }, [id, tab])
+
+  // Detect scan start/finish
+  useEffect(() => {
+    const unsubs = [
+      ws.on('task_started', (p) => { const ev = p as { target_id: string }; if (ev.target_id === id) setIsScanning(true) }),
+      ws.on('task_finished', (p) => {
+        const ev = p as { target_id: string }
+        if (ev.target_id !== id) return
+        setIsScanning(false)
+        loadTab(tab)
+        targetsApi.get(id!).then(setTarget).catch(() => {})
+      }),
+      ws.on('task_cancelled', () => setIsScanning(false)),
+    ]
+    return () => unsubs.forEach(u => u())
+  }, [id, tab])
+
+  useEffect(() => { if (id) loadTab(tab) }, [tab, id, fpView])
+
+  // Client-side sort of the loaded rows by response size or status code. Works
+  // on any tab: reads the first present numeric field, so tabs without size/
+  // status are simply unaffected. Lets you manage high-volume result sets.
+  const numOf = (item: unknown, keys: string[]): number => {
+    const o = item as Record<string, unknown>
+    for (const k of keys) if (typeof o?.[k] === 'number') return o[k] as number
+    return 0
+  }
+  // critical → high → medium → low → info, so "desc" reads as most-severe-first
+  // (the usual triage order) and "asc" flips to low→high per your request.
+  const severityRank: Record<string, number> = { critical: 4, high: 3, medium: 2, low: 1, info: 0 }
+  const applySort = (key: 'size' | 'status' | 'severity') => {
+    const dir: 'asc' | 'desc' = sort.key === key && sort.dir === 'desc' ? 'asc' : 'desc'
+    setSort({ key, dir })
+    const get = key === 'size'
+      ? (i: unknown) => numOf(i, ['content_length', 'size', 'contentLength'])
+      : key === 'status'
+      ? (i: unknown) => numOf(i, ['status_code', 'status', 'statusCode'])
+      : (i: unknown) => severityRank[String((i as Record<string, unknown>)?.severity || '').toLowerCase()] ?? -1
+    setData(prev => [...prev].sort((a, b) => dir === 'desc' ? get(b) - get(a) : get(a) - get(b)))
+  }
+  const isSeverityTab = tab === 'nuclei' || tab === 'vulns' || tab === 'candidates'
+
+  // URLs (http) tab: optional filter by HTTP status class (2xx…5xx) before windowing.
+  const filteredData = (tab === 'http' && statusClass !== 'all')
+    ? data.filter(row => {
+        const code = Number((row as { status_code?: number })?.status_code || 0)
+        return Math.floor(code / 100) === Number(statusClass)
+      })
+    : data
+  // Windowed view of the loaded rows — only the first `visibleCount` are mounted.
+  const pageData = filteredData.slice(0, visibleCount)
+  const hasMore = filteredData.length > visibleCount
+
+  // vulns/candidates: group same-root-cause findings (a host-wide issue like
+  // Host Header Injection re-confirmed on every URL) before windowing, so the
+  // "N loaded" footer and pagination both count DISTINCT issues, not raw rows.
+  // NOTE: this useMemo (and everything above computed from plain state) must
+  // stay ABOVE the `if (loading) return …` / `if (!target) return null`
+  // guards further down — those guards mean this component's render bails
+  // out early on some renders, and a hook declared after them would then be
+  // called on some renders but not others, which is exactly React's "Rendered
+  // more hooks than during the previous render" invariant (crashed the whole
+  // page in production the moment the target finished loading).
+  const isVulnTab = tab === 'vulns' || tab === 'candidates'
+  const vulnGroups = useMemo(
+    () => (isVulnTab ? groupVulnFindings(filteredData as VulnFinding[]) : []),
+    [isVulnTab, filteredData]
+  )
+  const vulnGroupPage = vulnGroups.slice(0, visibleCount)
+  const footerShownCount = isVulnTab ? vulnGroupPage.length : pageData.length
+  const footerTotalCount = isVulnTab ? vulnGroups.length : filteredData.length
+  const footerHasMore = isVulnTab ? vulnGroups.length > visibleCount : hasMore
+
+  const loadTab = async (t: string) => {
+    if (!id) return
+    setTabLoading(true)
+    try {
+      let r: unknown[] = []
+      if (t === 'subdomains') r = await findingsApi.subdomains(id)
+      else if (t === 'http') r = await findingsApi.httpServices(id)
+      else if (t === 'js') r = await findingsApi.jsFiles(id)
+      else if (t === 'js-findings') r = await findingsApi.jsFindings(id)
+      else if (t === 'params') r = await findingsApi.parameters(id, false)
+      else if (t === 'dirs') r = await findingsApi.directoryFindings(id)
+      else if (t === 'admin-panels') r = await findingsApi.adminPanels(id)
+			else if (t === 'network-services') r = await targetsApi.networkServices(id)
+      else if (t === 'backups') r = await findingsApi.backupFindings(id)
+      else if (t === 'redirects') r = await findingsApi.openRedirects(id)
+      else if (t === 'nuclei') r = await findingsApi.nucleiFindings(id)
+      else if (t === 'vulns' || t === 'candidates') {
+        r = t === 'vulns'
+          ? (fpView ? await findingsApi.vulnFindings(id, 'all', 'false_positive') : await findingsApi.vulnFindings(id, 'finding'))
+          : await findingsApi.vulnFindings(id, 'candidate')
+        // On a WordPress project, wp_enum/wp_users/wp_endpoints' confirmed
+        // inventory facts (plugin present, username recovered, endpoint
+        // reachable) have their own dedicated tabs below — keep them out of
+        // the generic Confirmed/Needs Review lists so those stay what their
+        // names say: actual vulnerabilities, not install inventory.
+        if ((target?.tags || []).includes(WP_TAG)) {
+          r = (r as VulnFinding[]).filter(f => !WP_NONVULN_TYPES.has(f.type))
+        }
+      }
+      else if (t === 'wp-inventory' || t === 'wp-users' || t === 'wp-endpoints') {
+        const all = await findingsApi.vulnFindings(id, 'all') as VulnFinding[]
+        const want = t === 'wp-inventory' ? WP_INVENTORY_TYPES : t === 'wp-users' ? new Set([WP_USER_TYPE]) : WP_ENDPOINT_TYPES
+        r = all.filter(f => want.has(f.type))
+      }
+      else if (t === 'cameras') r = await findingsApi.ingram(id)
+      else if (t === 'monitor') r = await findingsApi.monitoringChanges(id)
+      setData(r || [])
+      setVisibleCount(PAGE)
+    } catch { setData([]) }
+    setTabLoading(false)
+  }
+
+  if (loading) return <div className="flex items-center justify-center h-64"><Spinner /></div>
+  if (!target) return null
+
+  const dot: Record<string, string> = {
+    idle: 'bg-text-muted',
+    running: 'bg-accent animate-pulse',
+    paused: 'bg-severity-medium',
+    finished: 'bg-severity-low',
+    failed: 'bg-severity-critical',
+  }
+
+  const pauseScan = async () => {
+    if (!id) return
+    try {
+      await targetsApi.pauseScan(id)
+      setTarget(t => t ? { ...t, scan_status: 'paused' } : t)
+    } catch (e) { console.error(e) }
+  }
+  const resumeScan = async () => {
+    if (!id) return
+    try {
+      await targetsApi.resumeScan(id)
+      setTarget(t => t ? { ...t, scan_status: 'running' } : t)
+    } catch (e) { console.error(e) }
+  }
+  const skipPhase = async () => {
+    if (!id) return
+    try {
+      await targetsApi.skipPhase(id)
+      addToast('success', 'Skipping current phase — continuing to the next.')
+    } catch (e: any) { addToast('error', e?.message || 'Nothing to skip right now') }
+  }
+  const cancelScan = async () => {
+    if (!id) return
+    if (!confirm('Cancel the entire scan? All remaining phases stop. Findings already saved are kept.')) return
+    try {
+      await targetsApi.cancelScan(id)
+      setTarget(t => t ? { ...t, scan_status: 'idle' } : t)
+      addToast('success', 'Scan cancelled.')
+    } catch (e: any) { addToast('error', e?.message || 'Could not cancel') }
+  }
+
+  const saveMonitor = async (enabled: boolean, hours: number) => {
+    if (!id) return
+    setMonitorSaving(true)
+    try {
+      await targetsApi.updateMonitor(id, enabled, hours)
+      setTarget(prev => prev ? { ...prev, monitor_enabled: enabled, monitor_interval_hours: hours } : prev)
+    } catch { /* ignore */ } finally { setMonitorSaving(false) }
+  }
+
+  // Network targets' actual results (Nuclei/Vulns/Candidates) used to sit
+  // BELOW monitoring settings, attack paths, the auth-header form and the
+  // identities/authorization panels — none of which are commonly used for a
+  // network scope, so reaching results meant scrolling past all of it every
+  // time. CSS order (not a JSX reshuffle, to keep this low-risk) puts the
+  // results block right after Network Services for network targets only; web
+  // targets keep their original order untouched.
+  const isNetwork = target.kind === 'network'
+  const isWordPress = (target.tags || []).includes(WP_TAG)
+  // Not a hook — a plain derived value computed fresh each render, so it's
+  // safe to live after the loading/!target early-return guards above.
+  const tabGroups = tabGroupsFor(isNetwork, isWordPress)
+
+  return (
+    <ErrorBoundary>
+    <div className={cn('space-y-5', isNetwork && 'flex flex-col')}>
+      <section className="card overflow-visible">
+        <div className="relative rounded-t-lg border-b border-border px-4 py-4 sm:px-5">
+          <div className="pointer-events-none absolute inset-0 bg-gradient-to-r from-accent/[.09] via-transparent to-transparent" aria-hidden />
+          <div className="relative flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+            <div className="min-w-0 flex-1">
+              <button onClick={() => navigate('/targets')} className="mb-2 text-[10px] font-semibold uppercase tracking-[.16em] text-text-muted transition-colors hover:text-accent">← Project fleet</button>
+              <div className="flex min-w-0 flex-wrap items-center gap-2.5">
+                <span className={cn('h-2.5 w-2.5 shrink-0 rounded-full', dot[target.scan_status] || 'bg-text-muted')} />
+                {/* A network target's domain may contain thousands of hosts. Keep the
+                    control deck stable and expose the complete scope in the tooltip. */}
+                <h1 className="min-w-0 max-w-[36ch] truncate text-xl font-semibold tracking-tight md:max-w-[52ch]" title={target.domain}>
+                  {target.name || target.domain}
+                </h1>
+                <span className="badge-neutral uppercase">{target.scan_status}</span>
+                {target.priority !== 'medium' && (
+                  <Badge variant={target.priority === 'critical' ? 'critical' : target.priority === 'high' ? 'high' : 'low'}>
+                    {target.priority}
+                  </Badge>
+                )}
+                {target.monitor_enabled && <span className="badge-low">Automated</span>}
+              </div>
+              {target.name && <p className="mt-1.5 max-w-3xl truncate font-mono text-[11px] text-text-muted" title={target.domain}>{target.domain}</p>}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 xl:justify-end">
+              <ReportMenu targetId={id!} />
+              {target.scan_status === 'running' && <button onClick={pauseScan} className="btn-secondary text-sm">Pause</button>}
+              {target.scan_status === 'running' && (
+                <button onClick={skipPhase} className="btn-secondary text-sm text-severity-medium" title="Force-stop the current phase and continue with the next one">Skip phase</button>
+              )}
+              {target.scan_status === 'paused' && <button onClick={resumeScan} className="btn-secondary text-sm text-severity-medium">Resume</button>}
+              {(target.scan_status === 'running' || target.scan_status === 'paused') && (
+                <button onClick={cancelScan} className="btn-danger text-sm" title="Stop the entire scan and every remaining phase">Cancel</button>
+              )}
+              <button onClick={() => setScanOpen(true)} className="btn-primary text-sm">Start scan</button>
+            </div>
+          </div>
+        </div>
+
+        <dl className="grid grid-cols-2 divide-x divide-y divide-border sm:grid-cols-3 lg:grid-cols-6 lg:divide-y-0">
+          {[
+            { label: 'Subdomains', value: target.subdomain_count },
+            { label: 'Alive surface', value: target.alive_host_count, color: 'text-severity-low' },
+            { label: 'Verified findings', value: target.finding_count, color: target.finding_count > 0 ? 'text-severity-high' : undefined },
+            { label: 'Automation', value: target.monitor_enabled ? `Every ${target.monitor_interval_hours || 12}h` : 'Manual' },
+            { label: 'Last scan', value: target.last_scan_at ? timeAgo(target.last_scan_at) : 'Never' },
+            { label: 'Asset type', value: target.kind || 'web' },
+          ].map(metric => (
+            <div key={metric.label} className="min-w-0 px-4 py-3.5">
+              <dt className="text-[9px] font-semibold uppercase tracking-[.14em] text-text-muted">{metric.label}</dt>
+              <dd className={cn('mt-1 truncate text-sm font-semibold tabular-nums text-text-primary', metric.color)} title={String(metric.value)}>{metric.value}</dd>
+            </div>
+          ))}
+        </dl>
+      </section>
+
+	  {scopeEvents.some(e => e.status === 'pending') && (
+		<div className="card border-severity-medium/30 overflow-hidden">
+		  <div className="px-4 py-3 border-b border-border bg-severity-medium/[.06]">
+			<p className="text-sm font-semibold">Program scope changes need review</p>
+			<p className="mt-0.5 text-[11px] text-text-muted">Added assets stay unscanned until approved. Removed assets were suspended immediately.</p>
+		  </div>
+		  <div className="divide-y divide-white/[.05]">
+			{scopeEvents.filter(e => e.status === 'pending').map(e => (
+			  <div key={e.id} className="flex flex-col sm:flex-row sm:items-center gap-3 px-4 py-3">
+				<div className="min-w-0 flex-1"><div className="flex items-center gap-2"><Badge variant={e.event_type === 'removed' ? 'critical' : e.event_type === 'added' ? 'low' : 'medium'}>{e.event_type}</Badge><code className="text-[11px] break-all">{e.identifier}</code></div><p className="mt-1 text-[10px] text-text-muted">Detected {timeAgo(e.detected_at)}</p></div>
+				<div className="flex gap-2 self-end sm:self-auto"><Button size="sm" variant="ghost" disabled={eventBusy === e.id} onClick={() => resolveScopeEvent(e,'reject')}>Dismiss</Button><Button size="sm" loading={eventBusy === e.id} onClick={() => resolveScopeEvent(e,'approve')}>{e.event_type === 'removed' ? 'Keep suspended' : 'Approve asset'}</Button></div>
+			  </div>
+			))}
+		  </div>
+		</div>
+	  )}
+
+      {target.scan_status === 'failed' && lastFailedTask?.error && (
+        <div className="px-4 py-2.5 rounded-lg bg-severity-critical/10 border border-severity-critical/30 text-xs text-severity-critical flex items-center gap-3">
+          <span><span className="font-semibold">Last scan failed: </span>{lastFailedTask.error}</span>
+          {canResumeLastTask && (
+            <button onClick={resumeLastTask} disabled={resuming}
+              className="ml-auto shrink-0 btn-secondary text-[11px] whitespace-nowrap disabled:opacity-50">
+              {resuming ? 'Resuming…' : 'Resume remaining'}
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Assets — scan each one individually, add / remove / name them. */}
+      <div className="card p-4">
+        <div className="flex items-center justify-between mb-3">
+          <p className="text-[11px] font-semibold uppercase tracking-wider text-text-muted">
+            Assets <span className="normal-case text-text-muted/70">— scanned individually</span>
+          </p>
+          <span className="text-[10px] text-text-muted">{assets.length}</span>
+        </div>
+		<div className="flex flex-col sm:flex-row gap-2 mb-3">
+		  <select value={newAssetType} onChange={e => setNewAssetType(e.target.value)} className="bg-surface-alt border border-border rounded px-2 py-1.5 text-xs text-text-primary sm:w-32">
+			{[['auto','Auto type'],['domain','Domain'],['url','URL / page'],['js','JavaScript'],['api','API'],['wildcard','Wildcard'],['ip','IP / range'],['cidr','CIDR'],['source_code','Source code'],['other','Other']].map(([v,l]) => <option key={v} value={v} className="bg-surface-3">{l}</option>)}
+		  </select>
+          <input value={newAsset} onChange={e => setNewAsset(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') addAsset() }}
+			placeholder="domain, URL, IP, CIDR, or IP range"
+            className="flex-1 bg-surface-alt border border-border rounded px-2 py-1.5 text-xs font-mono" />
+          <Button size="sm" variant="secondary" loading={assetBusy} onClick={addAsset}>Add</Button>
+        </div>
+        {assets.length === 0 ? (
+          <p className="text-xs text-text-muted py-2">No assets yet — add one above, or they’re seeded from the target’s scope on creation.</p>
+        ) : (
+          <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
+            {assets.map(a => (
+              <div key={a.id} className="flex items-center gap-2 px-2 py-1.5 rounded-lg bg-white/[.02] border border-white/[.05] flex-wrap sm:flex-nowrap">
+				<span className={cn('text-[9px] px-1.5 py-0.5 rounded font-semibold uppercase shrink-0',
+                  a.kind === 'network' ? 'bg-series-3/15 text-series-3' : a.kind === 'mixed' ? 'bg-severity-low/15 text-severity-low' : 'bg-accent-muted text-accent-hover')}>{a.kind}</span>
+				<span className="text-[9px] px-1.5 py-0.5 rounded bg-white/[.05] text-text-muted uppercase shrink-0">{a.asset_type || 'domain'}</span>
+				{a.approval_status !== 'approved' && <Badge variant={a.approval_status === 'suspended' ? 'critical' : 'medium'}>{a.approval_status}</Badge>}
+                <div className="min-w-0 flex-1">
+                  {a.name && <p className="text-xs font-medium truncate">{a.name}</p>}
+                  <p className="text-[11px] font-mono text-text-secondary truncate" title={a.value}>{a.value}</p>
+                </div>
+                <Button size="sm" variant="primary" disabled={a.approval_status !== 'approved' || !isScannableProjectAsset(a)}
+					title={!isScannableProjectAsset(a) ? 'Reference-only asset type' : undefined} onClick={() => setScanAsset(a)}>Scan</Button>
+                <button onClick={() => renameAsset(a)} title="Rename" className="p-1 rounded text-text-muted hover:text-accent hover:bg-accent/10">
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
+                </button>
+                <button onClick={() => removeAsset(a)} title="Delete" className="p-1 rounded text-text-muted hover:text-severity-critical hover:bg-severity-critical/10">
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className={cn('space-y-5', isNetwork && 'order-2')}>
+      {/* Monitoring settings */}
+      <div className="card p-4 flex flex-wrap items-center gap-4">
+        <div className="flex items-center gap-3">
+          <label className="flex items-center gap-2 cursor-pointer select-none">
+            <div
+              onClick={() => saveMonitor(!target.monitor_enabled, target.monitor_interval_hours || 12)}
+              className={cn(
+                'w-10 h-5 rounded-full transition-colors relative cursor-pointer',
+                target.monitor_enabled ? 'bg-accent' : 'bg-surface-alt'
+              )}
+            >
+              <span className={cn(
+                'absolute top-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform',
+                target.monitor_enabled ? 'translate-x-5' : 'translate-x-0.5'
+              )} />
+            </div>
+            <span className="text-sm font-medium">
+              {target.monitor_enabled ? 'Monitoring On' : 'Monitoring Off'}
+            </span>
+          </label>
+          {monitorSaving && <span className="text-xs text-text-muted">Saving…</span>}
+        </div>
+        {target.monitor_enabled && (
+          <div className="flex items-center gap-2">
+            <span className="text-sm text-text-muted">Every</span>
+            <select
+              value={target.monitor_interval_hours || 12}
+              onChange={e => saveMonitor(true, parseInt(e.target.value))}
+              className="bg-surface-alt border border-border rounded px-2 py-1 text-sm"
+            >
+              {[1, 3, 6, 12, 24, 48, 72, 168].map(h => (
+                <option key={h} value={h}>{h < 24 ? `${h}h` : `${h/24}d`}</option>
+              ))}
+            </select>
+            <span className="text-sm text-text-muted">
+              {target.monitor_last_run ? `· Last: ${timeAgo(target.monitor_last_run)}` : '· Never run'}
+            </span>
+          </div>
+        )}
+        {target.monitor_enabled && (
+          <p className="w-full text-[11px] text-text-muted mt-1">
+            Each cycle re-enumerates subdomains, re-probes hosts, and runs takeover + backup/config-file discovery.
+            If a new subdomain/asset or change is found, you're notified and <b>nuclei + backup discovery</b> auto-run over the new surface.
+          </p>
+        )}
+      </div>
+
+      {/* Attack paths (correlation / intelligence layer) */}
+      {paths.length > 0 && (
+        <div className="card p-4">
+          <p className="text-sm font-semibold mb-2">Attack Paths <span className="text-text-muted font-normal">({paths.length} correlated)</span></p>
+          <div className="space-y-2">
+            {paths.slice(0, 8).map((p, i) => (
+              <div key={i} className="border border-border rounded p-2.5">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <Badge variant={p.severity}>{p.severity}</Badge>
+                  <span className="text-xs font-mono text-text-primary">{p.host}</span>
+                  {p.confidence > 0 && <span className="text-[10px] text-text-muted">{p.confidence}% conf</span>}
+                  {p.tech && p.tech.length > 0 && <span className="text-[10px] text-accent">{p.tech.join(' · ')}</span>}
+                </div>
+                <ul className="mt-1.5 space-y-0.5">
+                  {p.steps.map((s, j) => (
+                    <li key={j} className="text-xs text-text-secondary">↳ {s}</li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      </div>
+
+      <div className={cn('space-y-5', isNetwork && 'order-1')}>
+      {isScanning && <LiveResults targetId={id!} active={isScanning} />}
+
+      <div className="border-b border-border flex items-stretch overflow-x-auto">
+        {tabGroups.map((g, gi) => (
+          <div key={g.group} className="flex items-center">
+            {gi > 0 && <span className="mx-1.5 my-2 w-px bg-border" />}
+            <span className="pl-2 pr-1 text-[10px] font-semibold uppercase tracking-wider text-text-muted/60 self-center select-none">{g.group}</span>
+            {g.tabs.map(t => (
+              <button key={t.id} onClick={() => setTab(t.id)} title={t.desc}
+                className={cn(
+                  'px-3 py-2.5 text-sm font-medium whitespace-nowrap border-b-2 transition-all',
+                  tab === t.id ? 'border-accent text-accent' : 'border-transparent text-text-muted hover:text-text-secondary'
+                )}>
+                {t.label}
+              </button>
+            ))}
+          </div>
+        ))}
+      </div>
+      {(() => {
+        const activeTab = tabGroups.flatMap(g => g.tabs).find(t => t.id === tab)
+        return activeTab?.desc ? (
+          <p className="px-1 pt-1.5 text-[11px] text-text-muted">{activeTab.desc}</p>
+        ) : null
+      })()}
+
+      {tab !== 'cameras' && (
+      <div className="flex gap-2 items-center px-1 py-2 text-xs text-text-muted flex-wrap">
+        {tab === 'vulns' && (
+          <button onClick={() => setFpView(v => !v)}
+            className={cn('px-2 py-1 rounded border font-semibold mr-1',
+              fpView ? 'border-severity-critical text-severity-critical bg-severity-critical/10' : 'border-border text-text-muted hover:text-text-secondary')}>
+            {fpView ? '← Back to findings' : 'False Positives'}
+          </button>
+        )}
+        <span>Sort by:</span>
+        {isSeverityTab && (
+          <button onClick={() => applySort('severity')}
+            className={cn('px-2 py-1 rounded border', sort.key === 'severity' ? 'border-accent text-accent' : 'border-border')}>
+            Severity {sort.key === 'severity' ? (sort.dir === 'asc' ? '↑ low→high' : '↓ high→low') : ''}
+          </button>
+        )}
+        <button onClick={() => applySort('size')}
+          className={cn('px-2 py-1 rounded border', sort.key === 'size' ? 'border-accent text-accent' : 'border-border')}>
+          File size {sort.key === 'size' ? (sort.dir === 'desc' ? '↓' : '↑') : ''}
+        </button>
+        <button onClick={() => applySort('status')}
+          className={cn('px-2 py-1 rounded border', sort.key === 'status' ? 'border-accent text-accent' : 'border-border')}>
+          Response {sort.key === 'status' ? (sort.dir === 'desc' ? '↓' : '↑') : ''}
+        </button>
+        {tab === 'http' && (
+          <span className="flex items-center gap-1 ml-2 pl-2 border-l border-border">
+            <span className="text-text-muted">Status:</span>
+            {(['all', '2', '3', '4', '5'] as const).map(c => (
+              <button key={c} onClick={() => { setStatusClass(c); setVisibleCount(PAGE) }}
+                className={cn('px-2 py-1 rounded border',
+                  statusClass === c ? 'border-accent text-accent' : 'border-border',
+                  c === '2' ? 'text-severity-low' : c === '4' ? 'text-severity-medium' : c === '5' ? 'text-severity-critical' : '')}>
+                {c === 'all' ? 'All' : `${c}xx`}
+              </button>
+            ))}
+          </span>
+        )}
+      </div>
+      )}
+
+      <ErrorBoundary>
+      <div className="card overflow-hidden" style={{ padding: 0 }}>
+        {tabLoading
+          ? <div className="py-2"><SkeletonRows rows={8} cols={5} /></div>
+          : data.length === 0
+            ? <Empty message={tab === 'cameras' ? 'No legacy camera/DVR results are stored for this project. Network execution is unavailable in this build.' : 'No data found'} />
+            : tab === 'cameras'
+            ? (
+              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4 p-4">
+                {(pageData as IngramCamera[]).map(cam => (
+                  <div key={cam.id} className="border border-border rounded-lg overflow-hidden bg-bg-secondary/40 flex flex-col">
+                    {cam.image
+                      ? <a href={cam.image} target="_blank" rel="noreferrer" className="block bg-black">
+                          <img src={cam.image} alt={cam.address} loading="lazy"
+                            className="w-full h-52 object-contain bg-black hover:opacity-90 transition-opacity" />
+                        </a>
+                      : <div className="w-full h-52 flex items-center justify-center bg-bg-secondary text-text-muted text-xs gap-2">
+                          no snapshot
+                        </div>}
+                    <div className="p-3 space-y-1.5 flex-1 flex flex-col">
+                      <div className="flex items-center justify-between gap-2">
+                        <a href={`http://${cam.address}/`} target="_blank" rel="noreferrer"
+                          className="text-accent hover:underline font-mono text-sm font-semibold break-all">{cam.address}</a>
+                        <Badge variant={cam.severity || 'info'}>{cam.severity}</Badge>
+                      </div>
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span className="text-xs font-semibold text-text-primary capitalize">{cam.product}</span>
+                        {cam.poc && <span className="px-1.5 py-0.5 rounded bg-accent/15 text-accent text-[10px] font-mono">{cam.poc}</span>}
+                      </div>
+                      {cam.description && <p className="text-xs text-text-secondary break-words">{cam.description}</p>}
+                      {cam.impact && <p className="text-[11px] text-text-muted break-words"><span className="font-semibold">Impact:</span> {cam.impact}</p>}
+                      <div className="mt-auto pt-1 text-[10px] text-text-muted">{timeAgo(cam.created_at)}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )
+            : (
+              <div className="overflow-x-auto">
+                <table className="w-full">
+                  <thead>
+                    <tr className="border-b border-border">
+                      {tab === 'subdomains' && ['Subdomain', 'IP', 'Status', 'Title', 'Server', 'Last Seen'].map(h => <th key={h} className="table-header">{h}</th>)}
+                      {tab === 'http' && ['URL', 'Status', 'Title', 'Size', 'Time'].map(h => <th key={h} className="table-header">{h}</th>)}
+                      {tab === 'js' && ['URL', 'Size', 'Hash', 'Found'].map(h => <th key={h} className="table-header">{h}</th>)}
+                      {tab === 'js-findings' && ['Severity', 'Type', 'Value', 'JS File Source', 'Context', 'Found'].map(h => <th key={h} className="table-header">{h}</th>)}
+                      {tab === 'params' && ['Full URL', 'Parameter', 'Source', 'Reflected', 'Found'].map(h => <th key={h} className="table-header">{h}</th>)}
+                      {tab === 'dirs' && ['URL', 'Status', 'Size', 'Found'].map(h => <th key={h} className="table-header">{h}</th>)}
+                      {tab === 'admin-panels' && ['Panel', 'Type', 'Status', 'Evidence', 'Found'].map(h => <th key={h} className="table-header">{h}</th>)}
+											{tab === 'network-services' && ['Host', 'Port', 'Service', 'Product / Version', 'Banner', 'Web'].map(h => <th key={h} className="table-header">{h}</th>)}
+                      {tab === 'wp-inventory' && ['Kind', 'URL', 'Details', 'Found'].map(h => <th key={h} className="table-header">{h}</th>)}
+                      {(tab === 'wp-users' || tab === 'wp-endpoints') && ['URL', 'Details', 'Found'].map(h => <th key={h} className="table-header">{h}</th>)}
+                      {tab === 'backups' && ['URL', 'Status', 'Size', 'Type', 'Found'].map(h => <th key={h} className="table-header">{h}</th>)}
+                      {tab === 'redirects' && ['URL', 'Redirects To', 'Verified', 'Found'].map(h => <th key={h} className="table-header">{h}</th>)}
+                      {tab === 'nuclei' && ['Severity', 'Template', 'URL', 'Description', 'Found'].map(h => <th key={h} className="table-header">{h}</th>)}
+                      {(tab === 'vulns' || tab === 'candidates') && ['Severity', 'Type', 'URL', 'Parameter', 'Evidence / Provenance', 'Found'].map(h => <th key={h} className="table-header">{h}</th>)}
+                      {tab === 'monitor' && ['URL', 'Change Type', 'Old Value', 'New Value', 'Detected'].map(h => <th key={h} className="table-header">{h}</th>)}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {tab === 'subdomains' && (pageData as Subdomain[]).map(s => (
+                      <tr key={s.id} className="table-row">
+                        <td className="table-cell">
+                          <div className="flex items-center gap-2">
+                            <span className={cn('w-1.5 h-1.5 rounded-full shrink-0', s.is_alive ? 'bg-severity-low' : 'bg-text-muted')} />
+                            <span className="font-mono text-xs">{s.subdomain}</span>
+                            {s.source === 'vhost' && (
+                              <span title="Discovered via virtual-host scan (not in DNS)" className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-accent/20 text-accent-hover shrink-0">vhost</span>
+                            )}
+                            <CopyButton text={s.subdomain} />
+                          </div>
+                        </td>
+                        <td className="table-cell font-mono text-xs">{s.ip || '—'}</td>
+                        <td className="table-cell"><span className={cn('font-mono text-xs', statusCodeColor(s.status_code))}>{s.status_code || '—'}</span></td>
+                        <td className="table-cell text-xs">{truncate(s.page_title || '', 40) || '—'}</td>
+                        <td className="table-cell text-xs">{truncate(s.server || '', 30) || '—'}</td>
+                        <td className="table-cell text-xs">{timeAgo(s.last_seen)}</td>
+                      </tr>
+                    ))}
+                    {tab === 'http' && (pageData as HTTPService[]).map(s => (
+                      <tr key={s.id} className="table-row">
+                        <td className="table-cell max-w-xs">
+                          <div className="flex items-center gap-1.5">
+                            <a href={s.url} target="_blank" rel="noreferrer" className="text-accent hover:underline text-xs font-mono truncate">{truncate(s.url, 60)}</a>
+                            <CopyButton text={s.url} />
+                            {s.waf && (
+                              <span title={`Behind WAF: ${s.waf}`}
+                                className="shrink-0 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-severity-medium/15 text-severity-medium whitespace-nowrap">
+                                WAF · {s.waf}
+                              </span>
+                            )}
+                            {s.cms && (
+                              <span title={`CMS: ${s.cms} — stock WP/Joomla/Drupal skip active injection scans`}
+                                className="shrink-0 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-accent/15 text-accent whitespace-nowrap capitalize">
+                                {s.cms}
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="table-cell"><span className={cn('font-mono text-xs', statusCodeColor(s.status_code))}>{s.status_code}</span></td>
+                        <td className="table-cell text-xs">{truncate(s.title || '', 40) || '—'}</td>
+                        <td className="table-cell text-xs">{s.content_length > 0 ? `${(s.content_length / 1024).toFixed(1)}KB` : '—'}</td>
+                        <td className="table-cell text-xs">{s.response_time_ms > 0 ? `${s.response_time_ms}ms` : '—'}</td>
+                      </tr>
+                    ))}
+                    {tab === 'js' && (pageData as JSFile[]).map(f => (
+                      <tr key={f.id} className="table-row">
+                        <td className="table-cell max-w-sm">
+                          <div className="flex items-center gap-1.5">
+                            <a href={f.url} target="_blank" rel="noreferrer" className="text-accent hover:underline text-xs font-mono truncate">{truncate(f.url, 70)}</a>
+                            <CopyButton text={f.url} />
+                          </div>
+                        </td>
+                        <td className="table-cell text-xs">{f.size > 0 ? `${(f.size / 1024).toFixed(1)}KB` : '—'}</td>
+                        <td className="table-cell font-mono text-xs">{f.hash ? f.hash.slice(0, 8) : '—'}</td>
+                        <td className="table-cell text-xs">{timeAgo(f.created_at)}</td>
+                      </tr>
+                    ))}
+                    {tab === 'js-findings' && (pageData as JSFinding[]).map(f => (
+                      <tr key={f.id} className="table-row">
+                        <td className="table-cell whitespace-nowrap">
+                          <span className={cn('text-xs font-bold uppercase', severityColor[f.severity])}>{f.severity}</span>
+                          {f.verified && <span className="ml-1 text-[10px] font-bold text-severity-critical" title="Verified live credential">VERIFIED</span>}
+                        </td>
+                        <td className="table-cell text-xs font-mono whitespace-nowrap">{f.type}</td>
+                        <td className="table-cell max-w-xs">
+                          <div className="flex items-center gap-1">
+                            <span className="font-mono text-xs text-text-primary break-all">{truncate(f.value, 80)}</span>
+                            <CopyButton text={f.value} />
+                          </div>
+                        </td>
+                        <td className="table-cell max-w-xs">
+                          {f.js_file_url ? (
+                            <div className="flex items-center gap-1">
+                              <a href={f.js_file_url} target="_blank" rel="noreferrer"
+                                className="text-accent hover:underline text-xs font-mono truncate block max-w-xs"
+                                title={f.js_file_url}>{truncate(f.js_file_url, 60)}</a>
+                              <CopyButton text={f.js_file_url} />
+                            </div>
+                          ) : <span className="text-text-muted text-xs">—</span>}
+                        </td>
+                        <td className="table-cell text-xs text-text-muted max-w-xs font-mono">{truncate(f.context || '', 100)}</td>
+                        <td className="table-cell text-xs whitespace-nowrap">{timeAgo(f.created_at)}</td>
+                      </tr>
+                    ))}
+                    {tab === 'params' && (pageData as Parameter[]).map(p => {
+                      const fullUrl = (() => {
+                        try {
+                          const u = new URL(p.url)
+                          u.searchParams.set(p.parameter, p.value || 'FUZZ')
+                          return u.toString()
+                        } catch { return p.url }
+                      })()
+                      return (
+                        <tr key={p.id} className="table-row">
+                          <td className="table-cell max-w-lg">
+                            <div className="flex items-center gap-1.5">
+                              <a href={fullUrl} target="_blank" rel="noreferrer"
+                                className="text-accent hover:underline text-xs font-mono break-all"
+                                title={fullUrl}>{fullUrl}</a>
+                              <CopyButton text={fullUrl} />
+                            </div>
+                          </td>
+                          <td className="table-cell font-mono text-xs text-text-primary whitespace-nowrap">{p.parameter}</td>
+                          <td className="table-cell text-xs">{p.source || '—'}</td>
+                          <td className="table-cell">{p.is_reflected ? <Badge variant="high">Reflected</Badge> : <span className="text-xs text-text-muted">No</span>}</td>
+                          <td className="table-cell text-xs">{timeAgo(p.created_at)}</td>
+                        </tr>
+                      )
+                    })}
+                    {tab === 'dirs' && (pageData as DirectoryFinding[]).map(d => (
+                      <tr key={d.id} className="table-row">
+                        <td className="table-cell max-w-sm">
+                          <div className="flex items-center gap-1.5">
+                            <a href={d.url} target="_blank" rel="noreferrer" className="text-accent hover:underline text-xs font-mono truncate">{truncate(d.url, 70)}</a>
+                            <CopyButton text={d.url} />
+                          </div>
+                        </td>
+                        <td className="table-cell"><span className={cn('font-mono text-xs', statusCodeColor(d.status_code))}>{d.status_code}</span></td>
+                        <td className="table-cell text-xs">{d.content_length > 0 ? `${(d.content_length / 1024).toFixed(1)}KB` : '—'}</td>
+                        <td className="table-cell text-xs">{timeAgo(d.created_at)}</td>
+                      </tr>
+                    ))}
+                    {tab === 'admin-panels' && (pageData as AdminPanelFinding[]).map(p => (
+                      <tr key={p.id} className="table-row align-top">
+                        <td className="table-cell max-w-sm">
+                          <div className="flex items-start gap-1.5">
+                            <div className="min-w-0">
+                              <a href={p.url} target="_blank" rel="noreferrer" className="text-accent hover:underline text-xs font-mono break-all">{truncate(p.url, 72)}</a>
+                              <p className="text-xs font-semibold text-text-primary mt-0.5">{p.product || p.title || 'Sensitive panel'}</p>
+                              <PanelAffected panel={p} />
+                              <ScreenshotThumb screenshotId={p.screenshot_id} />
+                            </div>
+                            <CopyButton text={p.url} />
+                          </div>
+                        </td>
+                        <td className="table-cell text-xs capitalize">{p.panel_type || 'management panel'}</td>
+                        <td className="table-cell"><span className={cn('font-mono text-xs', statusCodeColor(p.status_code))}>{p.status_code}</span></td>
+                        <td className="table-cell text-xs text-text-muted max-w-sm">
+                          <p>{p.evidence || 'strong panel fingerprint'}</p>
+                          {p.redirect_url && <p className="font-mono text-[10px] break-all mt-1">→ {p.redirect_url}</p>}
+                        </td>
+                        <td className="table-cell text-xs whitespace-nowrap">{timeAgo(p.created_at)}</td>
+                      </tr>
+                    ))}
+									{tab === 'network-services' && (pageData as NetworkService[]).map(s => (
+										<tr key={`${s.ip}:${s.port}/${s.protocol}`} className="table-row">
+											<td className="table-cell"><span className="block font-mono text-xs">{s.ip}</span>{(s.rdns || s.os_guess) && <span className="block text-[10px] text-text-muted">{[s.rdns,s.os_guess].filter(Boolean).join(' · ')}</span>}</td>
+											<td className="table-cell font-mono text-xs">{s.port}/{s.protocol}</td>
+											<td className="table-cell text-xs">{s.service || 'unknown'}{s.tls ? ' · TLS' : ''}</td>
+											<td className="table-cell text-xs">{[s.product,s.version].filter(Boolean).join(' ') || '—'}</td>
+											<td className="table-cell max-w-sm font-mono text-[10px] text-text-muted">{truncate(s.banner || '',100) || '—'}</td>
+											<td className="table-cell text-xs">{s.web_url ? <a href={s.web_url} target="_blank" rel="noreferrer" className="text-accent hover:underline">{s.web_status || 'open'} · {truncate(s.web_title || s.web_url,35)}</a> : '—'}</td>
+										</tr>
+									))}
+                    {tab === 'wp-inventory' && (pageData as VulnFinding[]).map(f => (
+                      <tr key={f.id} className="table-row">
+                        <td className="table-cell">
+                          <span className="px-1.5 py-0.5 rounded bg-accent/15 text-accent text-[10px] font-semibold uppercase">
+                            {f.type === 'wordpress_version' ? 'Core' : f.type === 'wordpress_plugin' ? 'Plugin' : 'Theme'}
+                          </span>
+                        </td>
+                        <td className="table-cell max-w-sm">
+                          <div className="flex items-center gap-1.5">
+                            <a href={f.url} target="_blank" rel="noreferrer" className="text-accent hover:underline text-xs font-mono break-all">{truncate(f.url, 70)}</a>
+                            <CopyButton text={f.url} />
+                          </div>
+                        </td>
+                        <td className="table-cell text-xs text-text-muted max-w-lg">{f.evidence || '—'}</td>
+                        <td className="table-cell text-xs whitespace-nowrap">{timeAgo(f.created_at)}</td>
+                      </tr>
+                    ))}
+                    {(tab === 'wp-users' || tab === 'wp-endpoints') && (pageData as VulnFinding[]).map(f => (
+                      <tr key={f.id} className="table-row">
+                        <td className="table-cell max-w-sm">
+                          <div className="flex items-center gap-1.5">
+                            <a href={f.url} target="_blank" rel="noreferrer" className="text-accent hover:underline text-xs font-mono break-all">{truncate(f.url, 70)}</a>
+                            <CopyButton text={f.url} />
+                          </div>
+                        </td>
+                        <td className="table-cell text-xs text-text-muted max-w-lg">{f.evidence || '—'}</td>
+                        <td className="table-cell text-xs whitespace-nowrap">{timeAgo(f.created_at)}</td>
+                      </tr>
+                    ))}
+                    {tab === 'backups' && (pageData as BackupFinding[]).map(b => (
+                      <tr key={b.id} className="table-row">
+                        <td className="table-cell max-w-sm">
+                          <div className="flex items-center gap-1.5">
+                            <a href={b.url} target="_blank" rel="noreferrer" className="text-accent hover:underline text-xs font-mono truncate">{truncate(b.url, 70)}</a>
+                            <CopyButton text={b.url} />
+                          </div>
+                        </td>
+                        <td className="table-cell"><span className={cn('font-mono text-xs', statusCodeColor(b.status_code))}>{b.status_code}</span></td>
+                        <td className="table-cell text-xs">{b.content_length > 0 ? `${(b.content_length / 1024).toFixed(1)}KB` : '—'}</td>
+                        <td className="table-cell text-xs capitalize">{b.backup_type || '—'}</td>
+                        <td className="table-cell text-xs">{timeAgo(b.created_at)}</td>
+                      </tr>
+                    ))}
+                    {tab === 'redirects' && (pageData as OpenRedirectFinding[]).map(r => (
+                      <tr key={r.id} className="table-row">
+                        <td className="table-cell max-w-sm">
+                          <div className="flex items-center gap-1.5">
+                            <a href={r.url} target="_blank" rel="noreferrer"
+                              className="text-accent hover:underline text-xs font-mono break-all"
+                              title={r.url}>{truncate(r.url, 80)}</a>
+                            <CopyButton text={r.url} />
+                          </div>
+                        </td>
+                        <td className="table-cell max-w-sm">
+                          <div className="flex items-center gap-1.5">
+                            <a href={r.redirect_to} target="_blank" rel="noreferrer"
+                              className="text-severity-medium hover:underline text-xs font-mono break-all"
+                              title={r.redirect_to}>{truncate(r.redirect_to, 80)}</a>
+                            <CopyButton text={r.redirect_to} />
+                          </div>
+                        </td>
+                        <td className="table-cell">{r.verified ? <Badge variant="high">Verified</Badge> : <span className="text-xs text-text-muted">Unverified</span>}</td>
+                        <td className="table-cell text-xs">{timeAgo(r.created_at)}</td>
+                      </tr>
+                    ))}
+                    {tab === 'nuclei' && (pageData as NucleiFinding[]).map(n => (
+                      <tr key={n.id} className="table-row">
+                        <td className="table-cell whitespace-nowrap">
+                          <Badge variant={n.severity}>{n.severity}</Badge>
+                        </td>
+                        <td className="table-cell text-xs">
+                          <p className="text-text-primary font-semibold flex items-center gap-1.5">
+                            {n.template_name}
+                            {(n.affected_count ?? 1) > 1 && (
+                              <span className="px-1.5 py-0.5 rounded bg-accent/15 text-accent text-[10px] font-mono shrink-0"
+                                title={`This template matched ${n.affected_count} URLs — collapsed into one finding`}>
+                                ×{n.affected_count}
+                              </span>
+                            )}
+                          </p>
+                          <p className="text-text-muted font-mono text-xs">{n.template_id}</p>
+                        </td>
+                        <td className="table-cell max-w-sm">
+                          <div className="flex items-center gap-1.5">
+                            <a href={n.matched_url || n.url} target="_blank" rel="noreferrer"
+                              className="text-accent hover:underline text-xs font-mono break-all"
+                              title={n.matched_url || n.url}>{truncate(n.matched_url || n.url, 70)}</a>
+                            <CopyButton text={n.matched_url || n.url} />
+                          </div>
+                          {(n.affected_count ?? 1) > 1 && (
+                            <NucleiAffected targetId={id!} templateId={n.template_id} count={n.affected_count ?? 1} />
+                          )}
+                        </td>
+                        <td className="table-cell text-xs text-text-muted max-w-xs">
+                          {truncate(n.description || '', 80) || '—'}
+                          {n.curl_command && (
+                            <details className="mt-1.5">
+                              <summary className="cursor-pointer text-accent hover:underline select-none">PoC</summary>
+                              <div className="mt-1.5 space-y-1.5">
+                                <div className="flex items-start gap-1">
+                                  <pre className="flex-1 font-mono text-[10px] text-severity-medium whitespace-pre-wrap break-all bg-bg-secondary/50 p-1.5 rounded max-h-32 overflow-auto">{n.curl_command}</pre>
+                                  <CopyButton text={n.curl_command} />
+                                </div>
+                                {(n.request || n.response) && (
+                                  <details>
+                                    <summary className="cursor-pointer text-text-muted hover:text-text-secondary select-none">Raw request/response</summary>
+                                    {n.request && <pre className="mt-1 font-mono text-[10px] text-text-secondary whitespace-pre-wrap break-all bg-bg-secondary/50 p-1.5 rounded max-h-40 overflow-auto">{n.request}</pre>}
+                                    {n.response && <pre className="mt-1 font-mono text-[10px] text-text-muted whitespace-pre-wrap break-all bg-bg-secondary/50 p-1.5 rounded max-h-40 overflow-auto">{n.response}</pre>}
+                                  </details>
+                                )}
+                              </div>
+                            </details>
+                          )}
+                        </td>
+                        <td className="table-cell text-xs whitespace-nowrap">{timeAgo(n.created_at)}</td>
+                      </tr>
+                    ))}
+                    {(tab === 'vulns' || tab === 'candidates') && vulnGroupPage.map(group => {
+                      const v = group.representative
+                      const pocUrl = buildPocUrl(v.type, v.url, v.parameter, v.payload)
+                      const reproUrl = pocUrl || v.url
+                      const isXss = ['xss', 'dom_xss'].includes(String(v.type || '').toLowerCase())
+                      return (
+                      <tr key={group.key} className="table-row">
+                        <td className="table-cell whitespace-nowrap">
+                          <Badge variant={v.severity}>{v.severity}</Badge>
+                          {typeof v.confidence === 'number' && v.confidence > 0 && (
+                            <div className={cn('text-[10px] font-bold mt-0.5',
+                              v.confidence >= 85 ? 'text-severity-low' : v.confidence >= 60 ? 'text-severity-medium' : 'text-text-muted')}
+                              title="Verification confidence">
+                              {v.confidence}% conf
+                            </div>
+                          )}
+                        </td>
+                        <td className="table-cell text-xs font-mono font-semibold whitespace-nowrap">
+                          <div className="flex items-center gap-1.5">
+                            {String(v.type || '').replace(/_/g, ' ')}
+                            {group.members.length > 1 && (
+                              <span className="px-1.5 py-0.5 rounded bg-accent/15 text-accent text-[10px] font-mono shrink-0"
+                                title={`Same root cause confirmed on ${group.members.length} URLs on this host — collapsed into one finding`}>
+                                ×{group.members.length}
+                              </span>
+                            )}
+                          </div>
+                          {v.lifecycle && <LifecycleChip lifecycle={v.lifecycle} />}
+                        </td>
+                        <td className="table-cell max-w-sm">
+                          <div className="flex items-center gap-1.5">
+                            <a href={v.url} target="_blank" rel="noreferrer"
+                              className="text-accent hover:underline text-xs font-mono break-all"
+                              title={v.url}>{truncate(v.url, 60)}</a>
+                            <CopyButton text={v.url} />
+                          </div>
+                          {pocUrl && (
+                            <div className="flex items-center gap-1.5 mt-1">
+                              <a href={pocUrl} target="_blank" rel="noreferrer"
+                                className="text-severity-high hover:underline text-[11px] font-mono font-semibold whitespace-nowrap"
+                                title={pocUrl}>{isXss ? 'Fire PoC ↗' : 'Open PoC ↗'}</a>
+                              <CopyButton text={pocUrl} />
+                            </div>
+                          )}
+                          <VulnGroupAffected targetId={id!} group={group} onDone={() => loadTab(tab)} />
+                        </td>
+                        <td className="table-cell font-mono text-xs text-text-primary whitespace-nowrap">{v.parameter || '—'}</td>
+                        <td className="table-cell text-xs text-text-muted max-w-md">
+                          <span title={v.evidence}>{truncate(v.evidence, 90) || '—'}</span>
+                          {v.payload && <div className="font-mono text-xs text-severity-medium mt-0.5" title={v.payload}>payload: {truncate(v.payload, 60)}</div>}
+                          <details className="mt-1.5">
+                            <summary className="cursor-pointer text-accent hover:underline select-none text-[11px]">
+                              PoC &amp; full evidence
+                            </summary>
+                            <div className="mt-1.5 space-y-2">
+                              <div>
+                                <div className="text-[10px] uppercase tracking-wider text-text-muted mb-0.5">
+                                  {isXss ? 'Reproduction URL — open to fire the payload' : 'Reproduction URL (full path)'}
+                                </div>
+                                <div className="flex items-start gap-1">
+                                  <a href={reproUrl} target="_blank" rel="noreferrer"
+                                    className="flex-1 font-mono text-[10px] text-severity-high break-all hover:underline">{reproUrl}</a>
+                                  <CopyButton text={reproUrl} />
+                                </div>
+                              </div>
+                              {v.screenshot_id && (
+                                <div>
+                                  <div className="text-[10px] uppercase tracking-wider text-text-muted mb-0.5">Screenshot</div>
+                                  <ScreenshotThumb screenshotId={v.screenshot_id} />
+                                </div>
+                              )}
+                              {v.payload && (
+                                <div>
+                                  <div className="text-[10px] uppercase tracking-wider text-text-muted mb-0.5">Payload</div>
+                                  <div className="flex items-start gap-1">
+                                    <pre className="flex-1 font-mono text-[10px] text-severity-medium whitespace-pre-wrap break-all bg-bg-secondary/50 p-1.5 rounded">{v.payload}</pre>
+                                    <CopyButton text={v.payload} />
+                                  </div>
+                                </div>
+                              )}
+                              <div>
+                                <div className="text-[10px] uppercase tracking-wider text-text-muted mb-0.5">curl</div>
+                                <div className="flex items-start gap-1">
+                                  <pre className="flex-1 font-mono text-[10px] text-text-secondary whitespace-pre-wrap break-all bg-bg-secondary/50 p-1.5 rounded">{pocCurl(reproUrl)}</pre>
+                                  <CopyButton text={pocCurl(reproUrl)} />
+                                </div>
+                              </div>
+                              {v.evidence && (
+                                <div>
+                                  <div className="text-[10px] uppercase tracking-wider text-text-muted mb-0.5">Evidence</div>
+                                  <pre className="font-mono text-[10px] text-text-muted whitespace-pre-wrap break-all bg-bg-secondary/50 p-1.5 rounded max-h-48 overflow-auto">{v.evidence}</pre>
+                                </div>
+                              )}
+                              {v.provenance && (
+                                <div>
+                                  <div className="text-[10px] uppercase tracking-wider text-text-muted mb-0.5">Provenance (raw)</div>
+                                  <pre className="font-mono text-[10px] text-text-muted whitespace-pre-wrap break-all bg-bg-secondary/50 p-1.5 rounded max-h-48 overflow-auto">{v.provenance}</pre>
+                                </div>
+                              )}
+                              <div>
+                                <div className="text-[10px] uppercase tracking-wider text-severity-low mb-0.5">Remediation</div>
+                                <p className="text-[11px] text-text-secondary leading-relaxed bg-severity-low/[.06] border border-severity-low/20 rounded p-1.5">{remediationFor(v.type)}</p>
+                              </div>
+                            </div>
+                          </details>
+                        </td>
+                        <td className="table-cell text-xs whitespace-nowrap align-top">
+                          <button onClick={() => setEvidence({ id: v.id, url: v.url, type: v.type })}
+                            className="btn-secondary text-[11px] mb-1">Evidence</button>
+                          <div className="text-text-muted">{timeAgo(v.created_at)}</div>
+                          <TriageBar targetId={id!} finding={v} onDone={() => loadTab(tab)} />
+                        </td>
+                      </tr>
+                      )
+                    })}
+                    {tab === 'monitor' && (pageData as MonitoringChange[]).map(c => (
+                      <tr key={c.id} className="table-row">
+                        <td className="table-cell max-w-xs">
+                          <div className="flex items-center gap-1.5">
+                            <a href={c.url} target="_blank" rel="noreferrer" className="text-accent hover:underline text-xs font-mono truncate">{truncate(c.url, 50)}</a>
+                            <CopyButton text={c.url} />
+                          </div>
+                        </td>
+                        <td className="table-cell">
+                          <Badge variant={c.change_type === 'js_change' ? 'medium' : 'info'}>{c.change_type}</Badge>
+                        </td>
+                        <td className="table-cell text-xs text-text-muted max-w-xs font-mono">{truncate(c.old_value, 50)}</td>
+                        <td className="table-cell text-xs text-severity-medium max-w-xs font-mono">{truncate(c.new_value, 50)}</td>
+                        <td className="table-cell text-xs">{timeAgo(c.detected_at)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+        {!tabLoading && footerHasMore && (
+          <div className="flex items-center justify-center gap-3 py-3 border-t border-border text-xs">
+            <span className="text-text-muted">
+              Showing {footerShownCount.toLocaleString()} of {footerTotalCount.toLocaleString()}
+              {isVulnTab ? ' distinct issue(s)' : ''}
+            </span>
+            <button onClick={() => setVisibleCount(c => c + PAGE)} className="btn-secondary text-xs">
+              Load {Math.min(PAGE, footerTotalCount - visibleCount).toLocaleString()} more
+            </button>
+            <button onClick={() => setVisibleCount(data.length)} className="text-accent hover:underline">
+              Show all
+            </button>
+          </div>
+        )}
+      </div>
+      </ErrorBoundary>
+      </div>
+
+      {scanOpen && (
+        <ScanModal
+          target={target}
+          open={true}
+          onClose={() => setScanOpen(false)}
+          onStarted={() => targetsApi.get(id!).then(setTarget)}
+        />
+      )}
+      {scanAsset && (
+        <ScanModal
+          target={target}
+          asset={{ id: scanAsset.id, value: scanAsset.value, kind: scanAsset.kind, name: scanAsset.name }}
+          open={true}
+          onClose={() => setScanAsset(null)}
+          onStarted={() => targetsApi.get(id!).then(setTarget)}
+        />
+      )}
+      {evidence && (
+        <EvidenceViewer
+          targetId={id!}
+          findingId={evidence.id}
+          url={evidence.url}
+          type={evidence.type}
+          open={true}
+          onClose={() => setEvidence(null)}
+        />
+      )}
+    </div>
+    </ErrorBoundary>
+  )
+}

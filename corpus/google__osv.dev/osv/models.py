@@ -1,0 +1,1735 @@
+# Copyright 2021 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Datastore types."""
+
+import datetime
+import enum
+import logging
+import re
+import os
+
+from urllib.parse import urlparse
+from typing import Self
+
+from google.cloud import ndb
+from google.protobuf import json_format, timestamp_pb2
+from osv import importfinding_pb2
+
+# pylint: disable=relative-beyond-top-level
+from . import bug
+from . import ecosystems
+from .ecosystems.ecosystems_base import (
+    coarse_version_from_ints,
+    MAX_COARSE_PART,
+    MAX_COARSE_EPOCH,
+)
+from . import gcs
+from . import pubsub
+from . import purl_helpers
+from . import semver_index
+from . import sources
+from . import vulnerability_pb2
+
+SCHEMA_VERSION = '1.9.1'
+
+_MAX_GIT_VERSIONS_TO_INDEX = 5000
+
+MIN_COARSE_VERSION = coarse_version_from_ints((0,), 0)
+MAX_COARSE_VERSION = coarse_version_from_ints((MAX_COARSE_PART + 1,),
+                                              MAX_COARSE_EPOCH + 1)
+
+_EVENT_ORDER = {
+    'introduced': 0,
+    'last_affected': 1,
+    'fixed': 2,
+    'limit': 3,
+}
+
+
+def _check_valid_severity(prop, value):
+  """Check valid severity."""
+  del prop
+
+  if value not in ('NEGLIGIBLE', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'):
+    raise ValueError('Invalid severity: ' + value)
+
+
+def _check_valid_range_type(prop, value):
+  """Check valid range type."""
+  del prop
+
+  if value not in ('GIT', 'SEMVER', 'ECOSYSTEM'):
+    raise ValueError('Invalid range type: ' + value)
+
+
+def _check_valid_event_type(prop, value):
+  """Check valid event type."""
+  del prop
+
+  if value not in ('introduced', 'fixed', 'last_affected', 'limit'):
+    raise ValueError('Invalid event type: ' + value)
+
+
+def utcnow() -> datetime.datetime:
+  """For mocking."""
+  return datetime.datetime.now(datetime.UTC)
+
+
+def _get_purl_indexes(affected_packages):
+  """Get list of purls from affected packages, with and without qualifiers"""
+  resulting_set = set()
+  for pkg in affected_packages:
+    if pkg.package.purl:
+      resulting_set.add(pkg.package.purl)
+      if '?' in pkg.package.purl:
+        resulting_set.add(pkg.package.purl.split('?')[0])
+  return list(resulting_set)
+
+
+def _repo_name(repo_url: str) -> str:
+  # https://github.com/eclipse-openj9/openj9 -> openj9
+  url = urlparse(repo_url)
+  assumed_reponame = os.path.dirname(url.path).lstrip("/")
+  name = assumed_reponame.rstrip(".git")
+  return name
+
+
+def maybe_strip_repo_prefixes(versions: list[str], repo_urls: list[str]) -> str:
+  """Try to strip the repo name from tags prior to normalizing.
+
+  There are some particularly regex-unfriendly tag names that prefix the
+  reponame that end in a number, like "openj9-0.8.0", resulting in an
+  incorrectly normalized version.
+  """
+
+  repo_stripped_versions = versions
+
+  for repo_url in repo_urls:
+    assumed_reponame = _repo_name(repo_url).lower()
+    repo_stripped_versions = [
+        v.lstrip(assumed_reponame).lstrip("-") for v in versions
+    ]
+
+  return repo_stripped_versions
+
+
+# --- OSS-Fuzz-related Entities ---
+
+
+class IDCounter(ndb.Model):
+  """Counter for ID allocations."""
+  # Next ID to allocate.
+  next_id: int = ndb.IntegerProperty()
+
+
+class RegressResult(ndb.Model):
+  """Regression results."""
+  # The commit hash.
+  commit: str = ndb.StringProperty(default='')
+  # Vulnerability summary.
+  summary: str = ndb.TextProperty()
+  # Vulnerability details.
+  details: str = ndb.TextProperty()
+  # Error (if any).
+  error: str = ndb.StringProperty()
+  # OSS-Fuzz issue ID.
+  issue_id: str = ndb.StringProperty()
+  # Project for the bug.
+  project: str = ndb.StringProperty()
+  # Package ecosystem for the project.
+  ecosystem: str = ndb.StringProperty()
+  # Repo URL.
+  repo_url: str = ndb.StringProperty()
+  # Severity of the bug.
+  severity: str = ndb.StringProperty(validator=_check_valid_severity)
+  # Reference URLs.
+  reference_urls: list[str] = ndb.StringProperty(repeated=True)
+  # Source timestamp.
+  timestamp: datetime.datetime = ndb.DateTimeProperty(tzinfo=datetime.UTC)
+
+
+class FixResult(ndb.Model):
+  """Fix results."""
+  # The commit hash.
+  commit: str = ndb.StringProperty(default='')
+  # Vulnerability summary.
+  summary: str = ndb.TextProperty()
+  # Vulnerability details.
+  details: str = ndb.TextProperty()
+  # Error (if any).
+  error: str = ndb.StringProperty()
+  # OSS-Fuzz issue ID.
+  issue_id: str = ndb.StringProperty()
+  # Project for the bug.
+  project: str = ndb.StringProperty()
+  # Package ecosystem for the project.
+  ecosystem: str = ndb.StringProperty()
+  # Repo URL.
+  repo_url: str = ndb.StringProperty()
+  # Severity of the bug.
+  severity: str = ndb.StringProperty(validator=_check_valid_severity)
+  # Reference URLs.
+  reference_urls: list[str] = ndb.StringProperty(repeated=True)
+  # Source timestamp.
+  timestamp: datetime.datetime = ndb.DateTimeProperty(tzinfo=datetime.UTC)
+
+
+# --- OSV Bug entities ---
+
+
+class AffectedEvent(ndb.Model):
+  """Affected event."""
+  type: str = ndb.StringProperty(validator=_check_valid_event_type)
+  value: str = ndb.StringProperty()
+
+
+class AffectedRange2(ndb.Model):
+  """Affected range."""
+  # Type of range.
+  type: str = ndb.StringProperty(validator=_check_valid_range_type)
+  # Repo URL.
+  repo_url: str = ndb.StringProperty()
+  # Events.
+  events: list[AffectedEvent] = ndb.LocalStructuredProperty(
+      AffectedEvent, repeated=True)
+  # Database specific metadata.
+  database_specific: dict = ndb.JsonProperty()
+
+
+class SourceOfTruth(enum.IntEnum):
+  """Source of truth."""
+  NONE = 0
+  # Internal to OSV (e.g. private OSS-Fuzz bugs).
+  INTERNAL = 1
+  # Vulnerabilities that are available in a public repo.
+  SOURCE_REPO = 2
+
+
+class Package(ndb.Model):
+  """Package."""
+  ecosystem: str = ndb.StringProperty()
+  name: str = ndb.StringProperty()
+  purl: str = ndb.StringProperty()
+
+
+class Severity(ndb.Model):
+  """Severity."""
+  type: str = ndb.StringProperty()
+  score: str = ndb.StringProperty()
+
+
+class AffectedPackage(ndb.Model):
+  """Affected packages."""
+  # The affected package identifier.
+  package: Package = ndb.StructuredProperty(Package)
+  # The list of affected ranges.
+  ranges: list[AffectedRange2] = ndb.LocalStructuredProperty(
+      AffectedRange2, repeated=True)
+  # The list of explicit affected versions.
+  versions: list[str] = ndb.TextProperty(repeated=True)
+  # Database specific metadata.
+  database_specific: dict = ndb.JsonProperty()
+  # Ecosystem specific metadata.
+  ecosystem_specific: dict = ndb.JsonProperty()
+  # Severity of the bug.
+  severities: list[Severity] = ndb.LocalStructuredProperty(
+      Severity, repeated=True)
+
+
+class Credit(ndb.Model):
+  """Credits."""
+  name: str = ndb.StringProperty()
+  contact: list[str] = ndb.StringProperty(repeated=True)
+  type: str = ndb.StringProperty()
+
+
+class Bug(ndb.Model):
+  """Bug entity."""
+  OSV_ID_PREFIX = 'OSV-'
+  # Very large fake version to use when there is no fix available.
+  _NOT_FIXED_SEMVER = '999999.999999.999999'
+
+  # Display ID as used by the source database. The full qualified database that
+  # OSV tracks this as may be different.
+  db_id: str = ndb.StringProperty()
+  # Other IDs this bug is known as.
+  aliases: list[str] = ndb.StringProperty(repeated=True)
+  # Related IDs.
+  related: list[str] = ndb.StringProperty(repeated=True)
+  # Raw upstream vulnerability IDs from the source - does not include
+  # exhaustive transitive upstreams
+  upstream_raw: list[str] = ndb.StringProperty(repeated=True)
+  # Status of the bug.
+  status: int = ndb.IntegerProperty()
+  # Timestamp when Bug was allocated.
+  timestamp: datetime.datetime = ndb.DateTimeProperty(tzinfo=datetime.UTC)
+  # When the entry was last edited.
+  last_modified: datetime.datetime = ndb.DateTimeProperty(tzinfo=datetime.UTC)
+  # Last modified field of the original imported file
+  import_last_modified: datetime.datetime = ndb.DateTimeProperty(
+      tzinfo=datetime.UTC)
+  # When the entry was withdrawn.
+  withdrawn: datetime.datetime = ndb.DateTimeProperty(tzinfo=datetime.UTC)
+  # The source identifier.
+  # For OSS-Fuzz, this oss-fuzz:<ClusterFuzz testcase ID>.
+  # For others this is <source>:<path/to/source>.
+  source_id: str = ndb.StringProperty()
+  # The main fixed commit (from bisection).
+  fixed: str = ndb.StringProperty(default='')
+  # The main regressing commit (from bisection).
+  regressed: str = ndb.StringProperty(default='')
+  # List of affected versions.
+  affected: list[str] = ndb.TextProperty(repeated=True)
+  # List of normalized versions indexed for fuzzy matching.
+  affected_fuzzy: list[str] = ndb.StringProperty(repeated=True)
+  # OSS-Fuzz issue ID.
+  issue_id: str = ndb.StringProperty()
+  # Package URL for this package.
+  purl: list[str] = ndb.StringProperty(repeated=True)
+  # Project/package name for the bug.
+  project: list[str] = ndb.StringProperty(repeated=True)
+  # Package ecosystem for the project.
+  ecosystem: list[str] = ndb.StringProperty(repeated=True)
+  # Summary for the bug.
+  summary: str = ndb.TextProperty()
+  # Vulnerability details.
+  details: str = ndb.TextProperty()
+  # Severity of the bug.
+  severities: list[Severity] = ndb.LocalStructuredProperty(
+      Severity, repeated=True)
+  # Credits for the bug.
+  credits: list[Credit] = ndb.LocalStructuredProperty(Credit, repeated=True)
+  # Whether or not the bug is public (OSS-Fuzz only).
+  public: bool = ndb.BooleanProperty()
+  # Reference URL types (dict of url -> type).
+  reference_url_types: dict = ndb.JsonProperty()
+  # Search indices (auto-populated)
+  search_indices: list[str] = ndb.StringProperty(repeated=True)
+  # Search tags (auto-populated)
+  search_tags: list[str] = ndb.StringProperty(repeated=True)
+  # Whether or not the bug has any affected versions (auto-populated).
+  has_affected: bool = ndb.BooleanProperty()
+  # Source of truth for this Bug.
+  source_of_truth: SourceOfTruth = ndb.IntegerProperty(
+      default=SourceOfTruth.INTERNAL)
+  # Whether the bug is fixed (indexed for querying).
+  is_fixed: bool = ndb.BooleanProperty()
+  # Database specific.
+  database_specific: dict = ndb.JsonProperty()
+  # Normalized SEMVER fixed indexes for querying.
+  semver_fixed_indexes: list[str] = ndb.StringProperty(repeated=True)
+  # Affected packages and versions.
+  affected_packages: list[AffectedPackage] = ndb.LocalStructuredProperty(
+      AffectedPackage, repeated=True)
+  # A checksum of the Affected packages and versions for the importer.
+  # TODO(michaelkedar): move this to Vulnerability entity
+  affected_checksum: str = ndb.TextProperty()
+  # The source of this Bug.
+  source: str = ndb.StringProperty()
+
+  def id(self):
+    """Get the bug ID."""
+    if self.db_id:
+      return self.db_id
+
+    # TODO(ochang): Remove once all existing bugs have IDs migrated.
+    if re.match(r'^\d+', self.key.id()):
+      return self.OSV_ID_PREFIX + self.key.id()
+
+    return self.key.id()
+
+  @property
+  def repo_url(self):
+    """Repo URL. Assumes there is only ever one repo URL per advisory."""
+    for affected_package in self.affected_packages:
+      for affected_range in affected_package.ranges:
+        if affected_range.repo_url:
+          return affected_range.repo_url
+
+    return None
+
+  @classmethod
+  def get_by_id(cls, vuln_id, *args, **kwargs) -> Self | None:
+    """Overridden get_by_id to handle OSV allocated IDs."""
+    result = cls.query(cls.db_id == vuln_id).get()
+    if result:
+      return result
+
+    # TODO(ochang): Remove once all exsting bugs have IDs migrated.
+    if vuln_id.startswith(cls.OSV_ID_PREFIX):
+      vuln_id = vuln_id[len(cls.OSV_ID_PREFIX):]
+
+    return super().get_by_id(vuln_id, *args, **kwargs)
+
+  def _pre_put_hook(self):  # pylint: disable=arguments-differ
+    """Pre-put hook for populating search indices."""
+    search_indices = set()
+
+    search_indices.update(_tokenize(self.id()))
+
+    for pkg in self.affected_packages:
+      # Set PURL if it wasn't provided.
+      if not pkg.package.purl:
+        pkg.package.purl = purl_helpers.package_to_purl(
+            ecosystems.normalize(pkg.package.ecosystem), pkg.package.name)
+
+    self.project = list({
+        pkg.package.name for pkg in self.affected_packages if pkg.package.name
+    })
+
+    if self.repo_url and 'GIT' in self.ecosystem:
+      self.project.append(self.repo_url)
+
+    self.project.sort()
+
+    ecosystems_set = {
+        pkg.package.ecosystem
+        for pkg in self.affected_packages
+        if pkg.package.ecosystem
+    }
+
+    # Add the Git ecosystem if it has git ranges
+    for pkg in self.affected_packages:
+      if 'GIT' in ecosystems_set:
+        break
+      for r in pkg.ranges:
+        if r.type == 'GIT':
+          ecosystems_set.add('GIT')
+          break
+
+    # If a withdrawn record has no affected package,
+    # assign an '[EMPTY]' ecosystem value for export.
+    if not ecosystems_set:
+      ecosystems_set.add('[EMPTY]')
+
+    # For all ecosystems that specify a specific version with colon,
+    # also add the base name
+    ecosystems_set.update({ecosystems.normalize(x) for x in ecosystems_set})
+
+    # Expand the set to include all ecosystem variants.
+    ecosystems_set = ecosystems.add_matching_ecosystems(ecosystems_set)
+
+    self.ecosystem = list(ecosystems_set)
+    self.ecosystem.sort()
+
+    self.purl = _get_purl_indexes(self.affected_packages)
+    self.purl.sort()
+
+    for project in self.project:
+      search_indices.update(_tokenize(project))
+
+    for ecosystem in self.ecosystem:
+      search_indices.update(_tokenize(ecosystem))
+
+    extra_search_indices = set()
+
+    for alias in self.aliases:
+      extra_search_indices.update(_tokenize(alias))
+
+    # Please note this will not include exhaustive transitive upstream
+    # so may not appear for all cases.
+    for upstream in self.upstream_raw:
+      extra_search_indices.update(_tokenize(upstream))
+
+    for affected_package in self.affected_packages:
+      for affected_range in affected_package.ranges:
+        if affected_range.repo_url and affected_range.repo_url != '':
+          url_no_https = affected_range.repo_url.split('//')[1]  # remove https
+          repo_url_indices = url_no_https.split('/')[1:]  # remove domain
+          repo_url_indices.append(affected_range.repo_url)  # add full url
+          repo_url_indices.append(url_no_https)  # add url without https://
+          search_indices.update(repo_url_indices)
+
+    # Excessive amounts of search indices cause the record to have too many
+    # indexed properties to store in the database. Arbitrarily limit the number
+    # of search indices from aliases/upstream to curb this.
+    # TODO(michaelkedar): handle this more gracefully.
+    search_indices.update(list(extra_search_indices)[:5000])
+    self.search_indices = list(search_indices)
+    self.search_indices.sort()
+
+    search_tags = set()
+    search_tags.add(self.id().lower())
+    search_tags.update([p.lower() for p in self.project])
+    self.search_tags = list(search_tags)
+    self.search_tags.sort()
+
+    self.affected_fuzzy = []
+    self.semver_fixed_indexes = []
+    self.has_affected = False
+    self.is_fixed = False
+
+    for affected_package in self.affected_packages:
+      # Indexes used for querying by exact version.
+      ecosystem_helper = ecosystems.get(affected_package.package.ecosystem)
+      if ecosystem_helper is not None:
+        # No need to normalize if the ecosystem is supported.
+        self.affected_fuzzy.extend(affected_package.versions)
+      else:
+        if (not affected_package.package.ecosystem and
+            len(affected_package.versions) > _MAX_GIT_VERSIONS_TO_INDEX):
+          # Assume that if there is no ecosystem specified, then these versions
+          # were enumerated from Git.
+          #
+          # Mitigate cases where the Git repo tag matching results in too many
+          # versions to index for Datastore.
+          # It's OK to do this because the primary intended matching mechanism
+          # for Git is via commit hash matching instead.
+          logging.info(
+              'Skipping indexing of git versions for %s '
+              'as there are too many (%s).', self.db_id,
+              len(affected_package.versions))
+        else:
+          self.affected_fuzzy.extend(
+              bug.normalize_tags(
+                  maybe_strip_repo_prefixes(
+                      affected_package.versions,
+                      [range.repo_url for range in affected_package.ranges])))
+
+      self.has_affected |= bool(affected_package.versions)
+
+      for affected_range in affected_package.ranges:
+        fixed_version = None
+        for event in affected_range.events:
+          # Index used to query by fixed/unfixed.
+          if event.type == 'limit':
+            self.is_fixed = True
+            fixed_version = event.value
+
+          if event.type == 'fixed':
+            self.is_fixed = True
+            fixed_version = event.value
+
+        if affected_range.type == 'SEMVER':
+          # Indexes used for querying by semver.
+          fixed = fixed_version or self._NOT_FIXED_SEMVER
+          self.semver_fixed_indexes.append(semver_index.normalize(fixed))
+
+        self.has_affected |= (affected_range.type in ('SEMVER', 'ECOSYSTEM'))
+
+    self.affected_fuzzy = list(set(self.affected_fuzzy))
+    self.affected_fuzzy.sort()
+
+    if not self.last_modified:
+      self.last_modified = utcnow()
+
+    if self.source_id:
+      self.source, _ = sources.parse_source_id(self.source_id)
+
+    if not self.source:
+      raise ValueError('Source not specified for Bug.')
+
+    if not self.db_id:
+      raise ValueError('DB ID not specified for Bug.')
+
+    if not self.key:  # pylint: disable=access-member-before-definition
+      source_repo = get_source_repository(self.source)
+      if not source_repo:
+        raise ValueError(f'{self.db_id} has invalid source {self.source}')
+
+      if source_repo.db_prefix and not any(
+          self.db_id.startswith(prefix) for prefix in source_repo.db_prefix):
+        raise ValueError(
+            f'{self.db_id} has invalid prefix for source {self.source}')
+
+      self.key = ndb.Key(Bug, self.db_id)
+
+    if self.withdrawn:
+      self.status = bug.BugStatus.INVALID
+
+  def update_from_vulnerability(self, vulnerability):
+    """Set fields from vulnerability. Does not set the ID."""
+    self.summary = vulnerability.summary
+    self.details = vulnerability.details
+    self.reference_url_types = {
+        ref.url: vulnerability_pb2.Reference.Type.Name(ref.type)
+        for ref in vulnerability.references
+    }
+
+    if vulnerability.HasField('modified'):
+      self.last_modified = vulnerability.modified.ToDatetime(datetime.UTC)
+    if vulnerability.HasField('published'):
+      self.timestamp = vulnerability.published.ToDatetime(datetime.UTC)
+    if vulnerability.HasField('withdrawn'):
+      self.withdrawn = vulnerability.withdrawn.ToDatetime(datetime.UTC)
+    else:
+      self.withdrawn = None
+
+    self.aliases = list(vulnerability.aliases)
+    self.related = list(vulnerability.related)
+    self.upstream_raw = list(vulnerability.upstream)
+
+    self.affected_packages = []
+    for affected_package in vulnerability.affected:
+      current = AffectedPackage()
+      current.package = Package(
+          name=affected_package.package.name,
+          ecosystem=affected_package.package.ecosystem,
+          purl=affected_package.package.purl)
+      current.ranges = []
+
+      for affected_range in affected_package.ranges:
+        current_range = AffectedRange2(
+            type=vulnerability_pb2.Range.Type.Name(affected_range.type),
+            repo_url=affected_range.repo,
+            events=[])
+
+        for evt in affected_range.events:
+          if evt.introduced:
+            current_range.events.append(
+                AffectedEvent(type='introduced', value=evt.introduced))
+            continue
+
+          if evt.fixed:
+            current_range.events.append(
+                AffectedEvent(type='fixed', value=evt.fixed))
+            continue
+
+          if evt.last_affected:
+            current_range.events.append(
+                AffectedEvent(type='last_affected', value=evt.last_affected))
+            continue
+
+          if evt.limit:
+            current_range.events.append(
+                AffectedEvent(type='limit', value=evt.limit))
+            continue
+
+        if affected_range.database_specific:
+          current_range.database_specific = json_format.MessageToDict(
+              affected_range.database_specific,
+              preserving_proto_field_name=True)
+
+        current.ranges.append(current_range)
+
+      current.versions = list(affected_package.versions)
+      if affected_package.database_specific:
+        current.database_specific = json_format.MessageToDict(
+            affected_package.database_specific,
+            preserving_proto_field_name=True)
+
+      if affected_package.ecosystem_specific:
+        current.ecosystem_specific = json_format.MessageToDict(
+            affected_package.ecosystem_specific,
+            preserving_proto_field_name=True)
+
+      current.severities = []
+      for severity in affected_package.severity:
+        current.severities.append(
+            Severity(
+                type=vulnerability_pb2.Severity.Type.Name(severity.type),
+                score=severity.score))
+
+      self.affected_packages.append(current)
+
+    self.severities = []
+    for severity in vulnerability.severity:
+      self.severities.append(
+          Severity(
+              type=vulnerability_pb2.Severity.Type.Name(severity.type),
+              score=severity.score))
+
+    self.credits = []
+    for credit in vulnerability.credits:
+      cr = Credit(name=credit.name, contact=list(credit.contact))
+      if credit.type:
+        cr.type = vulnerability_pb2.Credit.Type.Name(credit.type)
+      self.credits.append(cr)
+
+    if vulnerability.database_specific:
+      self.database_specific = json_format.MessageToDict(
+          vulnerability.database_specific, preserving_proto_field_name=True)
+
+  def to_vulnerability_minimal(self):
+    """Convert to Vulnerability proto (minimal)."""
+    if self.last_modified:
+      modified = timestamp_pb2.Timestamp()
+      modified.FromDatetime(self.last_modified)
+    else:
+      modified = None
+
+    return vulnerability_pb2.Vulnerability(id=self.id(), modified=modified)
+
+  @ndb.tasklet
+  def to_vulnerability_minimal_async(self,
+                                     include_alias=True,
+                                     include_upstream=True):
+    """Convert to Vulnerability proto (minimal) asynchronously."""
+    modified_times = []
+    if self.last_modified:
+      modified_times.append(self.last_modified)
+
+    # Fetch the last_modified dates from the upstream/alias groups.
+    # TODO(michaelkedar): modified time needs to update if related changes.
+    # Probably requires a RelatedGroup entity/cron
+    alias_future = get_aliases_async(self.id()) if include_alias else None
+    upstream_future = (
+        get_upstream_async(self.id()) if include_upstream else None)
+
+    if include_alias:
+      alias = yield alias_future
+      if alias and alias.last_modified:
+        modified_times.append(alias.last_modified)
+
+    if include_upstream:
+      upstream = yield upstream_future
+      if upstream and upstream.last_modified:
+        modified_times.append(upstream.last_modified)
+
+    modified = None
+    if modified_times:
+      modified = timestamp_pb2.Timestamp()
+      modified.FromDatetime(max(modified_times))
+
+    return vulnerability_pb2.Vulnerability(id=self.id(), modified=modified)
+
+  def to_vulnerability(self,
+                       include_source=False,
+                       include_alias=True,
+                       include_upstream=True):
+    """Convert to Vulnerability proto."""
+    affected = []
+
+    source_link = None
+    if self.source and include_source:
+      source_repo = get_source_repository(self.source)
+      if source_repo and source_repo.link:
+        source_link = source_repo.link + sources.source_path(source_repo, self)
+
+    if self.affected_packages:
+      for affected_package in self.affected_packages:
+        ranges = []
+        for affected_range in affected_package.ranges:
+          events = []
+          for event in affected_range.events:
+            kwargs = {event.type: event.value}
+            events.append(vulnerability_pb2.Event(**kwargs))
+
+          current_range = vulnerability_pb2.Range(
+              type=vulnerability_pb2.Range.Type.Value(affected_range.type),
+              repo=affected_range.repo_url,
+              events=events)
+
+          if affected_range.database_specific:
+            current_range.database_specific.update(
+                affected_range.database_specific)
+
+          ranges.append(current_range)
+
+        current = vulnerability_pb2.Affected(
+            package=vulnerability_pb2.Package(
+                name=affected_package.package.name,
+                ecosystem=affected_package.package.ecosystem,
+                purl=affected_package.package.purl),
+            ranges=ranges,
+            versions=affected_package.versions)
+
+        # Converted CVE records have no package defined.
+        # Avoid exporting an empty package field.
+        if not current.package.ListFields():
+          current.ClearField("package")
+
+        if affected_package.database_specific:
+          current.database_specific.update(affected_package.database_specific)
+
+        if source_link:
+          current.database_specific.update({'source': source_link})
+
+        if affected_package.ecosystem_specific:
+          current.ecosystem_specific.update(affected_package.ecosystem_specific)
+
+        for entry in affected_package.severities:
+          current.severity.append(
+              vulnerability_pb2.Severity(
+                  type=vulnerability_pb2.Severity.Type.Value(entry.type),
+                  score=entry.score))
+
+        affected.append(current)
+
+    details = self.details
+
+    # Note that there is further possible mutation of this field below when
+    # `include_alias` is True or `include_upstream` is True
+    if self.last_modified:
+      modified = timestamp_pb2.Timestamp()
+      modified.FromDatetime(self.last_modified)
+    else:
+      modified = None
+
+    if self.withdrawn:
+      withdrawn = timestamp_pb2.Timestamp()
+      withdrawn.FromDatetime(self.withdrawn)
+    else:
+      withdrawn = None
+
+    if self.timestamp:
+      published = timestamp_pb2.Timestamp()
+      published.FromDatetime(self.timestamp)
+    else:
+      published = None
+
+    references = []
+    if self.reference_url_types:
+      for url, url_type in self.reference_url_types.items():
+        references.append(
+            vulnerability_pb2.Reference(
+                url=url, type=vulnerability_pb2.Reference.Type.Value(url_type)))
+
+    severity = []
+    for entry in self.severities:
+      severity.append(
+          vulnerability_pb2.Severity(
+              type=vulnerability_pb2.Severity.Type.Value(entry.type),
+              score=entry.score))
+
+    credits_ = []
+    for credit in self.credits:
+      cr = vulnerability_pb2.Credit(name=credit.name, contact=credit.contact)
+      if credit.type:
+        cr.type = vulnerability_pb2.Credit.Type.Value(credit.type)
+      credits_.append(cr)
+
+    related = self.related
+    aliases = []
+
+    if include_alias:
+      related_bugs = Bug.query(
+          Bug.related == self.db_id, projection=[Bug.db_id]).fetch()
+      related_bug_ids = [bug.db_id for bug in related_bugs]
+      related = sorted(list(set(related_bug_ids + self.related)))
+      # TODO(michaelkedar): modified time needs to update if related changes.
+      # Probably requires a RelatedGroup entity/cron
+
+      alias_group = AliasGroup.query(AliasGroup.bug_ids == self.db_id).get()
+      if alias_group:
+        aliases = sorted(list(set(alias_group.bug_ids) - {self.db_id}))
+        modified = timestamp_pb2.Timestamp()
+        modified.FromDatetime(
+            max(self.last_modified, alias_group.last_modified))
+
+    upstream = []
+
+    if include_upstream:
+      upstream_group = UpstreamGroup.query(
+          UpstreamGroup.db_id == self.db_id).get()
+      if upstream_group:
+        upstream = sorted(upstream_group.upstream_ids)
+        modified = timestamp_pb2.Timestamp()
+        modified.FromDatetime(
+            max(self.last_modified, upstream_group.last_modified))
+
+    result = vulnerability_pb2.Vulnerability(
+        schema_version=SCHEMA_VERSION,
+        id=self.id(),
+        published=published,
+        modified=modified,  # Note the three places above where this can be set.
+        aliases=aliases,
+        related=related,
+        upstream=upstream,
+        withdrawn=withdrawn,
+        summary=self.summary,
+        details=details,
+        affected=affected,
+        severity=severity,
+        credits=credits_,
+        references=references)
+
+    if self.database_specific:
+      result.database_specific.update(self.database_specific)
+
+    return result
+
+  @ndb.tasklet
+  def to_vulnerability_async(self,
+                             include_source=False,
+                             include_alias=False,
+                             include_upstream=False):
+    """Converts to Vulnerability proto and retrieves aliases asynchronously."""
+    # Convert the vulnerability without any subqueries first.
+    vulnerability: vulnerability_pb2.Vulnerability = self.to_vulnerability(
+        include_source=False, include_alias=False, include_upstream=False)
+
+    # Asynchronously make all necessary subqueries.
+    if not self.source:
+      include_source = False
+    source_future = (
+        SourceRepository.get_by_id_async(self.source)
+        if include_source else None)
+    related_future = (
+        get_related_async(vulnerability.id) if include_alias else None)
+    alias_future = (
+        get_aliases_async(vulnerability.id) if include_alias else None)
+    upstream_future = (
+        get_upstream_async(vulnerability.id) if include_upstream else None)
+
+    if include_source:
+      source_repo = yield source_future
+      if source_repo and source_repo.link:
+        source_link = source_repo.link + sources.source_path(source_repo, self)
+        for affected in vulnerability.affected:
+          affected.database_specific.update({'source': source_link})
+
+    if include_alias:
+      related_bug_ids = yield related_future
+      vulnerability.related[:] = sorted(
+          list(set(related_bug_ids + list(vulnerability.related))))
+      # TODO(michaelkedar): modified time needs to update if related changes.
+      # Probably requires a RelatedGroup entity/cron
+      alias_group = yield alias_future
+      if alias_group:
+        alias_ids = sorted(list(set(alias_group.bug_ids) - {vulnerability.id}))
+        vulnerability.aliases[:] = alias_ids
+        modified_time = vulnerability.modified.ToDatetime(datetime.UTC)
+        modified_time = max(alias_group.last_modified, modified_time)
+        vulnerability.modified.FromDatetime(modified_time)
+
+    if include_upstream:
+      upstream_group = yield upstream_future
+      if upstream_group:
+        vulnerability.upstream[:] = upstream_group.upstream_ids
+        modified_time = vulnerability.modified.ToDatetime(datetime.UTC)
+        modified_time = max(upstream_group.last_modified, modified_time)
+        vulnerability.modified.FromDatetime(modified_time)
+    return vulnerability
+
+  def _post_put_hook(self: Self, future: ndb.Future):  # pylint: disable=arguments-differ
+    """Post-put hook for writing new entities for database migration."""
+    if future.exception():
+      logging.error("Not writing new entities for %s since Bug.put() failed",
+                    self.db_id)
+      return
+    populate_entities_from_bug(self)
+
+
+def _tokenize(value):
+  """Tokenize value for indexing."""
+  if not value:
+    return []
+
+  value_lower = value.lower()
+
+  # Deconstructs the id given into parts by retrieving parts that are
+  # alphanumeric.
+  # This addresses special cases like SUSE that include ':' in their id suffix
+  tokens = {token for token in re.split(r'[^a-zA-Z0-9]+', value_lower) if token}
+  tokens.add(value_lower)
+
+  # Add subsection combinations from id (split at '-') in the search indices
+  # Specifically addresses situation in which UBUNTU-CVE-XXXs don't show up
+  # when searching for the CVE-XXX.
+  # e.g. `a-b-c-d' becomes ['a-b', 'b-c', 'c-d', 'a-b-c', 'b-c-d', 'a-b-c-d']
+  # Does not account for combinations with the suffix sections ':' like SUSE
+  parts = value_lower.split('-')
+  num_parts = len(parts)
+  for length in range(2, num_parts + 1):
+    for i in range(num_parts - length + 1):
+      sub_parts = parts[i:i + length]
+      combo = '-'.join(sub_parts)
+      tokens.add(combo)
+  return tokens
+
+
+# --- Vulnerability Entity ---
+
+
+class Vulnerability(ndb.Model):
+  """A Vulnerability entry.
+  
+  Contains a minimal amount of information of an OSV record, including the
+  overall modified date, an some raw fields that are overwritten by our
+  enrichment.
+  
+  The entity's key/id is ID in OSV.
+  """
+
+  # The source identifier.
+  # For OSS-Fuzz, this oss-fuzz:<ClusterFuzz testcase ID>.
+  # For others this is <source>:<path/to/source>.
+  source_id: str = ndb.StringProperty()
+  # When this record was truly last modified (including e.g. aliases/upstream).
+  modified: datetime.datetime = ndb.DateTimeProperty(tzinfo=datetime.UTC)
+  # Whether this record has been withdrawn
+  is_withdrawn: bool = ndb.BooleanProperty()
+
+  # Raw fields from the original source.
+  # The reported modified date in the record.
+  modified_raw: datetime.datetime = ndb.DateTimeProperty(tzinfo=datetime.UTC)
+  # The reported aliased IDs.
+  alias_raw: list[str] = ndb.StringProperty(repeated=True)
+  # The reported related IDs.
+  related_raw: list[str] = ndb.StringProperty(repeated=True)
+  # The reported upstream IDs.
+  upstream_raw: list[str] = ndb.StringProperty(repeated=True)
+
+
+# --- JobData ---
+
+
+class JobData(ndb.Expando):
+  """Job data."""
+
+
+# --- Affected versions for matching ---
+
+
+class AffectedCommits(ndb.Model):
+  """AffectedCommits entry."""
+  MAX_COMMITS_PER_ENTITY = 10000
+
+  # The main bug ID.
+  bug_id: str = ndb.StringProperty()
+  # The commit hash.
+  commits: list[bytes] = ndb.BlobProperty(repeated=True, indexed=True)
+  # Whether or not the bug is public.
+  public: bool = ndb.BooleanProperty()
+  # The page for this batch of commits.
+  page: int = ndb.IntegerProperty(indexed=False)
+
+
+class AffectedVersions(ndb.Model):
+  """AffectedVersions entry, used for finding matching vulnerabilities within
+  the OSV API."""
+  # The main vulnerability ID.
+  vuln_id: str = ndb.StringProperty()
+  # The ecosystem of the affected package.
+  ecosystem: str = ndb.StringProperty()
+  # The name of the affected package.
+  name: str = ndb.StringProperty()
+
+  # Only one of the following should be set:
+  # The enumerated affected versions.
+  versions: list[str] = ndb.TextProperty(repeated=True)
+  # The sorted affected events.
+  events: list[AffectedEvent] = ndb.LocalStructuredProperty(
+      AffectedEvent, repeated=True)
+
+  # Coarse, string-comparable version bounds
+  # for pre-filtering affected versions.
+  # minimum: 00:00000000.00000000.00000000
+  # maximum: 99:99999999.99999999.99999999
+  coarse_min: str = ndb.StringProperty()
+  coarse_max: str = ndb.StringProperty()
+
+  def sort_key(self):
+    """Key function for comparison and deduplication."""
+    return (self.vuln_id, self.ecosystem, self.name, tuple(self.versions),
+            tuple((e.type, e.value) for e in self.events))
+
+
+# --- Website search / list entity ---
+
+
+class ListedVulnerability(ndb.Model):
+  """ListedVulnerability entry, used for the website's /list page."""
+  # The entity's key/id is ID in OSV
+
+  # The date the vulnerability was published (for sorting & display).
+  published: datetime.datetime = ndb.DateTimeProperty(tzinfo=datetime.UTC)
+  # The ecosystems the vulnerability belongs to (for filtering).
+  ecosystems: list[str] = ndb.StringProperty(repeated=True)
+  # The list of rendered affected packages (for display).
+  # e.g. 'PyPI/urllib3', 'github.com/torvalds/linux'
+  packages: list[str] = ndb.TextProperty(repeated=True)
+  # The summary line (for display).
+  summary: str = ndb.TextProperty()
+  # Whether there is a fix available (for display).
+  is_fixed: bool = ndb.BooleanProperty(indexed=False)
+  # The severities of the vulnerability (for display).
+  severities: list[Severity] = ndb.LocalStructuredProperty(
+      Severity, repeated=True)
+
+  # Strings that the search bar may suggest while typing.
+  autocomplete_tags: list[str] = ndb.StringProperty(repeated=True)
+  # Strings this matches when searching.
+  search_indices: list[str] = ndb.StringProperty(repeated=True)
+
+  # The maximum number of search indices and autocomplete tags to store (each).
+  # Datastore has a limit of 20000 indexed properties + composite indexes.
+  # We use 2000 to be conservative.
+  _MAX_INDICES = 2000
+
+  @classmethod
+  def from_vulnerability(
+      cls: Self, vulnerability: vulnerability_pb2.Vulnerability) -> Self:
+    """Construct a ListedVulnerability from a complete vulnerability proto"""
+    published = vulnerability.published.ToDatetime(datetime.UTC)
+    summary = vulnerability.summary
+    # TODO(michaelkedar): Take the first line of details if summary is missing.
+
+    all_ecosystems = set()
+    all_packages = set()
+
+    is_fixed = False
+    severities = set()
+    for sev in vulnerability.severity:
+      severities.add(
+          (vulnerability_pb2.Severity.Type.Name(sev.type), sev.score))
+
+    search_indices = set()
+    search_indices.update(_tokenize(vulnerability.id))
+    pkg_search_indices = set()
+    repo_search_indices = set()
+    autocomplete_tags = {vulnerability.id.lower()}
+
+    for affected in vulnerability.affected:
+      if affected.package.name:
+        pkg_search_indices.add(affected.package.name.lower())
+        autocomplete_tags.add(affected.package.name.lower())
+        all_packages.add(affected.package.ecosystem + '/' +
+                         affected.package.name)
+      if affected.package.ecosystem:
+        all_ecosystems.add(affected.package.ecosystem)
+      for sev in affected.severity:
+        severities.add(
+            (vulnerability_pb2.Severity.Type.Name(sev.type), sev.score))
+      for r in affected.ranges:
+        if r.type == vulnerability_pb2.Range.Type.GIT:
+          all_ecosystems.add('GIT')
+          repo_search_indices.add(r.repo.lower())
+          autocomplete_tags.add(r.repo.lower())
+
+          split = r.repo.lower().split('//')
+          if len(split) >= 2:
+            no_http = split[1]
+            all_packages.add(no_http)
+          else:
+            all_packages.add(r.repo.lower())
+
+        if any(e.fixed or e.limit for e in r.events):
+          is_fixed = True
+
+    # prioritize exact matches for repo and package names
+    # before adding tokenized versions
+    search_indices.update(repo_search_indices)
+    search_indices.update(pkg_search_indices)
+    for repo in repo_search_indices:
+      if len(search_indices) >= cls._MAX_INDICES:
+        break
+      split = repo.split('//')
+      if len(split) >= 2:
+        no_http = split[1]
+        search_indices.add(no_http)
+        if len(search_indices) >= cls._MAX_INDICES:
+          break
+        # Add the path components exluding the domain name
+        to_add = no_http.split('/')[1:]
+        for t in to_add:
+          if len(search_indices) >= cls._MAX_INDICES:
+            break
+          search_indices.add(t)
+
+    for pkg in pkg_search_indices:
+      if len(search_indices) >= cls._MAX_INDICES:
+        break
+      to_add = _tokenize(pkg)
+      for t in to_add:
+        if len(search_indices) >= cls._MAX_INDICES:
+          break
+        search_indices.add(t)
+
+    for eco in all_ecosystems:
+      # TODO(michaelkedar): Seems like a noisy/useless search index?
+      to_add = _tokenize(eco)
+      for t in to_add:
+        if len(search_indices) >= cls._MAX_INDICES:
+          break
+        search_indices.add(t)
+      if (e := ecosystems.remove_variants(eco)) is not None:
+        to_add = _tokenize(e)
+        for t in to_add:
+          if len(search_indices) >= cls._MAX_INDICES:
+            break
+          search_indices.add(t)
+
+    for alias in vulnerability.aliases:
+      to_add = _tokenize(alias)
+      for t in to_add:
+        if len(search_indices) >= cls._MAX_INDICES:
+          break
+        search_indices.add(t)
+    for upstream in vulnerability.upstream:
+      to_add = _tokenize(upstream)
+      for t in to_add:
+        if len(search_indices) >= cls._MAX_INDICES:
+          break
+        search_indices.add(t)
+    # related intentionally omitted
+
+    ecos = sorted({ecosystems.normalize(e) for e in all_ecosystems})
+    pkgs = sorted(all_packages)
+    sevs = [Severity(type=t, score=s) for t, s in sorted(severities)]
+    search_indices = sorted(search_indices)[:cls._MAX_INDICES]
+    autocomplete_tags = sorted(autocomplete_tags)[:cls._MAX_INDICES]
+
+    return cls(
+        id=vulnerability.id,
+        published=published,
+        ecosystems=ecos,
+        packages=pkgs,
+        summary=summary,
+        is_fixed=is_fixed,
+        severities=sevs,
+        autocomplete_tags=autocomplete_tags,
+        search_indices=search_indices,
+    )
+
+
+def populate_entities_from_bug(entity: Bug):
+  """Puts entities (Vulnerability, ListedVulnerability, AffectedVersions) from
+  a given Bug entity, and writes completed OSV records to GCS bucket."""
+  if not entity.public or entity.status == bug.BugStatus.UNPROCESSED:
+    # OSS-Fuzz private Bugs
+    return
+
+  vuln_pb = entity.to_vulnerability(
+      include_source=True, include_alias=True, include_upstream=True)
+
+  def transaction():
+    vuln = Vulnerability.get_by_id(entity.db_id)
+    if vuln is None:
+      vuln = Vulnerability(id=entity.db_id)
+    if vuln.modified != vuln_pb.modified.ToDatetime(datetime.UTC):
+      vuln.source_id = entity.source_id
+      vuln.modified = vuln_pb.modified.ToDatetime(datetime.UTC)
+      vuln.is_withdrawn = entity.withdrawn is not None
+      vuln.modified_raw = entity.import_last_modified
+      vuln.alias_raw = entity.aliases
+      vuln.related_raw = entity.related
+      vuln.upstream_raw = entity.upstream_raw
+    put_entities(vuln, vuln_pb)
+
+  ndb.transaction(transaction)
+  try:
+    gcs.upload_vulnerability(vuln_pb)
+  except Exception:
+    # Writing to bucket failed for some reason. Send a pub/sub message to retry.
+    logging.error('Writing to bucket failed for %s', entity.db_id)
+    data = vuln_pb.SerializeToString(deterministic=True)
+    pubsub.publish_failure(data, type='gcs_retry')
+
+
+def put_entities(ds_vuln: Vulnerability,
+                 vuln_pb: vulnerability_pb2.Vulnerability):
+  """Puts entities (Vulnerability, ListedVulnerability, AffectedVersions) from
+  a given Vulnerability entity and proto into Datastore.
+
+  Does not write to GCS."""
+  to_put = [ds_vuln]
+  to_delete = []
+  old_affected = AffectedVersions.query(
+      AffectedVersions.vuln_id == vuln_pb.id).fetch()
+  if ds_vuln.is_withdrawn:
+    to_delete.append(ndb.Key(ListedVulnerability, vuln_pb.id))
+    to_delete.extend(av.key for av in old_affected)
+  else:
+    to_put.append(ListedVulnerability.from_vulnerability(vuln_pb))
+    new_affected = affected_from_proto(vuln_pb)
+    added, removed = diff_affected_versions(old_affected, new_affected)
+    to_put.extend(added)
+    to_delete.extend(r.key for r in removed)
+
+  ndb.put_multi(to_put)
+  ndb.delete_multi(to_delete)
+
+
+def _get_coarse_min_max(events: list[AffectedEvent],
+                        e_helper: ecosystems.OrderedEcosystem,
+                        db_id: str) -> tuple[str, str]:
+  """Get coarse min and max from sorted events."""
+  coarse_min = MIN_COARSE_VERSION
+  coarse_max = MAX_COARSE_VERSION
+  try:
+    # Find the lowest introduced event for coarse min
+    # (in case, for some reason, the first event is not introduced)
+    for e in events:
+      if e.type == 'introduced':
+        coarse_min = e_helper.coarse_version(e.value)
+        # Only if we found an introduced version, update coarse_max
+        # And only if the range is bounded.
+        last = events[-1]
+        if last.type != 'introduced':
+          coarse_max = e_helper.coarse_version(last.value)
+        break
+  except NotImplementedError:
+    # Coarse versioning not yet implemented for this ecosystem.
+    pass
+  except ValueError:
+    logging.warning('Invalid version in %s %s', db_id, events)
+    coarse_min = MIN_COARSE_VERSION
+    coarse_max = MAX_COARSE_VERSION
+
+  return coarse_min, coarse_max
+
+
+def _affected_versions_from_affected_proto(
+    affected: vulnerability_pb2.Affected, db_id: str) -> list[AffectedVersions]:
+  """Compute AffectedVersions for a single affected package."""
+  affected_versions = []
+  pkg_ecosystem = affected.package.ecosystem
+  # Make sure we capture all possible ecosystem variants for matching.
+  # e.g. {'Ubuntu:22.04:LTS', 'Ubuntu:22.04', 'Ubuntu'}
+  all_pkg_ecosystems = {pkg_ecosystem, ecosystems.normalize(pkg_ecosystem)}
+  if (e := ecosystems.remove_variants(pkg_ecosystem)) is not None:
+    all_pkg_ecosystems.add(e)
+
+  pkg_name = ecosystems.maybe_normalize_package_names(affected.package.name,
+                                                      pkg_ecosystem)
+
+  # Ecosystem helper for sorting the events.
+  e_helper = ecosystems.get(pkg_ecosystem)
+  # TODO(michaelkedar): I am matching the current behaviour of the API,
+  # where GIT tags match to the first git repo in the ranges list, even if
+  # there are non-git ranges or multiple git repos in a range.
+  repo_url = ''
+  pkg_has_affected = False
+  for r in affected.ranges:
+    if r.type == vulnerability_pb2.Range.Type.GIT:
+      if not repo_url:
+        repo_url = r.repo
+      continue
+    if r.type not in (vulnerability_pb2.Range.Type.SEMVER,
+                      vulnerability_pb2.Range.Type.ECOSYSTEM):
+      logging.warning('Unknown range type "%d" in %s', r.type, db_id)
+      continue
+    if not r.events:
+      continue
+    events = []
+    for e in r.events:
+      if e.introduced:
+        events.append(AffectedEvent(type='introduced', value=e.introduced))
+      elif e.fixed:
+        events.append(AffectedEvent(type='fixed', value=e.fixed))
+      elif e.limit:
+        events.append(AffectedEvent(type='limit', value=e.limit))
+      elif e.last_affected:
+        events.append(
+            AffectedEvent(type='last_affected', value=e.last_affected))
+    pkg_has_affected = True
+    coarse_min = MIN_COARSE_VERSION
+    coarse_max = MAX_COARSE_VERSION
+    if e_helper is not None:
+      # If we have an ecosystem helper sort the events to help with querying.
+      events.sort(key=lambda e, sort_key=e_helper.sort_key:
+                  (sort_key(e.value), _EVENT_ORDER.get(e.type, -1)))
+      coarse_min, coarse_max = _get_coarse_min_max(events, e_helper, db_id)
+
+    # If we don't have an ecosystem helper, assume the events are in order.
+    for e in all_pkg_ecosystems:
+      affected_versions.append(
+          AffectedVersions(
+              vuln_id=db_id,
+              ecosystem=e,
+              name=pkg_name,
+              coarse_min=coarse_min,
+              coarse_max=coarse_max,
+              events=events,
+          ))
+
+  # Add the enumerated versions
+  # We need at least a package name to perform matching.
+  if pkg_name and affected.versions:
+    pkg_has_affected = True
+    coarse_min = MIN_COARSE_VERSION
+    coarse_max = MAX_COARSE_VERSION
+    if e_helper is not None:
+      try:
+        all_coarse = [e_helper.coarse_version(v) for v in affected.versions]
+        coarse_min = min(all_coarse)
+        coarse_max = max(all_coarse)
+      except NotImplementedError:
+        # Coarse versioning not yet implemented for this ecosystem.
+        pass
+      except ValueError:
+        logging.warning('Invalid version in %s', db_id)
+    for e in all_pkg_ecosystems:
+      affected_versions.append(
+          AffectedVersions(
+              vuln_id=db_id,
+              ecosystem=e,
+              name=pkg_name,
+              versions=list(affected.versions),
+              coarse_min=coarse_min,
+              coarse_max=coarse_max,
+          ))
+  if pkg_name and not pkg_has_affected:
+    # We have a package that does not have any affected ranges or versions,
+    # which doesn't really make sense.
+    # Add an empty AffectedVersions entry so that this vuln is returned when
+    # querying the API with no version specified.
+    logging.warning('Vuln has empty affected ranges and versions: %s, %s/%s',
+                    db_id, pkg_ecosystem, pkg_name)
+    for e in all_pkg_ecosystems:
+      affected_versions.append(
+          AffectedVersions(
+              vuln_id=db_id,
+              ecosystem=e,
+              name=pkg_name,
+          ))
+
+  if repo_url:
+    # If we have a repository, always add a GIT entry.
+    # Even if affected.versions is empty, we still want to return this vuln
+    # for the API queries with no versions specified.
+    affected_versions.append(
+        AffectedVersions(
+            vuln_id=db_id,
+            ecosystem='GIT',
+            name=normalize_repo_package(repo_url),
+            versions=list(affected.versions),
+        ))
+
+  return affected_versions
+
+
+def affected_from_proto(
+    vuln_pb: vulnerability_pb2.Vulnerability) -> list[AffectedVersions]:
+  """Compute the AffectedVersions from a Vulnerability proto."""
+  affected_versions = []
+  for affected in vuln_pb.affected:
+    affected_versions.extend(
+        _affected_versions_from_affected_proto(affected, vuln_pb.id))
+
+  # Deduplicate and sort the affected_versions
+  unique_affected_dict = {av.sort_key(): av for av in affected_versions}
+  affected_versions = sorted(
+      unique_affected_dict.values(), key=AffectedVersions.sort_key)
+
+  return affected_versions
+
+
+def diff_affected_versions(
+    old: list[AffectedVersions], new: list[AffectedVersions]
+) -> tuple[list[AffectedVersions], list[AffectedVersions]]:
+  """Find all the AffectedVersion entities that were added/removed from `old` to
+  get `new` (ignoring the entity IDs).
+  
+  returns (added, removed)
+  """
+  all_dict = {av.sort_key(): av for av in old + new}
+  old_set = {av.sort_key() for av in old}
+  new_set = {av.sort_key() for av in new}
+
+  added_keys = new_set - old_set
+  removed_keys = old_set - new_set
+
+  added = [all_dict[k] for k in added_keys]
+  removed = [all_dict[k] for k in removed_keys]
+
+  return added, removed
+
+
+def normalize_repo_package(repo_url: str) -> str:
+  """Normalize the repo_url for use with GIT AffectedVersions entities.
+  
+  Removes the scheme/protocol and the .git extension, and trailing slashes.
+  
+  For example:
+    - 'http://git.musl-libc.org/git/musl' (e.g. CVE-2017-15650)
+      and 'https://git.musl-libc.org/git/musl' (e.g. CVE-2025-26519)
+      both become 'git.musl-libc.org/git/musl'
+    - 'https://github.com/curl/curl.git' (e.g. CURL-CVE-2024-2004)
+      and 'https://github.com/curl/curl' (e.g. CVE-2025-5025)
+      both become 'github.com/curl/curl'
+  """
+  if not repo_url:
+    return repo_url
+
+  try:
+    parsed = urlparse(repo_url)
+    # Remove scheme and reconstruct without it
+    # Keep netloc (hostname) and path
+    normalized = parsed.netloc + parsed.path
+
+    # Remove trailing slash
+    normalized = normalized.rstrip('/')
+    normalized = normalized.removesuffix('.git')
+    return normalized
+  except Exception:
+    return repo_url
+
+
+# --- Indexer entities ---
+
+
+class RepoIndex(ndb.Model):
+  """RepoIndex entry"""
+  # The dependency name
+  name: str = ndb.StringProperty()
+  # The base cpe without the version
+  base_cpe: str = ndb.StringProperty()
+  # The repository commit
+  commit: bytes = ndb.BlobProperty()
+  # The source address
+  repo_addr: str = ndb.StringProperty()
+  # The scanned file extensions
+  file_exts: list[str] = ndb.StringProperty(repeated=True)
+  # The hash algorithm used
+  file_hash_type: str = ndb.StringProperty()
+  # The repository type
+  repo_type: str = ndb.StringProperty()
+  # A bitmap of which buckets are empty
+  empty_bucket_bitmap: bytes = ndb.BlobProperty()
+  # Number of files in this repo
+  file_count: int = ndb.IntegerProperty()
+  # Tag name of the source
+  tag: str = ndb.StringProperty()
+
+
+class FileResult(ndb.Model):
+  """FileResult entry containing the path and hash"""
+  # The hash value of the file
+  hash: bytes = ndb.BlobProperty(indexed=True)
+  # The file path
+  path: str = ndb.TextProperty()
+
+
+class RepoIndexBucket(ndb.Model):
+  """RepoIndexResult entries containing the actual hash values"""
+  # The file results per file
+  node_hash: bytes = ndb.BlobProperty(indexed=True)
+  # number of files this hash represents
+  files_contained: int = ndb.IntegerProperty()
+
+
+# --- SourceRepository ---
+
+
+class SourceRepositoryType(enum.IntEnum):
+  """SourceRepository type."""
+  GIT = 0
+  BUCKET = 1
+  REST_ENDPOINT = 2
+
+
+class SourceRepository(ndb.Model):
+  """Source repository."""
+  # The SourceRepositoryType of the repository.
+  type: int = ndb.IntegerProperty()
+  # The name of the source.
+  name: str = ndb.StringProperty()
+  # The repo URL for the source for SourceRepositoryType.GIT.
+  repo_url: str = ndb.StringProperty()
+  # The username to use for SSH auth for SourceRepositoryType.GIT.
+  repo_username: str = ndb.StringProperty()
+  # Optional branch for repo for SourceRepositoryType.GIT.
+  repo_branch: str = ndb.StringProperty()
+  # The API endpoint for SourceRepositoryType.REST_ENDPOINT.
+  rest_api_url: str = ndb.StringProperty()
+  # Bucket name for SourceRepositoryType.BUCKET.
+  bucket: str = ndb.StringProperty()
+  # Vulnerability data not under this path is ignored by the importer.
+  directory_path: str = ndb.StringProperty()
+  # Last synced hash for SourceRepositoryType.GIT.
+  last_synced_hash: str = ndb.StringProperty()
+  # Last date recurring updates were requested.
+  last_update_date: datetime.datetime = ndb.DateTimeProperty(
+      tzinfo=datetime.UTC)
+  # Patterns of files to exclude (regex).
+  ignore_patterns: list[str] = ndb.StringProperty(repeated=True)
+  # Whether this repository is editable.
+  editable: bool = ndb.BooleanProperty(default=False)
+  # Default extension.
+  extension: str = ndb.StringProperty(default='.yaml')
+  # Key path within each file to store the vulnerability.
+  key_path: str = ndb.StringProperty()
+  # If true, don't analyze any Git ranges.
+  ignore_git: bool = ndb.BooleanProperty(default=False)
+  # List of ecosystems that this source is allowed to import.
+  # A value of '*' means allow all ecosystems.
+  accepted_ecosystems: list[str] = ndb.StringProperty(repeated=True)
+  # Whether to detect cherypicks or not (slow for large repos).
+  detect_cherrypicks: bool = ndb.BooleanProperty(default=True)
+  # Whether to consider all branches when analyzing GIT ranges.
+  consider_all_branches: bool = ndb.BooleanProperty(default=False)
+  # Whether to populate "affected[].versions" from Git ranges.
+  versions_from_repo: bool = ndb.BooleanProperty(default=True)
+  # Ignore last import time once (SourceRepositoryType.BUCKET).
+  ignore_last_import_time: bool = ndb.BooleanProperty(default=False)
+  # Ignore deletion threshold (SourceRepositoryType.BUCKET and REST_ENDPOINT).
+  ignore_deletion_threshold: bool = ndb.BooleanProperty(default=False)
+  # HTTP link prefix to individual OSV source records.
+  link: str = ndb.StringProperty()
+  # HTTP link prefix to individual vulnerability records for humans.
+  human_link: str = ndb.StringProperty()
+  # DB prefix, if the database allocates its own.
+  # https://ossf.github.io/osv-schema/#id-modified-fields
+  db_prefix: list[str] = ndb.StringProperty(repeated=True)
+  # Apply strict validation (JSON Schema + linter checks) to this source.
+  strict_validation: bool = ndb.BooleanProperty(default=False)
+  # The name of the work pool to use for this source.
+  work_pool: str = ndb.StringProperty()
+
+  def ignore_file(self, file_path):
+    """Return whether or not we should be ignoring a file."""
+    if not self.ignore_patterns:
+      return False
+
+    file_name = os.path.basename(file_path)
+    for pattern in self.ignore_patterns:
+      if re.match(pattern, file_name):
+        return True
+
+    return False
+
+  def _pre_put_hook(self):  # pylint: disable=arguments-differ
+    """Pre-put hook for validation."""
+    if self.type == SourceRepositoryType.BUCKET and self.editable:
+      raise ValueError('BUCKET SourceRepository cannot be editable.')
+
+
+# --- Alias & Upstream ---
+
+
+class AliasGroup(ndb.Model):
+  """Alias group."""
+  bug_ids: list[str] = ndb.StringProperty(repeated=True)
+  last_modified: datetime.datetime = ndb.DateTimeProperty(tzinfo=datetime.UTC)
+
+
+class AliasAllowListEntry(ndb.Model):
+  """Alias group allow list entry."""
+  bug_id: str = ndb.StringProperty()
+
+
+class AliasDenyListEntry(ndb.Model):
+  """Alias group deny list entry."""
+  bug_id: str = ndb.StringProperty()
+
+
+class UpstreamGroup(ndb.Model):
+  """Upstream group for storing transitive upstreams of a Bug
+     This group is in a separate table in order to prevent additional race
+     conditions. This makes sure that only the worker is modifying the Bug
+     entity directly. 
+  """
+  # Database ID of the corresponding Bug
+  db_id: str = ndb.StringProperty()
+  # List of transitive upstreams
+  upstream_ids: list[str] = ndb.StringProperty(repeated=True)
+  upstream_hierarchy: str = ndb.JsonProperty()
+  # Date when group was last modified
+  last_modified: datetime.datetime = ndb.DateTimeProperty(tzinfo=datetime.UTC)
+
+
+class RelatedGroup(ndb.Model):
+  """Related group for storing related ids of a Vulnerability"""
+  # Key is Vuln ID
+  # List of related ids
+  related_ids: list[str] = ndb.StringProperty(repeated=True)
+  # Date when group was last modified
+  modified: datetime.datetime = ndb.DateTimeProperty(tzinfo=datetime.UTC)
+
+
+# --- ImportFinding ---
+# TODO(gongh@): redesign this to make it easy to scale.
+class ImportFindings(enum.IntEnum):
+  """The possible quality findings about an individual record."""
+  UNKNOWN = -1
+  NONE = 0
+  DELETED = 1
+  INVALID_JSON = 2
+  INVALID_PACKAGE = 3
+  INVALID_PURL = 4
+  INVALID_VERSION = 5
+  INVALID_COMMIT = 6
+  INVALID_RANGE = 7
+  INVALID_RECORD = 8
+  INVALID_ALIASES = 9
+  INVALID_UPSTREAM = 10
+  INVALID_RELATED = 11
+  BAD_ALIASED_CVE = 12
+
+
+class ImportFinding(ndb.Model):
+  """Quality findings about an individual record."""
+  bug_id: str = ndb.StringProperty()
+  source: str = ndb.StringProperty()
+  findings: list[ImportFindings] = ndb.IntegerProperty(repeated=True)
+  first_seen: datetime.datetime = ndb.DateTimeProperty(tzinfo=datetime.UTC)
+  last_attempt: datetime.datetime = ndb.DateTimeProperty(tzinfo=datetime.UTC)
+
+  def _pre_put_hook(self):  # pylint: disable=arguments-differ
+    """Pre-put hook for setting key."""
+    if not self.key:  # pylint: disable=access-member-before-definition
+      self.key = ndb.Key(ImportFinding, self.bug_id)
+
+  def to_proto(self):
+    """Converts to ImportFinding proto."""
+    return importfinding_pb2.ImportFinding(
+        bug_id=self.bug_id,
+        source=self.source,
+        findings=self.findings,  # type: ignore
+        first_seen=self.first_seen.timestamp_pb(),  #type: ignore
+        last_attempt=self.last_attempt.timestamp_pb(),  #type: ignore
+    )
+
+
+def get_source_repository(source_name: str) -> SourceRepository:
+  """Get source repository."""
+  return SourceRepository.get_by_id(source_name)
+
+
+def sorted_events(ecosystem, range_type, events) -> list[AffectedEvent]:
+  """Sort events."""
+  if range_type == 'GIT':
+    # No need to sort.
+    return events
+
+  if range_type == 'SEMVER':
+    ecosystem_helper = ecosystems.SemverEcosystem()
+  else:
+    ecosystem_helper = ecosystems.get(ecosystem)
+
+  if ecosystem_helper is None:
+    raise ValueError('Unsupported ecosystem ' + ecosystem)
+
+  # Remove any magic '0' values.
+  sorted_copy = []
+  zero_event = None
+  for event in events:
+    if event.value == '0':
+      zero_event = event
+      continue
+
+    sorted_copy.append(event)
+
+  sorted_copy.sort(key=lambda e: ecosystem_helper.sort_key(e.value))
+  if zero_event:
+    sorted_copy.insert(0, zero_event)
+
+  return sorted_copy
+
+
+@ndb.tasklet
+def get_aliases_async(bug_id: str) -> ndb.Future:
+  """Gets aliases asynchronously."""
+  alias_group = yield AliasGroup.query(AliasGroup.bug_ids == bug_id).get_async()
+  return alias_group
+
+
+@ndb.tasklet
+def get_related_async(bug_id: str) -> ndb.Future:
+  """Gets related bugs asynchronously."""
+  related_bugs = yield Bug.query(
+      Bug.related == bug_id, projection=[Bug.db_id]).fetch_async()
+  related_bug_ids = [bug.db_id for bug in related_bugs]
+  return related_bug_ids
+
+
+@ndb.tasklet
+def get_upstream_async(bug_id: str) -> ndb.Future:
+  """Gets upstream bugs asynchronously."""
+  upstream_group = yield UpstreamGroup.query(
+      UpstreamGroup.db_id == bug_id).get_async()
+  return upstream_group

@@ -1,0 +1,244 @@
+package modules
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/akha-security/akca/engine/internal/evidencemarkers"
+	"github.com/akha-security/akca/engine/internal/findingtext"
+	"github.com/akha-security/akca/engine/internal/httpclient"
+	"github.com/akha-security/akca/engine/internal/payloadgen"
+	"github.com/akha-security/akca/engine/internal/timingblind"
+)
+
+type delayedTimingProbe struct {
+	Target     ScanTarget
+	Module     string
+	Payload    payloadgen.Payload
+	ZeroValue  string
+	FalseValue string
+	Baseline   timingblind.Baseline
+	SleepSec   int
+	FirstMs    int64
+	Scheduled  time.Time
+}
+
+func (r *Runner) calibrateTargetTiming(ctx context.Context, target ScanTarget) timingblind.Baseline {
+	return r.calibrateTargetTimingForModule(ctx, "", target)
+}
+
+func (r *Runner) calibrateTargetTimingForModule(ctx context.Context, module string, target ScanTarget) timingblind.Baseline {
+	n := timingblind.DefaultBaselineSampleCount()
+	samples := make([]int64, 0, n)
+	value := nativeTargetValue(target)
+	for i := 0; i < n; i++ {
+		start := time.Now()
+		rr, err := r.probeForModule(ctx, module, target, value)
+		if err != nil {
+			continue
+		}
+		ms := rr.Response.Duration.Milliseconds()
+		if ms <= 0 {
+			ms = time.Since(start).Milliseconds()
+		}
+		samples = append(samples, ms)
+	}
+	return timingblind.Calibrate(samples)
+}
+
+func (r *Runner) scheduleDelayedTimingProbe(entry delayedTimingProbe) {
+	if !timingblind.UseDelayedVerification(r.cfg) {
+		return
+	}
+	r.timingMu.Lock()
+	defer r.timingMu.Unlock()
+	r.delayedTiming = append(r.delayedTiming, entry)
+	if entry.Target.coverage != nil {
+		entry.Target.coverage.pendingTiming.Add(1)
+	}
+}
+
+func (r *Runner) flushDelayedTimingVerifications(ctx context.Context) []ModuleFinding {
+	r.timingMu.Lock()
+	pending := append([]delayedTimingProbe(nil), r.delayedTiming...)
+	r.delayedTiming = nil
+	r.timingMu.Unlock()
+	if len(pending) == 0 {
+		return nil
+	}
+	delay := timingblind.DelayInterval(r.cfg)
+	if delay > 0 {
+		earliest := time.Now()
+		for _, p := range pending {
+			if !p.Scheduled.IsZero() && p.Scheduled.Before(earliest) {
+				earliest = p.Scheduled
+			}
+		}
+		remaining := delay - time.Since(earliest)
+		if remaining > 0 {
+			if r.cfg.ScanIntensity != "stealth" && remaining > 5*time.Second {
+				remaining = 5 * time.Second
+			}
+			if r.emit != nil {
+				_ = r.emit("log", fmt.Sprintf("Verifying %d delayed timing probes...", len(pending)), map[string]interface{}{"scan_id": r.scanID})
+			}
+			timer := time.NewTimer(remaining)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil
+			case <-timer.C:
+			}
+		}
+	}
+	var out []ModuleFinding
+	for _, item := range pending {
+		ctx := ctx
+		if item.Target.coverage != nil {
+			ctx = withTargetRun(ctx, item.Target.coverage)
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		if item.Target.coverage != nil {
+			item.Target.coverage.pendingTiming.Add(-1)
+		}
+		start := time.Now()
+		rr, err := r.probeForModule(ctx, item.Module, item.Target, item.Payload.Value)
+		if err != nil {
+			continue
+		}
+		elapsed := time.Since(start).Milliseconds()
+		if rr.Response.Duration.Milliseconds() > 0 {
+			elapsed = rr.Response.Duration.Milliseconds()
+		}
+		if item.Module == "sqli" && !usableTimingSQLiResponse(rr.Response) {
+			continue
+		}
+		zeroValue := "akca-timing-zero-control"
+		if item.Module == "sqli" {
+			zeroValue = item.ZeroValue
+			if zeroValue == "" {
+				zeroValue = timingblind.SQLiMatchedZeroDelayPayload(item.Payload.Value, r.techDatabaseHint(item.Target.EndpointURL)).Value
+			}
+		} else if item.Module == "nosql" {
+			if strings.Contains(item.Payload.Value, "sleep(") {
+				zeroValue = strings.ReplaceAll(item.Payload.Value, "sleep(5000)", "sleep(0)")
+				zeroValue = strings.ReplaceAll(zeroValue, "sleep(5)", "sleep(0)")
+			} else {
+				zeroValue = "akca-nosql-control"
+			}
+		}
+		zeroRR, err := r.probeForModule(ctx, item.Module, item.Target, zeroValue)
+		if err != nil {
+			continue
+		}
+		if item.Module == "sqli" && (!usableTimingSQLiResponse(zeroRR.Response) || !acceptableTimingStatusPair(zeroRR.Response.StatusCode, rr.Response.StatusCode)) {
+			continue
+		}
+		zeroMs := responseDurationMs(zeroRR)
+		zeroSamples := []int64{zeroMs}
+		for len(zeroSamples) < 3 {
+			repeatZero, repeatErr := r.probeForModule(ctx, item.Module, item.Target, zeroValue)
+			if repeatErr != nil || item.Module == "sqli" &&
+				(!usableTimingSQLiResponse(repeatZero.Response) || !acceptableTimingStatusPair(repeatZero.Response.StatusCode, rr.Response.StatusCode)) {
+				zeroSamples = nil
+				break
+			}
+			zeroSamples = append(zeroSamples, responseDurationMs(repeatZero))
+		}
+		if len(zeroSamples) < 3 {
+			continue
+		}
+		ok, reason := timingblind.VerifyProbeWithControl(elapsed, zeroMs, item.Baseline, item.SleepSec)
+		if !ok {
+			continue
+		}
+		if item.Module == "sqli" {
+			falseValue := item.FalseValue
+			if falseValue == "" {
+				if falseControl, hasFalseControl := timingblind.SQLiXORFalseConditionControl(item.Payload.Value); hasFalseControl {
+					falseValue = falseControl.Value
+				}
+			}
+			if falseValue != "" {
+				falseRR, falseErr := r.probeForModule(ctx, item.Module, item.Target, falseValue)
+				if falseErr != nil || !usableTimingSQLiResponse(falseRR.Response) || !acceptableTimingStatusPair(falseRR.Response.StatusCode, rr.Response.StatusCode) {
+					continue
+				}
+				if matched, _ := timingblind.VerifyProbeWithControl(elapsed, responseDurationMs(falseRR), item.Baseline, item.SleepSec); !matched {
+					continue
+				}
+			}
+		}
+		thirdRR, err := r.probeForModule(ctx, item.Module, item.Target, item.Payload.Value)
+		if err != nil {
+			continue
+		}
+		if item.Module == "sqli" && (!usableTimingSQLiResponse(thirdRR.Response) || !acceptableTimingStatusPair(thirdRR.Response.StatusCode, rr.Response.StatusCode)) {
+			continue
+		}
+		thirdMs := responseDurationMs(thirdRR)
+		if ok, _ := timingblind.VerifyProbeWithControl(thirdMs, zeroMs, item.Baseline, item.SleepSec); !ok {
+			continue
+		}
+		f := r.buildTimedFinding(ctx, item.Target, item.Module, item.Payload, zeroRR, thirdRR,
+			"delayed_timing_confirmed", reason, item.Baseline, item.FirstMs, elapsed, thirdMs, zeroSamples, item.SleepSec)
+		if f != nil {
+			r.recordFinding(ctx, &out, f, item.Module, "delayed_timing_confirmed")
+		}
+	}
+	return out
+}
+
+func responseDurationMs(rr httpclient.RequestResponse) int64 {
+	if ms := rr.Response.Duration.Milliseconds(); ms > 0 {
+		return ms
+	}
+	return 0
+}
+
+func (r *Runner) buildTimedFinding(ctx context.Context, target ScanTarget, module string, p payloadgen.Payload,
+	baseline, probe httpclient.RequestResponse, signal, reason string, base timingblind.Baseline,
+	firstMs, secondMs, thirdMs int64, zeroSamples []int64, sleepSec int) *ModuleFinding {
+	if !moduleSignalConfirmed(module, p, signal, baseline.Response, probe.Response, false, "") {
+		return nil
+	}
+	candidate := r.buildCandidate(ctx, module, target, p, baseline, probe, signal)
+	candidate.TimingSamples = []int64{firstMs, secondMs, thirdMs}
+	candidate.TimingBaseline = append([]int64(nil), base.Samples...)
+	candidate.TimingMatchedControl = append([]int64(nil), zeroSamples...)
+	candidate.TimingControl = append([]int64(nil), zeroSamples...)
+	result := r.verifier.Verify(candidate)
+	if result.Suppressed || !result.ProofSatisfied {
+		r.recordVerificationOutcome(target, module, signal, result)
+		return nil
+	}
+	responseMarkers := evidencemarkers.ForResponse(p.Value, signal, baseline.Response.Body, probe.Response.Body, "")
+	if strings.Contains(strings.ToLower(signal), "timing") {
+		// Timing evidence is the measured delayed/control sample set below;
+		// arbitrary body differences must never be highlighted as proof.
+		responseMarkers = nil
+	}
+	return &ModuleFinding{
+		Title:     findingtext.HumanTitle(module),
+		VulnClass: module,
+		Severity:  severityFor(module, result.Confidence),
+		Endpoint:  target.EndpointURL,
+		Parameter: target.Parameter,
+		Location:  target.Location,
+		Description: findingtext.HumanDescription(module, signal, target.Parameter, target.EndpointURL, p.Value, p.Variant, target.Location) +
+			fmt.Sprintf(" Timing: delayed probes %d/%d/%dms, zero control %dms, baseline avg %.0fms, sleep %ds (%s).",
+				firstMs, secondMs, thirdMs, medianInt64(zeroSamples), base.AvgMs, sleepSec, reason),
+		Confidence: result.Confidence,
+		Evidence: Evidence{
+			Module: module, Signal: signal, Payload: p,
+			Parameter: target.Parameter, Location: target.Location,
+			ResponseMarkers: responseMarkers,
+			Request:         probe.Request, Response: probe.Response, Verification: result,
+			DetectedAt: time.Now().UTC(),
+		},
+	}
+}

@@ -1,0 +1,235 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Read physical addresses from Device Tree reserved-memory nodes at
+// /sys/firmware/devicetree/base/reserved-memory/*/reg.
+//
+// The reserved-memory node contains child nodes that describe firmware-
+// reserved DRAM regions: CMA pools, secure-world buffers (OP-TEE, TrustZone
+// shared memory), TEE carve-outs, GPU/display framebuffers, vendor-specific
+// reservations, etc. Each child's "reg" property is a binary big-endian
+// array of (address, size) cell pairs, identical in format to the memory@*
+// nodes parsed by sysfs_devicetree_memory.
+//
+// The number of cells per field is read from #address-cells and #size-cells
+// in the reserved-memory node itself; if absent, the root node's cell counts
+// are used (the DT spec allows reserved-memory to define its own cells).
+//
+// All non-security sysfs properties are world-readable (0444); no
+// capability check is required.
+//
+// Leak primitive:
+//   Data leaked:      physical addresses of firmware-reserved DRAM regions
+//   Kernel subsystem: drivers/of — /sys/firmware/devicetree/base/
+//                     reserved-memory/*/reg
+//   Data structure:   device tree reserved-memory child node reg properties
+//   Address type:     physical (DRAM)
+//   Method:           parsed (binary sysfs property)
+//   Status:           unfixed (information exposure by design)
+//   Access check:     none (world-readable sysfs attribute, 0444)
+//   Source:
+//   https://elixir.bootlin.com/linux/v6.12/source/drivers/of/kobj.c#L65
+//
+// Mitigations:
+//   CONFIG_OF=n removes device tree sysfs entirely. The reg property is
+//   world-readable (0444); no runtime sysctl can restrict access.
+//
+// Requires:
+// - CONFIG_OF (device tree support — standard on ARM/RISC-V/MIPS/PPC)
+// - CONFIG_SYSFS
+// - A platform with a reserved-memory node in the device tree
+//
+// References:
+// https://elixir.bootlin.com/linux/v6.12/source/drivers/of/kobj.c#L65
+// https://www.kernel.org/doc/Documentation/devicetree/bindings/reserved-memory/reserved-memory.txt
+// https://www.kernel.org/doc/Documentation/ABI/testing/sysfs-firmware-ofw
+// ---
+// <bcoles@gmail.com>
+
+#include "include/kasld/api.h"
+#include "include/kasld/cli.h"
+#include "include/kasld/devicetree.h"
+#include <dirent.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+KASLD_EXPLAIN(
+    "Reads physical addresses from Device Tree reserved-memory child "
+    "nodes (/sys/firmware/devicetree/base/reserved-memory/*/reg). These "
+    "world-readable binary reg properties describe firmware-reserved DRAM "
+    "regions: CMA pools, OP-TEE / TrustZone buffers, display framebuffers, "
+    "and vendor-specific carve-outs. Physical addresses bound the DRAM "
+    "layout. Only present on device tree platforms (ARM, ARM64, RISC-V, "
+    "MIPS, PowerPC); requires CONFIG_OF.");
+
+KASLD_META("method:parsed\n"
+           "phase:inference\n"
+           "discloses:physical\n"
+           "source:files\n"
+           "config:CONFIG_OF\n");
+
+int main(void) {
+  const char *base = "/sys/firmware/devicetree/base";
+  const char *alt = "/proc/device-tree";
+  const char *root;
+  DIR *d;
+  struct dirent *ent;
+  char path[512];
+  unsigned char buf[256];
+  int n;
+  int count = 0;
+  int addr_cells = 1, size_cells = 1;
+
+  /* Try sysfs first, then /proc/device-tree symlink. A tree that exists but is
+   * hidden is a different fact from one that is absent; keep that across both
+   * candidates, since errno alone would describe only the last one tried. */
+  int dt_denied = 0;
+  d = kasld_opendir(base);
+  if (d) {
+    root = base;
+    closedir(d);
+  } else {
+    if (errno == EACCES || errno == EPERM)
+      dt_denied = 1;
+    d = kasld_opendir(alt);
+    if (d) {
+      root = alt;
+      closedir(d);
+    } else {
+      if (errno == EACCES || errno == EPERM)
+        dt_denied = 1;
+      if (dt_denied) {
+        kasld_err("device tree present but not readable");
+        return KASLD_EXIT_NOPERM;
+      }
+      kasld_err("device tree not available (not a DT platform?)");
+      return KASLD_EXIT_UNAVAILABLE;
+    }
+  }
+
+  /* Check that the reserved-memory node exists */
+  snprintf(path, sizeof(path), "%s/reserved-memory", root);
+  d = kasld_opendir(path);
+  if (!d) {
+    if (errno == EACCES || errno == EPERM)
+      return KASLD_EXIT_NOPERM;
+    kasld_err("reserved-memory node not found in device tree");
+    return KASLD_EXIT_UNAVAILABLE;
+  }
+  closedir(d);
+
+  kasld_info("searching %s/reserved-memory for physical addresses ...", root);
+
+  /* Read root #address-cells and #size-cells as defaults */
+  snprintf(path, sizeof(path), "%s/#address-cells", root);
+  n = kasld_dt_read_blob(path, buf, sizeof(buf));
+  if (n == 4)
+    addr_cells = (int)kasld_dt_be32(buf);
+
+  snprintf(path, sizeof(path), "%s/#size-cells", root);
+  n = kasld_dt_read_blob(path, buf, sizeof(buf));
+  if (n == 4)
+    size_cells = (int)kasld_dt_be32(buf);
+
+  /* The reserved-memory node often defines its own #address-cells and
+   * #size-cells (commonly both 2 on 64-bit platforms); prefer those. */
+  snprintf(path, sizeof(path), "%s/reserved-memory/#address-cells", root);
+  n = kasld_dt_read_blob(path, buf, sizeof(buf));
+  if (n == 4)
+    addr_cells = (int)kasld_dt_be32(buf);
+
+  snprintf(path, sizeof(path), "%s/reserved-memory/#size-cells", root);
+  n = kasld_dt_read_blob(path, buf, sizeof(buf));
+  if (n == 4)
+    size_cells = (int)kasld_dt_be32(buf);
+
+  if (addr_cells < 1 || addr_cells > 2 || size_cells < 1 || size_cells > 2) {
+    kasld_err("unexpected cell counts: #address-cells=%d, "
+              "#size-cells=%d",
+              addr_cells, size_cells);
+    return 0;
+  }
+
+  int entry_bytes = (addr_cells + size_cells) * 4;
+
+  kasld_info("device tree: #address-cells=%d, #size-cells=%d", addr_cells,
+             size_cells);
+
+  /* Scan all children of reserved-memory/ for reg properties */
+  snprintf(path, sizeof(path), "%s/reserved-memory", root);
+  d = kasld_opendir(path);
+  if (!d) {
+    int e = errno;
+    kasld_errno("opendir");
+    return (e == EACCES || e == EPERM) ? KASLD_EXIT_NOPERM
+                                       : KASLD_EXIT_UNAVAILABLE;
+  }
+
+  while ((ent = readdir(d)) != NULL) {
+    if (ent->d_name[0] == '.')
+      continue;
+
+    char reg_path[512];
+    snprintf(reg_path, sizeof(reg_path), "%s/reserved-memory/%s/reg", root,
+             ent->d_name);
+    n = kasld_dt_read_blob(reg_path, buf, sizeof(buf));
+    if (n < entry_bytes)
+      continue;
+
+    /* Parse all (address, size) pairs in the reg property */
+    int offset = 0;
+    while (offset + entry_bytes <= n) {
+      unsigned long base_addr = kasld_dt_cells(buf + offset, addr_cells);
+      unsigned long size =
+          kasld_dt_cells(buf + offset + addr_cells * 4, size_cells);
+
+      if (!base_addr || !size) {
+        offset += entry_bytes;
+        continue;
+      }
+
+      unsigned long res_hi = base_addr + size - 1;
+
+      kasld_info("reserved-memory %s: base=0x%016lx size=0x%lx", ent->d_name,
+                 base_addr, size);
+
+      /* Emit the full [base, base+size-1] extent, not just the base point, so
+       * the band bounds DRAM from both edges. The DT node name identifies the
+       * reservation (e.g. "linux,cma", "optee@a0000000").
+       *
+       * REGION_DRAM_CARVEOUT, not REGION_RESERVED_MEM: a node carrying a `reg`
+       * names a FIXED address the blob chose, and was never allocated over
+       * free memblock. __reserved_mem_reserve_reg() hands it to
+       * memblock_reserve(), which merges silently when it overlaps the loaded
+       * image and reports nothing; the `no-map` form is refused outright when
+       * the range is already reserved, yet the node keeps publishing its reg
+       * either way. So the address bounds DRAM and establishes nothing about
+       * where the image is not -- reading it as a region the image cannot
+       * occupy carves the true base out of the guaranteed window. Only the
+       * dynamically sized nodes satisfy the allocated-after-placement
+       * argument, and the kernel writes back no `reg` for those. */
+      if (res_hi >= base_addr)
+        kasld_result_range(KASLD_TYPE_PHYS, REGION_DRAM_CARVEOUT, base_addr,
+                           res_hi, ent->d_name, CONF_PARSED);
+
+      count++;
+      offset += entry_bytes;
+    }
+  }
+  closedir(d);
+
+  if (!count) {
+    if (kasld_dt_root_denied(root)) {
+      kasld_err(
+          "device tree present but its property files are unreadable from "
+          "this vantage (EACCES); nothing emitted");
+      return KASLD_EXIT_NOPERM;
+    }
+    kasld_err("no reserved-memory regions with reg properties found");
+    return 0;
+  }
+
+  return 0;
+}

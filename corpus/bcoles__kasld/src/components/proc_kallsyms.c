@@ -1,0 +1,190 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Retrieve kernel _text (image base) and _stext symbols from /proc/kallsyms,
+// and the image footprint from the outer symbols.
+//
+// Based on original code by spender:
+// https://grsecurity.net/~spender/exploits/exploit.txt
+//
+// Requires:
+// - kernel.kptr_restrict = 0 (Default on Debian <= 9 systems)
+//
+// On modern kernels, kptr_restrict = 0 alone is insufficient.
+// /proc/kallsyms uses kallsyms_show_value() (evaluated at open time)
+// to gate address visibility. This requires CAP_SYSLOG, or
+// perf_event_paranoid <= 1 (with kptr_restrict = 0), to reveal
+// addresses. Without these, all addresses appear as zero.
+//
+// Leak primitive:
+//   Data leaked:      kernel symbol virtual addresses (_stext, etc.)
+//   Kernel subsystem: kernel/kallsyms — /proc/kallsyms
+//   Data structure:   kernel symbol table (struct kallsym_iter)
+//   Address type:     virtual (kernel text / data)
+//   Method:           parsed (symbol table read)
+//   Status:           gated by design (kallsyms_show_value)
+//   Access check:     kallsyms_show_value() — kptr_restrict, then
+//                     perf_event_paranoid, then CAP_SYSLOG
+//   Source: https://elixir.bootlin.com/linux/v6.12/source/kernel/kallsyms.c
+//
+// Mitigations:
+//   kernel.kptr_restrict >= 1 masks addresses (mainline defaults to 0;
+//   Debian/Ubuntu ship 1).
+//   Bypass requires CAP_SYSLOG or (kptr_restrict=0 + perf_event_paranoid<=1).
+//   On modern kernels, kallsyms_show_value() checks at open() time.
+// ---
+// <bcoles@gmail.com>
+
+#include "include/kasld/api.h"
+#include "include/kasld/cli.h"
+#include "include/kasld/kernel_image.h"
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+KASLD_EXPLAIN(
+    "Reads kernel symbol virtual addresses from /proc/kallsyms. When "
+    "kernel.kptr_restrict is 0 (or the reader has CAP_SYSLOG), symbol "
+    "addresses are printed in full. The _stext symbol gives the kernel "
+    "text base directly, and the distance from _text to _end is the image "
+    "footprint exactly. Distributions such as Debian and Ubuntu set "
+    "kptr_restrict to 1 (mainline defaults to 0), hiding addresses from "
+    "unprivileged users.");
+
+KASLD_META("method:parsed\n"
+           "phase:inference\n"
+           "discloses:virtual\n"
+           "source:files\n"
+           "sysctl:kptr_restrict>=1\n"
+           "bypass:CAP_SYSLOG\n");
+
+int main(void) {
+  kasld_info("scanning /proc/kallsyms for _text, _stext, _etext and _end ...");
+  /* Pre-check: is /proc/kallsyms readable? */
+  FILE *f = kasld_fopen("/proc/kallsyms", "r");
+  if (!f)
+    return (errno == EACCES || errno == EPERM) ? KASLD_EXIT_NOPERM
+                                               : KASLD_EXIT_UNAVAILABLE;
+
+  /* Detect kptr_restrict: when restricted, ALL addresses are 0.
+   * Some symbols (e.g. __per_cpu_start) are legitimately at address 0,
+   * so check several lines — if every address is 0, the read is restricted. */
+  char buf[64];
+  int all_zero = 1;
+  for (int i = 0; i < 16 && fgets(buf, sizeof(buf), f); i++) {
+    unsigned long test;
+    const char *e;
+    int ok = kasld_addr_parse(buf, 16, &test, &e);
+    if (ok && test != 0) {
+      all_zero = 0;
+      break;
+    }
+    /* A refusal that consumed digits means the address was too wide for this
+     * build, not that the kernel masked it — a masked line parses cleanly as
+     * zero and must keep the scan going. */
+    if (!ok && e != buf) {
+      all_zero = 0;
+      break;
+    }
+  }
+  fclose(f);
+
+  if (all_zero) {
+    /* Name the rule, not a knob. kallsyms_show_value() falls through
+     * kptr_restrict to perf_event_paranoid to CAP_SYSLOG, so the blocker is
+     * whichever of the three the caller fails -- and with kptr_restrict at 0,
+     * the most permissive setting, it is one of the other two. Naming
+     * kptr_restrict there sends a reader to change a value that is already
+     * what they would change it to. */
+    kasld_err("every address in /proc/kallsyms reads as zero "
+              "(needs CAP_SYSLOG, or kptr_restrict=0 with "
+              "perf_event_paranoid<=1)");
+    return KASLD_EXIT_NOPERM;
+  }
+
+  unsigned long text = 0, stext = 0, etext = 0, end = 0;
+
+  FILE *ks = kasld_fopen("/proc/kallsyms", "r");
+  if (ks) {
+    unsigned long a;
+    char line[512], type, sym[256];
+    /* Read line-wise rather than with a "%lx" field: a symbol address wider
+     * than this build's word must be refused, and scanf would hand back a
+     * truncated one that looks like a valid base. */
+    while (fgets(line, sizeof(line), ks)) {
+      const char *e;
+      if (!kasld_addr_parse(line, 16, &a, &e))
+        continue;
+      if (sscanf(e, " %c %255s", &type, sym) != 2)
+        continue;
+      if (!text && strcmp(sym, "_text") == 0)
+        text = a;
+      else if (!stext && strcmp(sym, "_stext") == 0)
+        stext = a;
+      else if (!etext && strcmp(sym, "_etext") == 0)
+        etext = a;
+      else if (!end && strcmp(sym, "_end") == 0)
+        end = a;
+      if (text && stext && etext && end)
+        break;
+    }
+    fclose(ks);
+  }
+
+  if (!text && !stext) {
+    kasld_err("neither _text nor _stext found in /proc/kallsyms");
+    return 0;
+  }
+
+  /* Each symbol is reported on its own. They are read independently and either
+   * can be absent -- older mips exports _stext but no _text -- so neither may
+   * gate the other: a symbol that was read is a fact already in hand, and
+   * discarding it because its neighbour is missing loses the strongest witness
+   * there is.
+   *
+   * _text IS the kernel image base — emit it directly (KERNEL_IMAGE) so the
+   * engine anchors the image base on the real symbol, with no reliance on the
+   * compile-time head gap. _stext is also reported (KERNEL_TEXT) for provenance
+   * and as the source for arches/sources that only expose _stext. */
+  if (text) {
+    kasld_info("kernel image base (_text): 0x%lx", text);
+    kasld_result_base(KASLD_TYPE_VIRT, REGION_KERNEL_IMAGE, text, "_text",
+                      CONF_PARSED);
+  }
+
+  if (stext) {
+    kasld_info("kernel text start (_stext): 0x%lx", stext);
+    kasld_info("possible kernel base: 0x%lx", kasld_floor_text_base(stext));
+    kasld_result_base(KASLD_TYPE_VIRT, REGION_KERNEL_TEXT, stext, "_stext",
+                      CONF_PARSED);
+  }
+
+  if (etext)
+    kasld_info("kernel text end   (_etext): 0x%lx", etext);
+
+  if (end)
+    kasld_info("kernel image end  (_end):   0x%lx", end);
+
+  /* Image footprint from the outermost symbols in hand. Any pair with
+   * _text <= lo and hi <= _end satisfies hi - lo <= _end - _text, so a partial
+   * pair still bounds the footprint from below -- older mips exports _stext
+   * with no _text, and a kallsyms filtered to the text symbols has no _end.
+   *
+   * Only the true outer edges give the footprint ITSELF, which is what the
+   * upper bound requires: it must be a value no in-image leak can exceed, and
+   * every arch linker script places _end after BSS, so nothing in text, data or
+   * bss lies above it. A span built from _stext or _etext understates and is
+   * emitted as a lower bound alone. */
+  unsigned long lo = text ? text : stext;
+  unsigned long hi = end ? end : etext;
+  if (lo && hi && hi > lo) {
+    unsigned long span = hi - lo;
+    if (span >= KIMG_MIN_BYTES) {
+      kasld_emit_scalar(SF_IMAGE_SIZE_MIN, span, CONF_PARSED);
+      if (text && end)
+        kasld_emit_scalar(SF_IMAGE_SIZE_MAX, span, CONF_PARSED);
+    }
+  }
+
+  return 0;
+}

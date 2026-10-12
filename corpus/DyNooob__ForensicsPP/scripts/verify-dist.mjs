@@ -1,0 +1,171 @@
+#!/usr/bin/env node
+/**
+ * Forensics++ (ForensicsPP.com)
+ * Local-first browser forensics workbench
+ *
+ * Copyright (c) 2026 DyNooob. All rights reserved.
+ * Author: DyNooob
+ * Website: https://www.forensicspp.com
+ * Platform: DigiForensics.cn
+ * Project: https://github.com/DyNooob/ForensicsPP
+ *
+ * Forensics++ is an open-source, browser-side toolkit for CTF/MISC,
+ * lightweight forensic triage, encoding/decoding, metadata inspection,
+ * hashes, archive parsing, and local analysis.
+ *
+ * Do not use this project for unauthorized access, intrusion,
+ * privacy infringement, or unlawful activity.
+ *
+ * Released under the MIT License.
+ * Full source code: https://github.com/DyNooob/ForensicsPP
+ */
+
+import { access, readFile, readdir, stat } from "node:fs/promises";
+import { extname, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
+
+const projectRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
+const distRoot = join(projectRoot, "dist");
+const copyrightMarker = "Forensics++ (ForensicsPP.com)";
+const packageJson = JSON.parse(await readFile(join(projectRoot, "package.json"), "utf8"));
+
+const requiredFiles = [
+  "index.html",
+  "404.html",
+  "CNAME",
+  ".nojekyll",
+  "favicon.svg",
+  "legal.html",
+  "og-image.png",
+  "robots.txt",
+  "site.webmanifest",
+  "sitemap.xml",
+  "sw.js",
+  "cyberchef/CyberChef_v10.19.4.html"
+];
+
+const forbiddenNames = new Set([
+  ".git",
+  ".env",
+  ".DS_Store",
+  "package.json",
+  "package-lock.json",
+  "tsconfig.json",
+  "tsconfig.node.json",
+  "vite.config.ts",
+  "vitest.config.ts"
+]);
+
+const textExtensions = new Set([".css", ".html", ".js", ".json", ".svg", ".txt", ".webmanifest", ".xml"]);
+
+async function walk(directory) {
+  const entries = await readdir(directory, { withFileTypes: true });
+  const files = [];
+  for (const entry of entries) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) files.push(...await walk(path));
+    else files.push(path);
+  }
+  return files;
+}
+
+const errors = [];
+for (const path of requiredFiles) {
+  try {
+    await access(join(distRoot, path));
+  } catch {
+    errors.push(`missing required file: ${path}`);
+  }
+}
+
+let files = [];
+try {
+  files = await walk(distRoot);
+} catch {
+  errors.push("dist/ does not exist or cannot be read");
+}
+
+try {
+  const indexHtml = await readFile(join(distRoot, "index.html"), "utf8");
+  if (!indexHtml.includes(`<meta name="version" content="${packageJson.version}"`)) errors.push("index.html version metadata does not match package.json");
+  if (!indexHtml.includes(`"softwareVersion": "${packageJson.version}"`)) errors.push("index.html structured-data version does not match package.json");
+  // Web build uses root-absolute /assets/ so SPA deep-links and the
+  // Nginx `try_files ... /index.html` fallback boot the app from a sub-path
+  // (e.g. /tools/<unknown>/). The standalone build inlines the app and keeps
+  // relative paths, so when index.html references no external assets at all
+  // (fully inlined single file) this assertion does not apply.
+  const usesExternalAssets = /\b(?:src|href)="[^"]*\/assets\//.test(indexHtml);
+  const usesRootAbsolute = /\b(?:src|href)="\/assets\//.test(indexHtml);
+  if (usesExternalAssets && !usesRootAbsolute) {
+    errors.push("web build index.html must use root-absolute /assets/ paths so deep-linked and fallback routes boot");
+  }
+
+  // Environment-aware indexing assertion:
+  //  - production build must NOT carry a noindex meta (would hide the launch)
+  //  - preview build MUST carry a noindex meta (would otherwise be indexed)
+  const isPreview = process.env.VITE_PREVIEW === "1" || process.env.VITE_PREVIEW === "true";
+  const hasNoindex = /name="robots"[^>]*content="[^"]*noindex/i.test(indexHtml);
+  if (isPreview && !hasNoindex) errors.push("preview build must contain a noindex robots meta");
+  if (!isPreview && hasNoindex) errors.push("production build must NOT contain a noindex robots meta");
+
+  // robots.txt must match the deploy mode.
+  const robotsTxt = await readFile(join(distRoot, "robots.txt"), "utf8").catch(() => "");
+  if (isPreview && !/Disallow:\s*\//.test(robotsTxt)) errors.push("preview robots.txt must Disallow /");
+  if (!isPreview && !/Allow:\s*\//.test(robotsTxt)) errors.push("production robots.txt must Allow /");
+} catch {
+  // The required-file check above reports a missing index.html.
+}
+
+try {
+  const serviceWorker = await readFile(join(distRoot, "sw.js"), "utf8");
+  const assetsDir = join(distRoot, "assets");
+  let fingerprint = "static";
+  try {
+    const names = (await readdir(assetsDir)).filter((name) => /\.(js|css)$/.test(name)).sort();
+    fingerprint = createHash("sha1").update(names.join("|")).digest("hex").slice(0, 10);
+  } catch {}
+  const expectedCacheVersion = `forensicspp-v${packageJson.version}-${fingerprint}`;
+  if (!serviceWorker.includes(`const CACHE_VERSION = "${expectedCacheVersion}";`)) {
+    errors.push("sw.js cache version does not match package.json + asset fingerprint");
+  }
+} catch {
+  // The required-file check above reports a missing sw.js.
+}
+
+let totalBytes = 0;
+for (const path of files) {
+  const outputPath = relative(distRoot, path);
+  const segments = outputPath.split(/[\\/]/);
+  const fileStat = await stat(path);
+  totalBytes += fileStat.size;
+
+  if (segments.some((segment) => forbiddenNames.has(segment))) errors.push(`forbidden release path: ${outputPath}`);
+  if ([".map", ".log", ".ts", ".tsx"].includes(extname(path))) errors.push(`forbidden release extension: ${outputPath}`);
+  if (fileStat.size > 50 * 1024 * 1024) errors.push(`file exceeds 50 MiB: ${outputPath}`);
+
+  if (textExtensions.has(extname(path).toLowerCase())) {
+    const content = await readFile(path, "utf8");
+    if (/GitHub\.cn/i.test(content)) errors.push(`release asset contains forbidden publisher domain: ${outputPath}`);
+  }
+}
+
+if (totalBytes > 100 * 1024 * 1024) errors.push("release artifact exceeds 100 MiB");
+
+const generatedProjectAssets = files.filter((file) => {
+  const outputPath = relative(distRoot, file);
+  return /^assets\/(?:index-|(?:[A-Z][A-Za-z]+Tool|entropy\.worker)-).*\.js$/.test(outputPath)
+    || /^assets\/index-.*\.css$/.test(outputPath);
+});
+
+for (const path of generatedProjectAssets) {
+  const content = await readFile(path, "utf8");
+  if (!content.includes(copyrightMarker)) errors.push(`generated asset is missing copyright banner: ${relative(distRoot, path)}`);
+}
+
+if (errors.length) {
+  console.error(`Release artifact verification failed:\n${errors.map((error) => `- ${error}`).join("\n")}`);
+  process.exit(1);
+}
+
+console.log(`Release artifact verified: ${files.length} files, ${(totalBytes / 1024 / 1024).toFixed(1)} MiB.`);

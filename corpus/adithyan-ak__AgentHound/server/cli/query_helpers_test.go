@@ -1,0 +1,765 @@
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"os"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/adithyan-ak/agenthound/server/internal/analysis"
+	"github.com/adithyan-ak/agenthound/server/internal/analysis/prebuilt"
+	"github.com/adithyan-ak/agenthound/server/internal/appdb"
+	"github.com/adithyan-ak/agenthound/server/internal/graph"
+	"github.com/adithyan-ak/agenthound/server/internal/projection"
+	"github.com/adithyan-ak/agenthound/server/model"
+	"github.com/spf13/cobra"
+)
+
+func TestParseNodeRef(t *testing.T) {
+	tests := []struct {
+		name    string
+		ref     string
+		kind    string
+		nname   string
+		wantErr string
+	}{
+		{"valid MCPServer", "MCPServer:my-server", "MCPServer", "my-server", ""},
+		{"valid A2AAgent", "A2AAgent:agent1", "A2AAgent", "agent1", ""},
+		{"valid with colon in name", "MCPResource:postgres://prod:5432", "MCPResource", "postgres://prod:5432", ""},
+		{"unknown kind", "FakeKind:x", "", "", "unknown node kind"},
+		{"no colon", "MCPServer", "", "", "invalid format"},
+		{"empty name", "MCPServer:", "", "", "invalid format"},
+		{"empty kind", ":name", "", "", "invalid format"},
+		{"just colon", ":", "", "", "invalid format"},
+		{"empty string", "", "", "", "invalid format"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kind, name, err := parseNodeRef(tt.ref)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+				}
+				if !containsSubstring(err.Error(), tt.wantErr) {
+					t.Fatalf("error %q does not contain %q", err.Error(), tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if kind != tt.kind {
+				t.Errorf("kind = %q, want %q", kind, tt.kind)
+			}
+			if name != tt.nname {
+				t.Errorf("name = %q, want %q", name, tt.nname)
+			}
+		})
+	}
+}
+
+func TestFormatValue(t *testing.T) {
+	tests := []struct {
+		name string
+		val  any
+		want string
+	}{
+		{"nil", nil, "<null>"},
+		{"string", "hello", "hello"},
+		{"integer float", float64(42.0), "42"},
+		{"fractional float", float64(3.14159), "3.1416"},
+		{"int64", int64(99), "99"},
+		{"true", true, "true"},
+		{"false", false, "false"},
+		{"slice", []any{"a", "b"}, "[a, b]"},
+		{"empty slice", []any{}, "[]"},
+		{"nested nil in slice", []any{nil, "x"}, "[<null>, x]"},
+		{"default type", struct{ X int }{42}, "{42}"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := formatValue(tt.val)
+			if got != tt.want {
+				t.Errorf("formatValue(%v) = %q, want %q", tt.val, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOrderedColumns(t *testing.T) {
+	t.Run("returns all keys", func(t *testing.T) {
+		row := map[string]any{"name": "x", "kind": "MCPServer", "score": 42}
+		cols := orderedColumns(row)
+
+		if len(cols) != len(row) {
+			t.Fatalf("len = %d, want %d", len(cols), len(row))
+		}
+
+		sort.Strings(cols)
+		want := []string{"kind", "name", "score"}
+		for i, c := range cols {
+			if c != want[i] {
+				t.Errorf("cols[%d] = %q, want %q", i, c, want[i])
+			}
+		}
+	})
+
+	t.Run("empty map", func(t *testing.T) {
+		cols := orderedColumns(map[string]any{})
+		if len(cols) != 0 {
+			t.Fatalf("expected empty slice, got %v", cols)
+		}
+	})
+}
+
+func containsSubstring(s, substr string) bool {
+	return len(s) >= len(substr) && searchSubstring(s, substr)
+}
+
+func searchSubstring(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
+// --- Capture helpers for stdout/stderr ---
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+
+	fn()
+
+	_ = w.Close()
+	os.Stdout = old
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+
+	fn()
+
+	_ = w.Close()
+	os.Stderr = old
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
+// --- printRows tests ---
+
+func TestPrintRows_Empty(t *testing.T) {
+	out := captureStdout(t, func() {
+		err := printRows(nil, "table")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	if !strings.Contains(out, "(no results)") {
+		t.Errorf("expected stdout to contain %q, got %q", "(no results)", out)
+	}
+}
+
+func TestPrintRows_Table(t *testing.T) {
+	rows := []map[string]any{
+		{"name": "server-a", "count": float64(3)},
+		{"name": "server-b", "count": float64(7)},
+	}
+
+	var stderrOut string
+	stdoutOut := captureStdout(t, func() {
+		stderrOut = captureStderr(t, func() {
+			err := printRows(rows, "table")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	})
+
+	if !strings.Contains(stdoutOut, "server-a") {
+		t.Errorf("stdout missing %q: %q", "server-a", stdoutOut)
+	}
+	if !strings.Contains(stdoutOut, "server-b") {
+		t.Errorf("stdout missing %q: %q", "server-b", stdoutOut)
+	}
+	if !strings.Contains(stderrOut, "2 row(s)") {
+		t.Errorf("stderr missing row count: %q", stderrOut)
+	}
+}
+
+func TestPrintRows_JSON(t *testing.T) {
+	rows := []map[string]any{
+		{"id": "node-1", "score": float64(85)},
+	}
+
+	out := captureStdout(t, func() {
+		err := printRows(rows, "json")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	var decoded []map[string]any
+	if err := json.Unmarshal([]byte(out), &decoded); err != nil {
+		t.Fatalf("output is not valid JSON: %v\nraw: %q", err, out)
+	}
+	if len(decoded) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(decoded))
+	}
+	if decoded[0]["id"] != "node-1" {
+		t.Errorf("expected id %q, got %v", "node-1", decoded[0]["id"])
+	}
+}
+
+// --- printJSON tests ---
+
+func TestPrintJSON(t *testing.T) {
+	input := map[string]any{"tool": "nmap", "version": float64(7)}
+
+	out := captureStdout(t, func() {
+		err := printJSON(input)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(out), &decoded); err != nil {
+		t.Fatalf("output is not valid JSON: %v\nraw: %q", err, out)
+	}
+	if decoded["tool"] != "nmap" {
+		t.Errorf("expected tool %q, got %v", "nmap", decoded["tool"])
+	}
+}
+
+func TestPrintPublishedFindingsRejectsUnavailableAndStaleScopes(t *testing.T) {
+	revision := int64(7)
+	for _, test := range []struct {
+		name  string
+		scope appdb.FindingScope
+	}{
+		{
+			name:  "unavailable",
+			scope: appdb.FindingScope{Mode: "published"},
+		},
+		{
+			name: "stale",
+			scope: appdb.FindingScope{
+				Mode:             "published",
+				ScanID:           "scan-7",
+				Revision:         &revision,
+				ProjectionStatus: model.ProjectionIncomplete,
+				SnapshotStatus:   model.LifecycleComplete,
+				Available:        true,
+				Stale:            true,
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var gotErr error
+			stdout := captureStdout(t, func() {
+				stderr := captureStderr(t, func() {
+					gotErr = printPublishedFindings(nil, test.scope, "table")
+				})
+				if stderr != "" {
+					t.Fatalf("stderr = %q, want no output", stderr)
+				}
+			})
+			if gotErr == nil {
+				t.Fatal("expected fail-closed publication error")
+			}
+			if stdout != "" {
+				t.Fatalf("stdout = %q, want no empty claim", stdout)
+			}
+		})
+	}
+}
+
+func TestPrintPublishedFindingsCurrentEmptyIncludesProjectionIdentity(t *testing.T) {
+	revision := int64(7)
+	scope := appdb.FindingScope{
+		Mode:             "published",
+		ScanID:           "scan-7",
+		Revision:         &revision,
+		ProjectionStatus: model.ProjectionComplete,
+		SnapshotStatus:   model.LifecycleComplete,
+		Available:        true,
+	}
+	var stderr string
+	stdout := captureStdout(t, func() {
+		stderr = captureStderr(t, func() {
+			if err := printPublishedFindings(nil, scope, "table"); err != nil {
+				t.Fatal(err)
+			}
+		})
+	})
+
+	if !strings.Contains(stderr, "scan=scan-7 revision=7") {
+		t.Fatalf("stderr missing projection identity: %q", stderr)
+	}
+	if !strings.Contains(stdout, "No findings found.") {
+		t.Fatalf("stdout missing authoritative empty result: %q", stdout)
+	}
+}
+
+func TestPrintPublishedFindingsQualifiesLimitedEmptyResult(t *testing.T) {
+	revision := int64(7)
+	scope := appdb.FindingScope{
+		Mode:             "published",
+		ScanID:           "scan-7",
+		Revision:         &revision,
+		ProjectionStatus: model.ProjectionComplete,
+		SnapshotStatus:   model.LifecycleComplete,
+		Available:        true,
+		ActiveCoverageLimitations: []model.PostureCoverageLimitation{{
+			CoverageKey: "mcp:target:sha256:limited",
+			State:       "partial",
+			ScanID:      "scan-7",
+		}},
+	}
+	var stderr string
+	stdout := captureStdout(t, func() {
+		stderr = captureStderr(t, func() {
+			if err := printPublishedFindings(nil, scope, "table"); err != nil {
+				t.Fatal(err)
+			}
+		})
+	})
+	if !strings.Contains(stderr, "missing evidence is not proof of absence") {
+		t.Fatalf("stderr missing coverage warning: %q", stderr)
+	}
+	if !strings.Contains(stdout, "No findings in observed data; coverage is limited.") {
+		t.Fatalf("stdout contains unqualified empty result: %q", stdout)
+	}
+}
+
+func TestPrintPublishedFindingsJSONIncludesProjectionIdentity(t *testing.T) {
+	revision := int64(7)
+	scope := appdb.FindingScope{
+		Mode:             "published",
+		ScanID:           "scan-7",
+		Revision:         &revision,
+		ProjectionStatus: model.ProjectionComplete,
+		SnapshotStatus:   model.LifecycleComplete,
+		Available:        true,
+	}
+	stdout := captureStdout(t, func() {
+		if err := printPublishedFindings([]model.Finding{}, scope, "json"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	var result struct {
+		Scope appdb.FindingScope `json:"scope"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Scope.ScanID != "scan-7" ||
+		result.Scope.Revision == nil ||
+		*result.Scope.Revision != 7 {
+		t.Fatalf("scope = %+v", result.Scope)
+	}
+}
+
+type fakeCLIProjectionReader struct {
+	states []*model.ProjectionState
+	calls  int
+}
+
+func (f *fakeCLIProjectionReader) GetProjectionState(
+	_ context.Context,
+) (*model.ProjectionState, error) {
+	if len(f.states) == 0 {
+		return nil, nil
+	}
+	index := f.calls
+	if index >= len(f.states) {
+		index = len(f.states) - 1
+	}
+	f.calls++
+	return f.states[index], nil
+}
+
+func completeCLIProjection(scanID string, revision int64) *model.ProjectionState {
+	return &model.ProjectionState{
+		Status:            model.ProjectionComplete,
+		ScanID:            scanID,
+		PublishedScanID:   scanID,
+		PublishedRevision: &revision,
+		DirtyCoverage:     []string{},
+	}
+}
+
+func TestExecutePrebuiltQueryRejectsUnreadableProjectionBeforeGraphRead(t *testing.T) {
+	mismatched := completeCLIProjection("published", 7)
+	mismatched.ScanID = "updating"
+	dirty := completeCLIProjection("published", 7)
+	dirty.DirtyCoverage = []string{"mcp:root:sha256:dirty"}
+
+	for _, state := range []*model.ProjectionState{
+		nil,
+		{Status: model.ProjectionUpdating},
+		{Status: model.ProjectionIncomplete},
+		mismatched,
+		dirty,
+	} {
+		for _, id := range []string{"no-auth-servers", "shortest-to-database"} {
+			t.Run(id+"/"+projectionStateName(state), func(t *testing.T) {
+				query, ok := prebuilt.Get(id)
+				if !ok {
+					t.Fatalf("prebuilt query %q missing", id)
+				}
+				db := &graph.MockGraphDB{QueryResult: []map[string]any{{"row": "must-not-read"}}}
+				_, err := executePrebuiltQuery(
+					context.Background(),
+					id,
+					query,
+					db,
+					&fakeCLIProjectionReader{states: []*model.ProjectionState{state}},
+				)
+				if err == nil {
+					t.Fatal("expected fail-closed projection error")
+				}
+				if len(db.CallsTo("Query")) != 0 {
+					t.Fatal("graph read ran before projection was proven readable")
+				}
+			})
+		}
+	}
+}
+
+func TestExecutePrebuiltQueryRejectsUnavailableProjectionReader(t *testing.T) {
+	query, ok := prebuilt.Get("no-auth-servers")
+	if !ok {
+		t.Fatal("no-auth-servers query missing")
+	}
+	db := &graph.MockGraphDB{QueryResult: []map[string]any{{"row": "must-not-read"}}}
+	_, err := executePrebuiltQuery(
+		context.Background(),
+		query.ID,
+		query,
+		db,
+		nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("error = %v, want unavailable projection failure", err)
+	}
+	if len(db.CallsTo("Query")) != 0 {
+		t.Fatal("graph read ran without a projection state reader")
+	}
+}
+
+func projectionStateName(state *model.ProjectionState) string {
+	if state == nil {
+		return "absent"
+	}
+	if len(state.DirtyCoverage) > 0 {
+		return "dirty"
+	}
+	if state.ScanID != state.PublishedScanID {
+		return "mismatched"
+	}
+	return state.Status
+}
+
+func TestExecutePrebuiltQueryRejectsProjectionChangeIncludingShortestDatabase(t *testing.T) {
+	for _, id := range []string{"no-auth-servers", "shortest-to-database"} {
+		t.Run(id, func(t *testing.T) {
+			query, ok := prebuilt.Get(id)
+			if !ok {
+				t.Fatalf("prebuilt query %q missing", id)
+			}
+			db := &graph.MockGraphDB{QueryResult: []map[string]any{}}
+			_, err := executePrebuiltQuery(
+				context.Background(),
+				id,
+				query,
+				db,
+				&fakeCLIProjectionReader{states: []*model.ProjectionState{
+					completeCLIProjection("scan-1", 7),
+					completeCLIProjection("scan-2", 8),
+				}},
+			)
+			if err == nil || !strings.Contains(err.Error(), "changed during read") {
+				t.Fatalf("error = %v, want projection-change failure", err)
+			}
+			if len(db.CallsTo("Query")) == 0 {
+				t.Fatal("test did not exercise a graph read between projection checks")
+			}
+		})
+	}
+}
+
+func TestExecutePrebuiltQueryAndOutputIncludeProjectionIdentity(t *testing.T) {
+	query, ok := prebuilt.Get("no-auth-servers")
+	if !ok {
+		t.Fatal("no-auth-servers query missing")
+	}
+	result, err := executePrebuiltQuery(
+		context.Background(),
+		query.ID,
+		query,
+		&graph.MockGraphDB{QueryResult: []map[string]any{{"server_name": "server"}}},
+		&fakeCLIProjectionReader{
+			states: []*model.ProjectionState{completeCLIProjection("scan-7", 7)},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Projection != (projection.Identity{ScanID: "scan-7", Revision: 7}) {
+		t.Fatalf("projection = %+v", result.Projection)
+	}
+
+	jsonOutput := captureStdout(t, func() {
+		if err := printPrebuiltResult(result, "json"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	var decoded prebuiltExecution
+	if err := json.Unmarshal([]byte(jsonOutput), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Projection != result.Projection || len(decoded.Rows) != 1 {
+		t.Fatalf("JSON output = %+v", decoded)
+	}
+
+	var tableStderr string
+	_ = captureStdout(t, func() {
+		tableStderr = captureStderr(t, func() {
+			if err := printPrebuiltResult(result, "table"); err != nil {
+				t.Fatal(err)
+			}
+		})
+	})
+	if !strings.Contains(tableStderr, "scan=scan-7 revision=7") {
+		t.Fatalf("table output missing projection identity: %q", tableStderr)
+	}
+}
+
+func TestPrebuiltOutputWarnsForLimitedPublishedProjection(t *testing.T) {
+	query, ok := prebuilt.Get("no-auth-servers")
+	if !ok {
+		t.Fatal("no-auth-servers query missing")
+	}
+	state := completeCLIProjection("scan-limited", 8)
+	state.ActiveCoverageLimitations = []model.PostureCoverageLimitation{{
+		CoverageKey: "mcp:target:sha256:limited",
+		State:       "partial",
+		ScanID:      "scan-limited",
+	}}
+	result, err := executePrebuiltQuery(
+		context.Background(),
+		query.ID,
+		query,
+		&graph.MockGraphDB{},
+		&fakeCLIProjectionReader{states: []*model.ProjectionState{state}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Projection.CoverageLimited ||
+		result.Projection.CoverageLimitationCount != 1 {
+		t.Fatalf("projection limitation = %+v", result.Projection)
+	}
+	stderr := captureStderr(t, func() {
+		_ = captureStdout(t, func() {
+			if err := printPrebuiltResult(result, "table"); err != nil {
+				t.Fatal(err)
+			}
+		})
+	})
+	if !strings.Contains(stderr, "missing evidence is not proof of absence") {
+		t.Fatalf("stderr missing coverage warning: %q", stderr)
+	}
+}
+
+// --- printPrebuiltList tests ---
+
+func TestPrintPrebuiltList(t *testing.T) {
+	out := captureStderr(t, func() {
+		printPrebuiltList()
+	})
+
+	if !strings.Contains(out, "ID") {
+		t.Errorf("expected header %q in output: %q", "ID", out)
+	}
+	if !strings.Contains(out, "agents-shell-access") {
+		t.Errorf("expected %q in output: %q", "agents-shell-access", out)
+	}
+}
+
+// --- runQuery validation tests ---
+
+func newQueryCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:  "query",
+		RunE: runQuery,
+	}
+	cmd.Flags().String("prebuilt", "", "")
+	cmd.Flags().Bool("findings", false, "")
+	cmd.Flags().String("severity", "", "")
+	cmd.Flags().Bool("shortest-path", false, "")
+	cmd.Flags().String("from", "", "")
+	cmd.Flags().String("to", "", "")
+	cmd.Flags().String("path-mode", "security", "")
+	cmd.Flags().String("format", "table", "")
+	cmd.Flags().String("fail-on", "", "")
+	cmd.Flags().Bool("all-findings", false, "")
+	cmd.Flags().String("diff", "", "")
+	return cmd
+}
+
+func TestRunQuery_InvalidFormat(t *testing.T) {
+	cmd := newQueryCmd()
+	_ = cmd.Flags().Set("format", "xml")
+	err := runQuery(cmd, nil)
+	if err == nil {
+		t.Fatal("expected error for invalid format")
+	}
+	if !strings.Contains(err.Error(), "invalid format") {
+		t.Errorf("error = %q, want to contain 'invalid format'", err.Error())
+	}
+}
+
+func TestRunQuery_NoMode(t *testing.T) {
+	cmd := newQueryCmd()
+	err := runQuery(cmd, nil)
+	if err == nil {
+		t.Fatal("expected error when no mode specified")
+	}
+	if !strings.Contains(err.Error(), "specify a query mode") {
+		t.Errorf("error = %q, want to contain 'specify a query mode'", err.Error())
+	}
+}
+
+func TestRunQuery_MultipleModes(t *testing.T) {
+	cmd := newQueryCmd()
+	_ = cmd.Flags().Set("findings", "true")
+	_ = cmd.Flags().Set("prebuilt", "agents-shell-access")
+	err := runQuery(cmd, nil)
+	if err == nil {
+		t.Fatal("expected error when multiple modes specified")
+	}
+	if !strings.Contains(err.Error(), "specify only one query mode") {
+		t.Errorf("error = %q, want to contain 'specify only one query mode'", err.Error())
+	}
+}
+
+func TestRunFindings_InvalidSeverity(t *testing.T) {
+	err := runFindings(context.Background(), "bogus", "table", "", false)
+	if err == nil {
+		t.Fatal("expected error for invalid severity")
+	}
+	if !strings.Contains(err.Error(), "invalid severity") {
+		t.Errorf("error = %q, want to contain 'invalid severity'", err.Error())
+	}
+}
+
+func TestRunShortestPath_MissingFlags(t *testing.T) {
+	err := runShortestPath(context.Background(), "", "", "security", "table")
+	if err == nil {
+		t.Fatal("expected error for missing --from/--to")
+	}
+	if !strings.Contains(err.Error(), "requires both") {
+		t.Errorf("error = %q, want to contain 'requires both'", err.Error())
+	}
+}
+
+func TestRunShortestPath_InvalidFrom(t *testing.T) {
+	err := runShortestPath(context.Background(), "badformat", "MCPServer:srv", "security", "table")
+	if err == nil {
+		t.Fatal("expected error for invalid --from")
+	}
+	if !strings.Contains(err.Error(), "--from") {
+		t.Errorf("error = %q, want to contain '--from'", err.Error())
+	}
+}
+
+func TestRunShortestPath_InvalidTo(t *testing.T) {
+	err := runShortestPath(context.Background(), "MCPServer:srv", "badformat", "security", "table")
+	if err == nil {
+		t.Fatal("expected error for invalid --to")
+	}
+	if !strings.Contains(err.Error(), "--to") {
+		t.Errorf("error = %q, want to contain '--to'", err.Error())
+	}
+}
+
+func TestFindShortestPathUsesSharedDirectedSecurityTraversal(t *testing.T) {
+	db := &graph.MockGraphDB{}
+	db.QueryFunc = func(_ context.Context, cypher string, params map[string]any) ([]map[string]any, error) {
+		switch {
+		case strings.Contains(cypher, "traversal:resolve"):
+			value, _ := params["value"].(string)
+			return []map[string]any{{
+				"id": value, "name": value, "kinds": []any{"MCPServer"},
+				"properties": map[string]any{},
+			}}, nil
+		case strings.Contains(cypher, "traversal:adjacency"):
+			if !strings.Contains(cypher, "-[r]->") {
+				t.Fatalf("security traversal is not directed:\n%s", cypher)
+			}
+			if _, ok := params["relationship_kinds"]; !ok {
+				t.Fatal("security traversal omitted the shared relationship policy")
+			}
+			return []map[string]any{{
+				"traversal_source": "source",
+				"traversal_target": "target",
+				"next_id":          "target",
+				"next_name":        "target",
+				"next_kinds":       []any{"MCPResource"},
+				"next_properties":  map[string]any{},
+				"source":           "source",
+				"target":           "target",
+				"kind":             "HAS_ACCESS_TO",
+				"risk_weight":      0.2,
+			}}, nil
+		default:
+			t.Fatalf("unexpected query: %s", cypher)
+			return nil, nil
+		}
+	}
+
+	result, err := findShortestPath(
+		context.Background(),
+		db,
+		"MCPServer", "source",
+		"MCPResource", "target",
+		analysis.TraversalScopeSecurity,
+	)
+	if err != nil {
+		t.Fatalf("findShortestPath: %v", err)
+	}
+	if result.Metadata.Scope != analysis.TraversalScopeSecurity ||
+		result.Metadata.Direction != "out" ||
+		len(result.Paths) != 1 {
+		t.Fatalf("result = %+v", result)
+	}
+}

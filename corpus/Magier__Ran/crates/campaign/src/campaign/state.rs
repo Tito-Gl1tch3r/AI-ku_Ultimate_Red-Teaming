@@ -1,0 +1,1542 @@
+use std::collections::{BTreeSet, HashMap};
+use std::net::IpAddr;
+
+use cortex::KnowledgeGraph;
+use ran_domain::{
+    AuthenticatesTo, BinaryPresence, C2Server, Contains, Entity, EntityId, K8sCluster,
+    K8sCredential, K8sNode, Namespace, OperatorHost, Pod, PodExec, Relation, RelationSummary,
+    SessionStatus, UnknownSystem,
+};
+use serde::{Deserialize, Serialize};
+
+use c2::{ExecTtp, BUILTIN_C2_ID};
+
+use crate::execution_record::ExecutionRecord;
+use crate::external_parser::SystemFieldUpdates;
+use crate::{
+    external_parser, KnowledgeProvenance, KnowledgeProvenanceStore, ParseAudit,
+    RelationProvenanceKey,
+};
+
+use super::{CampaignSystemEntityMut, CampaignSystemEntityRef, EntityStore, ExecChannel};
+
+const IN_FLIGHT_OUTPUT_LIMIT: usize = 1024 * 1024;
+
+fn append_bounded(buffer: &mut String, delta: &str) -> bool {
+    buffer.push_str(delta);
+    if buffer.len() <= IN_FLIGHT_OUTPUT_LIMIT {
+        return false;
+    }
+    let mut remove = buffer.len() - IN_FLIGHT_OUTPUT_LIMIT;
+    while !buffer.is_char_boundary(remove) {
+        remove += 1;
+    }
+    buffer.drain(..remove);
+    true
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InFlightOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub last_sequence: u64,
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+}
+
+/// Aggregate root for campaign knowledge and execution history.
+///
+/// Storage is intentionally inaccessible to other crates. Callers can query
+/// state and use aggregate mutations, but cannot update the entity store
+/// without its graph and provenance.
+///
+/// ```compile_fail
+/// use campaign::Campaign;
+/// use ran_domain::K8sCluster;
+///
+/// let campaign = Campaign::bootstrap("Ran", K8sCluster::new("demo"));
+/// let _ = &campaign.entities;
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Campaign {
+    pub(crate) entities: EntityStore,
+    /// Topology and relation metadata, backed by a petgraph `StableGraph`.
+    #[serde(skip)]
+    pub(crate) graph: KnowledgeGraph,
+    pub(crate) parse_audits: Vec<ParseAudit>,
+    pub(crate) execution_records: Vec<ExecutionRecord>,
+    /// Steps that have been dispatched to C2 but not yet completed.
+    pub(crate) open_steps: Vec<ExecTtp>,
+    /// Bounded output snapshots for currently running commands. SSE carries
+    /// deltas; this map lets a reconnecting frontend recover the latest output.
+    #[serde(default)]
+    pub(crate) in_flight_outputs: HashMap<String, InFlightOutput>,
+    /// Raw file contents captured by `file:content(path)` effects, keyed by path.
+    #[serde(default)]
+    pub(crate) file_contents: HashMap<String, String>,
+    /// Per-command multi-hop traversal breakdown, keyed by command id.
+    /// Presentation/audit side data (see [`crate::traversal`]) kept off
+    /// `ExecTtp`/`ExecutionRecord`; surfaced by the flow API by joining on id.
+    #[serde(default)]
+    pub(crate) command_traversals: HashMap<String, crate::traversal::CommandTraversal>,
+    /// Hop path each active session tunnels through, keyed by session backend
+    /// id, captured when the session was established. Replayed for every command
+    /// that later routes over that session.
+    #[serde(default)]
+    pub(crate) session_traversals: HashMap<String, Vec<crate::traversal::TraversalHop>>,
+    #[serde(default)]
+    pub(crate) knowledge_provenance: KnowledgeProvenanceStore,
+    /// Stale entity id → the id it was merged into. Recorded whenever two
+    /// entities turn out to be the same thing: an `UnknownSystem` promoted into
+    /// the Pod it always was, an IP-placeholder pod folded into its real
+    /// identity, a C2-supplied target id resolved to a locally created system.
+    ///
+    /// The merge changes the entity id, but long-lived callers keep the old
+    /// one - the C2 session bookkeeping captures a target id when a shell first
+    /// connects and quotes it back minutes later. Every id-keyed system lookup
+    /// therefore resolves through this table
+    /// (see [`Self::canonical_entity_id`]).
+    #[serde(default)]
+    pub(crate) entity_aliases: HashMap<EntityId, EntityId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InitialClusterKnowledge {
+    pub cluster: K8sCluster,
+    pub provenance: BTreeSet<KnowledgeProvenance>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InitialKubeconfigKnowledge {
+    pub credential: K8sCredential,
+    pub cluster_id: EntityId,
+    pub provenance: BTreeSet<KnowledgeProvenance>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InitialKnowledge {
+    pub clusters: Vec<InitialClusterKnowledge>,
+    pub kubeconfigs: Vec<InitialKubeconfigKnowledge>,
+    /// Display name for the operator host (the machine running Ran). When set,
+    /// this is the local machine's hostname so it is obvious which host holds
+    /// the kubeconfig. Defaults to a generic label when unknown.
+    pub operator_host_name: Option<String>,
+    /// Which of the armory's tools are installed on the machine running Ran,
+    /// probed once at startup. Answers "can this operator-side action run at
+    /// all?" through the same binary map every other system uses.
+    pub operator_host_binaries: HashMap<String, BinaryPresence>,
+    /// Non-loopback IPs of the machine running Ran.
+    ///
+    /// Recorded as observed facts, plural. Which of them (if any) a payload
+    /// should call back to is a property of the *return path* from the target,
+    /// not of this host, so that choice deliberately is not made here.
+    pub operator_host_ips: Vec<IpAddr>,
+}
+
+impl Campaign {
+    pub fn bootstrap(ran_name: impl Into<String>, target_cluster: K8sCluster) -> Self {
+        let mut origins = BTreeSet::new();
+        origins.insert(KnowledgeProvenance::Operator);
+        Self::bootstrap_with_knowledge(
+            ran_name,
+            InitialKnowledge {
+                clusters: vec![InitialClusterKnowledge {
+                    cluster: target_cluster,
+                    provenance: origins,
+                }],
+                kubeconfigs: Vec::new(),
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn bootstrap_with_knowledge(
+        ran_name: impl Into<String>,
+        initial: InitialKnowledge,
+    ) -> Self {
+        let mut entities = EntityStore::default();
+        let mut graph = KnowledgeGraph::new();
+        let mut knowledge_provenance = KnowledgeProvenanceStore::default();
+        // The operator host (the machine running Ran) always exists: it is the
+        // target of the Read Local Kubeconfig TTP, which is how Ran's own
+        // Kubernetes identity is now discovered rather than seeded at bootstrap.
+        let operator_host_id = {
+            let host_name = initial
+                .operator_host_name
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| "Operator host".to_string());
+            let mut operator_host = OperatorHost::new(host_name);
+            operator_host.system.binaries = initial.operator_host_binaries.clone();
+            operator_host.system.ips = initial.operator_host_ips.clone();
+            let id = operator_host.entity_id();
+            entities.insert_typed(operator_host);
+            graph.ensure_node(id.clone());
+            knowledge_provenance.add_entity(id.clone(), KnowledgeProvenance::Operator);
+            id
+        };
+
+        let c2 = C2Server::new(ran_name.into());
+        let c2_id = c2.entity_id();
+        entities.insert_typed(c2);
+        graph.ensure_node(c2_id.clone());
+        knowledge_provenance.add_entity(c2_id.clone(), KnowledgeProvenance::Operator);
+        let host_contains_c2 = Contains::new(operator_host_id.0.clone(), c2_id.0);
+        graph.insert_edge(
+            host_contains_c2.source_id(),
+            host_contains_c2.target_id(),
+            cortex::edge_data_for(host_contains_c2.relation_name(), None, None),
+        );
+        knowledge_provenance.add_relation(
+            RelationProvenanceKey::from_relation(&host_contains_c2),
+            KnowledgeProvenance::Operator,
+        );
+
+        for entry in initial.clusters {
+            let cluster_id = entry.cluster.entity_id();
+            entities.insert_typed(entry.cluster);
+            graph.ensure_node(cluster_id.clone());
+            for origin in entry.provenance {
+                knowledge_provenance.add_entity(cluster_id.clone(), origin);
+            }
+        }
+
+        for entry in initial.kubeconfigs {
+            let credential_id = entry.credential.entity_id();
+            let default_namespace = entry.credential.default_namespace.clone();
+            let is_active = entry.credential.active;
+            entities.insert_typed(entry.credential);
+            graph.ensure_node(credential_id.clone());
+            if is_active {
+                let contains = Contains::new(operator_host_id.0.clone(), credential_id.0.clone());
+                graph.insert_edge(
+                    contains.source_id(),
+                    contains.target_id(),
+                    cortex::edge_data_for(contains.relation_name(), None, None),
+                );
+                knowledge_provenance.add_relation(
+                    RelationProvenanceKey::from_relation(&contains),
+                    KnowledgeProvenance::Operator,
+                );
+            }
+            let relation =
+                AuthenticatesTo::new(credential_id.0.clone(), entry.cluster_id.0.clone());
+            graph.insert_edge(
+                relation.source_id(),
+                relation.target_id(),
+                cortex::edge_data_for(relation.relation_name(), None, None),
+            );
+            for origin in &entry.provenance {
+                knowledge_provenance.add_entity(credential_id.clone(), *origin);
+                knowledge_provenance
+                    .add_relation(RelationProvenanceKey::from_relation(&relation), *origin);
+            }
+
+            if let Some(namespace_name) = default_namespace {
+                let namespace = Namespace::new(namespace_name);
+                let namespace_id = namespace.entity_id();
+                entities.insert_typed(namespace);
+                graph.ensure_node(namespace_id.clone());
+                let contains = Contains::new(entry.cluster_id.0.clone(), namespace_id.0.clone());
+                if !graph
+                    .targets_of(&entry.cluster_id, contains.relation_name())
+                    .contains(&&namespace_id)
+                {
+                    graph.insert_edge(
+                        contains.source_id(),
+                        contains.target_id(),
+                        cortex::edge_data_for(contains.relation_name(), None, None),
+                    );
+                }
+                for origin in &entry.provenance {
+                    knowledge_provenance.add_entity(namespace_id.clone(), *origin);
+                    knowledge_provenance
+                        .add_relation(RelationProvenanceKey::from_relation(&contains), *origin);
+                }
+            }
+        }
+
+        Campaign {
+            entities,
+            graph,
+            parse_audits: Vec::new(),
+            execution_records: Vec::new(),
+            open_steps: Vec::new(),
+            in_flight_outputs: HashMap::new(),
+            file_contents: HashMap::new(),
+            command_traversals: HashMap::new(),
+            session_traversals: HashMap::new(),
+            knowledge_provenance,
+            entity_aliases: HashMap::new(),
+        }
+    }
+
+    /// The recorded multi-hop traversal breakdown for a dispatched command, if
+    /// any. Used by the flow API to annotate steps without storing traversal on
+    /// the execution record itself.
+    pub fn command_traversal(&self, cmd_id: &str) -> Option<&crate::traversal::CommandTraversal> {
+        self.command_traversals.get(cmd_id)
+    }
+
+    /// Reset all campaign state back to the initial bootstrap state.
+    pub fn reset(&mut self, ran_name: impl Into<String>, target_cluster: K8sCluster) {
+        *self = Campaign::bootstrap(ran_name, target_cluster);
+    }
+
+    pub fn reset_with_knowledge(&mut self, ran_name: impl Into<String>, initial: InitialKnowledge) {
+        *self = Campaign::bootstrap_with_knowledge(ran_name, initial);
+    }
+
+    pub fn entity_count(&self) -> usize {
+        self.entities.entity_count()
+    }
+
+    /// Iterate over all entities of a registered concrete type without
+    /// exposing the mutable entity store.
+    pub fn entities_of<T: super::EntityType>(
+        &self,
+    ) -> std::collections::hash_map::Values<'_, EntityId, T> {
+        self.entities.values::<T>()
+    }
+
+    /// Find one entity by its concrete type and stable ID.
+    pub fn find_entity<T: super::EntityType>(&self, id: &EntityId) -> Option<&T> {
+        self.entities.find::<T>(id)
+    }
+
+    /// Test whether an entity of a concrete type exists at `id`.
+    pub fn contains_entity<T: super::EntityType>(&self, id: &EntityId) -> bool {
+        self.entities.contains::<T>(id)
+    }
+
+    pub fn get_entities(&self) -> Vec<super::CampaignEntityRef<'_>> {
+        self.entities.all_entities()
+    }
+
+    pub fn get_relations(&self) -> Vec<RelationSummary> {
+        self.graph.to_relation_summaries()
+    }
+
+    /// Return IDs reached by outgoing relations with `relation_name`.
+    pub fn relation_targets(&self, source: &EntityId, relation_name: &str) -> Vec<EntityId> {
+        self.graph
+            .targets_of(source, relation_name)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Return IDs reaching `target` through relations with `relation_name`.
+    pub fn relation_sources(&self, target: &EntityId, relation_name: &str) -> Vec<EntityId> {
+        self.graph
+            .sources_of(target, relation_name)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Insert or merge an observed entity while keeping its graph node and
+    /// provenance synchronized with the entity store.
+    pub fn upsert_entity<T: super::EntityType>(
+        &mut self,
+        entity: T,
+        provenance: KnowledgeProvenance,
+    ) {
+        let id = entity.entity_id();
+        let is_new_cluster =
+            entity.entity_kind() == "Cluster" && !self.entities.contains::<K8sCluster>(&id);
+        let is_namespace = entity.entity_kind() == "Namespace";
+        self.graph.ensure_node(id.clone());
+        self.entities.insert_typed(entity);
+        self.knowledge_provenance.add_entity(id.clone(), provenance);
+        if is_new_cluster {
+            self.reconcile_namespace_cluster_containment(true, &[]);
+        } else if is_namespace {
+            self.reconcile_namespace_cluster_containment(false, &[id]);
+        }
+    }
+
+    pub(crate) fn reconcile_namespace_cluster_containment(
+        &mut self,
+        cluster_changed: bool,
+        changed_namespaces: &[EntityId],
+    ) {
+        let clusters = self
+            .entities
+            .values::<K8sCluster>()
+            .map(Entity::entity_id)
+            .collect::<Vec<_>>();
+        let [cluster_id] = clusters.as_slice() else {
+            return;
+        };
+        let namespace_ids = if cluster_changed {
+            self.entities
+                .values::<Namespace>()
+                .map(Entity::entity_id)
+                .collect::<Vec<_>>()
+        } else {
+            changed_namespaces
+                .iter()
+                .map(|id| EntityId::new(self.canonical_entity_id(&id.0)))
+                .collect()
+        };
+
+        for namespace_id in namespace_ids {
+            if !self.entities.contains::<Namespace>(&namespace_id) {
+                continue;
+            }
+            if self
+                .graph
+                .sources_of(&namespace_id, "contains")
+                .contains(&cluster_id)
+            {
+                continue;
+            }
+            let relation = Contains::new(cluster_id.0.clone(), namespace_id.0.clone());
+            if self.insert_relation(&relation) {
+                self.knowledge_provenance.add_relation(
+                    RelationProvenanceKey::from_relation(&relation),
+                    KnowledgeProvenance::Inference,
+                );
+            }
+        }
+    }
+
+    /// Insert an observed relation and record its provenance as one aggregate
+    /// mutation.
+    pub fn upsert_relation<R: Relation>(&mut self, relation: &R, provenance: KnowledgeProvenance) {
+        if self.insert_relation(relation) {
+            self.knowledge_provenance
+                .add_relation(RelationProvenanceKey::from_relation(relation), provenance);
+        }
+    }
+
+    pub fn entity_provenance(&self, id: &EntityId) -> BTreeSet<KnowledgeProvenance> {
+        self.knowledge_provenance.entity(id)
+    }
+
+    /// Whether `credential_id` is a local kubeconfig identity - i.e. contained
+    /// by the operator host. Every context read from Ran's own kubeconfig is
+    /// contained by the operator host. Credentials discovered elsewhere (for
+    /// example on a node) are linked by `Uses`, not `Contains`. Static captured
+    /// credentials may still be executable from their embedded token or
+    /// certificate material.
+    pub fn is_operator_host_credential(&self, credential_id: &EntityId) -> bool {
+        let host = EntityId::new("system/operator-host");
+        self.graph
+            .targets_of(&host, "contains")
+            .iter()
+            .any(|id| id.0 == credential_id.0)
+    }
+
+    pub fn relation_provenance(
+        &self,
+        name: &str,
+        source_id: &str,
+        target_id: &str,
+    ) -> BTreeSet<KnowledgeProvenance> {
+        self.knowledge_provenance
+            .relation(&RelationProvenanceKey::new(name, source_id, target_id))
+    }
+
+    pub fn get_parse_audits(&self) -> &[ParseAudit] {
+        &self.parse_audits
+    }
+
+    pub fn get_execution_records(&self) -> &[ExecutionRecord] {
+        &self.execution_records
+    }
+
+    /// Append one entry to the campaign's execution audit trail.
+    pub fn append_execution_record(&mut self, record: ExecutionRecord) {
+        self.execution_records.push(record);
+    }
+
+    pub fn get_open_steps(&self) -> &[ExecTtp] {
+        &self.open_steps
+    }
+
+    pub fn get_in_flight_output(&self, id: &str) -> Option<&InFlightOutput> {
+        self.in_flight_outputs.get(id)
+    }
+
+    pub fn record_in_flight_output(
+        &mut self,
+        id: &str,
+        sequence: u64,
+        stdout: &str,
+        stderr: &str,
+        stdout_bytes: u64,
+        stderr_bytes: u64,
+    ) -> bool {
+        if !self.open_steps.iter().any(|step| step.id == id) {
+            return false;
+        }
+        let output = self.in_flight_outputs.entry(id.to_string()).or_default();
+        if sequence <= output.last_sequence {
+            return false;
+        }
+        output.last_sequence = sequence;
+        output.stdout_bytes = stdout_bytes;
+        output.stderr_bytes = stderr_bytes;
+        output.stdout_truncated |= append_bounded(&mut output.stdout, stdout);
+        output.stderr_truncated |= append_bounded(&mut output.stderr, stderr);
+        true
+    }
+
+    pub fn store_file_content(&mut self, path: impl Into<String>, content: impl Into<String>) {
+        self.file_contents.insert(path.into(), content.into());
+    }
+
+    pub fn get_file_content(&self, path: &str) -> Option<&str> {
+        self.file_contents.get(path).map(String::as_str)
+    }
+
+    pub fn add_open_step(&mut self, exec: ExecTtp) {
+        self.open_steps.push(exec);
+    }
+
+    pub fn complete_open_step(&mut self, id: &str) {
+        self.open_steps.retain(|s| s.id != id);
+        self.in_flight_outputs.remove(id);
+    }
+
+    /// Returns `true` when `id` identifies a machine - anything implementing
+    /// `SystemEntity`. This is the capability question, not the target question:
+    /// the operator host counts here (it has binaries and IPs) yet is never a
+    /// target. It never becomes an exec-path seed because no exec-channel edge
+    /// ever points at it; commands there would run locally, not over a channel.
+    pub(crate) fn is_system_entity_id(&self, id: &EntityId) -> bool {
+        self.entities.contains::<Pod>(id)
+            || self.entities.contains::<K8sNode>(id)
+            || self.entities.contains::<UnknownSystem>(id)
+            || self.entities.contains::<OperatorHost>(id)
+    }
+
+    /// Returns the entity IDs of all systems (Pods and Nodes) that the C2 can
+    /// exec into directly - seeds for Dijkstra / BFS path searches.
+    pub(crate) fn direct_foothold_systems(&self) -> Vec<EntityId> {
+        self.graph
+            .exec_edges()
+            .into_iter()
+            .filter(|(src, tgt, data)| {
+                !self.is_system_entity_id(src)
+                    && self.is_system_entity_id(tgt)
+                    && data.grants_target_execution()
+                    && data.is_realizable(tgt)
+                    && data.is_backend_entry()
+            })
+            .map(|(_, tgt, _)| tgt.clone())
+            .collect()
+    }
+
+    pub(super) fn active_session_backend(&self, system_id: &str) -> Option<String> {
+        let canonical = self.canonical_entity_id(system_id);
+        let system_id = canonical.as_str();
+        let incoming = self.graph.incoming(&EntityId::new(system_id));
+        self.get_system_entity(system_id)?
+            .entity()
+            .system()
+            .sessions
+            .iter()
+            .filter(|session| session.status == SessionStatus::Active)
+            .map(|session| session.backend_id())
+            .filter(|backend| {
+                !incoming
+                    .iter()
+                    .any(|(_, edge)| edge.session_id.as_ref() == Some(backend) && edge.broken)
+            })
+            .min()
+    }
+
+    pub(super) fn executable_paths_from(
+        &self,
+        seeds: &[EntityId],
+        excluded: Option<&EntityId>,
+        allow_output_transform: bool,
+    ) -> std::collections::HashMap<EntityId, super::transport::PlannedExecPath> {
+        self.graph
+            .executable_paths_filtered(
+                seeds,
+                excluded,
+                allow_output_transform,
+                |source, target, data| {
+                    if data.relation_name == "kubelet-exec" && data.envelope.is_none() {
+                        return self.kubelet_source_usable(source, target);
+                    }
+                    if data.relation_name == "kubelet-pod-exec"
+                        && (self.kubelet_endpoint(source, target).is_none()
+                            || self.entities.find::<Pod>(target).is_none_or(|pod| {
+                                pod.meta.name.is_empty()
+                                    || pod.meta.namespace.as_deref().is_none_or(str::is_empty)
+                                    || pod.system.has_binary("sh") == BinaryPresence::Absent
+                            }))
+                    {
+                        return false;
+                    }
+                    let tool = data
+                        .envelope
+                        .as_deref()
+                        .and_then(super::execution::simple_shell_tool)
+                        .or_else(|| {
+                            (data.relation_name == "k8s.can-exec").then(|| "kubectl".to_string())
+                        });
+                    let tool = tool
+                        .as_deref()
+                        .and_then(|word| std::path::Path::new(word).file_name())
+                        .and_then(|word| word.to_str());
+                    tool.is_none_or(|tool| {
+                        self.get_system_entity(&source.0).is_none_or(|system| {
+                            system.entity().system().has_binary(tool)
+                                != ran_domain::BinaryPresence::Absent
+                        })
+                    })
+                },
+            )
+            .into_iter()
+            .filter_map(|(id, path)| {
+                let mut kubelet_plans = Vec::new();
+                for pair in path.edges.windows(2) {
+                    if pair[0].data.relation_name == "kubelet-exec"
+                        && pair[0].data.envelope.is_none()
+                    {
+                        kubelet_plans.push(self.plan_kubelet_pair(
+                            &pair[0].source,
+                            &pair[0].target,
+                            &pair[1].target,
+                        )?);
+                    }
+                }
+                Some((
+                    id,
+                    super::transport::PlannedExecPath {
+                        cost: path.cost,
+                        nodes: path.nodes,
+                        edges: path.edges,
+                        kubelet_plans,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Follow [`Self::entity_aliases`] until the id names a live entity.
+    ///
+    /// An id that is still in the entity store is returned unchanged, so an
+    /// alias can never shadow an entity that exists - only ids that were merged
+    /// away (or were never created in the first place) are rewritten. Bounded
+    /// so a cyclic alias pair cannot spin.
+    pub fn canonical_entity_id(&self, id: &str) -> String {
+        let mut current = EntityId::new(id);
+        for _ in 0..16 {
+            if self.entities.contains_id(&current) {
+                break;
+            }
+            match self.entity_aliases.get(&current) {
+                Some(next) if *next != current => current = next.clone(),
+                _ => break,
+            }
+        }
+        current.0
+    }
+
+    /// Return every stale entity id mapped to its final surviving id.
+    ///
+    /// The stored aliases may form a chain as identities are refined more than
+    /// once. API consumers should not need to reproduce that resolution logic,
+    /// so this snapshot always flattens each entry through
+    /// [`Self::canonical_entity_id`].
+    pub fn entity_aliases(&self) -> HashMap<String, String> {
+        self.entity_aliases
+            .keys()
+            .map(|stale| (stale.0.clone(), self.canonical_entity_id(&stale.0)))
+            .collect()
+    }
+
+    /// Record that `stale` was merged into `preferred`, so later lookups keyed
+    /// by the old id still land on the surviving entity.
+    pub fn record_entity_alias(&mut self, stale: &EntityId, preferred: &EntityId) {
+        if stale == preferred {
+            return;
+        }
+        self.entity_aliases.insert(stale.clone(), preferred.clone());
+    }
+
+    pub fn get_system_entity(&self, id: &str) -> Option<CampaignSystemEntityRef<'_>> {
+        let entity_id = EntityId::new(self.canonical_entity_id(id));
+
+        if let Some(node) = self.entities.find::<K8sNode>(&entity_id) {
+            return Some(CampaignSystemEntityRef::Node(node));
+        }
+        if let Some(pod) = self.entities.find::<Pod>(&entity_id) {
+            return Some(CampaignSystemEntityRef::Pod(pod));
+        }
+        if let Some(system) = self.entities.find::<UnknownSystem>(&entity_id) {
+            return Some(CampaignSystemEntityRef::Unknown(system));
+        }
+        self.entities
+            .find::<OperatorHost>(&entity_id)
+            .map(CampaignSystemEntityRef::OperatorHost)
+    }
+
+    pub fn get_system_entity_mut(&mut self, id: &str) -> Option<CampaignSystemEntityMut<'_>> {
+        let entity_id = EntityId::new(self.canonical_entity_id(id));
+
+        if self.entities.contains::<K8sNode>(&entity_id) {
+            return self
+                .entities
+                .find_mut::<K8sNode>(&entity_id)
+                .map(CampaignSystemEntityMut::Node);
+        }
+        if self.entities.contains::<Pod>(&entity_id) {
+            return self
+                .entities
+                .find_mut::<Pod>(&entity_id)
+                .map(CampaignSystemEntityMut::Pod);
+        }
+        if self.entities.contains::<UnknownSystem>(&entity_id) {
+            return self
+                .entities
+                .find_mut::<UnknownSystem>(&entity_id)
+                .map(CampaignSystemEntityMut::Unknown);
+        }
+        self.entities
+            .find_mut::<OperatorHost>(&entity_id)
+            .map(CampaignSystemEntityMut::OperatorHost)
+    }
+
+    /// Apply partial system-info updates from an external parser to a target entity.
+    pub fn apply_system_update(
+        &mut self,
+        target_id: &str,
+        updates: &SystemFieldUpdates,
+    ) -> Result<usize, String> {
+        let Some(mut target) = self.get_system_entity_mut(target_id) else {
+            return Err(format!("target '{}' is not a system entity", target_id));
+        };
+        let sys = target.entity_mut().system_mut();
+        Ok(external_parser::apply_system_field_updates(sys, updates))
+    }
+
+    /// Query the knowledge graph and return the best execution channel for `target_id`.
+    pub fn resolve_exec_channel(&self, target_id: &str) -> Result<ExecChannel, String> {
+        self.resolve_exec_channel_inner(target_id)
+    }
+
+    /// Inner resolver used for recursive resolution through non-system entities.
+    pub(super) fn resolve_exec_channel_inner(
+        &self,
+        target_id: &str,
+    ) -> Result<ExecChannel, String> {
+        // The caller may hold an id that was merged away (a promoted foothold,
+        // a pod that gained its real name); route to whatever it became.
+        let canonical = self.canonical_entity_id(target_id);
+        let target_id = canonical.as_str();
+        let target_eid = EntityId::new(target_id);
+
+        // Prefer an Active session on the target system. Routing is independent
+        // of tactic: a session's containment is a property of the session, not
+        // of the action it happens to execute.
+        let active_session = self.active_session_backend(target_id);
+
+        if let Some(ref backend_id) = active_session {
+            tracing::debug!(
+                target_id = %target_id,
+                backend_id = %backend_id,
+                "resolve_exec_channel: using active session"
+            );
+            return Ok(ExecChannel {
+                kubelet_plans: vec![],
+                edges: vec![],
+                backend_id: backend_id.clone(),
+                hops: vec![],
+                exec_target_id: None,
+            });
+        }
+
+        // No live session, but a down (lost/broken) one exists on this target:
+        // make the reroute explicit in the logs rather than silently falling
+        // through to graph-based routing.
+        let has_down_session = self.get_system_entity(target_id).is_some_and(|sys| {
+            sys.entity()
+                .system()
+                .sessions
+                .iter()
+                .any(|s| s.status != SessionStatus::Active)
+        });
+        if has_down_session {
+            tracing::info!(
+                target_id = %target_id,
+                "resolve_exec_channel: session on target is down; \
+                 rerouting via the knowledge graph"
+            );
+        }
+
+        let direct_footholds: std::collections::HashSet<String> = self
+            .direct_foothold_systems()
+            .into_iter()
+            .map(|id| id.0)
+            .collect();
+
+        if let Some(source_id) = self
+            .execution_records
+            .iter()
+            .rev()
+            .map(|r| r.target_id.as_str())
+            .find(|id| direct_footholds.contains(*id))
+        {
+            let source_eid = EntityId::new(source_id);
+            if let Some(path) = self
+                .executable_paths_from(&[source_eid], None, true)
+                .remove(&target_eid)
+            {
+                let kubelet_plans = path.kubelet_plans;
+                let edges = path.edges;
+                let path = path.nodes;
+                let hops = path[..path.len().saturating_sub(1)]
+                    .iter()
+                    .map(|id| id.0.clone())
+                    .collect();
+                let backend_id = self.resolve_source_backend_id(source_id);
+                return Ok(ExecChannel {
+                    kubelet_plans,
+                    edges,
+                    backend_id,
+                    hops,
+                    exec_target_id: None,
+                });
+            }
+        }
+
+        if let Some((src, _, _)) = self
+            .graph
+            .exec_edges()
+            .into_iter()
+            .find(|(src, tgt, data)| {
+                tgt.0 == target_id
+                    && !self.is_system_entity_id(src)
+                    && data.is_backend_entry()
+                    && data.is_realizable(tgt)
+            })
+        {
+            let backend_id = if src.0.starts_with("c2/") {
+                src.0.clone()
+            } else {
+                BUILTIN_C2_ID.to_string()
+            };
+            return Ok(ExecChannel::direct(backend_id));
+        }
+
+        let seeds = self.direct_foothold_systems();
+        if let Some(path) = self
+            .executable_paths_from(&seeds, None, true)
+            .remove(&target_eid)
+        {
+            let kubelet_plans = path.kubelet_plans;
+            let edges = path.edges;
+            let path = path.nodes;
+            let hops = path[..path.len().saturating_sub(1)]
+                .iter()
+                .map(|id| id.0.clone())
+                .collect();
+            let backend_id = path
+                .first()
+                .map(|id| self.resolve_source_backend_id(&id.0))
+                .unwrap_or_else(|| BUILTIN_C2_ID.to_string());
+            return Ok(ExecChannel {
+                kubelet_plans,
+                edges,
+                backend_id,
+                hops,
+                exec_target_id: None,
+            });
+        }
+
+        let sa_pod_id = self
+            .graph
+            .incoming(&target_eid)
+            .into_iter()
+            .find(|(_, d)| d.relation_name == "uses")
+            .map(|(src, _)| src.clone());
+
+        if let Some(pod_id) = sa_pod_id {
+            return self.resolve_exec_channel_inner(&pod_id.0).map(|mut ch| {
+                ch.exec_target_id = Some(pod_id.0);
+                ch
+            });
+        }
+
+        Err(format!(
+            "no viable execution channel to '{}' found in the knowledge graph \
+             (no k8s.can-exec or kubelet-pod-exec path reaches this target)",
+            target_id
+        ))
+    }
+
+    /// Resolve an execution channel to `target_id`, constrained to start from
+    /// the caller-supplied system entity `source_id`.
+    ///
+    /// This is used when the user explicitly chooses an executing system in the
+    /// UI: that system should be treated as the source foothold for path
+    /// routing, not as the final execution destination unless it is also the
+    /// target.
+    pub(super) fn resolve_exec_channel_from_source_inner(
+        &self,
+        source_id: &str,
+        target_id: &str,
+    ) -> Result<ExecChannel, String> {
+        // Both ids come from the UI and may predate a merge (the operator was
+        // looking at the foothold before it became a pod).
+        let canonical_source = self.canonical_entity_id(source_id);
+        let canonical_target = self.canonical_entity_id(target_id);
+        let source_id = canonical_source.as_str();
+        let target_id = canonical_target.as_str();
+
+        let source_eid = EntityId::new(source_id);
+        if !self.is_system_entity_id(&source_eid) {
+            return Err(format!(
+                "caller-supplied execution source '{}' is not a system entity",
+                source_id
+            ));
+        }
+
+        // Degenerate case: explicit source equals target system.
+        if source_id == target_id {
+            return Ok(ExecChannel {
+                kubelet_plans: vec![],
+                edges: vec![],
+                backend_id: self.resolve_source_backend_id(source_id),
+                hops: vec![],
+                exec_target_id: None,
+            });
+        }
+
+        let target_eid = EntityId::new(target_id);
+        if let Some(path) = self
+            .executable_paths_from(std::slice::from_ref(&source_eid), None, true)
+            .remove(&target_eid)
+        {
+            let kubelet_plans = path.kubelet_plans;
+            let edges = path.edges;
+            let path = path.nodes;
+            let hops = path[..path.len().saturating_sub(1)]
+                .iter()
+                .map(|id| id.0.clone())
+                .collect();
+            return Ok(ExecChannel {
+                kubelet_plans,
+                edges,
+                backend_id: self.resolve_source_backend_id(source_id),
+                hops,
+                exec_target_id: None,
+            });
+        }
+
+        // Non-system targets (e.g. ServiceAccount) can be reached by first
+        // routing to a pod that uses them.
+        let sa_pod_id = self
+            .graph
+            .incoming(&target_eid)
+            .into_iter()
+            .find(|(_, d)| d.relation_name == "uses")
+            .map(|(src, _)| src.clone());
+
+        if let Some(pod_id) = sa_pod_id {
+            if let Some(path) = self
+                .executable_paths_from(std::slice::from_ref(&source_eid), None, true)
+                .remove(&pod_id)
+            {
+                let kubelet_plans = path.kubelet_plans;
+                let edges = path.edges;
+                let path = path.nodes;
+                let hops = path[..path.len().saturating_sub(1)]
+                    .iter()
+                    .map(|id| id.0.clone())
+                    .collect();
+                return Ok(ExecChannel {
+                    kubelet_plans,
+                    edges,
+                    backend_id: self.resolve_source_backend_id(source_id),
+                    hops,
+                    exec_target_id: Some(pod_id.0),
+                });
+            }
+        }
+
+        Err(format!(
+            "no viable execution channel from '{}' to '{}' found in the knowledge graph",
+            source_id, target_id
+        ))
+    }
+
+    pub fn reachable_pods(&self) -> std::collections::HashSet<String> {
+        let seeds = self.direct_foothold_systems();
+        let mut reachable: std::collections::HashSet<String> =
+            seeds.iter().map(|id| id.0.clone()).collect();
+
+        for id in self.executable_paths_from(&seeds, None, true).into_keys() {
+            if self.entities.contains::<Pod>(&id) {
+                reachable.insert(id.0);
+            }
+        }
+
+        reachable
+    }
+
+    pub fn resolve_exec_source(&self) -> Result<ExecChannel, String> {
+        self.resolve_exec_source_excluding(None)
+    }
+
+    /// Resolve a directly reachable execution source while optionally
+    /// excluding one semantic target from consideration.
+    ///
+    /// Source-side procedures use this to keep a selected target in their
+    /// grounding and attribution context without executing inside that target.
+    pub(super) fn resolve_exec_source_excluding(
+        &self,
+        excluded_target_id: Option<&str>,
+    ) -> Result<ExecChannel, String> {
+        let excluded_target_id = excluded_target_id.map(|id| self.canonical_entity_id(id));
+        let direct_reachable: std::collections::HashSet<String> = self
+            .direct_foothold_systems()
+            .into_iter()
+            .map(|id| id.0)
+            .filter(|id| excluded_target_id.as_deref() != Some(id.as_str()))
+            .collect();
+
+        if direct_reachable.is_empty() {
+            return Err(match excluded_target_id {
+                Some(target_id) => format!(
+                    "no compromised execution source other than target '{}' is available",
+                    target_id
+                ),
+                None => "no compromised system available to use as a lateral-movement \
+                     exec source; gain initial access first"
+                    .to_string(),
+            });
+        }
+
+        if let Some(system_id) = self
+            .execution_records
+            .iter()
+            .rev()
+            .map(|r| &r.target_id)
+            .find(|id| direct_reachable.contains(*id))
+        {
+            let mut ch = ExecChannel::direct(self.resolve_source_backend_id(system_id));
+            ch.exec_target_id = Some(system_id.clone());
+            return Ok(ch);
+        }
+
+        let best_access = direct_reachable
+            .iter()
+            .filter_map(|id| {
+                let sys = self.get_system_entity(id)?;
+                let access = sys.entity().system().access_level;
+                sys.entity()
+                    .system()
+                    .can_exec()
+                    .then_some((id.clone(), access))
+            })
+            .max_by_key(|(_, access)| *access as u8)
+            .map(|(id, _)| id);
+
+        if let Some(system_id) = best_access {
+            let mut ch = ExecChannel::direct(self.resolve_source_backend_id(&system_id));
+            ch.exec_target_id = Some(system_id);
+            return Ok(ch);
+        }
+
+        let any_system = direct_reachable
+            .iter()
+            .find(|id| self.get_system_entity(id).is_some())
+            .cloned();
+
+        if let Some(system_id) = any_system {
+            let mut ch = ExecChannel::direct(self.resolve_source_backend_id(&system_id));
+            ch.exec_target_id = Some(system_id);
+            return Ok(ch);
+        }
+
+        Err(match excluded_target_id {
+            Some(target_id) => format!(
+                "no compromised execution source other than target '{}' is available",
+                target_id
+            ),
+            None => "no compromised system available to use as a lateral-movement \
+                 exec source; gain initial access first"
+                .to_string(),
+        })
+    }
+
+    /// Seed a pod into the campaign with a direct kubectl-exec channel from the
+    /// C2 server. Used by `ran trigger` to prepare a target without prior
+    /// discovery. Returns the pod's entity ID.
+    pub fn seed_pod_for_trigger(&mut self, name: &str, namespace: &str) -> EntityId {
+        let mut pod = Pod::new(name, namespace);
+        pod.is_running = true;
+        let pod_id = pod.entity_id();
+        self.upsert_entity(pod, KnowledgeProvenance::Operator);
+        self.upsert_relation(
+            &PodExec::new(BUILTIN_C2_ID, pod_id.0.clone()),
+            KnowledgeProvenance::Operator,
+        );
+        pod_id
+    }
+
+    /// Add a live initial-access candidate to campaign knowledge without
+    /// granting an execution channel. The Valid Accounts action must succeed
+    /// before the C2-to-Pod edge is created.
+    pub fn stage_initial_access_pod(&mut self, name: &str, namespace: &str) -> EntityId {
+        let mut pod = Pod::new(name, namespace);
+        pod.is_running = true;
+        let pod_id = pod.entity_id();
+        self.upsert_entity(pod, KnowledgeProvenance::Operator);
+        pod_id
+    }
+
+    /// Activate a session on any existing exec-channel edge pointing to `target_id`.
+    /// Sets `session_id` on the edge so the frontend can render it as active.
+    /// Returns `true` when a matching edge was found; the caller should only
+    /// create a new `SessionChannel` relation when this returns `false`.
+    pub fn activate_session_on_exec_channel(&mut self, target_id: &str, backend_id: &str) -> bool {
+        let target_eid = EntityId::new(self.canonical_entity_id(target_id));
+        self.graph
+            .activate_session_on_incoming_exec(&target_eid, backend_id.to_string())
+    }
+
+    /// Clear `session_id` from every exec-channel edge that carries `backend_id`.
+    /// Called when a session is lost regardless of how it was established.
+    pub fn deactivate_session(&mut self, backend_id: &str) {
+        self.graph.deactivate_session(backend_id);
+    }
+
+    /// Mark every exec-channel edge carrying `backend_id` as broken so it is no
+    /// longer traversable, while keeping the edge (and its `session_id`) for
+    /// potential recovery. Returns the number of edges marked.
+    pub fn mark_session_broken(&mut self, backend_id: &str) -> usize {
+        self.graph.mark_session_broken(backend_id)
+    }
+
+    /// Remove the deliberate operator-closed session channel and its
+    /// provenance. Facts learned through the session remain in the campaign.
+    pub fn remove_session_channel(&mut self, backend_id: &str) -> usize {
+        let sessions = self
+            .graph
+            .to_relation_summaries()
+            .into_iter()
+            .filter(|relation| {
+                relation.name == "c2.session" && relation.session_id.as_deref() == Some(backend_id)
+            })
+            .collect::<Vec<_>>();
+        let count = sessions.len();
+        for relation in sessions {
+            let source_id = EntityId::new(relation.source_id.clone());
+            let target_id = EntityId::new(relation.target_id.clone());
+            self.graph
+                .remove_edges(&source_id, &target_id, "c2.session");
+            self.knowledge_provenance
+                .remove_relation(&RelationProvenanceKey::new(
+                    "c2.session",
+                    relation.source_id,
+                    relation.target_id,
+                ));
+        }
+
+        for pod in self.entities.get_mut::<Pod>().values_mut() {
+            pod.system
+                .sessions
+                .retain(|session| session.backend_id() != backend_id);
+        }
+        for node in self.entities.get_mut::<K8sNode>().values_mut() {
+            node.system
+                .sessions
+                .retain(|session| session.backend_id() != backend_id);
+        }
+        for system in self.entities.get_mut::<UnknownSystem>().values_mut() {
+            system
+                .system
+                .sessions
+                .retain(|session| session.backend_id() != backend_id);
+        }
+        for host in self.entities.get_mut::<OperatorHost>().values_mut() {
+            host.system
+                .sessions
+                .retain(|session| session.backend_id() != backend_id);
+        }
+        count
+    }
+
+    /// Insert an entity into the store and register its node in the graph.
+    pub(crate) fn insert_entity(&mut self, entity: &dyn Entity) {
+        let id = entity.entity_id();
+        self.graph.ensure_node(id);
+        self.entities.insert_entity(entity);
+    }
+
+    /// Insert an entity and all currently known origins as one aggregate
+    /// update. This is the type-erased counterpart to [`Self::upsert_entity`]
+    /// used by parsed fact batches.
+    pub(super) fn insert_entity_with_provenance(
+        &mut self,
+        entity: &dyn Entity,
+        origins: impl IntoIterator<Item = KnowledgeProvenance>,
+    ) {
+        let id = entity.entity_id();
+        self.insert_entity(entity);
+        for origin in origins {
+            self.knowledge_provenance.add_entity(id.clone(), origin);
+        }
+    }
+
+    /// Remove an entity from the store and drop its graph node, which takes
+    /// every relation touching it with it.
+    pub(crate) fn remove_entity<T: crate::campaign::entity_store::EntityType>(
+        &mut self,
+        id: &EntityId,
+    ) -> bool {
+        if !self.entities.contains::<T>(id) {
+            return false;
+        }
+        self.graph.remove_entity(id);
+        self.knowledge_provenance.remove_entity(id);
+        self.entity_aliases
+            .retain(|stale, preferred| stale != id && preferred != id);
+        self.entities.remove_typed::<T>(id)
+    }
+
+    /// Remove an entity when an effect identifies it by ID rather than by its
+    /// concrete Rust type.
+    pub(crate) fn remove_entity_by_id(&mut self, id: &EntityId) -> bool {
+        if !self.entities.contains_id(id) {
+            return false;
+        }
+        self.graph.remove_entity(id);
+        self.knowledge_provenance.remove_entity(id);
+        self.entity_aliases
+            .retain(|stale, preferred| stale != id && preferred != id);
+        self.entities.remove_entity(id)
+    }
+
+    /// Drop whichever listener holds `port`, returning how many were removed.
+    ///
+    /// A port can only be bound once, so this is at most one - the protocol is
+    /// not needed to identify it.
+    pub fn remove_listeners_on_port(&mut self, port: u16) -> usize {
+        let ids: Vec<EntityId> = self
+            .entities
+            .values::<ran_domain::Listener>()
+            .filter(|listener| listener.port == port)
+            .map(|listener| listener.entity_id())
+            .collect();
+        let removed = ids.len();
+        for id in ids {
+            self.remove_entity::<ran_domain::Listener>(&id);
+        }
+        removed
+    }
+
+    /// Drop the redirector forwarding `remote_port` on `play_id`.
+    ///
+    /// Unlike [`Campaign::remove_listeners_on_port`] this needs both halves: a
+    /// port is bound once on the operator host, but two playgrounds are two hosts
+    /// and can each forward the same remote port.
+    pub fn remove_redirector(&mut self, play_id: &str, remote_port: u16) -> bool {
+        let id = ran_domain::Redirector::id_for(play_id, remote_port);
+        self.remove_entity::<ran_domain::Redirector>(&id)
+    }
+
+    /// Insert a relation into the graph using the IDs stored on the relation itself.
+    pub(crate) fn insert_relation(&mut self, rel: &dyn ran_domain::Relation) -> bool {
+        let src = rel.source_id().clone();
+        let tgt = rel.target_id().clone();
+        self.insert_relation_with_ids(&src, &tgt, rel)
+    }
+
+    /// Resolve which C2 backend should execute commands on `system_id`.
+    ///
+    /// Priority:
+    /// 1. An active session on the entity (live shell - most direct path).
+    /// 2. A direct exec-channel edge from a `c2/<name>` source.
+    /// 3. Built-in C2 (fresh kubectl exec).
+    ///
+    /// Preferring the active session here means that when this entity is used
+    /// as an intermediate hop (e.g. pod → node via container.escape), the
+    /// nsenter-wrapped command is sent through the interactive shell rather
+    /// than a separate one-shot kubectl exec.
+    pub(super) fn resolve_source_backend_id(&self, system_id: &str) -> String {
+        if let Some(backend) = self.active_session_backend(system_id) {
+            return backend;
+        }
+        let system_eid = EntityId::new(system_id);
+        if let Some(backend) = self
+            .graph
+            .incoming(&system_eid)
+            .into_iter()
+            .filter(|(src, edge)| {
+                !self.is_system_entity_id(src)
+                    && edge.is_backend_entry()
+                    && edge.is_realizable(&system_eid)
+            })
+            .filter_map(|(_, edge)| edge.session_id.clone())
+            .min()
+        {
+            return backend;
+        }
+        if let Some(src) = self
+            .graph
+            .incoming(&system_eid)
+            .into_iter()
+            .filter(|(src, d)| {
+                d.is_exec_channel
+                    && !d.broken
+                    && !self.is_system_entity_id(src)
+                    && src.0.starts_with("c2/")
+                    && d.is_backend_entry()
+                    && d.is_realizable(&system_eid)
+            })
+            .map(|(src, _)| src)
+            .min_by(|a, b| a.0.cmp(&b.0))
+        {
+            return src.0.clone();
+        }
+
+        BUILTIN_C2_ID.to_string()
+    }
+
+    pub fn all_entity_ids(&self) -> Vec<String> {
+        self.entities
+            .all_entities()
+            .into_iter()
+            .map(|e| e.entity_id().0)
+            .collect()
+    }
+
+    pub fn entity_has_relation(&self, entity_id: &str, relation: &str) -> bool {
+        let eid = EntityId::new(entity_id);
+        !self.graph.targets_of(&eid, relation).is_empty()
+    }
+}
+
+#[cfg(test)]
+mod planner_helper_tests {
+    use super::*;
+
+    fn open_step(id: &str) -> ExecTtp {
+        ExecTtp {
+            id: id.to_string(),
+            ttp: armory::Ttp::new("test", "Test", "Execution"),
+            procedure: armory::Procedure::new("shell", "echo test"),
+            operation: c2::ExecutionOperation::Shell {
+                command: "echo test".to_string(),
+            },
+            args: HashMap::new(),
+            target_id: "node/test".to_string(),
+            exec_chain: vec!["node/test".to_string()],
+            exec_system_id: "node/test".to_string(),
+            execution_environment: None,
+            transport_environment: None,
+            auth_identity_id: None,
+            started_at_ms: 0,
+            execution_timeout_seconds: 60,
+            output_transform: None,
+            is_cleanup: false,
+            reasoning: String::new(),
+        }
+    }
+
+    fn minimal_campaign() -> Campaign {
+        Campaign {
+            entities: EntityStore::default(),
+            graph: KnowledgeGraph::new(),
+            parse_audits: Vec::new(),
+            execution_records: Vec::new(),
+            open_steps: Vec::new(),
+            in_flight_outputs: std::collections::HashMap::new(),
+            file_contents: std::collections::HashMap::new(),
+            command_traversals: std::collections::HashMap::new(),
+            session_traversals: std::collections::HashMap::new(),
+            knowledge_provenance: KnowledgeProvenanceStore::default(),
+            entity_aliases: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn all_entity_ids_returns_empty_for_new_campaign() {
+        let c = minimal_campaign();
+        let ids = c.all_entity_ids();
+        // A new campaign has no entities - the method must not panic.
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn in_flight_output_is_ordered_bounded_and_removed_on_completion() {
+        let mut campaign = minimal_campaign();
+        campaign.add_open_step(open_step("cmd-1"));
+
+        assert!(campaign.record_in_flight_output("cmd-1", 1, "first", "", 5, 0));
+        assert!(!campaign.record_in_flight_output("cmd-1", 1, "duplicate", "", 14, 0));
+        assert!(campaign.record_in_flight_output("cmd-1", 2, " second", "warn", 12, 4));
+
+        let output = campaign.get_in_flight_output("cmd-1").expect("output");
+        assert_eq!(output.stdout, "first second");
+        assert_eq!(output.stderr, "warn");
+        assert_eq!(output.last_sequence, 2);
+
+        campaign.complete_open_step("cmd-1");
+        assert!(campaign.get_in_flight_output("cmd-1").is_none());
+    }
+
+    #[test]
+    fn entity_has_relation_false_when_no_relation() {
+        let c = minimal_campaign();
+        assert!(!c.entity_has_relation("ns/default/pod/nginx-abc", "rce.can-exec"));
+    }
+
+    #[test]
+    fn aggregate_mutations_keep_entity_graph_provenance_and_aliases_aligned() {
+        let mut campaign = minimal_campaign();
+        let pod = Pod::new("api", "default");
+        let pod_id = pod.entity_id();
+        let stale_id = EntityId::new("system/api");
+
+        campaign.upsert_entity(pod, KnowledgeProvenance::Scenario);
+        assert!(campaign.contains_entity::<Pod>(&pod_id));
+        assert!(campaign.graph.contains(&pod_id));
+        assert_eq!(
+            campaign.entity_provenance(&pod_id),
+            BTreeSet::from([KnowledgeProvenance::Scenario])
+        );
+
+        let relation = PodExec::new(BUILTIN_C2_ID, pod_id.0.clone());
+        campaign.upsert_relation(&relation, KnowledgeProvenance::Scenario);
+        assert_eq!(
+            campaign.relation_targets(&EntityId::new(BUILTIN_C2_ID), "k8s.can-exec"),
+            vec![pod_id.clone()]
+        );
+        assert_eq!(
+            campaign.relation_provenance("k8s.can-exec", BUILTIN_C2_ID, &pod_id.0),
+            BTreeSet::from([KnowledgeProvenance::Scenario])
+        );
+
+        campaign.record_entity_alias(&stale_id, &pod_id);
+        assert_eq!(campaign.canonical_entity_id(&stale_id.0), pod_id.0);
+
+        assert!(campaign.remove_entity::<Pod>(&pod_id));
+        assert!(!campaign.contains_entity::<Pod>(&pod_id));
+        assert!(!campaign.graph.contains(&pod_id));
+        assert!(campaign.entity_provenance(&pod_id).is_empty());
+        assert!(campaign
+            .relation_provenance("k8s.can-exec", BUILTIN_C2_ID, &pod_id.0)
+            .is_empty());
+        assert_eq!(campaign.canonical_entity_id(&stale_id.0), stale_id.0);
+    }
+
+    /// A standalone `c2.session` edge (reverse shell to an otherwise-unknown
+    /// host) must carry its `session_id` onto the graph edge so a later session
+    /// break can find and mark it broken - otherwise the dead connection keeps
+    /// rendering as a live one.
+    #[test]
+    fn standalone_session_edge_carries_session_id_and_can_break() {
+        let mut c = minimal_campaign();
+        let channel = ran_domain::SessionChannel::new("c2/ran", "node/victim", "session/victim-1");
+        c.insert_relation(&channel);
+
+        let rel = c
+            .get_relations()
+            .into_iter()
+            .find(|r| r.name == "c2.session")
+            .expect("c2.session edge should exist");
+        assert_eq!(
+            rel.session_id.as_deref(),
+            Some("session/victim-1"),
+            "session_id must be carried onto the graph edge"
+        );
+        assert!(!rel.broken);
+
+        assert_eq!(c.mark_session_broken("session/victim-1"), 1);
+
+        let rel = c
+            .get_relations()
+            .into_iter()
+            .find(|r| r.name == "c2.session")
+            .expect("c2.session edge should still exist");
+        assert!(rel.broken, "the session's edge should be marked broken");
+    }
+
+    #[test]
+    fn staging_initial_access_pod_adds_knowledge_without_access_edge() {
+        let mut campaign = Campaign::bootstrap("Ran", K8sCluster::new("demo"));
+        let pod_id = campaign.stage_initial_access_pod("target", "default");
+
+        assert!(campaign.entities.contains::<Pod>(&pod_id));
+        assert!(campaign.graph.incoming(&pod_id).is_empty());
+        assert_eq!(
+            campaign.entity_provenance(&pod_id),
+            BTreeSet::from([KnowledgeProvenance::Operator])
+        );
+    }
+
+    #[test]
+    fn bootstrap_with_kubeconfig_records_relation_and_provenance() {
+        let cluster = K8sCluster::new("demo").with_server(Some("https://demo".into()));
+        let cluster_id = cluster.entity_id();
+        let mut credential = K8sCredential::new("https://demo").with_name("developer");
+        credential.default_namespace = Some("default".to_string());
+        credential.active = true;
+        let credential_id = credential.entity_id();
+        let namespace_id = EntityId::new("ns/default");
+        let origins =
+            BTreeSet::from([KnowledgeProvenance::Operator, KnowledgeProvenance::Scenario]);
+        let initial = InitialKnowledge {
+            clusters: vec![InitialClusterKnowledge {
+                cluster,
+                provenance: origins.clone(),
+            }],
+            kubeconfigs: vec![InitialKubeconfigKnowledge {
+                credential,
+                cluster_id: cluster_id.clone(),
+                provenance: origins.clone(),
+            }],
+            ..Default::default()
+        };
+        let mut campaign = Campaign::bootstrap_with_knowledge("test", initial.clone());
+
+        assert!(campaign.entities.contains::<K8sCredential>(&credential_id));
+        let operator_host_id = EntityId::new("system/operator-host");
+        assert!(campaign
+            .entities
+            .contains::<OperatorHost>(&operator_host_id));
+        let host_contents = campaign.graph.targets_of(&operator_host_id, "contains");
+        assert_eq!(host_contents.len(), 2);
+        assert!(host_contents.contains(&&EntityId::new("c2/test")));
+        assert!(host_contents.contains(&&credential_id));
+        assert_eq!(
+            campaign
+                .graph
+                .targets_of(&credential_id, "authenticates-to"),
+            vec![&cluster_id]
+        );
+        assert_eq!(campaign.entity_provenance(&credential_id), origins);
+        assert!(campaign.entities.contains::<Namespace>(&namespace_id));
+        assert_eq!(
+            campaign.graph.targets_of(&cluster_id, "contains"),
+            vec![&namespace_id]
+        );
+        assert_eq!(campaign.entity_provenance(&namespace_id), origins);
+        assert!(campaign.execution_records.is_empty());
+        assert!(serde_json::to_string(&campaign).is_ok());
+
+        campaign.reset_with_knowledge("test", initial);
+        assert!(campaign.entities.contains::<K8sCredential>(&credential_id));
+        assert!(campaign.entities.contains::<Namespace>(&namespace_id));
+        assert_eq!(
+            campaign
+                .graph
+                .targets_of(&credential_id, "authenticates-to"),
+            vec![&cluster_id]
+        );
+    }
+}

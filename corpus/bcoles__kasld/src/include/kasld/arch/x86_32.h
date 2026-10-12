@@ -1,0 +1,160 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Definitions for x86_32 (i386 / i686)
+//
+// KASLR support added in commit 8ab3820fd5b2896d66da7bb2a906bc382e63e7bc in
+// kernel v3.14-rc1~156^2~11 on 2013-10-13.
+//
+// KASLR was not compatible with hibernation (CONFIG_HIBERNATION) until commit
+// 65fe935dd2387a4faf15314c73f5e6d31ef0217e in v4.8-rc1~179^2~20 on 2016-06-26.
+//
+// Enabled by default in commit 16b76293c5c81e6345323d7aef41b26e8390f62d in
+// kernel v4.12-rc1~150 on 2017-05-01.
+//
+// References:
+// https://github.com/torvalds/linux/commit/8ab3820fd5b2896d66da7bb2a906bc382e63e7bc
+// https://github.com/torvalds/linux/commit/16b76293c5c81e6345323d7aef41b26e8390f62d
+// https://elixir.bootlin.com/linux/v6.1.1/source/arch/x86/Kconfig
+// https://elixir.bootlin.com/linux/v6.1.1/source/arch/x86/kernel/head_32.S
+// ---
+// <bcoles@gmail.com>
+
+#ifndef KASLD_X86_32_H
+#define KASLD_X86_32_H
+
+// 3GB vmsplit (0xc0000000) is a common configuration
+// for distro kernels for non-embedded systems. Configurable vmsplits range
+// from CONFIG_VMSPLIT_1G (0x40000000) to CONFIG_VMSPLIT_3G (0xc0000000).
+// https://elixir.bootlin.com/linux/v6.1.1/source/arch/x86/Kconfig#L1474
+#define PAGE_OFFSET 0xc0000000ul
+// VMSPLIT (CONFIG_PAGE_OFFSET) is a compile-time constant, fixed at boot.
+#define PAGE_OFFSET_FROM_CONFIG 1
+// Every linear-map base an x86_32 kernel can be built with, highest first
+// (arch/x86/Kconfig: VMSPLIT_3G / 3G_OPT / 2G / 2G_OPT / 1G). Which one is in
+// force is a build choice of the kernel under analysis, not of this binary.
+#define PAGE_OFFSET_CANDIDATES                                                 \
+  {0xc0000000ul, 0xb0000000ul, 0x80000000ul, 0x78000000ul, 0x40000000ul}
+// Admissible kernel page sizes on this architecture. PAGE_SIZE_KNOWN_AT_BUILD
+// is derived from the pair in api.h and gates pfn_to_phys(); a page-frame
+// number may only be converted with a compile-time constant where the two
+// edges coincide. Where they differ the runtime SF_PAGE_SIZE observation is
+// the only sound multiplier.
+// x86 fixes the base page at 4 KiB; arch/x86 selects
+// HAVE_PAGE_SIZE_4KB and offers no alternative.
+#define PAGE_SIZE_MIN 0x1000ul
+#define PAGE_SIZE_MAX 0x1000ul
+
+#define PAGE_OFFSET_MIN 0x40000000ul
+#define PAGE_OFFSET_MAX 0xc0000000ul
+
+// TASK_SIZE == __PAGE_OFFSET exactly on x86_32, with no gap (arch/x86/include/
+// asm/page_32_types.h: `#define TASK_SIZE __PAGE_OFFSET`; STACK_TOP ==
+// TASK_SIZE too). So the mmap user/kernel split boundary IS PAGE_OFFSET,
+// letting mmap_brute_vmsplit bound PAGE_OFFSET soundly (arm32 differs:
+// TASK_SIZE = PAGE_OFFSET - 16 MiB).
+#define TASK_SIZE_IS_PAGE_OFFSET 1
+
+// https://elixir.bootlin.com/linux/v6.1.1/source/arch/x86/include/asm/page.h#L59
+#define PHYS_OFFSET 0ul
+// PAGE_OFFSET and PHYS_OFFSET are both compile-time constants on x86_32 (no
+// PAGE_OFFSET randomization, no PHYS_OFFSET patching), and x86_32 has no
+// mainline KASLR — text sits at a fixed offset within the linear map.
+// LINEAR_MAP_ANCHOR: __va(x) = x + PAGE_OFFSET on 32-bit x86 — physical 0
+// maps to the linear-map base, so the anchor is the compile-time
+// PHYS_OFFSET (0) whatever the VMSPLIT moves PAGE_OFFSET to.
+// arch/x86/include/asm/page_32.h __va()
+#define LINEAR_MAP_ANCHOR LM_ANCHOR_PHYS_OFFSET
+#define DIRECTMAP_STATIC 1
+#define TEXT_TRACKS_DIRECTMAP 1
+
+// Minimum possible kernel base across all vmsplit configurations.
+// CONFIG_VMSPLIT_1G sets PAGE_OFFSET=0x40000000, the lowest possible value.
+// This is VIRT_TEXT_PLAUSIBLE_MIN to accept kernel addresses from all
+// vmsplits.
+// https://elixir.bootlin.com/linux/v6.1.1/source/arch/x86/Kconfig#L1474
+#define VIRT_TEXT_PLAUSIBLE_MIN 0x40000000ul
+
+// VAS start uses the lowest possible PAGE_OFFSET to cover all vmsplit
+// configurations. The orchestrator adjusts at runtime once vmsplit is detected.
+#define KERNEL_VIRT_VAS_START VIRT_TEXT_PLAUSIBLE_MIN
+#define KERNEL_VIRT_VAS_END 0xfffffffful
+// Kernel text ceiling, and a deliberate over-estimate rather than a region
+// boundary: the image sits within KERNEL_IMAGE_SIZE (512 MiB) of PAGE_OFFSET,
+// so even the highest split puts it no higher than 0xe0000000. What lies above
+// the image is the rest of the linear map, whose top is the runtime lowmem
+// size -- there is no fixed address at which the module region begins.
+#define VIRT_TEXT_PLAUSIBLE_MAX 0xf0000000ul
+
+// x86_32 has no module region at a fixed address. MODULES_VADDR is
+// VMALLOC_START, which is `high_memory + VMALLOC_OFFSET` (8 MiB), and
+// high_memory is PAGE_OFFSET plus the span of lowmem:
+//
+//   MODULES_VADDR = PAGE_OFFSET + lowmem_span + 8 MiB
+//
+// Two runtime terms, and only the first is a PAGE_OFFSET relation. The lowmem
+// span is a property of how much RAM the machine has (capped by MAXMEM), which
+// nothing here observes, so the floor states the limit it approaches as that
+// span goes to zero: PAGE_OFFSET + 8 MiB. Sound under the older definition
+// too, which rounded down to an 8 MiB boundary -- every admissible PAGE_OFFSET
+// is already 8 MiB-aligned, so the rounding cannot land below.
+//
+// The ceiling is VMALLOC_END, which moves with NR_CPUS through
+// CPU_ENTRY_AREA_PAGES and is no more a compile-time constant than the floor,
+// so it is the top of the address space.
+//
+// A band stated as a literal cannot hold here: the floor is correct only for a
+// 3G split carrying more than ~760 MiB of lowmem, and drops below any fixed
+// value on a smaller machine or a lower split.
+// https://elixir.bootlin.com/linux/v7.2/source/arch/x86/include/asm/pgtable_32_areas.h
+// https://elixir.bootlin.com/linux/v7.2/source/arch/x86/mm/init_32.c
+#define MODULES_START_FOR(po) ((po) + 0x00800000ul)
+#define MODULES_END_FOR(po) (KERNEL_VIRT_VAS_END)
+// Where the module band is anchored: a fixed delta from PAGE_OFFSET, so a
+// runtime VMSPLIT moves the band with it.
+#define MODULES_ANCHOR MOD_ANCHOR_PAGE_OFFSET
+#define MODULES_START MODULES_START_FOR(KERNEL_VIRT_VAS_START) // 0x40800000ul
+#define MODULES_END MODULES_END_FOR(PAGE_OFFSET)
+// Module region is fixed; does not shift with KASLR.
+
+// The alignment _text is GUARANTEED to have, which on x86_32 is the smallest
+// CONFIG_PHYSICAL_ALIGN the architecture admits and not the one it defaults to.
+// Kconfig ranges the option over [0x2000, 0x100_0000] with a 0x20_0000 default,
+// and the boot stub steps its slot array by whichever value the kernel was
+// built with, so a base need only be 8 KiB-aligned. Physical and virtual are
+// coupled here, so the same granularity governs both.
+//
+// The default is the wrong value to hold, not merely a loose one: this drives
+// the grid image_base_grid_align SNAPS a resolved window onto, so a coarser
+// figure raises a floor past a finely aligned base and drops the truth from the
+// guaranteed window. A run that reads the real value recovers the precision --
+// boot_params_kaslr_align states it as the granularity itself.
+// https://elixir.bootlin.com/linux/v6.1.1/source/arch/x86/boot/compressed/kaslr.c#L850
+// https://elixir.bootlin.com/linux/v6.1.1/source/arch/x86/Kconfig#L2182
+#define IMAGE_ALIGN 0x2000ul
+
+#define IMAGE_BASE_OFFSET 0
+
+// Plausible physical address range for kernel image.
+// KASLR ceiling is KERNEL_IMAGE_SIZE = 512 MB
+// (arch/x86/boot/compressed/kaslr.c: `if (IS_ENABLED(CONFIG_X86_32)) mem_limit
+// = KERNEL_IMAGE_SIZE`). Physical and virtual are coupled on x86-32
+// (TEXT_TRACKS_DIRECTMAP = 1).
+#define PHYS_PLAUSIBLE_MIN 0ul
+#define PHYS_PLAUSIBLE_MAX (512ul * MB)
+
+// Default: 0xc0000000 (PAGE_OFFSET with 3GB vmsplit, no offset).
+// See docs/kaslr.md "Default text base and KASLR alignment" for all
+// architectures. Kernel source: arch/x86/kernel/vmlinux.lds.S
+#define KERNEL_VIRT_TEXT_DEFAULT (PAGE_OFFSET + IMAGE_BASE_OFFSET)
+
+#define KASLR_SUPPORTED 1
+
+// Residue 0: _text is on the KASLR granule, so the grid is plain alignment.
+#define IMAGE_BASE_RESIDUE_FIXED 1
+
+// The /boot artefact is a boot blob, not an ELF, so its on-disk size never
+// exceeds the in-memory footprint and can be read with stat() where the file
+// content is unreadable. See the axis contract in api.h.
+#define BOOT_IMAGE_SIZE_FLOORS_FOOTPRINT 1
+
+#endif /* KASLD_X86_32_H */

@@ -1,0 +1,234 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Per-quantity definitions: lattice kind + honest top, compiled per-arch
+// (init_top reads the arch constants via api.h).
+//
+// Honest tops are constant and maximally wide — they must contain every
+// value the quantity can take on this arch. All narrowing, including from
+// runtime-discovered config (CPUID phys-bits, VA_BITS, VMSPLIT), happens
+// via constraints, never via a dependent or runtime top. This is the
+// soundness invariant the rest of the engine relies on.
+//
+// x86_64 is fully treated. Other arches build via fallbacks and may carry
+// looser (still sound, where the existing VAS/phys constants span honestly)
+// tops until they receive the same per-arch treatment.
+// ---
+// <bcoles@gmail.com>
+
+#include "include/kasld/estimate.h"
+#include "include/kasld/quantity.h"
+
+#include <limits.h>
+
+/* ---- VA_BITS candidate table (finite-set lattice) --------------------- */
+#if defined(VA_BITS_CANDIDATES)
+static const unsigned long va_bits_candidates[] = VA_BITS_CANDIDATES;
+#else
+/* No candidate set is declared for this architecture. The lattice still needs a
+ * non-empty set -- an EMPTY finite set is the lattice's bottom and would assert
+ * that no address-space width is possible, which is a contradiction rather than
+ * the ignorance actually being expressed -- so it holds one candidate, and that
+ * candidate is 0.
+ *
+ * Zero because no architecture has a zero-bit address space, so the value can
+ * never be mistaken for a resolved width. Every consumer already rejects it:
+ * `va_bits == 0` is the established "no answer" test, and kasld_rm_level_for()
+ * matches 48 and 57 and returns 0 for anything else. A plausible stand-in like
+ * 48 would instead be read as an answer by any future reader that forgot this
+ * set was never declared, and would be wrong on most of the architectures that
+ * land here -- the 32-bit ones above all.
+ *
+ * It also keeps "the architecture pins one width" distinguishable from "nobody
+ * declared one", which a single plausible candidate cannot express: one live
+ * candidate that is 0 is the absence, one that is non-zero is the pin. */
+static const unsigned long va_bits_candidates[] = {0ul};
+#endif
+#define N_VA_BITS                                                              \
+  ((int)(sizeof(va_bits_candidates) / sizeof(va_bits_candidates[0])))
+/* The live set is a bitmask in one unsigned long; see the bound's definition
+ * in quantity.h. Checked here so estimate_meet's `1ul << i` needs no runtime
+ * guard, on the 32-bit builds too. */
+__extension__ _Static_assert(N_VA_BITS <= KASLD_FINSET_MAX_CANDIDATES,
+                             "VA_BITS_CANDIDATES longer than the finite-set "
+                             "bitmask can represent");
+
+/* ---- honest tops ------------------------------------------------------ */
+
+static void top_interval(struct estimate *e, unsigned long lo,
+                         unsigned long hi) {
+  e->kind = LK_INTERVAL;
+  e->lo = lo;
+  e->hi = hi;
+  e->lo_binding = e->hi_binding = 0;
+  e->lo_conf = e->hi_conf = CONF_PARSED; /* honest top is an arch axiom */
+  e->stride = 0;
+  e->stride_offset = 0;
+}
+
+/* Honest top of a finite set: every candidate live. The shift is guarded at
+ * exactly the word width, where `(1 << n) - 1` would be undefined and `~0ul`
+ * is the answer anyway. */
+static void top_finset(struct estimate *e, int n) {
+  e->kind = LK_FINSET;
+  e->lo = (n >= (int)(sizeof(unsigned long) * 8)) ? ~0ul : ((1ul << n) - 1ul);
+  e->hi = 0ul;
+  e->lo_binding = e->hi_binding = 0;
+  e->lo_conf = e->hi_conf = CONF_PARSED; /* honest top is an arch axiom */
+  e->stride = e->stride_offset = 0;
+}
+
+static void top_virt_image_base(struct estimate *e) {
+  /* The virtual kernel-text base lives in the virtual KASLR window
+   * [VIRT_TEXT_MIN_ANY_CONFIG, VIRT_TEXT_MAX_ANY_CONFIG] — fixed per-arch by
+   * the kernel's VA layout (unlike the physical base, this does not depend on
+   * DRAM placement), so it is a sound and tighter honest top than the raw
+   * mapping-region bounds VIRT_TEXT_PLAUSIBLE_MIN/MAX.
+   *
+   * Both edges are the ANY_CONFIG variants, which is what a top requires: the
+   * DEFAULT_CONFIG pair holds only for a default build, and a top has to
+   * contain every value the quantity can take on this arch. They are the same
+   * number wherever the arch's window already spans every layout, and wider
+   * where it does not — x86_64 CONFIG_PHYSICAL_START at the floor, arm64
+   * sub-48 VA_BITS at the ceiling. The
+   * physical_start_lower_bound rule restores the tight floor at the
+   * appropriate confidence (CONF_PARSED from a learned SF_PHYSICAL_START,
+   * CONF_HEURISTIC from the compile-time default — overridable by any
+   * real evidence). */
+  top_interval(e, (unsigned long)VIRT_TEXT_MIN_ANY_CONFIG,
+               (unsigned long)VIRT_TEXT_MAX_ANY_CONFIG);
+}
+
+static void top_phys_image_base(struct estimate *e) {
+  /* Floor: the arch's minimum physical load address. Same widening
+   * rationale as top_virt_image_base — PHYS_MIN_ANY_CONFIG is the
+   * conservative variant of KERNEL_PHYS_DEFAULT. */
+#if defined(PHYS_MIN_ANY_CONFIG)
+  unsigned long lo = (unsigned long)PHYS_MIN_ANY_CONFIG;
+#elif defined(KERNEL_PHYS_DEFAULT)
+  unsigned long lo = (unsigned long)KERNEL_PHYS_DEFAULT;
+#else
+  unsigned long lo = 0ul;
+#endif
+#if defined(PHYS_ADDR_TOP)
+  top_interval(e, lo, (unsigned long)PHYS_ADDR_TOP);
+#elif defined(PHYS_PLAUSIBLE_MAX)
+  /* Fallback: the heuristic ceiling, until this arch gets PHYS_ADDR_TOP.
+   * Sound only insofar as PHYS_PLAUSIBLE_MAX is honest for the arch. */
+  top_interval(e, lo, (unsigned long)PHYS_PLAUSIBLE_MAX);
+#else
+  /* Coupled arch with no independent physical KASLR: quantity inactive,
+   * fully unknown. It simply never gets constrained. */
+  top_interval(e, lo, ULONG_MAX);
+#endif
+}
+
+static void top_page_offset(struct estimate *e) {
+  /* Interval over every linear-map base the architecture admits. An interval
+   * can represent any address in the bracket, so no value the target might hold
+   * is unrepresentable; an enumeration would have to be complete for every
+   * kernel in scope, and a base outside it would be excluded from the
+   * guaranteed window rather than merely unresolved.
+   *
+   * The bracket is a single value on the architectures that fix the base
+   * (PAGE_OFFSET_MIN == PAGE_OFFSET_MAX), so those resolve before any rule
+   * runs. The rest are narrowed by measurement: the mmap split probe on 32-bit,
+   * and the paging-mode coupling from Q_VA_BITS on arm64 and riscv64. */
+  top_interval(e, (unsigned long)PAGE_OFFSET_MIN,
+               (unsigned long)PAGE_OFFSET_MAX);
+}
+
+static void top_kernel_vas_window(struct estimate *e) {
+  /* vmalloc/vmemmap bases (x86_64 RANDOMIZE_MEMORY) live somewhere in the
+   * kernel VAS; inactive on other arches (never constrained). */
+  top_interval(e, (unsigned long)KERNEL_VIRT_VAS_START,
+               (unsigned long)KERNEL_VIRT_VAS_END);
+}
+
+static void top_module_base(struct estimate *e) {
+  /* The kernel VAS window, NOT [MODULES_START, MODULES_END]. The band would be
+   * the tighter top, but a top must be constant and contain every value the
+   * quantity can take on this arch, and the band fails that on two counts: it
+   * follows a runtime PAGE_OFFSET where MODULES_RELATIVE_TO_PAGE_OFFSET (a
+   * moved VMSPLIT leaves the compile-time macros describing a place the
+   * modules are not), and on x86_32 the region starts at
+   * `high_memory + VMALLOC_OFFSET`, so its floor tracks how much lowmem
+   * exists. Narrowing to the band is a RULE (module_base_bounds), which can
+   * consult the resolved PAGE_OFFSET and can decline on an arch whose band
+   * does not span every configuration. Wide here, narrowed by evidence --
+   * the same discipline as every other top.
+   *
+   * The floor is 0, NOT KERNEL_VIRT_VAS_START: on arm32 and ppc32 the module
+   * region sits BELOW PAGE_OFFSET (`PAGE_OFFSET - 16M` and `- 256M`), so a
+   * VAS-start floor excludes the very address the quantity names and every
+   * bound derived from a real module leak lands under it. Nothing is lost by
+   * starting at 0: a top exists to be narrowed, and an un-narrowed one is
+   * reported as the whole span it opens at, which is the honest statement of
+   * how much is still unknown. */
+  top_interval(e, 0ul, (unsigned long)KERNEL_VIRT_VAS_END);
+}
+
+static void top_maxalign(struct estimate *e) {
+  /* Least information for an alignment lattice is "aligned to 1 byte";
+   * meet (max) only raises it as evidence arrives. */
+  e->kind = LK_MAXALIGN;
+  e->lo = 1ul;
+  e->hi = 0ul;
+  e->lo_binding = e->hi_binding = 0;
+  e->lo_conf = e->hi_conf = CONF_PARSED; /* honest top is an arch axiom */
+  e->stride = e->stride_offset = 0;
+}
+
+static void top_va_bits(struct estimate *e) { top_finset(e, N_VA_BITS); }
+
+/* ---- the table -------------------------------------------------------- */
+
+/* X-macro list of every quantity the engine resolves. Used both to populate
+ * the table below and to compile-time-verify (via the _Static_assert at the
+ * bottom) that the list mentions exactly Q__COUNT entries — adding a new
+ * Q_ enumerator without a list entry, or adding a list entry without a
+ * matching enumerator, fails the build. Avoids the previous foot-gun where
+ * a missing `[Q_NEW] = {...}` left the slot zero-initialised (NULL `name`,
+ * NULL `init_top`, LK_INTERVAL by default) and surfaced as a NULL-deref on
+ * the first access. */
+#define KASLD_QUANTITY_LIST(X)                                                 \
+  X(Q_VIRT_IMAGE_BASE, "virt_image_base", LK_INTERVAL, top_virt_image_base,    \
+    NULL, 0)                                                                   \
+  X(Q_PHYS_IMAGE_BASE, "phys_image_base", LK_INTERVAL, top_phys_image_base,    \
+    NULL, 0)                                                                   \
+  X(Q_PAGE_OFFSET, "virt_page_offset", LK_INTERVAL, top_page_offset, NULL, 0)  \
+  X(Q_VMALLOC_BASE, "virt_vmalloc_base", LK_INTERVAL, top_kernel_vas_window,   \
+    NULL, 0)                                                                   \
+  X(Q_VMEMMAP_BASE, "virt_vmemmap_base", LK_INTERVAL, top_kernel_vas_window,   \
+    NULL, 0)                                                                   \
+  X(Q_MODULE_BASE, "virt_module_base", LK_INTERVAL, top_module_base, NULL, 0)  \
+  X(Q_VIRT_KASLR_ALIGN, "virt_kaslr_align", LK_MAXALIGN, top_maxalign, NULL,   \
+    0)                                                                         \
+  X(Q_PHYS_KASLR_ALIGN, "phys_kaslr_align", LK_MAXALIGN, top_maxalign, NULL,   \
+    0)                                                                         \
+  X(Q_VA_BITS, "va_bits", LK_FINSET, top_va_bits, va_bits_candidates, N_VA_BITS)
+
+const struct quantity_def quantities[Q__COUNT] = {
+#define X(qid, name, kind, top, cands, ncands)                                 \
+  [qid] = {name, kind, top, cands, ncands},
+    KASLD_QUANTITY_LIST(X)
+#undef X
+};
+
+/* Compile-time completeness check: counts the X-macro entries and compares
+ * to Q__COUNT. Drift in either direction (missing entry, extra entry)
+ * fails the build. */
+enum {
+  kasld_quantity_list_count = 0
+#define X(...) +1
+  KASLD_QUANTITY_LIST(X)
+#undef X
+};
+/* Cast both sides to int so the comparison is between integers, not between
+ * two distinct anonymous enum types (gcc's -Wenum-compare otherwise warns).
+ * __extension__ silences -Wpedantic on the -std=c99 build path:
+ * _Static_assert is a C11 keyword that gcc has supported as an extension
+ * since well before then, but pedantic flags any post-C99 keyword. */
+__extension__ _Static_assert(
+    (int)kasld_quantity_list_count == (int)Q__COUNT,
+    "quantities[] X-macro must mention every Q_ enumerator "
+    "(and nothing else)");

@@ -1,0 +1,530 @@
+package translate_test
+
+import (
+	"fmt"
+	"testing"
+
+	"github.com/specterops/dawgs/cypher/models/pgsql"
+	"github.com/specterops/dawgs/cypher/models/pgsql/format"
+	"github.com/specterops/dawgs/cypher/models/pgsql/translate"
+	"github.com/stretchr/testify/require"
+)
+
+func mustAsLiteral(value any) pgsql.Literal {
+	if literal, err := pgsql.AsLiteral(value); err != nil {
+		panic(fmt.Sprintf("%v", err))
+	} else {
+		return literal
+	}
+}
+
+func TestInferExpressionType(t *testing.T) {
+	type testCase struct {
+		ExpectedType pgsql.DataType
+		Expression   pgsql.Expression
+		Exclusive    bool
+	}
+
+	var (
+		testCases = []testCase{{
+			ExpectedType: pgsql.Boolean,
+			Expression: pgsql.NewBinaryExpression(
+				pgsql.NewPropertyLookup(
+					pgsql.CompoundIdentifier{"n", "properties"},
+					mustAsLiteral("field_a"),
+				),
+				pgsql.OperatorAnd,
+				pgsql.NewBinaryExpression(
+					mustAsLiteral("123"),
+					pgsql.OperatorIn,
+					pgsql.ArrayLiteral{
+						Values:   []pgsql.Expression{mustAsLiteral("a"), mustAsLiteral("b")},
+						CastType: pgsql.TextArray,
+					},
+				),
+			),
+		}, {
+			ExpectedType: pgsql.Boolean,
+			Expression: pgsql.NewBinaryExpression(
+				pgsql.NewPropertyLookup(
+					pgsql.CompoundIdentifier{"n", "properties"},
+					mustAsLiteral("field_a"),
+				),
+				pgsql.OperatorAnd,
+				pgsql.NewPropertyLookup(
+					pgsql.CompoundIdentifier{"n", "properties"},
+					mustAsLiteral("field_b"),
+				),
+			),
+		}, {
+			ExpectedType: pgsql.Boolean,
+			Expression: pgsql.NewBinaryExpression(
+				mustAsLiteral("123"),
+				pgsql.OperatorIn,
+				pgsql.ArrayLiteral{
+					Values:   []pgsql.Expression{mustAsLiteral("a"), mustAsLiteral("b")},
+					CastType: pgsql.TextArray,
+				},
+			),
+		}, {
+			ExpectedType: pgsql.Text,
+			Expression: pgsql.NewBinaryExpression(
+				mustAsLiteral("123"),
+				pgsql.OperatorConcatenate,
+				mustAsLiteral("456"),
+			),
+		}, {
+			ExpectedType: pgsql.Text,
+			Expression: pgsql.NewBinaryExpression(
+				mustAsLiteral("n"),
+				pgsql.OperatorConcatenate,
+				mustAsLiteral(123),
+			),
+		}, {
+			ExpectedType: pgsql.Int8,
+			Expression: pgsql.NewBinaryExpression(
+				mustAsLiteral(123),
+				pgsql.OperatorAdd,
+				pgsql.NewBinaryExpression(
+					mustAsLiteral(123),
+					pgsql.OperatorMultiply,
+					mustAsLiteral(1),
+				),
+			),
+		}, {
+			ExpectedType: pgsql.Int8,
+			Expression: pgsql.NewBinaryExpression(
+				mustAsLiteral(123),
+				pgsql.OperatorAdd,
+				pgsql.NewBinaryExpression(
+					mustAsLiteral(int16(123)),
+					pgsql.OperatorMultiply,
+					mustAsLiteral(int16(1)),
+				),
+			),
+		}, {
+			Exclusive:    true,
+			ExpectedType: pgsql.Int4,
+			Expression: pgsql.NewBinaryExpression(
+				pgsql.NewPropertyLookup(
+					pgsql.CompoundIdentifier{"n", "properties"},
+					mustAsLiteral("field"),
+				),
+				pgsql.OperatorAdd,
+				pgsql.NewBinaryExpression(
+					mustAsLiteral(int16(123)),
+					pgsql.OperatorMultiply,
+					mustAsLiteral(int32(1)),
+				),
+			),
+		}}
+		exclusive    []testCase
+		hasExclusive bool
+	)
+
+	for _, nextCase := range testCases {
+		if hasExclusive {
+			if nextCase.Exclusive {
+				exclusive = append(exclusive, nextCase)
+			}
+		} else if nextCase.Exclusive {
+			hasExclusive = true
+
+			exclusive = exclusive[:0]
+			exclusive = append(exclusive, nextCase)
+		} else {
+			exclusive = append(exclusive, nextCase)
+		}
+	}
+
+	for _, nextCase := range exclusive {
+		if testName, err := format.Expression(nextCase.Expression, format.NewOutputBuilder()); err != nil {
+			t.Fatalf("unable to format test case expression: %v", err)
+		} else {
+			t.Run(testName.Statement, func(t *testing.T) {
+				inferredType, err := translate.InferExpressionType(nextCase.Expression)
+
+				require.Nil(t, err)
+				require.Equal(t, nextCase.ExpectedType, inferredType)
+			})
+		}
+	}
+}
+
+func TestInferUnaryExpressionType(t *testing.T) {
+	testCases := []struct {
+		Name         string
+		ExpectedType pgsql.DataType
+		Expression   pgsql.Expression
+	}{{
+		Name:         "not",
+		ExpectedType: pgsql.Boolean,
+		Expression: pgsql.NewUnaryExpression(
+			pgsql.OperatorNot,
+			pgsql.NewBinaryExpression(
+				mustAsLiteral("a"),
+				pgsql.OperatorEquals,
+				mustAsLiteral("a"),
+			),
+		),
+	}, {
+		Name:         "negative numeric",
+		ExpectedType: pgsql.Int4,
+		Expression: pgsql.NewUnaryExpression(
+			pgsql.OperatorSubtract,
+			mustAsLiteral(int32(1)),
+		),
+	}, {
+		Name:         "positive numeric value",
+		ExpectedType: pgsql.Int2,
+		Expression: pgsql.UnaryExpression{
+			Operator: pgsql.OperatorAdd,
+			Operand:  mustAsLiteral(int16(1)),
+		},
+	}, {
+		Name:         "unknown numeric operand",
+		ExpectedType: pgsql.UnknownDataType,
+		Expression: pgsql.NewUnaryExpression(
+			pgsql.OperatorSubtract,
+			pgsql.Identifier("x"),
+		),
+	}, {
+		Name:         "non-numeric operand",
+		ExpectedType: pgsql.UnknownDataType,
+		Expression: pgsql.NewUnaryExpression(
+			pgsql.OperatorSubtract,
+			mustAsLiteral("text"),
+		),
+	}, {
+		Name:         "is null",
+		ExpectedType: pgsql.Boolean,
+		Expression: pgsql.NewUnaryExpression(
+			pgsql.OperatorIs,
+			pgsql.Identifier("x"),
+		),
+	}, {
+		Name:         "is not null",
+		ExpectedType: pgsql.Boolean,
+		Expression: pgsql.NewUnaryExpression(
+			pgsql.OperatorIsNot,
+			pgsql.Identifier("x"),
+		),
+	}, {
+		Name:         "nil pointer",
+		ExpectedType: pgsql.UnknownDataType,
+		Expression:   (*pgsql.UnaryExpression)(nil),
+	}}
+
+	for _, nextCase := range testCases {
+		t.Run(nextCase.Name, func(t *testing.T) {
+			inferredType, err := translate.InferExpressionType(nextCase.Expression)
+
+			require.NoError(t, err)
+			require.Equal(t, nextCase.ExpectedType, inferredType)
+		})
+	}
+}
+
+func TestInferWrappedExpressionType(t *testing.T) {
+	testCases := []struct {
+		Name         string
+		ExpectedType pgsql.DataType
+		Expression   pgsql.Expression
+	}{{
+		Name:         "composite value",
+		ExpectedType: pgsql.PathComposite,
+		Expression: pgsql.CompositeValue{
+			DataType: pgsql.PathComposite,
+		},
+	}, {
+		Name:         "empty composite value",
+		ExpectedType: pgsql.UnknownDataType,
+		Expression:   pgsql.CompositeValue{},
+	}, {
+		Name:         "aliased expression",
+		ExpectedType: pgsql.Text,
+		Expression: pgsql.AliasedExpression{
+			Expression: mustAsLiteral("text"),
+			Alias:      pgsql.AsOptionalIdentifier("alias"),
+		},
+	}, {
+		Name:         "aliased expression pointer",
+		ExpectedType: pgsql.Int8,
+		Expression: &pgsql.AliasedExpression{
+			Expression: mustAsLiteral(int64(1)),
+			Alias:      pgsql.AsOptionalIdentifier("alias"),
+		},
+	}, {
+		Name:         "exists expression",
+		ExpectedType: pgsql.Boolean,
+		Expression:   pgsql.ExistsExpression{},
+	}, {
+		Name:         "negated exists expression",
+		ExpectedType: pgsql.Boolean,
+		Expression:   pgsql.ExistsExpression{Negated: true},
+	}, {
+		Name:         "variadic expression",
+		ExpectedType: pgsql.Int8Array,
+		Expression: pgsql.Variadic{
+			Expression: pgsql.ArrayLiteral{
+				CastType: pgsql.Int8Array,
+			},
+		},
+	}, {
+		Name:         "all expression",
+		ExpectedType: pgsql.Int8,
+		Expression: pgsql.NewAllExpression(pgsql.ArrayLiteral{
+			CastType: pgsql.Int8Array,
+		}),
+	}, {
+		Name:         "unknown all expression",
+		ExpectedType: pgsql.UnknownDataType,
+		Expression:   pgsql.NewAllExpression(pgsql.Identifier("path")),
+	}, {
+		Name:         "all expression over scalar",
+		ExpectedType: pgsql.UnknownDataType,
+		Expression:   pgsql.NewAllExpression(mustAsLiteral(int64(1))),
+	}}
+
+	for _, nextCase := range testCases {
+		t.Run(nextCase.Name, func(t *testing.T) {
+			inferredType, err := translate.InferExpressionType(nextCase.Expression)
+
+			require.NoError(t, err)
+			require.Equal(t, nextCase.ExpectedType, inferredType)
+		})
+	}
+}
+
+func TestPropertyLookupEqualityScalarRewrites(t *testing.T) {
+	var (
+		propertyLookup = func(property string) *pgsql.BinaryExpression {
+			return pgsql.NewPropertyLookup(
+				pgsql.CompoundIdentifier{"n", pgsql.ColumnProperties},
+				mustAsLiteral(property),
+			)
+		}
+		renderComparison = func(t *testing.T, lOperand pgsql.Expression, operator pgsql.Operator, rOperand pgsql.Expression) (string, map[string]any) {
+			t.Helper()
+
+			treeTranslator := translate.NewExpressionTreeTranslator(nil)
+			treeTranslator.PushOperand(lOperand)
+			treeTranslator.PushOperand(rOperand)
+			require.NoError(t, treeTranslator.CompleteBinaryExpression(translate.NewScope(), operator))
+
+			formatted, err := format.Expression(treeTranslator.PeekOperand(), format.NewOutputBuilder())
+			require.NoError(t, err)
+
+			return formatted.Statement, formatted.Parameters
+		}
+		testCases = []struct {
+			Name           string
+			LOperand       pgsql.Expression
+			Operator       pgsql.Operator
+			ROperand       pgsql.Expression
+			ExpectedSql    string
+			ExpectedParams map[string]any
+		}{{
+			Name:           "string literal uses typed text property lookup",
+			LOperand:       propertyLookup("isassignabletorole"),
+			Operator:       pgsql.OperatorEquals,
+			ROperand:       mustAsLiteral("true"),
+			ExpectedSql:    "(jsonb_typeof((n.properties -> E'isassignabletorole')) = @__strlit0::text and (n.properties ->> E'isassignabletorole') = @__strlit1::text)",
+			ExpectedParams: map[string]any{"__strlit0": "string", "__strlit1": "true"},
+		}, {
+			Name:           "string literal uses typed text property lookup when reversed",
+			LOperand:       mustAsLiteral("true"),
+			Operator:       pgsql.OperatorEquals,
+			ROperand:       propertyLookup("isassignabletorole"),
+			ExpectedSql:    "(jsonb_typeof((n.properties -> E'isassignabletorole')) = @__strlit0::text and @__strlit1::text = (n.properties ->> E'isassignabletorole'))",
+			ExpectedParams: map[string]any{"__strlit0": "string", "__strlit1": "true"},
+		}, {
+			Name:           "numeric-looking string literal remains string typed",
+			LOperand:       propertyLookup("rank"),
+			Operator:       pgsql.OperatorEquals,
+			ROperand:       mustAsLiteral("1"),
+			ExpectedSql:    "(jsonb_typeof((n.properties -> E'rank')) = @__strlit0::text and (n.properties ->> E'rank') = @__strlit1::text)",
+			ExpectedParams: map[string]any{"__strlit0": "string", "__strlit1": "1"},
+		}, {
+			Name:           "text parameter uses typed text property lookup",
+			LOperand:       propertyLookup("objectid"),
+			Operator:       pgsql.OperatorEquals,
+			ROperand:       pgsql.Parameter{Identifier: "pi0", CastType: pgsql.Text},
+			ExpectedSql:    "(jsonb_typeof((n.properties -> E'objectid')) = @__strlit0::text and (n.properties ->> E'objectid') = @pi0::text)",
+			ExpectedParams: map[string]any{"__strlit0": "string"},
+		}, {
+			Name:     "text function uses typed text property lookup",
+			LOperand: propertyLookup("distinguishedname"),
+			Operator: pgsql.OperatorEquals,
+			ROperand: pgsql.FunctionCall{
+				Function:   pgsql.FunctionToUpper,
+				Parameters: []pgsql.Expression{mustAsLiteral("admin")},
+				CastType:   pgsql.Text,
+			},
+			ExpectedSql:    "(jsonb_typeof((n.properties -> E'distinguishedname')) = @__strlit0::text and (n.properties ->> E'distinguishedname') = upper(@__strlit1::text)::text)",
+			ExpectedParams: map[string]any{"__strlit0": "string", "__strlit1": "admin"},
+		}, {
+			Name: "text function uses typed text property lookup when reversed",
+			LOperand: pgsql.FunctionCall{
+				Function:   pgsql.FunctionToUpper,
+				Parameters: []pgsql.Expression{mustAsLiteral("admin")},
+				CastType:   pgsql.Text,
+			},
+			Operator:       pgsql.OperatorEquals,
+			ROperand:       propertyLookup("distinguishedname"),
+			ExpectedSql:    "(jsonb_typeof((n.properties -> E'distinguishedname')) = @__strlit0::text and upper(@__strlit1::text)::text = (n.properties ->> E'distinguishedname'))",
+			ExpectedParams: map[string]any{"__strlit0": "string", "__strlit1": "admin"},
+		}, {
+			Name:           "string inequality keeps non-string JSONB branch",
+			LOperand:       propertyLookup("rank"),
+			Operator:       pgsql.OperatorCypherNotEquals,
+			ROperand:       mustAsLiteral("1"),
+			ExpectedSql:    "(jsonb_typeof((n.properties -> E'rank')) = @__strlit0::text and (n.properties ->> E'rank') <> @__strlit1::text or jsonb_typeof((n.properties -> E'rank')) <> @__strlit0::text and (n.properties -> E'rank') <> to_jsonb((@__strlit1::text)::text)::jsonb)",
+			ExpectedParams: map[string]any{"__strlit0": "string", "__strlit1": "1"},
+		}, {
+			Name:           "boolean literal keeps jsonb scalar equality",
+			LOperand:       propertyLookup("isassignabletorole"),
+			Operator:       pgsql.OperatorEquals,
+			ROperand:       mustAsLiteral(true),
+			ExpectedSql:    "((n.properties -> E'isassignabletorole'))::jsonb = to_jsonb((true)::bool)::jsonb",
+			ExpectedParams: map[string]any{},
+		}, {
+			Name:           "numeric literal keeps jsonb scalar equality",
+			LOperand:       propertyLookup("count"),
+			Operator:       pgsql.OperatorEquals,
+			ROperand:       mustAsLiteral(1),
+			ExpectedSql:    "((n.properties -> E'count'))::jsonb = to_jsonb((1)::int8)::jsonb",
+			ExpectedParams: map[string]any{},
+		}, {
+			Name:           "property to property equality keeps jsonb operands",
+			LOperand:       propertyLookup("left"),
+			Operator:       pgsql.OperatorEquals,
+			ROperand:       propertyLookup("right"),
+			ExpectedSql:    "(n.properties -> E'left') = (n.properties -> E'right')",
+			ExpectedParams: map[string]any{},
+		}}
+	)
+
+	for _, testCase := range testCases {
+		t.Run(testCase.Name, func(t *testing.T) {
+			expectedSql, expectedParams := renderComparison(t, testCase.LOperand, testCase.Operator, testCase.ROperand)
+			require.Equal(t, testCase.ExpectedSql, expectedSql)
+			require.Equal(t, testCase.ExpectedParams, expectedParams)
+		})
+	}
+}
+
+func TestExpressionTreeTranslator(t *testing.T) {
+	// Tree translator is a stack oriented expression tree builder
+	var (
+		treeTranslator = translate.NewExpressionTreeTranslator(nil)
+		scope          = translate.NewScope()
+	)
+
+	// Case: Translating the constraint: a.name = 'a' and a.num_a > 1 and b.name = 'b' and a.other = b.other
+
+	// Perform a prefix visit of the parent expression and its operator. This is used for tracking
+	// conjunctions and disjunctions.
+	treeTranslator.VisitOperator(pgsql.OperatorEquals)
+
+	// Postfix visit and push the compound identifier first: a.name
+	treeTranslator.PushOperand(pgsql.CompoundIdentifier{"a", "name"})
+
+	// Postfix visit and push the literal next: "a"
+	treeTranslator.PushOperand(mustAsLiteral("a"))
+
+	// Perform a postfix visit of the parent expression and its operator.
+	require.Nil(t, treeTranslator.CompleteBinaryExpression(scope, pgsql.OperatorEquals))
+
+	// Expect one newly created binary expression to be the only thing left on the tree
+	// translator's operand stack
+	require.IsType(t, &pgsql.BinaryExpression{}, treeTranslator.PeekOperand())
+
+	// Continue with: and a.num_a > 1
+	// Preform a prefix visit of the 'and' operator:
+	treeTranslator.VisitOperator(pgsql.OperatorAnd)
+
+	// Preform a prefix visit of the '>' operator:
+	treeTranslator.VisitOperator(pgsql.OperatorGreaterThan)
+
+	// Postfix visit and push the compound identifier first: a.num_a
+	treeTranslator.PushOperand(pgsql.CompoundIdentifier{"a", "num_a"})
+
+	// Postfix visit and push the literal next: 1
+	treeTranslator.PushOperand(mustAsLiteral(1))
+
+	// Perform a postfix visit of the parent expression and its operator.
+	require.Nil(t, treeTranslator.CompleteBinaryExpression(scope, pgsql.OperatorGreaterThan))
+
+	// Perform a postfix visit of the conjoining parent expression and its operator.
+	require.Nil(t, treeTranslator.CompleteBinaryExpression(scope, pgsql.OperatorAnd))
+
+	// Continue with: and b.name = "b"
+	// Preform a prefix visit of the 'and' operator:
+	treeTranslator.VisitOperator(pgsql.OperatorAnd)
+
+	// Preform a prefix visit of the '=' operator:
+	treeTranslator.VisitOperator(pgsql.OperatorEquals)
+
+	// Postfix visit and push the compound identifier first: b.name
+	treeTranslator.PushOperand(pgsql.CompoundIdentifier{"b", "name"})
+
+	// Postfix visit and push the literal next: "b"
+	treeTranslator.PushOperand(mustAsLiteral("b"))
+
+	// Perform a postfix visit of the parent expression and its operator.
+	require.Nil(t, treeTranslator.CompleteBinaryExpression(scope, pgsql.OperatorEquals))
+
+	// Perform a postfix visit of the conjoining parent expression and its operator.
+	require.Nil(t, treeTranslator.CompleteBinaryExpression(scope, pgsql.OperatorAnd))
+
+	// Continue with: and a.other = b.other
+	// enter Op(and), enter Op(=)
+	treeTranslator.VisitOperator(pgsql.OperatorAnd)
+	treeTranslator.VisitOperator(pgsql.OperatorEquals)
+
+	// push LOperand, push ROperand
+	treeTranslator.PushOperand(pgsql.CompoundIdentifier{"a", "other"})
+	treeTranslator.PushOperand(pgsql.CompoundIdentifier{"b", "other"})
+
+	// exit  exit Op(=), Op(and)
+	treeTranslator.CompleteBinaryExpression(scope, pgsql.OperatorEquals)
+	treeTranslator.CompleteBinaryExpression(scope, pgsql.OperatorAnd)
+
+	// Assign remaining operands as constraints
+	treeTranslator.PopRemainingExpressionsAsUserConstraints()
+
+	// Pull out the 'a' constraint
+	var (
+		aIdentifier         = pgsql.AsIdentifierSet("a")
+		expectedTranslation = "(a.name = @__strlit0::text and a.num_a > 1)"
+		expectedParameters  = map[string]any{"__strlit0": "a"}
+	)
+
+	validateConstraints(t, treeTranslator, aIdentifier, expectedTranslation, expectedParameters)
+
+	// Pull out the 'b' constraint next
+	bIdentifier := pgsql.AsIdentifierSet("b")
+	expectedTranslation = "(b.name = @__strlit0::text)"
+	expectedParameters = map[string]any{"__strlit0": "b"}
+	validateConstraints(t, treeTranslator, bIdentifier, expectedTranslation, expectedParameters)
+
+	// Pull out the constraint that depends on both 'a' and 'b' identifiers
+	idents := pgsql.AsIdentifierSet("a", "b")
+	expectedTranslation = "(a.other = b.other)"
+	validateConstraints(t, treeTranslator, idents, expectedTranslation, map[string]any{})
+}
+
+func validateConstraints(t *testing.T, constraintTracker *translate.ExpressionTreeTranslator, idents *pgsql.IdentifierSet, expectedTranslation string, expectedParameters map[string]any) {
+	constraint, err := constraintTracker.ConsumeConstraintsFromVisibleSet(idents)
+
+	require.NotNil(t, constraint)
+	require.True(t, constraint.Dependencies.Matches(idents))
+	require.Nil(t, err)
+
+	formattedConstraint, err := format.Expression(constraint.Expression, format.NewOutputBuilder())
+
+	require.Nil(t, err)
+	require.Equal(t, expectedTranslation, formattedConstraint.Statement)
+	require.Equal(t, expectedParameters, formattedConstraint.Parameters)
+}

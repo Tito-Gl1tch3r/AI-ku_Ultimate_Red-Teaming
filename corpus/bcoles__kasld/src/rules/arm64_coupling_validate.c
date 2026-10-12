@@ -1,0 +1,126 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Verdict: arm64 regional VA-band validation (sibling of
+// coupling_validate.c for x86_64).
+//
+// Each region in the arm64 modern (v5.4+) VAS lives in a fixed sub-band
+// anchored to VA_BITS_MIN = 48 constants:
+//
+//   DIRECTMAP / PAGE_OFFSET   in [PAGE_OFFSET,
+//   _PAGE_END(VA_BITS_VALIDATE_MIN = 39)) = [..., 0xffffffc000000000) MODULE /
+//   MODULE_REGION    in [MODULES_START,
+//   MODULES_END]   (union over kernel-version layouts) KERNEL_TEXT /
+//   KERNEL_IMAGE in [VIRT_TEXT_PLAUSIBLE_MIN, VIRT_TEXT_PLAUSIBLE_MAX] (the
+//   validation range) VMEMMAP                   in [VMEMMAP_START,
+//   0xffffffffc0000000) (VA48 floor; ~0xfffffdffc0000000)
+//
+// IMPORTANT: the KERNEL_TEXT / KERNEL_IMAGE check uses
+// VIRT_TEXT_PLAUSIBLE_MIN/MAX (the *validation* range that covers every
+// in-scope kernel-version layout), NOT VIRT_TEXT_MIN_DEFAULT_CONFIG/MAX (the
+// narrower *per-formula KASLR randomization window* derived from kaslr_early.c
+// at one specific kernel version). The kernel's KASLR algorithm has shifted
+// across versions (v6.6 vs v6.12); pinning the validation band to one formula's
+// window would reject legitimate text leaks produced by any other version
+// sitting inside the wider arch VAS. Same shape as the modules-window union
+// widening — see api.h MODULES_* validation-union contract.
+//
+// The bands themselves are KASLR-invariant — the kernel image's KASLR slot
+// inside the KASLR window is the only randomized position; the band
+// containers are fixed. An observation whose eff_region claims one band
+// but whose address falls in a different band's range is misclassified —
+// typically a heap pointer, percpu offset, or stack pointer mistakenly
+// tagged. The verdict rule emits V_INVALID for such observations so they
+// do not pollute downstream rules (e.g., a heap pointer mistagged as
+// DIRECTMAP would otherwise feed directmap_page_offset_bounds an unsound
+// floor).
+//
+// The ruling is a pure function of the observation's own region and anchor
+// versus compile-time geometry — no cross-observation or estimate dependency.
+// Same shape as coupling_validate.
+//
+// arm64 only; inert elsewhere. Defensive insurance against a mistagged
+// observation; matches the pattern used on x86_64.
+//
+// References:
+// arch/arm64/include/asm/memory.h    (band constants)
+// arch/arm64/include/asm/pgtable.h   (VMEMMAP_END = -SZ_1G)
+// ---
+// <bcoles@gmail.com>
+
+#include "include/kasld/engine_rules.h"
+
+#include <string.h>
+
+/* The linear map sits in [PAGE_OFFSET, _PAGE_END), both functions of VA_BITS.
+ * The accepting ceiling is _PAGE_END of ARM64_VA_BITS_VALIDATE_MIN (the
+ * smallest width admitted pre-resolution, not the smallest supported) — so a
+ * PAGE_OFFSET for any width DOWN TO that one (e.g. 39-bit 0xffffff8000000000)
+ * is admitted, not flagged as out-of-band. Trade-off, in both directions: the
+ * gap between the 48-bit and VALIDATE_MIN _PAGE_END values is no longer policed
+ * pre-resolution (a 48-bit heap pointer mistagged DIRECTMAP there is admitted),
+ * and a width BELOW VALIDATE_MIN has its base above this ceiling, so a real
+ * leak from one (VA36's 0xfffffff000000000) is rejected. Both resolve the same
+ * way: the directmap consumers narrow once PAGE_OFFSET resolves — from the
+ * width the mmap probe pins, which does not pass through this filter. */
+#define ARM64_VMEMMAP_END 0xffffffffc0000000ul /* −SZ_1G */
+/* VA_BITS=48 VMEMMAP floor; conservative for both VA48 and VA52 (VA52's
+ * VMEMMAP extends further down, so any address < VA48 floor is consistent
+ * with VA52 vmemmap — it is not invalidated). Matches the threshold the
+ * arm64_va_bits_from_vmemmap rule uses. Currently unused by this verdict: the
+ * REGION_VMEMMAP case only rejects a >= VMEMMAP_END and never consults this
+ * floor discriminator. Retained for reference and parity with that rule. */
+#define ARM64_VA48_VMEMMAP_START 0xfffffdffc0000000ul
+
+#if defined(__aarch64__)
+static int arm64_va_band_bad(enum kasld_region region, unsigned long a) {
+  switch (region) {
+  case REGION_DIRECTMAP:
+  case REGION_PAGE_OFFSET:
+    /* Linear map lives in [PAGE_OFFSET, _PAGE_END), both VA_BITS-dependent.
+     * Accepting bounds: floor at the lowest PAGE_OFFSET (VA52's,
+     * KERNEL_VIRT_VAS_START); ceiling at _PAGE_END of
+     * ARM64_VA_BITS_VALIDATE_MIN
+     * -- the smallest width admitted PRE-resolution, NOT the smallest
+     * supported. A VA36 base sits above this ceiling and is rejected (see the
+     * file-top note). */
+    return (a >= arm64_page_end_for(ARM64_VA_BITS_VALIDATE_MIN)) ||
+           (a < (unsigned long)KERNEL_VIRT_VAS_START);
+  case REGION_MODULE:
+  case REGION_MODULE_BAND:
+    /* Modules sit in the fixed [MODULES_START, MODULES_END] band. */
+    return (a < (unsigned long)MODULES_START) ||
+           (a > (unsigned long)MODULES_END);
+  case REGION_KERNEL_TEXT:
+  case REGION_KERNEL_IMAGE:
+    /* Inside the *validation* range — VIRT_TEXT_PLAUSIBLE_MIN/MAX (the arch's
+     * widest plausible text-base window) rather than
+     * VIRT_TEXT_MIN_DEFAULT_CONFIG/MAX (one specific KASLR formula's narrower
+     * randomization window). The latter would reject legitimate text leaks from
+     * kernel versions whose kaslr_early.c algorithm produces slots outside the
+     * current header's modelled window. */
+    return (a < (unsigned long)VIRT_TEXT_PLAUSIBLE_MIN) ||
+           (a > (unsigned long)VIRT_TEXT_PLAUSIBLE_MAX);
+  case REGION_VMEMMAP:
+    /* Above VA48 vmemmap floor *or* anywhere below it (VA52 territory); either
+     * way, must be below VMEMMAP_END (= −SZ_1G). The arm64 va_bits-from-vmemmap
+     * rule cares about the *floor* discriminator; this verdict only rejects the
+     * unambiguously-out-of-range case. */
+    return (a >= ARM64_VMEMMAP_END);
+  default:
+    return 0; /* no band check for this region kind */
+  }
+}
+#endif
+
+int rule_arm64_coupling_validate(const struct evidence_set *ev,
+                                 struct verdict *out, int out_max) {
+#if defined(__aarch64__)
+  return kasld_emit_va_band_verdicts(ev, out, out_max, arm64_va_band_bad,
+                                     "arm64_coupling_validate");
+#else
+  (void)ev;
+  (void)out;
+  (void)out_max;
+  return 0;
+#endif
+}

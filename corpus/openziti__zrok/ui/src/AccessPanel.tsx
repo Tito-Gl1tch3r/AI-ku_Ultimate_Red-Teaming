@@ -1,0 +1,156 @@
+import {Node} from "@xyflow/react";
+import {Box, Button, CircularProgress, Grid2, Tooltip, Typography} from "@mui/material";
+import AccessIcon from "@mui/icons-material/Lan";
+import useApiConsoleStore from "./model/store.ts";
+import React, {useCallback, useEffect, useState} from "react";
+import {Frontend} from "./api";
+import DeleteIcon from "@mui/icons-material/Delete";
+import PropertyTable from "./PropertyTable.tsx";
+import ReleaseAccessModal from "./ReleaseAccessModal.tsx";
+import {getMetadataApi} from "./model/api.ts";
+import ClipboardText from "./ClipboardText.tsx";
+import BandwidthLimitedWarning from "./BandwidthLimitedWarning.tsx";
+import {extractErrorMessage, isAbortError} from "./model/errors.ts";
+import {PropertyRow} from "./model/util.ts";
+
+interface AccessPanelProps {
+    access: Node;
+}
+
+const AccessPanel = ({ access }: AccessPanelProps) => {
+    const user = useApiConsoleStore((state) => state.user);
+    const limited = useApiConsoleStore((state) => state.limited);
+    const frontendId = access.data.feId as number | undefined;
+    const [detail, setDetail] = useState<Frontend>(null);
+    const [loading, setLoading] = useState<boolean>(true);
+    const [errorMessage, setErrorMessage] = useState<string>("");
+    const [releaseAccessOpen, setReleaseAccessOpen] = useState<boolean>(false);
+    const openReleaseAccess = () => {
+        setReleaseAccessOpen(true);
+    }
+    const closeReleaseAccess = () => {
+        setReleaseAccessOpen(false);
+    };
+
+    const loadDetail = useCallback((signal?: AbortSignal) => {
+        if (!user || frontendId == null) {
+            return Promise.resolve();
+        }
+
+        setLoading(true);
+        setErrorMessage("");
+        setDetail(null);
+        return getMetadataApi(user).getFrontendDetail({frontendId: frontendId}, { signal })
+            .then(d => {
+                const nextDetail = {...d} as Partial<Frontend> & Record<string, unknown>;
+                delete nextDetail.id;
+                delete nextDetail.zId;
+                delete nextDetail.description;
+                setDetail(nextDetail as Frontend);
+                setLoading(false);
+            })
+            .catch(async (e) => {
+                if (isAbortError(e)) return;
+                const msg = await extractErrorMessage(e, "failed to load access details");
+                setErrorMessage(msg);
+                setLoading(false);
+            });
+    }, [frontendId, user]);
+
+    useEffect(() => {
+        if (!user || frontendId == null) return;
+        const controller = new AbortController();
+        void loadDetail(controller.signal);
+        return () => controller.abort();
+    }, [frontendId, loadDetail, user]);
+
+    if (!user) return null;
+
+    const customProperties = {
+        bindAddress: (row: PropertyRow) => <>
+            <Grid2 container sx={{ flexGrow: 1 }} alignItems="center">
+                <Grid2 display="flex" justifyContent="left">
+                    <span>{row.value as string}</span>
+                </Grid2>
+                <Grid2 display="flex" justifyContent="right" sx={{ flexGrow: 1 }}>
+                    <ClipboardText text={row.value as string} />
+                </Grid2>
+            </Grid2>
+        </>,
+        frontendToken: (row: PropertyRow) => <>
+            <Grid2 container sx={{ flexGrow: 1 }} alignItems="center">
+                <Grid2 display="flex" justifyContent="left">
+                    <span>{row.value as string}</span>
+                </Grid2>
+                <Grid2 display="flex" justifyContent="right" sx={{ flexGrow: 1 }}>
+                    <ClipboardText text={row.value as string} />
+                </Grid2>
+            </Grid2>
+        </>,
+        shareToken: (row: PropertyRow) => <>
+            <Grid2 container sx={{ flexGrow: 1 }} alignItems="center">
+                <Grid2 display="flex" justifyContent="left">
+                    <span>{row.value as string}</span>
+                </Grid2>
+                <Grid2 display="flex" justifyContent="right" sx={{ flexGrow: 1 }}>
+                    <ClipboardText text={row.value as string} />
+                </Grid2>
+            </Grid2>
+        </>,
+        createdAt: (row: PropertyRow) => new Date(row.value as string).toLocaleString(),
+        updatedAt: (row: PropertyRow) => new Date(row.value as string).toLocaleString(),
+    }
+
+    const labels = {
+        createdAt: "Created",
+        updatedAt: "Updated",
+    };
+
+    const actionsDisabled = detail == null;
+
+    return (
+        <>
+            <Typography component="div">
+                <Grid2 container spacing={2}>
+                    <Grid2 >
+                        <Grid2 container sx={{ flexGrow: 1 }} alignItems="center">
+                            <Grid2 display="flex"><AccessIcon sx={{ fontSize: 30, mr: 0.5 }}/></Grid2>
+                            <Grid2 display="flex" component="h3">{String(access.data.label)}</Grid2>
+                        </Grid2>
+                        {loading ? (
+                            <Grid2 container justifyContent="center" sx={{ mt: 4 }}><CircularProgress /></Grid2>
+                        ) : (
+                            <>
+                                { errorMessage && <Typography color="error" sx={{ mb: 2 }}>{errorMessage}</Typography> }
+                                { limited ? <BandwidthLimitedWarning /> : null }
+                                <Grid2 container sx={{ flexGrow: 1, mb: 3 }} alignItems="left">
+                                    <Tooltip title="Release Access">
+                                        <span>
+                                            <Button variant="contained" color="error" aria-label="Release Access" onClick={openReleaseAccess} disabled={actionsDisabled}><DeleteIcon /></Button>
+                                        </span>
+                                    </Tooltip>
+                                    {actionsDisabled ? <Button variant="outlined" sx={{ ml: 1 }} onClick={() => void loadDetail()}>Retry</Button> : null}
+                                </Grid2>
+                                {detail ? (
+                                    <>
+                                        <Grid2 container sx={{ flexGrow: 1, mt: 0, mb: 2, p: 0 }} alignItems="center">
+                                            <Box component="h5" sx={{ m: 0 }}>A private access frontend {detail.bindAddress ? <span>at <code>{detail.bindAddress}</code></span> : <span>with frontend token <code>{detail.frontendToken}</code></span>}</Box>
+                                        </Grid2>
+                                        <Grid2 container sx={{ flexGrow: 1 }}>
+                                            <Grid2 display="flex">
+                                                <PropertyTable object={detail} custom={customProperties} labels={labels} />
+                                            </Grid2>
+                                        </Grid2>
+                                    </>
+                                ) : null}
+                            </>
+                        )}
+                    </Grid2>
+                </Grid2>
+            </Typography>
+            <ReleaseAccessModal close={closeReleaseAccess} isOpen={releaseAccessOpen} user={user} access={access} detail={detail} />
+        </>
+    );
+};
+
+export default AccessPanel;

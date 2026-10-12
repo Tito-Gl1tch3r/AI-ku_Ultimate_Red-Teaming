@@ -1,0 +1,742 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Builds the report model from the engine's two resolutions.
+//
+// This is the only place that decides what a run reports. It reads estimates
+// and the constraints behind them; it performs no I/O, consults no host fact,
+// and reads nothing any format prints. Formats consume what it produces.
+//
+// ---
+// <bcoles@gmail.com>
+
+#include "include/kasld/report.h"
+
+#include "include/kasld/api.h"
+
+#include <string.h>
+
+/* Human names, one per quantity, in one place.
+ *
+ * Indexed by the enum rather than listed in order, so a quantity added without
+ * a name yields NULL instead of silently shifting every label onto the wrong
+ * row. The machine name comes from the quantity table itself
+ * (`quantities[q].name`), so the two cannot drift: there is one table of
+ * quantities and one table of their labels, keyed the same way.
+ *
+ * The alignment quantities carry no label because they are not items. An
+ * alignment is a parameter of the search rather than an unknown a reader hunts,
+ * and it is already reported as the grain of every item it governs. */
+static const char *const q_labels[Q__COUNT] = {
+    [Q_VIRT_IMAGE_BASE] = "Virtual Image Base",
+    [Q_PHYS_IMAGE_BASE] = "Physical Image Base",
+    [Q_PAGE_OFFSET] = "Direct Map Base",
+    [Q_VMALLOC_BASE] = "Vmalloc Base",
+    [Q_VMEMMAP_BASE] = "Vmemmap Base",
+    [Q_MODULE_BASE] = "Module Region Base",
+    [Q_VA_BITS] = "Paging Level",
+};
+
+/* Whether this architecture has this unknown at all.
+ *
+ * Membership is a property of the machine: a target that does not randomize its
+ * vmalloc base has no such unknown, and reporting one would state a non-fact.
+ * Decided once here rather than per format, so no format can add or drop an
+ * item.
+ *
+ * The alignment quantities are excluded because they are not items (see above).
+ * Q_VA_BITS is a member only where more than one address-space size is
+ * admissible; where the architecture admits one, nothing is unknown. */
+static int q_is_member(enum kasld_quantity q) {
+  switch (q) {
+  case Q_VIRT_IMAGE_BASE:
+  case Q_PHYS_IMAGE_BASE:
+  case Q_PAGE_OFFSET:
+  case Q_MODULE_BASE:
+    return 1;
+  case Q_VMALLOC_BASE:
+  case Q_VMEMMAP_BASE:
+    /* The memory-KASLR regions exist as unknowns only where the architecture
+     * randomizes them. */
+    return RANDOMIZE_MEMORY_ALIGN > 0;
+  case Q_VA_BITS:
+    return quantities[Q_VA_BITS].n_candidates > 1;
+  default:
+    return 0;
+  }
+}
+
+/* The alignment quantity governing a base, or Q__COUNT where none does. Named
+ * once so the grain and the test for whether it is exact cannot end up reading
+ * different quantities. */
+static enum kasld_quantity q_align_quantity(enum kasld_quantity q) {
+  switch (q) {
+  case Q_VIRT_IMAGE_BASE:
+    return Q_VIRT_KASLR_ALIGN;
+  case Q_PHYS_IMAGE_BASE:
+    return Q_PHYS_KASLR_ALIGN;
+  default:
+    return Q__COUNT;
+  }
+}
+
+/* Whether a quantity's grain is the pitch itself or only a floor under it.
+ *
+ * Two ways to be exact, and they are not interchangeable. The
+ * memory-randomization grid is fixed by the kernel's own layout code, so it is
+ * exact for every run on the architecture that has one -- no evidence required,
+ * which is why that arm needs no estimate. An image base's granularity is a
+ * build option, so it is exact only for a run that resolved it: the alignment
+ * quantity is proven from below by default, and a source that read the kernel's
+ * placement constant closes it to a value (see estimate.h). Anything short of
+ * that leaves a kernel built more coarsely aligned than the engine could prove
+ * sitting on fewer placements than a count on this grain states. */
+static int q_grain_exact(enum kasld_quantity q, const struct estimate *est,
+                         unsigned long grain) {
+  enum kasld_quantity aq;
+  unsigned long pitch;
+  switch (q) {
+  case Q_PAGE_OFFSET:
+  case Q_VMALLOC_BASE:
+  case Q_VMEMMAP_BASE:
+    return RANDOMIZE_MEMORY_ALIGN > 0;
+  case Q_MODULE_BASE:
+    /* Exact where the architecture states the allocator's step rather than
+     * leaving the page-granular floor to stand for it: the placement is that
+     * step times a whole number, so the candidates sit on it exactly. */
+#ifdef MODULES_BASE_RANDOM_STEP
+    return 1;
+#else
+    return 0;
+#endif
+  default:
+    break;
+  }
+  aq = q_align_quantity(q);
+  if (aq == Q__COUNT || est == NULL)
+    return 0;
+  /* The resolved granularity has to BE the grain being qualified. Where the
+   * architecture's own minimum is coarser it is the grain instead, and a
+   * statement about a finer one says nothing about it. */
+  return quantity_pinned(aq, &est[aq], &pitch) && pitch == grain;
+}
+
+/* The grain this quantity's candidates are counted on.
+ *
+ * Each quantity is counted at ITS OWN granularity. RANDOMIZE_MEMORY_ALIGN is
+ * x86_64's memory-KASLR granule and is 0 elsewhere, so using it for every
+ * target would count the memory regions at a pitch of zero on every other
+ * architecture -- which yields no count at all rather than a coarse one. A
+ * quantity that sits on no modelled grid returns 0, and has no candidate count
+ * to state; that is a property of the quantity, not a judgement about whether
+ * the count is worth showing. */
+static unsigned long q_grain_value(enum kasld_quantity q,
+                                   const struct estimate *est) {
+  switch (q) {
+  /* The resolved alignment or the architecture's own, whichever is coarser.
+   *
+   * An alignment lattice starts at "aligned to 1 byte" -- least information --
+   * and only rises as evidence arrives, so reading it directly would count a
+   * window in BYTES whenever the rule that establishes the architectural floor
+   * has not run. Taking the maximum makes the grain correct without depending
+   * on any rule having fired, and is sound in the same direction the lattice
+   * moves: the architectural value is the coarsest the kernel can be relied on
+   * to use, and a resolved floor can only raise it. */
+  case Q_VIRT_IMAGE_BASE: {
+    unsigned long a = est[Q_VIRT_KASLR_ALIGN].lo;
+    return a > (unsigned long)KASLR_VIRT_ALIGN
+               ? a
+               : (unsigned long)KASLR_VIRT_ALIGN;
+  }
+  case Q_PHYS_IMAGE_BASE: {
+    unsigned long a = est[Q_PHYS_KASLR_ALIGN].lo;
+    return a > (unsigned long)KASLR_PHYS_ALIGN
+               ? a
+               : (unsigned long)KASLR_PHYS_ALIGN;
+  }
+  case Q_PAGE_OFFSET:
+  case Q_VMALLOC_BASE:
+  case Q_VMEMMAP_BASE:
+#if RANDOMIZE_MEMORY_ALIGN > 0
+    return (unsigned long)RANDOMIZE_MEMORY_ALIGN;
+#else
+    /* Not randomized here, but still bounded, and a base is page-granular at
+     * worst -- so there is a real pitch to count on. "At worst" is what makes
+     * it a floor: a coarser true grain would mean fewer candidates. */
+    return KASLD_LAYOUT_GRANULE;
+#endif
+  case Q_MODULE_BASE:
+#ifdef MODULES_BASE_RANDOM_STEP
+    /* The allocator's own step, where the architecture states one. */
+    return (unsigned long)MODULES_BASE_RANDOM_STEP;
+#else
+    return KASLD_LAYOUT_GRANULE;
+#endif
+  case Q_VA_BITS:
+    return 0; /* a finite set of sizes sits on no grid */
+  default:
+    return 0;
+  }
+}
+
+static unsigned long q_grain(enum kasld_quantity q, const struct estimate *est,
+                             int *exact) {
+  unsigned long grain = q_grain_value(q, est);
+  *exact = q_grain_exact(q, est, grain);
+  return grain;
+}
+
+/* Bits of entropy from a candidate count: ceil(log2(v)) for v >= 1, 0 for 0.
+ *
+ * CEIL, not floor: the user-facing question is how much brute-force work
+ * remains, and 13 candidates is ~4 bits of worst-case work rather than 3.
+ * Power-of-two inputs are unaffected. */
+static int report_bits(unsigned long v) {
+  int r = 0;
+  unsigned long n;
+  if (v <= 1)
+    return 0;
+  n = v;
+  while (n >>= 1)
+    r++;
+  if ((v & (v - 1)) != 0)
+    r++;
+  return r;
+}
+
+/* What this quantity's honest top IS, which decides whether a denominator may
+ * be built from it and from what.
+ *
+ * The distinction is the difference between "one of the 512 placements this
+ * architecture admits" and "one of the 2^31 addresses that fit" -- the first is
+ * a derandomization result, the second is a property of the pointer. It follows
+ * from which constant quantities.c seeds the top with, so it is a question
+ * about the quantity, answered per architecture only where the architecture
+ * changes what that constant means.
+ *
+ * Three answers, because a top that is not a window fails to be one for two
+ * unrelated reasons and they do not license the same thing:
+ *
+ *   Q_TOP_DRAWN_WINDOW   the top is itself the set the value was drawn from.
+ *     The image base's top is [VIRT_TEXT_MIN_ANY_CONFIG,
+ *     VIRT_TEXT_MAX_ANY_CONFIG], the widest placement any build admits: loose
+ *     on an architecture with several VA layouts, but a window still, and
+ *     publishable as a denominator on its own.
+ *
+ *   Q_TOP_ADDRESS_WIDTH  the top bounds how wide an address can be, and says
+ *     nothing about placement. Where a kernel lands physically is set by where
+ *     the board puts DRAM, so the physical top is PHYS_ADDR_TOP; the
+ *     memory-KASLR regions are drawn from a RAM budget rather than from the
+ *     address space their top spans. A ratio against the raw top would read as
+ *     entropy that was never there -- but a top NARROWED by what the machine
+ *     has is the set the kernel drew from, and does count. Such a quantity
+ *     therefore has a denominator exactly when something established one.
+ *
+ *   Q_TOP_NOT_DRAWN      the value was not drawn from a set at all: an
+ *     architecture that does not randomize the base, an alignment, a module
+ *     band that is fixed or rides the text slide. Here narrowing establishes
+ *     nothing either, because there was never a choice to reduce. These state
+ *     the count alone.
+ *
+ * The middle answer is why this is not a boolean. Collapsing it into the last
+ * one suppresses a real window; collapsing it into the first publishes an
+ * address width as though the kernel had chosen among its addresses. */
+enum q_top_kind {
+  Q_TOP_DRAWN_WINDOW,
+  Q_TOP_ADDRESS_WIDTH,
+  Q_TOP_NOT_DRAWN,
+};
+
+static enum q_top_kind q_top_kind(enum kasld_quantity q) {
+  switch (q) {
+  case Q_VIRT_IMAGE_BASE:
+    return KASLR_SUPPORTED ? Q_TOP_DRAWN_WINDOW : Q_TOP_NOT_DRAWN;
+  case Q_MODULE_BASE:
+    /* The module band is a declared region, but on most architectures it is not
+     * a set the base was DRAWN from: it is fixed, it rides the text slide, or
+     * it brackets the image. Counting it would state a reduction against
+     * addresses the allocator never chose among, and narrowing it by what the
+     * machine has would not make it one. Where an architecture does randomize
+     * the base within a span of its own, q_entropy_top supplies that span and
+     * this answer is never reached. */
+    return Q_TOP_NOT_DRAWN;
+  case Q_VA_BITS:
+    /* Moot: a finite set is its own denominator, and RSHAPE_SET is read from
+     * search_top directly without passing through here. */
+    return Q_TOP_DRAWN_WINDOW;
+  case Q_PHYS_IMAGE_BASE:
+  case Q_PAGE_OFFSET:
+  case Q_VMALLOC_BASE:
+  case Q_VMEMMAP_BASE:
+    return Q_TOP_ADDRESS_WIDTH;
+  case Q_VIRT_KASLR_ALIGN:
+  case Q_PHYS_KASLR_ALIGN:
+  case Q__COUNT:
+    return Q_TOP_NOT_DRAWN;
+  }
+  return Q_TOP_NOT_DRAWN;
+}
+
+/* The window the kernel's own randomization draws from, in candidates.
+ *
+ * A static property of the architecture, so it is read from the arch header
+ * rather than from the run -- it says what the kernel could have done, not what
+ * this run learned. Zero where the architecture defines no randomization window
+ * for the quantity: the memory-KASLR regions are bounded by a budget derived
+ * from observed RAM rather than by a constant, so their denominator is resolved
+ * rather than declared and does not belong here. A finite set is its own
+ * denominator and needs none.
+ *
+ * The image bases are zero for the same reason, which the constants' names say
+ * outright: the only arch-declared window for them is the DEFAULT_CONFIG pair,
+ * and that holds for a default build rather than for the kernel being measured.
+ * Published as a denominator it states a figure that is wrong wherever the
+ * build differs -- an arm64 kernel at VA_BITS 39 randomises over 22 bits
+ * against a declared 31; a 3-level s390 over at most 28 against a declared 39.
+ * Where the window IS derivable from resolved facts it reaches the item through
+ * the caller's points[], the same route the memory regions take.
+ *
+ * Zero here does not mean the row goes without a denominator. It means this
+ * function has nothing to say, and the caller falls back to the set the engine
+ * started from -- see the three tiers where entropy_top is assigned. */
+static unsigned long q_entropy_top(enum kasld_quantity q, unsigned long grain) {
+  unsigned long lo = 0, hi = 0;
+  switch (q) {
+  case Q_VIRT_IMAGE_BASE:
+  case Q_PHYS_IMAGE_BASE:
+    return 0;
+#if defined(MODULES_BASE_RANDOMIZED) && defined(MODULES_BASE_RANDOM_SPAN)
+  case Q_MODULE_BASE:
+    /* The allocator draws the module base from a span above a fixed point,
+     * independently of the text slide, and both edges are admissible. Declared
+     * by the architecture like the image windows above, so it is read the same
+     * way: the rule that confines the quantity to this window gates on WHERE
+     * the window sits, which does not change how wide it is. */
+    lo = (unsigned long)MODULES_BASE_RANDOMIZED;
+    hi = (unsigned long)MODULES_BASE_RANDOMIZED +
+         (unsigned long)MODULES_BASE_RANDOM_SPAN;
+    break;
+#else
+  case Q_MODULE_BASE:
+    /* The architecture declares no module randomization window: the band is
+     * fixed, rides the text slide, or brackets the image, and in none of those
+     * is there a set of its own for the base to have been drawn from. */
+    return 0;
+#endif
+  case Q_PAGE_OFFSET:
+  case Q_VMALLOC_BASE:
+    /* Bounded by a budget derived from observed RAM rather than by a constant,
+     * so the denominator is resolved rather than declared and reaches the item
+     * through the caller's points[]. Zero here is what lets that through. */
+    return 0;
+  case Q_VMEMMAP_BASE:
+    /* The third region drawn from that budget. Its position turns on how much
+     * of the shared allowance the first two consumed, which nothing observable
+     * reveals, so no window is modelled -- see randomize_memory.h. */
+    return 0;
+  case Q_VIRT_KASLR_ALIGN:
+  case Q_PHYS_KASLR_ALIGN:
+  case Q_VA_BITS:
+  case Q__COUNT:
+    /* Not items, or not a location: an alignment is a parameter of the search
+     * and a finite set is its own denominator. */
+    return 0;
+  }
+  return (grain && hi > lo) ? (hi - lo) / grain + 1 : 0;
+}
+
+/* Whether two inclusive ranges overlap or abut, and so describe one hole.
+ *
+ * Adjacency counts: two exclusions that meet end-to-end carve a single
+ * contiguous range, and keeping them apart reports two holes where a reader
+ * can see one. Written as a gap test on the larger-minus-smaller difference so
+ * no `+1` runs off the end of the address space -- a hole reaching
+ * ULONG_MAX is ordinary on the physical axis. */
+static int holes_touch(unsigned long alo, unsigned long ahi, unsigned long blo,
+                       unsigned long bhi) {
+  if (ahi < blo)
+    return blo - ahi <= 1;
+  if (bhi < alo)
+    return alo - bhi <= 1;
+  return 1; /* they overlap */
+}
+
+/* Merge one clipped exclusion into the window's retained set, which is kept
+ * sorted by `lo` and disjoint. Returns 1 when the range is now represented,
+ * 0 when it is disjoint from everything retained and there was no room.
+ *
+ * Absorption frees at least one slot whenever it happens, so a range that
+ * touches anything can always be inserted; the no-room case is therefore
+ * tested before anything is modified, and a failed insert leaves the set
+ * untouched rather than half-merged. */
+static int holes_insert(struct kasld_report_window *w, unsigned long a,
+                        unsigned long b) {
+  int touched = 0, keep = 0, pos;
+
+  for (int i = 0; i < w->excluded_listed; i++)
+    if (holes_touch(a, b, w->excluded[i].lo, w->excluded[i].hi)) {
+      touched = 1;
+      break;
+    }
+  if (!touched && w->excluded_listed >= KASLD_REPORT_MAX_EXCLUDED)
+    return 0;
+
+  /* Absorb every entry the range touches, widening it to their union, and
+   * compact the rest down. */
+  for (int i = 0; i < w->excluded_listed; i++) {
+    struct kasld_report_hole *h = &w->excluded[i];
+    if (holes_touch(a, b, h->lo, h->hi)) {
+      if (h->lo < a)
+        a = h->lo;
+      if (h->hi > b)
+        b = h->hi;
+    } else {
+      w->excluded[keep++] = *h;
+    }
+  }
+  w->excluded_listed = keep;
+
+  for (pos = keep; pos > 0 && w->excluded[pos - 1].lo > a; pos--)
+    w->excluded[pos] = w->excluded[pos - 1];
+  w->excluded[pos].lo = a;
+  w->excluded[pos].hi = b;
+  w->excluded_listed++;
+  return 1;
+}
+
+/* Collect the excluded sub-ranges the engine carved out of this window's hull.
+ *
+ * The holes are NOT stored in the estimate -- it keeps only the convex hull --
+ * so they are re-derived from the constraint list, exactly as the candidate
+ * count is. A consumer handed only the estimate cannot recover them, which is
+ * why they are lifted into the model here rather than left for a format to
+ * rediscover.
+ *
+ * Reported as HOLES, not as constraints. The two differ by a lot: each
+ * forbidden region produces its own `C_EXCLUDE` over the bases whose image
+ * would overlap it, and neighbouring regions produce heavily overlapping
+ * bands -- a live x86_64 run raises 34 of them describing 2 disjoint holes.
+ * Left unmerged, the count answers a question nobody asked (how many
+ * constraints were raised), the listed ranges overlap each other on sight, and
+ * a consumer that measures them double-counts the overlaps. Merging here means
+ * each consumer sees the carved set itself.
+ *
+ * Merging before the cap rather than after is what keeps the set complete:
+ * the raw records routinely outnumber the array, while the holes they describe
+ * fit inside it with room to spare.
+ *
+ * The floor gate matches the resolver's: a sub-floor exclusion never reached
+ * this window's edges, so it must not be presented as carving its interior. */
+static void collect_holes(struct kasld_report_window *w, enum kasld_quantity q,
+                          enum kasld_confidence floor,
+                          const struct constraint *cs, int n_cs) {
+  int dropped = 0;
+
+  w->n_excluded = 0;
+  w->excluded_listed = 0;
+  if (!cs || !w->present)
+    return;
+  for (int i = 0; i < n_cs; i++) {
+    unsigned long a, b;
+    if (cs[i].q != q || cs[i].op != C_EXCLUDE || (int)cs[i].conf < (int)floor)
+      continue;
+    a = cs[i].value;
+    b = cs[i].value2;
+    if (b < w->lo || a > w->hi)
+      continue; /* entirely outside the hull */
+    if (a < w->lo)
+      a = w->lo;
+    if (b > w->hi)
+      b = w->hi;
+    if (!holes_insert(w, a, b))
+      dropped++;
+  }
+  /* Every hole the set holds, plus the ones it had no room for. A dropped
+   * range was disjoint from everything retained when it arrived, so it is a
+   * hole of its own; two dropped ranges that would have merged with each other
+   * are counted twice, which overstates the total in the one direction that
+   * costs a reader nothing -- the listed ranges remain exact. */
+  w->n_excluded = w->excluded_listed + dropped;
+}
+
+/* An interval states both of its edges, always.
+ *
+ * There is no unbounded address. Every quantity opens at the widest window the
+ * architecture admits and is only ever narrowed from there, so at any moment
+ * both edges are real bounds -- the architecture's until evidence arrives, and
+ * whatever narrowed them afterwards. An estimate cannot reach a state where an
+ * edge means nothing, so there is nothing here to test for.
+ *
+ * Deciding it from the contents instead is what this replaces, and the reason
+ * is that the contents do not carry the answer. An edge holds an address, and
+ * an address has no mark saying whether a rule chose it or the architecture
+ * supplied it. Zero is both at once: the linear-map base of an s390 built
+ * without CONFIG_RANDOMIZE_IDENTITY_BASE, and the opening floor of a quantity
+ * nothing has bounded yet. Testing the value dropped a pin at zero; admitting
+ * the binding as well then discarded a proven ceiling wherever the floor the
+ * architecture states happens to be zero -- which is every architecture
+ * defining no KERNEL_PHYS_DEFAULT, for the physical base.
+ *
+ * An alignment is the one genuinely one-sided quantity, and for a structural
+ * reason rather than an evidential one: it states a floor and has no ceiling to
+ * put opposite it. That is a property of what an alignment IS, so build_window
+ * spells it out per lattice below rather than deriving it from an estimate. */
+
+/* Project one resolution's estimate for one quantity into a reported window. */
+static void build_window(struct kasld_report_window *w, enum kasld_quantity q,
+                         struct kasld_resolution_view v, unsigned long grain) {
+  const struct estimate *e;
+  memset(w, 0, sizeof(*w));
+  if (!v.est)
+    return;
+  e = &v.est[q];
+
+  switch (e->kind) {
+  case LK_INTERVAL:
+    w->shape = RSHAPE_INTERVAL;
+    w->lo = e->lo;
+    w->hi = e->hi;
+    w->has_lo = 1;
+    w->has_hi = 1;
+    w->stride = e->stride;
+    w->stride_offset = e->stride_offset;
+    break;
+  case LK_FINSET: {
+    /* Decode the live-candidate bitmask into the values it stands for. A set is
+     * not an interval: it has no endpoints to report and no grid to count on,
+     * so quantity_slots -- which needs a pitch -- cannot count it, and the
+     * count is simply how many values remain admissible. */
+    const struct quantity_def *qd = &quantities[q];
+    w->shape = RSHAPE_SET;
+    for (int i = 0; i < qd->n_candidates; i++)
+      if (e->lo & (1ul << i))
+        w->values[w->n_values++] = qd->candidates[i];
+    w->present = w->n_values > 0;
+    w->candidates = (unsigned long)w->n_values;
+    w->bits = report_bits(w->candidates);
+    return;
+  }
+  case LK_MAXALIGN:
+    w->shape = RSHAPE_FLOOR;
+    w->lo = e->lo;
+    w->has_lo = 1;
+    w->has_hi = 0;
+    break;
+  }
+  w->present = w->has_lo || w->has_hi;
+  if (!w->present)
+    return;
+
+  /* A count needs both edges, so an interval is counted and an alignment is
+   * not: there is no grid between a floor and a ceiling that does not exist. */
+  if (w->has_lo && w->has_hi) {
+    w->candidates = quantity_slots(q, e, v.floor, v.cs, v.n_cs, grain);
+    w->bits = report_bits(w->candidates);
+  }
+  collect_holes(w, q, v.floor, v.cs, v.n_cs);
+}
+
+void kasld_report_build(struct kasld_resolution_view guaranteed,
+                        struct kasld_resolution_view likely,
+                        const struct kasld_resolution_view *config,
+                        const struct kasld_report_point *points,
+                        enum kasld_posture posture, int replay,
+                        struct kasld_report *out) {
+  memset(out, 0, sizeof(*out));
+  out->posture = posture;
+  out->replay = replay;
+  if (!guaranteed.est)
+    return;
+
+  for (int qi = 0; qi < Q__COUNT; qi++) {
+    enum kasld_quantity q = (enum kasld_quantity)qi;
+    struct kasld_report_quantity *it;
+    unsigned long grain;
+    struct estimate top;
+
+    if (!q_is_member(q))
+      continue;
+
+    it = &out->quantities[out->n_quantities++];
+    memset(it, 0, sizeof(*it));
+    it->q = q;
+    it->key = quantities[q].name;
+    it->label = q_labels[q];
+
+    grain = q_grain(q, guaranteed.est, &it->align_exact);
+    it->align_min = grain;
+
+    /* What the engine was willing to consider, counted the same way the
+     * resolved window is so the two are directly comparable. */
+    int have_top = 0;
+    if (quantities[q].lattice == LK_FINSET) {
+      it->search_top = (unsigned long)quantities[q].n_candidates;
+    } else if (quantities[q].init_top) {
+      quantities[q].init_top(&top);
+      have_top = 1;
+      /* Counted on the same terms a resolved window is counted on, and under
+       * the same condition, so a denominator never stands over a numerator that
+       * was not stated: an interval is counted, an alignment is not. */
+      if (quantities[q].lattice == LK_INTERVAL)
+        it->search_top =
+            quantity_slots(q, &top, guaranteed.floor, NULL, 0, grain);
+    }
+    /* The set the residual is stated against, in three tiers.
+     *
+     * First the leak-free resolution, where it bounds the quantity at all: the
+     * window the machine alone fixes, which is the only answer available where
+     * the honest top is an address width rather than a window.
+     *
+     * Then a window PROVED from this run: the caller may know one the builder
+     * cannot derive -- the memory regions' RAM budget is the worked example --
+     * and an architecture that declares its own randomization window supplies
+     * it through q_entropy_top. Either is the set the kernel actually drew
+     * from.
+     *
+     * Failing both, and only where the quantity's honest top is a WINDOW, the
+     * set the engine started from: search_top, the top counted at the same
+     * grain the resolved window is counted at. That is an upper bound on the
+     * kernel's window rather than the window itself, since an architecture
+     * admitting several layouts has to seed a top spanning all of them -- so
+     * the reduction it implies is a ceiling, which is what the output contract
+     * already says of this figure. It is never BELOW the numerator: the
+     * resolved window is a subset of the top it narrowed from, counted on the
+     * same grain, and the top is counted with no holes carved while the
+     * numerator carries them -- so an exclusion-only narrowing shows in the
+     * ratio rather than hiding behind an unchanged hull.
+     *
+     * Assigned here rather than at the two places that read it, so the count
+     * and the bit figure below cannot answer this question differently. */
+    const enum q_top_kind kind = q_top_kind(q);
+    it->entropy_top = 0;
+
+    /* The leak-free resolution: the same rules over the same run with every
+     * observation that locates the kernel withheld, so what it leaves is the
+     * window the kernel chose within, as far as the machine alone fixes it.
+     * Rejected where the quantity was never drawn from a set, and where it
+     * establishes nothing -- a count equal to the a-priori top means no fact
+     * bounded the quantity, and on an address-width top that is the whole
+     * address space rather than a window. */
+    if (config && config->est && kind != Q_TOP_NOT_DRAWN &&
+        (quantities[q].lattice == LK_INTERVAL ||
+         quantities[q].lattice == LK_FINSET)) {
+      unsigned long cfg = quantity_slots(q, &config->est[q], config->floor,
+                                         config->cs, config->n_cs, grain);
+      /* An address-width top becomes a window only once something BOUNDS the
+       * quantity -- the board's DRAM extent is what does it for the physical
+       * base. Holes carved inside the top do not: what is left of the whole
+       * address space once MMIO is removed from it is still the whole address
+       * space, and counting it would state a reduction against addresses no
+       * kernel was ever placed among. So the test is on the hull, not on the
+       * count, which a hole moves without anything having been learned. */
+      int bounded = kind == Q_TOP_DRAWN_WINDOW ||
+                    (have_top && (config->est[q].lo > top.lo ||
+                                  config->est[q].hi < top.hi));
+      if (cfg && bounded)
+        it->entropy_top = cfg;
+    }
+    if (it->entropy_top == 0)
+      it->entropy_top = (points && points[q].entropy_top)
+                            ? points[q].entropy_top
+                            : q_entropy_top(q, grain);
+    if (it->entropy_top == 0 && kind == Q_TOP_DRAWN_WINDOW)
+      it->entropy_top = it->search_top;
+
+    build_window(&it->guaranteed, q, guaranteed, grain);
+    build_window(&it->likely, q, likely, grain);
+
+    it->top_bits = report_bits(
+        it->guaranteed.shape == RSHAPE_SET ? it->search_top : it->entropy_top);
+
+    /* The concrete base, reconciled against what was resolved.
+     *
+     * The caller picks it by scanning the observations, so it arrives as a bare
+     * address that may be a witness to the region's base or merely a point
+     * inside it. Either way the observation behind it has ALREADY been given to
+     * the engine, so whatever it establishes is in the windows above: a base
+     * witness pins them, an interior sample bounds them and becomes the top
+     * edge. The point therefore never adds information -- it can only name one
+     * of the values a window admits.
+     *
+     * So it is recorded only where a window agrees it is the answer: exactly
+     * one candidate, and that candidate is this address. Anything else is a
+     * guess the resolution does not support, and handing it to the formats
+     * unqualified is what let one of them present a ceiling as the base and
+     * count it as a single candidate while the engine counted thirty-three.
+     *
+     * Reconciled against the LIKELY window where there is one -- the point is
+     * the all-signals answer, and that is the resolution it must agree with --
+     * falling back to the proven window otherwise. */
+    if (points && points[q].present) {
+      const struct kasld_report_window *w =
+          it->likely.present ? &it->likely : &it->guaranteed;
+      int names_one = w->present && w->candidates == 1 && w->has_lo &&
+                      w->has_hi && w->lo == w->hi;
+      if (names_one && points[q].value == w->lo) {
+        it->has_point = 1;
+        it->point = points[q].value;
+        it->slide = points[q].slide;
+        it->has_slide = points[q].has_slide;
+        /* Only alongside a resolved base, and only where it differs from it. */
+        if (points[q].stext && points[q].stext != it->point) {
+          it->has_stext = 1;
+          it->stext = points[q].stext;
+        }
+      }
+    }
+  }
+}
+
+int kasld_report_likely_is_tighter(const struct kasld_report_quantity *it) {
+  const struct kasld_report_window *l, *g;
+  if (!it || !it->likely.present)
+    return 0;
+  l = &it->likely;
+  g = &it->guaranteed;
+  /* A set has no endpoints, so the count is the only thing there is to compare
+   * -- and for a set it is exact, since the values are enumerated rather than
+   * counted over a grid. An interval is compared by its BOUNDS instead: a count
+   * there can be absent while the bounds are real. */
+  if (l->shape == RSHAPE_SET || g->shape == RSHAPE_SET)
+    return l->shape == g->shape && l->candidates < g->candidates;
+  if (l->has_lo && (!g->has_lo || l->lo > g->lo))
+    return 1;
+  if (l->has_hi && (!g->has_hi || l->hi < g->hi))
+    return 1;
+  return 0;
+}
+
+int kasld_report_value(const struct kasld_report_quantity *it,
+                       unsigned long *out) {
+  const struct kasld_report_window *w;
+  if (!it || !out)
+    return 0;
+  /* The concrete base where one was reconciled, else a window that admits a
+   * single value. Both are answers; a window with room in it is not. */
+  if (it->has_point) {
+    *out = it->point;
+    return 1;
+  }
+  w = it->likely.present ? &it->likely : &it->guaranteed;
+  if (!w->present)
+    return 0;
+  if (w->shape == RSHAPE_SET) {
+    if (w->n_values != 1)
+      return 0;
+    *out = w->values[0];
+    return 1;
+  }
+  if (w->candidates != 1 || !w->has_lo || !w->has_hi || w->lo != w->hi)
+    return 0;
+  *out = w->lo;
+  return 1;
+}
+
+const struct kasld_report_quantity *
+kasld_report_find(const struct kasld_report *r, enum kasld_quantity q) {
+  if (!r)
+    return NULL;
+  for (int i = 0; i < r->n_quantities; i++)
+    if (r->quantities[i].q == q)
+      return &r->quantities[i];
+  return NULL;
+}

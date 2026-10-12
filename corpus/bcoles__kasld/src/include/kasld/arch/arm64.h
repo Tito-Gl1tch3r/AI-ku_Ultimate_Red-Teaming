@@ -1,0 +1,549 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Definitions for ARM 64-bit (aarch64 / arm64)
+//
+// The arm64 kernel VAS layout has changed across versions.
+//
+// Old layout — modules and kernel image below PAGE_OFFSET:
+//   MODULES_VADDR = VA_START(48) = 0xffff000000000000
+//   KIMAGE_VADDR  = VA_START(48) + SZ_128M = 0xffff000008000000
+//   (with BPF JIT: +SZ_128M BPF, +SZ_128M modules → KIMAGE at +SZ_256M)
+//   PAGE_OFFSET   = 0xffff800000000000
+//
+// New layout — modules and kernel image at/above _PAGE_END:
+//   _PAGE_END(48) = 0xffff800000000000
+//   KIMAGE_VADDR  = _PAGE_END(48) + module_region_size
+//     +SZ_128M  → 0xffff800008000000
+//     +SZ_256M  → 0xffff800010000000
+//     +SZ_2G    → 0xffff800080000000
+//
+// The key runtime discriminator is whether kernel text is above or below
+// 0xffff800000000000 (_PAGE_END for 48-bit VA).
+//
+// KASLR support added in commit 588ab3f9afdfa1a6b1e5761c858b2c4ab6098285 in
+// kernel v4.6-rc1~110 on 2016-03-17.
+//
+// References:
+// https://github.com/torvalds/linux/commit/588ab3f9afdfa1a6b1e5761c858b2c4ab6098285
+// https://lwn.net/Articles/673598/
+// https://www.kernel.org/doc/Documentation/arm64/memory.txt
+// https://github.com/torvalds/linux/blob/master/Documentation/arm64/booting.rst
+// https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/arm64/memory.rst
+// https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/arm64/kernel/head.S
+// ---
+// <bcoles@gmail.com>
+
+#ifndef KASLD_ARM64_H
+#define KASLD_ARM64_H
+
+// 52 va bits (CONFIG_ARM64_VA_BITS_52) is the default in v6.12+.
+// 48 va bits (CONFIG_ARM64_VA_BITS_48) is common on older kernels.
+// PAGE_OFFSET = _PAGE_OFFSET(VA_BITS) = -(1UL << VA_BITS)
+//   VA_BITS=48: 0xffff000000000000
+//   VA_BITS=52: 0xfff0000000000000
+// https://elixir.bootlin.com/linux/v6.12/source/arch/arm64/include/asm/memory.h#L44
+// Assume 52 va bits (broadest, covers all configs):
+#define PAGE_OFFSET 0xfff0000000000000ul
+
+// Derived from the paging mode: PAGE_OFFSET is -(1 << VA_BITS). Q_VA_BITS
+// carries that finite set and arm64_page_offset_from_va_bits applies it, so
+// the bracket here stays the whole kernel VAS rather than the span of the
+// VA_BITS candidates. A bracket is a GUARANTEED window: tightening it to a
+// candidate list makes every value outside that list unrepresentable, and the
+// list would then have to be complete for every kernel in scope — which is the
+// obligation that broke riscv64's equivalent.
+// Admissible kernel page sizes on this architecture. PAGE_SIZE_KNOWN_AT_BUILD
+// is derived from the pair in api.h and gates pfn_to_phys(); a page-frame
+// number may only be converted with a compile-time constant where the two
+// edges coincide. Where they differ the runtime SF_PAGE_SIZE observation is
+// the only sound multiplier.
+// arm64 admits 4, 16 and 64 KiB pages
+// (ARM64_4K_PAGES / ARM64_16K_PAGES / ARM64_64K_PAGES in arch/arm64/Kconfig).
+#define PAGE_SIZE_MIN 0x1000ul
+#define PAGE_SIZE_MAX 0x10000ul
+
+/* The default huge page is the PMD block, so its size is 2^(2*PAGE_SHIFT - 3)
+ * and the three granules give three distinct sizes. That makes a reported huge
+ * page size invert to the page size, which is the only route a REPLAYED
+ * capture has to one -- the direct reader describes whoever is replaying it.
+ *
+ * Declared per architecture rather than tested for by name, because it is a
+ * property of the layout and not of the CPU: powerpc chooses its huge page at
+ * runtime from the MMU's page-size table, or fixes it independently of the
+ * granule, so the same figure there names nothing. An architecture gains the
+ * derivation by defining this and needs no other change.
+ */
+#define HUGEPAGE_IS_PMD_BLOCK 1
+
+#define PAGE_OFFSET_MIN KERNEL_VIRT_VAS_START
+#define PAGE_OFFSET_MAX KERNEL_VIRT_VAS_END
+#define PHYS_OFFSET 0ul
+
+// VA_BITS candidates for Q_VA_BITS (finite-set lattice), smallest first. Each
+// arm64 paging config has its own VA_BITS (hence its own PAGE_OFFSET /
+// KIMAGE_VADDR geometry): 16K 2-level=36 (EXPERT-gated), 4K 3-level=39 (common
+// on Android), 64K 2-level=42, 16K 3-level=47, 4K/16K 4-level=48, and 52-bit
+// LVA (VA_BITS_MIN still 48). The complete ARM64_VA_BITS_* choice from
+// arch/arm64/Kconfig; mmap_arm64_va_bits walks this same array rather than
+// keeping a second copy.
+#define VA_BITS_CANDIDATES {36ul, 39ul, 42ul, 47ul, 48ul, 52ul}
+
+// The smallest VA_BITS whose linear map is admitted BEFORE the width is
+// resolved — a validation-filter knob, NOT a statement about which widths are
+// supported. Deliberately not the smallest candidate: the accepting ceiling is
+// _PAGE_END of this width, so lowering it widens the band for EVERY arm64
+// kernel and admits more mistagged pointers as direct-map candidates (see the
+// trade-off note in arm64_coupling_validate).
+//
+// A 36-bit kernel's WIDTH still resolves — mmap_arm64_va_bits pins Q_VA_BITS
+// directly (the probe does not pass through this filter), and PAGE_OFFSET then
+// projects from that pin. But this knob does cost 36-bit its direct-map
+// EVIDENCE: a VA36 linear-map base is 0xfffffff000000000, above _PAGE_END(39),
+// so arm64_coupling_validate marks a REGION_DIRECTMAP / REGION_PAGE_OFFSET leak
+// there V_INVALID and it cannot corroborate. That is a completeness loss on a
+// config that needs 16K pages and EXPERT (the base still resolves from the
+// width pin), not a soundness one — dropping a real observation only fails to
+// narrow. Lowering the knob to 36 to recover it would widen the accepting band
+// for every arm64 kernel, which is the worse trade.
+#define ARM64_VA_BITS_VALIDATE_MIN 39ul
+
+// VA_BITS-derived geometry, kept in one place so the layout math is not
+// duplicated across mmap_arm64_va_bits, arm64_coupling_validate, and
+// arm64_va_bits_from_directmap. arm64 PAGE_OFFSET = -(1<<VA_BITS); the linear
+// map occupies [PAGE_OFFSET, _PAGE_END), _PAGE_END = -(1<<(VA_BITS-1)). Pure
+// functions of VA_BITS, not randomized.
+static inline unsigned long arm64_page_offset_for(unsigned long va_bits) {
+  return -(1UL << va_bits);
+}
+static inline unsigned long arm64_page_end_for(unsigned long va_bits) {
+  return -(1UL << (va_bits - 1));
+}
+
+// The linear-map base the OLD (pre-flip) layout placed at this width. The two
+// layouts are mirror images of one another: what the modern layout calls
+// _PAGE_END -- the TOP of its linear map -- is exactly where the old layout's
+// linear map BEGINS, so the expression coincides with arm64_page_end_for().
+// Kept as its own name because the two answer different questions and only one
+// of them names a base; a caller reaching for "the old PAGE_OFFSET" should not
+// have to know they happen to be the same arithmetic.
+static inline unsigned long
+arm64_page_offset_preflip_for(unsigned long va_bits) {
+  return -(1UL << (va_bits - 1));
+}
+
+// Does an observed kernel-region address prove the MODERN ("flipped") VA
+// layout? On the old layout the linear map occupied the top of the kernel half
+// and every other kernel region -- image, modules, vmalloc, vmemmap -- sat
+// BELOW PAGE_OFFSET; the flip inverted that. So a kernel-region address
+// strictly above every PAGE_OFFSET the estimate still admits cannot have come
+// from the old layout, whatever VA_BITS that layout ran at. This is the same
+// discriminator arm64_va_bits_from_directmap uses to decide whether the
+// ambiguous linear-map base may pin a width.
+//
+// page_offset_hi is the UPPER edge of the resolved window, so the answer holds
+// for every admitted value rather than one guess, and an unresolved
+// PAGE_OFFSET (edge at the top of the VAS) answers 0. That is the fail-safe
+// direction: the predicate is never wrongly true, only wrongly false. A 0 means
+// "the old layout is still possible", never "the layout is old".
+static inline int arm64_modern_layout_proven(unsigned long witness,
+                                             unsigned long page_offset_hi) {
+  return witness != 0 && page_offset_hi != 0 && witness > page_offset_hi;
+}
+
+// On arm64, PHYS_OFFSET is runtime (= memstart_addr, randomized at boot), so
+// the compile-time formula is NOT a sound runtime directmap projection;
+// phys_to_directmap_virt() is therefore left undefined (see gate at end of
+// file). Kernel text KASLR slides independently of the linear map, so text
+// does not track the directmap.
+// https://elixir.bootlin.com/linux/v6.1.1/source/arch/arm64/include/asm/memory.h#L295
+// LINEAR_MAP_ANCHOR: the anchor is memstart_addr, which the kernel places
+// AWAY from where DRAM begins and by no fixed amount or direction:
+//   round_down(memblock_start_of_DRAM(), ARM64_MEMSTART_ALIGN)  — below
+//   round_up(memblock_end_of_DRAM() - linear_region_size, ...)  — above,
+//     when memory overflows the linear map
+//   -= _PAGE_OFFSET(vabits_actual) - _PAGE_OFFSET(52)          — far below,
+//     on a 52-bit build running without 52-bit hardware
+//   -= ARM64_MEMSTART_ALIGN * random()                         — below, on
+//     kernels predating the linear-map derandomisation
+// Every displacement is large-page aligned, so an alignment check cannot
+// separate a displaced candidate from a true base. Nothing unprivileged
+// recovers memstart_addr, so a rule needing the anchor must decline.
+// arch/arm64/mm/init.c arm64_memblock_init()
+#define LINEAR_MAP_ANCHOR LM_ANCHOR_UNKNOWABLE
+#define DIRECTMAP_STATIC 0
+#define TEXT_TRACKS_DIRECTMAP 0
+
+#define KERNEL_VIRT_VAS_START PAGE_OFFSET
+#define KERNEL_VIRT_VAS_END 0xfffffffffffffffful
+
+// 48 va bits (CONFIG_ARM64_VA_BITS_48) is a common configuration;
+// but an unsafe assumption since introduction of CONFIG_ARM64_VA_BITS_48_52.
+//
+// The validation range spans BOTH image layouts, so it floors at the pre-flip
+// KIMAGE_VADDR rather than the modern one: a text address between the two is
+// real on a pre-v5.4 kernel, and a floor at the modern KIMAGE_VADDR would
+// discard that leak as implausible while the estimate still searched for it.
+#define VIRT_TEXT_PLAUSIBLE_MIN 0xffff000008000000ul
+#define VIRT_TEXT_PLAUSIBLE_MAX 0xffffffffff000000ul
+
+// Module region — VALIDATION UNION across all in-scope kernel versions.
+//
+//   pre-v5.4 layout:   [0xffff000000000000, 0xffff000007fffffful]  (128 MiB at
+//   old VA_START(48)) v5.4 .. v6.1 :     [0xffff800000000000,
+//   0xffff800007fffffful]  (128 MiB at _PAGE_END(48)) v5.0+ variant:
+//   [0xffff800000000000, 0xffff80000fffffful]   (256 MiB) v6.2+:
+//   [0xffff800000000000, 0xffff80007ffffffful]  (2 GiB)
+//
+// Those are the STATIC bands: they describe the module region only when KASLR
+// is off. With KASLR on the region is placed around the kernel image and moves
+// with it — pre-v6.9 module_alloc_base is derived from _etext/_end, v6.9+
+// module_init_limits() draws a random_bounding_box() containing [_text, _end]
+// — so modules sit wherever _text sits, not in the static band. A module on a
+// KASLR kernel is routinely tens of TiB above the highest static ceiling.
+//
+// The validation union is therefore the RELOCATABLE range. Both allocators
+// serve from a window of at most SZ_2G that also spans the kernel image, so a
+// module lies within 2 GiB of the image base; the image base in turn spans the
+// honest top [VIRT_TEXT_MIN_ANY_CONFIG, VIRT_TEXT_MAX_ANY_CONFIG]. The union
+// is that window grown by 2 GiB on both sides, clamped to the top of the
+// kernel VAS — which the upper edge reaches. This subsumes every static layout
+// above. MODULES_BRACKET_TEXT below states the same 2 GiB as an inference
+// axis; the guards beside VIRT_TEXT_MAX_ANY_CONFIG keep the two in step.
+//
+// Consequence: classifying an address as a module purely by range is
+// near-vacuous on arm64, since the band covers most of the kernel VAS. Per the
+// union's contract that is the correct trade (a wider-than-truth window admits
+// non-module addresses; a narrower-than-truth window drops real data), but it
+// leaves the weak REGION_MODULE_BAND tag carrying no information here, which
+// is why module_text_bracket consumes only the structurally-known
+// REGION_MODULE. A range-classified observation must not bound the text base
+// on this arch. The runtime band rendered to the user comes from observed
+// module addresses when available (engine_sync), not this validation window.
+// https://elixir.bootlin.com/linux/v6.6/source/arch/arm64/include/asm/memory.h
+// https://elixir.bootlin.com/linux/v6.9/source/arch/arm64/kernel/module.c#L32
+// Where the module band is anchored: a window CENTRED on the image;
+// MODULES_BRACKET_TEXT is its half-width.
+#define MODULES_ANCHOR MOD_ANCHOR_BRACKETS_TEXT
+#define MODULES_START 0xfffeffff88000000ul // VIRT_TEXT_MIN_ANY_CONFIG - SZ_2G
+#define MODULES_END KERNEL_VIRT_VAS_END
+
+// Usable as a BOUND on the module base, not only as an admission filter: the
+// floor is a full bracket below the lowest text base the honest top admits and
+// the ceiling is the top of the VAS, so both edges hold with KASLR on or off
+// (KASLR off puts _text at KIMAGE_VADDR, well inside) and across every VA
+// layout, which is what the guards beside VIRT_TEXT_MAX_ANY_CONFIG assert.
+#define MODULES_BAND_STRENGTH MOD_BAND_BOUNDS
+// Module region does not shift with KASLR on arm64.
+// (Modules are loaded independently of kernel text placement.)
+
+// The band is not at a fixed offset from text, but every module allocation is
+// drawn from a window that also contains the kernel image, so a module address
+// brackets _text to +/-2GiB. That holds across every arm64 allocator
+// generation:
+//
+//   v6.9+ (module VA range rework): module_init_limits() sets
+//     module_direct_base = random_bounding_box(SZ_128M, _text, _end) and/or
+//     module_plt_base = random_bounding_box(SZ_2G, _text, _end); both boxes
+//     contain [_text, _end] by construction. execmem_arch_setup() serves from
+//     [direct_base, +SZ_128M) with fallback [plt_base, +SZ_2G). When the image
+//     is too large to randomize, or KASLR is off, module_direct_base = _text
+//     and the range is [_text, _text + SZ_128M).
+//   pre-v6.9 with ARM64_MODULE_PLTS (MODULES_VSIZE == SZ_2G):
+//     RANDOMIZE_MODULE_REGION_FULL puts module_alloc_base in
+//     [_end - SZ_2G, _text] and allocates up to base + SZ_2G.
+//     Without FULL, base is in [_etext - MODULES_VSIZE, _stext], which is
+//     tighter still.
+//   pre-v6.9 without PLTs (MODULES_VSIZE == SZ_128M): tighter again.
+//
+// SZ_2G is therefore the widest path, and bounds all of them.
+// https://elixir.bootlin.com/linux/v6.9/source/arch/arm64/kernel/module.c#L32
+// https://elixir.bootlin.com/linux/v6.6/source/arch/arm64/kernel/kaslr.c#L128
+//
+// Only REGION_MODULE (structurally-known module addresses) may feed this — see
+// the module-region provenance note in api.h. The MODULES_START/END union
+// below overlaps the VA_BITS=48 direct map, so a range-classified pointer
+// would bracket _text around the wrong region entirely.
+#define MODULES_BRACKET_TEXT 0x80000000ul // SZ_2G
+
+// MIN_KIMG_ALIGN is 2MiB (used without KASLR).
+// https://elixir.bootlin.com/linux/v6.2-rc2/source/arch/arm64/include/asm/boot.h#L18
+// EFI_KIMG_ALIGN is the larger of THREAD_ALIGN or SEGMENT_ALIGN:
+// https://elixir.bootlin.com/linux/v6.2-rc2/source/arch/arm64/include/asm/efi.h#L102
+// https://elixir.bootlin.com/linux/v6.2-rc2/source/arch/arm64/include/asm/efi.h#L72
+// SEGMENT_ALIGN is hard-coded as 64KiB:
+// https://elixir.bootlin.com/linux/v6.2-rc2/source/arch/arm64/include/asm/memory.h#L131
+// THREAD_ALIGN = 2 * THREAD_SIZE = 2 * (1 << max(PAGE_SHIFT,
+// MIN_THREAD_SHIFT=14))
+// - 4K pages (PAGE_SHIFT=12): THREAD_SHIFT=14, THREAD_ALIGN=32KiB,
+// EFI_KIMG_ALIGN=64KiB
+// - 16K pages (PAGE_SHIFT=14): THREAD_SHIFT=14, THREAD_ALIGN=32KiB,
+// EFI_KIMG_ALIGN=64KiB
+// - 64K pages (PAGE_SHIFT=16): THREAD_SHIFT=16, THREAD_ALIGN=128KiB,
+// EFI_KIMG_ALIGN=128KiB For 4K/16K (the common case), EFI_KIMG_ALIGN=64KiB. Use
+// 64KiB (0x10000) by default. On 64K-page EFI systems this is conservative
+// (128KiB actual) but still a multiple of 64 KiB, so the alignment stays sound.
+#define IMAGE_ALIGN 0x10000ul
+
+// EFI_KIMG_ALIGN is the alignment the EFI stub uses when calling
+// AllocatePages() for the kernel image (see arch/arm64/include/asm/efi.h).
+// The arm64 stub allocates the image at this granularity, so the running
+// kernel's EFI_LOADER_CODE memmap entry always starts at a multiple of
+// this value — used by efi_loader_kernel_pick to filter multi-entry
+// memmaps. Conservative 64 KiB matches 4K/16K-page builds (the common
+// case); 64K-page builds use 128 KiB but ARE a multiple of 64 KiB, so
+// the filter stays sound (just slightly less selective).
+#define EFI_KIMG_ALIGN 0x10000ul
+
+// IMAGE_BASE_OFFSET is the alignment residue (where _text sits within the KASLR
+// granule = KASLR_VIRT_ALIGN = EFI_KIMG_ALIGN, 64 KiB). _text is placed on the
+// EFI_KIMG_ALIGN grid (both the seed slot and the phys-grafted low bits are
+// multiples of it), so the residue is 0. (The kernel's historical 0x80000
+// TEXT_OFFSET, dropped in v5.8, was the *physical* load offset from the start
+// of RAM — a different quantity, not the _text alignment residue.)
+// https://lore.kernel.org/all/20200428134119.GI6791@willie-the-truck/T/
+#define IMAGE_BASE_OFFSET 0
+
+// How far _text could sit ABOVE KIMAGE_VADDR on the pre-flip layout. That is a
+// different question from the residue above: the pre-flip linker script opens
+// with `. = KIMAGE_VADDR + TEXT_OFFSET` and sets `_text = .` immediately after
+// (arch/arm64/kernel/vmlinux.lds.S), so the offset displaces the image base
+// itself. arch/arm64/Makefile made TEXT_OFFSET 0x00080000 by default and, under
+// CONFIG_ARM64_RANDOMIZE_TEXT_OFFSET, a page-aligned build-time random value
+// below SZ_2M; it was set to 0 in v5.8 (cfa7ede20f13) and the flipped layout
+// places _text at KIMAGE_VADDR with no offset at all. So this bounds the
+// pre-flip case only, and SZ_2M covers every value the formula can produce.
+#define ARM64_PREFLIP_TEXT_OFFSET_MAX (2ul * MB)
+
+// How far _text can sit above KIMAGE_VADDR when NO seed placed it. Not a slide:
+// the kernel builds the displacement from two parts and only the high part
+// comes from the seed. The low bits below MIN_KIMG_ALIGN (SZ_2M,
+// arch/arm64/include/asm/boot.h) are copied from the image's PHYSICAL load
+// address so text can still be mapped with 2 MiB blocks. v4.8..v6.8 does it in
+// head.S, masking the physical address of the image with `MIN_KIMG_ALIGN - 1`
+// on entry; the masking is the invariant, while the symbol holding that address
+// (`__PHYS_OFFSET`, later renamed `KERNEL_START`) and the registers it moves
+// through both vary across the range. The later kernels in that range call the
+// result "physical misalignment" in their own comment. v6.9+ does it in
+// arch/arm64/kernel/pi/map_kernel.c (`kaslr_offset = pa_base % MIN_KIMG_ALIGN`,
+// commit 97a6f43bb049). arch/arm64/kernel/kaslr.c states the consequence from
+// the other side: a displacement "of less than MIN_KIMG_ALIGN means that no
+// seed was provided".
+//
+// So a no-seed base is KIMAGE_VADDR plus this residue, and the residue is zero
+// only where the image was loaded 2 MiB-aligned. Two admissible configurations
+// load it finer, which is why the term is carried rather than assumed away:
+//   * a non-EFI bootloader that ignores the 2 MiB requirement of
+//     Documentation/arch/arm64/booting.rst -- arch/arm64/kernel/setup.c warns
+//     FW_BUG "Kernel image misaligned at boot" and relocates ANYWAY, so the
+//     kernel runs rather than refusing;
+//   * an EFI boot whose physical seed succeeded while the FDT seed call did
+//     not, leaving efi_nokaslr clear so the stub keeps EFI_KIMG_ALIGN (64 KiB)
+//     while no seed property is written.
+// Where the seed is absent because the stub gave up (no EFI_RNG_PROTOCOL,
+// nokaslr, no CONFIG_RANDOMIZE_BASE) efi_nokaslr is set BEFORE the allocation,
+// efi_get_kimg_min_align() returns MIN_KIMG_ALIGN, and the residue really is 0
+// -- but that is three causes out of four, not a guarantee.
+//
+// Belongs in the no-KASLR CEILING only. The slid ceilings already absorb it:
+// the seed term is masked to ~(MIN_KIMG_ALIGN - 1) where it is applied, so
+// arm64_kaslr_offset_max() -- an exclusive top -- leaves exactly this much
+// headroom. Adding it there too would merely loosen them.
+#define ARM64_PHYS_GRAFT_MAX (2ul * MB)
+
+// Head gap _stext - _text: arm64 places .head.text (EFI header + early vectors)
+// before _stext, and .text is ALIGN(SEGMENT_ALIGN), so _stext = _text + 0x10000
+// wherever SEGMENT_ALIGN is SZ_64K. The engine solves the image base (_text);
+// _stext is projected from it with STEXT_OFFSET.
+//
+// SEGMENT_ALIGN is not architectural. Before v5.7 it was SZ_2M under
+// CONFIG_DEBUG_ALIGN_RODATA (asm/memory.h, removed by e16e65a02913 "arm64:
+// remove CONFIG_DEBUG_ALIGN_RODATA feature", 2020-03-29), so a pre-5.7 kernel
+// built with it has a gap of up to 2 MiB. The option lived in Kconfig.debug,
+// depended on STRICT_KERNEL_RWX and defaulted off, so it means a hand-built
+// kernel -- but the version cannot be consulted to tell the two apart, and
+// every arm64 build measured here is 5.15 or later, which structurally cannot
+// exhibit it. So the ceiling covers both: 0x10000 wherever the align is SZ_64K,
+// up to 0x200000 where it is SZ_2M.
+//
+// The cost is confined to a vantage that publishes _stext without _text, since
+// emit_pin prefers the lower witness and _text wins wherever it exists. No
+// arm64 kernel observed here is in that vantage: all eight cells
+// across 5.15/6.6/7.0 and every VA variant publish _text, as do both fixtures
+// carrying kallsyms. The gap takes one of two values and nothing between them:
+// it is ALIGN(sizeof(.head.text), SEGMENT_ALIGN), the head is comfortably under
+// 64 KiB (the boot protocol constrains it, and 0x10000 was measured across
+// 5.15/6.6/7.0 and every VA variant), and SEGMENT_ALIGN is the only term that
+// moves -- SZ_64K today, SZ_2M under the pre-v5.7 CONFIG_DEBUG_ALIGN_RODATA.
+// Two aligns, two gaps. Enumerating them leaves a _stext witness admitting two
+// bases instead of the 31 grid positions the range alone allows, on the same
+// head-size assumption the single constant already carried.
+#define STEXT_GAP_CANDIDATES {0x10000ul, 0x200000ul}
+#define STEXT_OFFSET 0x10000ul
+#define STEXT_OFFSET_MIN 0x10000ul
+#define STEXT_OFFSET_MAX 0x200000ul
+
+// Plausible physical address range for kernel image. PHYS_PLAUSIBLE_MAX is a
+// RAM heuristic (a defeasible ceiling), NOT an architectural limit — a large
+// machine's phys base can exceed it. The honest top is PHYS_ADDR_TOP below.
+#define PHYS_PLAUSIBLE_MIN 0ul
+#define PHYS_PLAUSIBLE_MAX (256ul * GB)
+
+// Honest architectural phys top: 2^MAX_PHYSMEM_BITS. arm64 PHYS_MASK_SHIFT =
+// CONFIG_ARM64_PA_BITS, up to 52 bits with FEAT_LPA2 — the widest realisable
+// physical address. The engine narrows from here via RAM/DRAM ceilings; it must
+// never start below a valid placement.
+#define PHYS_ADDR_TOP (1ul << 52)
+
+// KIMAGE_VADDR = MODULES_END on arm64. Varies by version (new layout only):
+//   v5.4:  _PAGE_END(48) + SZ_128M  = 0xffff800008000000
+//   v5.0:  _PAGE_END(48) + SZ_256M  = 0xffff800010000000
+//   v6.2+: _PAGE_END(48) + SZ_2G    = 0xffff800080000000
+// (Old pre-v5.4 layout used VA_START(48) + SZ_128M = 0xffff000008000000.)
+// https://elixir.bootlin.com/linux/v6.12/source/arch/arm64/include/asm/memory.h#L46
+// Use v6.2+ value (2G module region, current default).
+#define KIMAGE_VADDR 0xffff800080000000ul
+// Module-region size (KIMAGE_VADDR = _PAGE_END(VA_BITS_MIN) + this). It varies
+// by version: v5.4 used SZ_128M, a v5.x variant SZ_256M, v6.2+ SZ_2G. The size
+// is not runtime-discoverable and cannot be keyed on a version number, so
+// rule_arm64_text_base brackets KIMAGE_VADDR across the whole spread:
+//   * the image-base FLOOR uses _MIN (SZ_128M, the lowest KIMAGE_VADDR), so the
+//     window admits a 5.4..6.1 (128M-region) kernel whose text sits at
+//     _PAGE_END+128M — using the 2G value here excludes it (unsound);
+//   * the KASLR ceiling and the no-KASLR cap use the _MAX (SZ_2G, the highest
+//     KIMAGE_VADDR), so the window admits a v6.2+ kernel's higher base.
+// KIMAGE_VADDR above is the _MAX value (= _PAGE_END(48) + SZ_2G).
+#define ARM64_MODULE_REGION_SIZE (2ul * GB)
+#define ARM64_MODULE_REGION_SIZE_MIN (128ul * MB)
+
+// See docs/kaslr.md "Default text base and KASLR alignment" for all
+// architectures. Kernel source: arch/arm64/kernel/vmlinux.lds.S,
+// arch/arm64/include/asm/memory.h
+#define KERNEL_VIRT_TEXT_DEFAULT (KIMAGE_VADDR + IMAGE_BASE_OFFSET)
+
+/* KASLR-off pin is LAYOUT-DEPENDENT on arm64: KIMAGE_VADDR varies with
+ * VA_BITS_MIN (= min(VA_BITS, 48)), so the no-KASLR text base is not a single
+ * compile-time constant. The generic virt_kaslr_disabled_pin (one fixed
+ * default) is therefore opted OUT; rule_arm64_text_base owns the text base,
+ * deriving VA_BITS_MIN from the resolved PAGE_OFFSET and narrowing/pinning to
+ * KIMAGE_VADDR(VA_BITS_MIN) — correct for VA_BITS 39/42/47/48/52, not just 48.
+ * Same shape as rule_riscv64_text_base. When PAGE_OFFSET is unresolved (no
+ * probe result, no leak) it does not pin — the honest window stays wide
+ * (sound).
+ *
+ * There is deliberately no arch_default_text_base() here. That hook returns a
+ * single compile-time constant, which on arm64 can only be the VA_BITS_MIN=48
+ * KIMAGE_VADDR — the very answer this arch opted out of, wrong for VA_BITS
+ * 39/42/47. api.h's stub stands in and nothing calls it. */
+#define KASLR_DISABLED_PINS_VIRT_TEXT 0
+
+// KASLR randomization window (v4.6+):
+// The KASLR offset from KIMAGE_VADDR is in [BIT(45), BIT(45)+BIT(46)).
+// VA_BITS_MIN is 48 on VA_BITS>=48 builds but equals VA_BITS on sub-48
+// configs (e.g. 39 on 4K/3-level, common on Android; 47 on 16K/52-bit), so
+// the per-formula window is not constant across configs, which is why these
+// are the DEFAULT_CONFIG pair and the ANY_CONFIG bounds cover the spread.
+//
+// v6.6   kaslr_early.c: return BIT(VA_BITS_MIN-3) + (seed &
+// GENMASK(VA_BITS_MIN-3,0)); v6.12  kaslr_early.c: range = (VMALLOC_END -
+// KIMAGE_VADDR) / 2;
+//                        return range / 2 + (((__uint128_t)range * seed) >>
+//                        64);
+// https://elixir.bootlin.com/linux/v6.12/source/arch/arm64/kernel/pi/kaslr_early.c
+#define VIRT_TEXT_MIN_DEFAULT_CONFIG (KIMAGE_VADDR + (1ul << 45))
+#define VIRT_TEXT_MAX_DEFAULT_CONFIG                                           \
+  (VIRT_TEXT_MIN_DEFAULT_CONFIG + (1ul << 46))
+
+// KASLR_VIRT_ALIGN is the alignment of the *_text address*: the finest grid the
+// virtual text base can land on, used both to snap the guaranteed base window
+// (kasld_floor_text_base and the align_down virtual ceilings) and to count
+// KASLR slots. On arm64 that grid is EFI_KIMG_ALIGN (= IMAGE_ALIGN, 64 KiB on
+// 4K/16K pages; 128 KiB on 64K pages, raised at runtime by
+// arm64_efi_kimg_align), NOT the 2 MiB seed step. The virtual text base is 64
+// KiB-granular, not 2 MiB- aligned, because arm64 builds _text from two
+// independently-randomised parts:
+//
+//   virt_text = KIMAGE_VADDR
+//             + (seed & ~(MIN_KIMG_ALIGN-1))   // high bits: a 2 MiB seed slot
+//             + (phys_text & (MIN_KIMG_ALIGN-1))// low bits: grafted from phys
+//
+// The low log2(MIN_KIMG_ALIGN)=21 bits of the KASLR displacement are copied
+// from the *physical* load address so kernel text can be mapped with 2 MiB
+// blocks (arch/arm64/kernel/head.S `and x23,x23,MIN_KIMG_ALIGN-1` + `orr
+// x23,x23,x0`, present since v4.8; moved to arch/arm64/kernel/pi/map_kernel.c
+// in v6.9). Under KASLR the EFI stub allocates the image at EFI_KIMG_ALIGN = 64
+// KiB, weaker than the 2 MiB boot protocol (arch/arm64/include/asm/efi.h
+// efi_get_kimg_min_align() returns EFI_KIMG_ALIGN unless efi_nokaslr; added
+// v4.14). So phys_text — and therefore virt_text's low 2 MiB bits — is 64
+// KiB-granular and non-zero in general. The 2 MiB seed step governs only the
+// high bits; it is NOT the alignment of _text and must not be used to snap the
+// base window (doing so floors a guaranteed ceiling below a real off-2 MiB-grid
+// _text — an unsound exclusion). Only under nokaslr does the stub fall back to
+// 2 MiB alignment; a 64 KiB grid still contains a 2 MiB-aligned base, so the
+// window stays sound.
+//
+// Slot count (upper bound on entropy): (BIT(46)) / 64 KiB. The realisable
+// entropy is smaller, bounded by the DTB/RNDR seed and the EFI RNG that place
+// the two parts.
+#define KASLR_VIRT_ALIGN IMAGE_ALIGN
+
+/* Honest-top floor for Q_VIRT_IMAGE_BASE — widened down to the OLD (pre-v5.4)
+ * layout's image base so the engine's honest window admits every in-scope
+ * arm64 text placement:
+ *   (a) the pre-v5.4 layout, where the kernel image sits LOW — below _PAGE_END,
+ *       at VA_START(48) + module-region (128 MiB) = 0xffff000008000000, with
+ *       _text a TEXT_OFFSET above that (e.g. v4.14: 0xffff000008080000). This
+ *       is the lowest text base across layouts (48-bit VA gives the lowest
+ *       VA_START; sub-48 old layouts and all modern layouts sit higher);
+ *   (b) the modern (v5.4+) no-KASLR case, where text sits at KIMAGE_VADDR;
+ *   (c) the v6.12+ KASLR formula's lower edge at
+ *       KIMAGE_VADDR + (VMALLOC_END − KIMAGE_VADDR) / 4 ≈ KIMAGE_VADDR + 31.5
+ *       TiB — below the v4.6→v6.6 formula's floor at KIMAGE_VADDR + 32 TiB.
+ *
+ * Without this widening the honest window floors at KIMAGE_VADDR
+ * (0xffff800080000000), so on a pre-v5.4 kernel with no narrowing leak
+ * (the unprivileged/hardened case) Q_VIRT_IMAGE_BASE stays at a window that
+ * EXCLUDES the real low text base — an unsound report. The widening only
+ * widens the honest top — never narrows — so it cannot eliminate a true leak;
+ * it can only stop falsely excluding one. When PAGE_OFFSET resolves,
+ * rule_arm64_text_base re-narrows to the tight per-VA_BITS band.
+ *
+ * VIRT_TEXT_MIN_DEFAULT_CONFIG is preserved for entropy / slot reporting on
+ * KASLR-on systems (the per-formula randomization window's narrower lower
+ * edge). VIRT_TEXT_MAX_DEFAULT_CONFIG is unchanged — KIMAGE_VADDR + 96 TiB
+ * already covers both the v6.6 upper edge (96 TiB) and the v6.12+ upper edge
+ * (~94.5 TiB). */
+#define VIRT_TEXT_MIN_ANY_CONFIG 0xffff000008000000ul
+
+/* Honest-top CEILING for Q_VIRT_IMAGE_BASE. VIRT_TEXT_MAX_DEFAULT_CONFIG is the
+ * 48-bit formula's window top (kept for entropy/slot reporting); it is too low
+ * for sub-48 configs, whose KIMAGE_VADDR is HIGHER (39-bit →
+ * 0xffffffc080000000). Widen the honest top to the validation ceiling
+ * VIRT_TEXT_PLAUSIBLE_MAX, which admits every supported VA_BITS_MIN's text
+ * base, so a sub-48 text leak is not falsely excluded. Widen-only, never-narrow
+ * — same discipline as the floor. */
+#define VIRT_TEXT_MAX_ANY_CONFIG VIRT_TEXT_PLAUSIBLE_MAX
+
+/* The module band is the honest top grown by the bracket on both sides (see
+ * MODULES_START/END above). Those are literals — they sit above these
+ * ANY_CONFIG definitions and cannot reference them — so assert the relation
+ * here rather than let the two drift apart: widening the honest top without
+ * widening the band alongside it would drop real module addresses. */
+#if MODULES_START > VIRT_TEXT_MIN_ANY_CONFIG - MODULES_BRACKET_TEXT
+#error "arm64 module band floor excludes a module a full bracket below _text"
+#endif
+#if MODULES_END < VIRT_TEXT_MAX_ANY_CONFIG
+#error "arm64 module band ceiling excludes a module at the highest text base"
+#endif
+
+#define KASLR_SUPPORTED 1
+
+// Residue 0: KIMAGE_VADDR plus a MIN_KIMG_ALIGN-aligned slide, so _text sits on
+// the granule. The 0x10000 head gap is _stext's (STEXT_OFFSET), not the base's.
+#define IMAGE_BASE_RESIDUE_FIXED 1
+
+// The /boot artefact is a boot blob, not an ELF, so its on-disk size never
+// exceeds the in-memory footprint and can be read with stat() where the file
+// content is unreadable. See the axis contract in api.h.
+#define BOOT_IMAGE_SIZE_FLOORS_FOOTPRINT 1
+
+#endif /* KASLD_ARM64_H */

@@ -1,0 +1,137 @@
+package scanner
+
+import (
+	"context"
+	"sync"
+	"time"
+)
+
+// Adaptive per-host throttle governor.
+//
+// Every active web module funnels its requests through sendInjectedFull, and each
+// runs its own worker pool, so a single fragile or WAF-fronted host can be hit by
+// many modules at once. Two bad things follow: the host starts timing out (→
+// false NEGATIVES, because a detector reads a dropped response as "no signal"),
+// and its WAF starts issuing block/challenge pages (→ false POSITIVES on the
+// differential detectors, and wasted requests). A fixed global rate limit would
+// throttle healthy hosts too and cost scan speed.
+//
+// This governor instead paces PER HOST, adaptively (AIMD, the TCP-congestion
+// idea): a healthy host carries ZERO added delay (full speed), but the moment a
+// host returns timeouts / 429 / 503 its per-request delay ramps up multiplicatively
+// and eases back down additively as it recovers. Crucially the wait happens
+// BEFORE the timing window in sendInjectedFull, so it never corrupts a time-based
+// SQLi/RCE measurement.
+
+type hostThrottleState struct {
+	mu      sync.Mutex
+	backoff time.Duration
+	slots   chan struct{}
+}
+
+const (
+	throttleMax      = 2 * time.Second       // hard ceiling on per-request delay
+	throttleBumpBase = 60 * time.Millisecond // added on each unhealthy response
+	throttleEase     = 30 * time.Millisecond // removed on each healthy response
+	// Independent modules used to multiply their private worker pools into dozens
+	// of simultaneous requests to one app. Twelve keeps a healthy DAST worker pool
+	// fully busy while bounding cross-module bursts that cause 429/challenges and
+	// timeout-driven misses. This is shared per host across every target/module.
+	hostMaxInFlight = 12
+)
+
+var hostThrottles sync.Map // host -> *hostThrottleState
+
+func throttleFor(host string) *hostThrottleState {
+	if v, ok := hostThrottles.Load(host); ok {
+		return v.(*hostThrottleState)
+	}
+	v, _ := hostThrottles.LoadOrStore(host, &hostThrottleState{slots: make(chan struct{}, hostMaxInFlight)})
+	return v.(*hostThrottleState)
+}
+
+// hostRequestAcquire reserves one shared per-host request slot. Waiting occurs
+// before any detector timing window, and cancellation releases waiters promptly.
+func hostRequestAcquire(ctx context.Context, host string) (func(), bool) {
+	if host == "" {
+		return func() {}, true
+	}
+	st := throttleFor(host)
+	select {
+	case st.slots <- struct{}{}:
+		return func() { <-st.slots }, true
+	case <-ctx.Done():
+		return nil, false
+	}
+}
+
+// hostThrottleWait sleeps the host's current adaptive backoff (0 for a healthy
+// host), honouring ctx. Call BEFORE starting any timing measurement.
+func hostThrottleWait(ctx context.Context, host string) {
+	if host == "" {
+		return
+	}
+	st := throttleFor(host)
+	st.mu.Lock()
+	d := st.backoff
+	st.mu.Unlock()
+	if d <= 0 {
+		return
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+	case <-ctx.Done():
+	}
+}
+
+// hostThrottleSevere reports whether a host's adaptive backoff has already
+// ramped to (or near) the hard ceiling — i.e. this host has been repeatedly
+// unhealthy (timeouts / 429 / 503) very recently, observed by ANY module
+// against ANY target. A detector with a large, multi-request proof ladder
+// (SQLi's error-forced/boolean/OR-based extraction easily runs 40-80+ requests
+// per candidate) should skip that ladder entirely on such a host rather than
+// grinding through it: the extra requests just add more load to an already
+// struggling host, the differential signal is unreliable behind a WAF/rate-
+// limiter to begin with (this is what looksLikeBlockPage/bodyLooksLikeWAFBlock
+// already guard against per-response), and on a large multi-hundred-endpoint
+// target this is the dominant real-world cause of a scan taking many hours
+// longer than it needs to.
+func hostThrottleSevere(host string) bool {
+	if host == "" {
+		return false
+	}
+	st := throttleFor(host)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.backoff >= throttleMax*3/4
+}
+
+// hostThrottleObserve updates a host's backoff from one response: multiplicative
+// increase when it looks overloaded/blocked (transport error/timeout, 429, 503),
+// additive decrease when it answered cleanly. status 0 with unhealthy=true marks
+// a transport failure.
+func hostThrottleObserve(host string, status int, transportErr bool) {
+	if host == "" {
+		return
+	}
+	unhealthy := transportErr || status == 429 || status == 503
+	st := throttleFor(host)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if unhealthy {
+		// multiplicative increase (double, plus a floor bump) up to the ceiling.
+		next := st.backoff*2 + throttleBumpBase
+		if next > throttleMax {
+			next = throttleMax
+		}
+		st.backoff = next
+		return
+	}
+	// additive decrease toward zero.
+	st.backoff -= throttleEase
+	if st.backoff < 0 {
+		st.backoff = 0
+	}
+}

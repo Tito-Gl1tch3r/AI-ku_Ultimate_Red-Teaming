@@ -1,0 +1,1115 @@
+use crate::error::ArmoryError;
+use crate::model::{Procedure, ProcedureOperation, Ttp};
+use crate::raw::RawTtp;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
+
+pub const VALID_ACCOUNTS_KUBECONFIG_ID: &str = "valid-accounts-kubeconfig";
+
+#[cfg(feature = "bundled-armory")]
+#[derive(rust_embed::Embed)]
+#[folder = "../../armory/TTPs"]
+struct BundledTtps;
+
+#[derive(Debug, Clone)]
+pub struct Armory {
+    source_dir: PathBuf,
+    ttps: Vec<Ttp>,
+}
+
+impl Armory {
+    /// Primary entry point.
+    ///
+    /// **Dev builds** (no `bundled-armory` feature): loads TTPs exclusively from
+    /// `user_dir`. The caller is responsible for resolving a default path when
+    /// `user_dir` is `None`.
+    ///
+    /// **Release builds** (`bundled-armory` feature): always loads the built-in
+    /// TTPs embedded in the binary first, then appends any TTPs found in
+    /// `user_dir` (if provided).
+    pub fn load(user_dir: Option<&Path>) -> Result<Self, ArmoryError> {
+        let mut ttps: Vec<Ttp> = Vec::new();
+
+        // --- Phase 1: built-in TTPs (release only) ---------------------------
+        #[cfg(feature = "bundled-armory")]
+        {
+            ttps.extend(Self::ttps_from_bundled()?);
+        }
+
+        // --- Phase 2: user-supplied directory --------------------------------
+        if let Some(dir) = user_dir {
+            ttps.extend(Self::ttps_from_dir(dir)?);
+        }
+
+        if ttps.is_empty() {
+            let label = user_dir
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|| "<bundled>".to_string());
+            return Err(ArmoryError::NoTtpsLoaded(label));
+        }
+
+        // --- Phase 3: expand slot references ---------------------------------
+        Self::expand_slot_procedures(&mut ttps);
+        Self::validate_k8s_auth(&ttps)?;
+
+        Ok(Self {
+            source_dir: user_dir
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("<bundled>")),
+            ttps,
+        })
+    }
+
+    /// Load TTPs from a filesystem directory. Used by both `load()` and tests.
+    pub fn load_from_dir(path: impl AsRef<Path>) -> Result<Self, ArmoryError> {
+        let path = path.as_ref();
+        let mut ttps = Self::ttps_from_dir(path)?;
+
+        if ttps.is_empty() {
+            return Err(ArmoryError::NoTtpsLoaded(path.display().to_string()));
+        }
+
+        Self::expand_slot_procedures(&mut ttps);
+        Self::validate_k8s_auth(&ttps)?;
+
+        Ok(Self {
+            source_dir: path.to_path_buf(),
+            ttps,
+        })
+    }
+
+    pub fn source_dir(&self) -> &Path {
+        &self.source_dir
+    }
+
+    pub fn ttps(&self) -> &[Ttp] {
+        &self.ttps
+    }
+
+    /// Mark every TTP with a configured ID as disabled.
+    ///
+    /// This runs after all sources have been merged, so it also applies to
+    /// release-bundled TTPs and to identically named user-supplied TTPs.
+    pub fn disable_ttps(&mut self, ids: &[String]) {
+        let ids: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        for ttp in &mut self.ttps {
+            if ids.contains(ttp.id.as_str()) {
+                ttp.status = "disabled".to_string();
+            }
+        }
+    }
+
+    /// Construct an `Armory` directly from a list of TTPs (useful in tests).
+    pub fn from_ttps(ttps: Vec<Ttp>) -> Self {
+        Self {
+            source_dir: PathBuf::new(),
+            ttps,
+        }
+    }
+
+    pub fn get_ttp(&self, id: &str) -> Option<&Ttp> {
+        self.ttps.iter().find(|ttp| ttp.id == id)
+    }
+
+    /// Find a TTP by ID for application-provided defaults or status updates.
+    pub fn get_ttp_mut(&mut self, id: &str) -> Option<&mut Ttp> {
+        self.ttps.iter_mut().find(|ttp| ttp.id == id)
+    }
+
+    /// Find a tool TTP by its ID (e.g. `"curl"`, `"wget"`).
+    /// Only returns TTPs that declare a `tool_slot`.
+    pub fn get_tool_ttp(&self, id: &str) -> Option<&Ttp> {
+        self.ttps
+            .iter()
+            .find(|t| t.tool_slot.is_some() && t.id == id)
+    }
+
+    /// Return all tool TTPs that fill the given slot (e.g. `"http-request"`).
+    pub fn get_tools_for_slot(&self, slot: &str) -> Vec<&Ttp> {
+        self.ttps
+            .iter()
+            .filter(|t| t.tool_slot.as_deref() == Some(slot))
+            .collect()
+    }
+
+    pub fn ttps_for_tactic(&self, tactic: Option<&str>) -> Vec<Ttp> {
+        let Some(tactic) = tactic.and_then(|t| {
+            let trimmed = t.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }) else {
+            return self.ttps.clone();
+        };
+
+        self.ttps
+            .iter()
+            .filter(|ttp| ttp.tactic.eq_ignore_ascii_case(tactic))
+            .cloned()
+            .collect()
+    }
+
+    // -------------------------------------------------------------------------
+    // Private helpers
+    // -------------------------------------------------------------------------
+
+    /// For each non-tool TTP, replace any procedure whose `tool` field names a
+    /// known slot (e.g. `"http-request"`) with one cloned procedure per
+    /// concrete tool that fills that slot. Structured `http_request`
+    /// procedures implicitly reference the `"http-request"` slot. The clone
+    /// receives the concrete tool's ID as both its `id` and `tool` field.
+    fn expand_slot_procedures(ttps: &mut [Ttp]) {
+        // Build slot → [concrete tool IDs] map from tool TTPs.
+        let mut slot_map: HashMap<String, Vec<String>> = HashMap::new();
+        for ttp in ttps.iter() {
+            if let Some(slot) = &ttp.tool_slot {
+                slot_map
+                    .entry(slot.clone())
+                    .or_default()
+                    .push(ttp.id.clone());
+            }
+        }
+
+        if slot_map.is_empty() {
+            return;
+        }
+
+        for ttp in ttps.iter_mut() {
+            if ttp.tool_slot.is_some() {
+                continue; // tool TTPs themselves are never expanded
+            }
+
+            let original = std::mem::take(&mut ttp.procedures);
+            let mut expanded: Vec<Procedure> = Vec::with_capacity(original.len());
+
+            for proc in original {
+                let slot = if proc.http_request.is_some() {
+                    Some("http-request")
+                } else {
+                    proc.tool.as_deref()
+                };
+                let slot_tools = slot.and_then(|slot| slot_map.get(slot));
+
+                match slot_tools {
+                    Some(tool_ids) => {
+                        for tool_id in tool_ids {
+                            let mut p = proc.clone();
+                            p.id = tool_id.clone();
+                            p.tool = Some(tool_id.clone());
+                            expanded.push(p);
+                        }
+                    }
+                    None => expanded.push(proc),
+                }
+            }
+
+            ttp.procedures = expanded;
+        }
+    }
+
+    fn validate_k8s_auth(ttps: &[Ttp]) -> Result<(), ArmoryError> {
+        for ttp in ttps {
+            let procedures = ttp.procedures.iter().chain(ttp.cleanup.iter());
+            let uses_k8s_auth = procedures.clone().any(|procedure| {
+                procedure.k8s_request.is_some()
+                    || procedure.command.contains("${K8S_AUTH}")
+                    || procedure
+                        .http_request
+                        .as_ref()
+                        .and_then(|request| request.get("authentication"))
+                        .is_some()
+                    || procedure.command.contains("kubectl ")
+                    || matches!(
+                        procedure.operation,
+                        ProcedureOperation::KubernetesExecSession { .. }
+                            | ProcedureOperation::SelfSubjectRulesReview { .. }
+                    )
+            });
+            if !uses_k8s_auth {
+                continue;
+            }
+
+            let references_k8s_auth = procedures.clone().any(|procedure| {
+                procedure.command.contains("${K8S_AUTH}")
+                    || procedure
+                        .k8s_request
+                        .as_ref()
+                        .is_some_and(|request| request.to_string().contains("${K8S_AUTH}"))
+                    || procedure
+                        .http_request
+                        .as_ref()
+                        .is_some_and(|request| request.to_string().contains("${K8S_AUTH}"))
+            });
+            if references_k8s_auth {
+                let Some(auth_param) = ttp
+                    .params
+                    .iter()
+                    .find(|param| param.name.eq_ignore_ascii_case("K8S_AUTH"))
+                else {
+                    return Err(ArmoryError::InvalidTtp {
+                        ttp_id: ttp.id.clone(),
+                        reason: "TTPs that reference ${K8S_AUTH} must explicitly declare a K8S_AUTH parameter of type K8sAuth"
+                            .to_string(),
+                    });
+                };
+                if !auth_param.param_type.eq_ignore_ascii_case("K8sAuth") {
+                    return Err(ArmoryError::InvalidTtp {
+                        ttp_id: ttp.id.clone(),
+                        reason: "K8S_AUTH must use parameter type K8sAuth".to_string(),
+                    });
+                }
+            }
+
+            if ttp
+                .params
+                .iter()
+                .any(|param| param.name.eq_ignore_ascii_case("TOKEN"))
+            {
+                return Err(ArmoryError::InvalidTtp {
+                    ttp_id: ttp.id.clone(),
+                    reason:
+                        "Kubernetes authentication must use Authenticate As, not a TOKEN parameter"
+                            .to_string(),
+                });
+            }
+
+            for procedure in ttp.procedures.iter().chain(ttp.cleanup.iter()) {
+                let serialized_k8s_request = procedure
+                    .k8s_request
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                let serialized_http_request = procedure
+                    .http_request
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                if procedure.command.contains("${TOKEN}")
+                    || procedure.command.contains("$TOKEN")
+                    || procedure.command.contains("--token")
+                    || serialized_k8s_request.contains("${TOKEN}")
+                    || serialized_http_request.contains("${TOKEN}")
+                    || procedure
+                        .k8s_request
+                        .as_ref()
+                        .and_then(|request| request.get("token"))
+                        .is_some()
+                {
+                    return Err(ArmoryError::InvalidTtp {
+                        ttp_id: ttp.id.clone(),
+                        reason: format!(
+                            "Kubernetes procedure '{}' uses legacy TOKEN authentication; use authentication: ${{K8S_AUTH}} for structured requests or ${{K8S_AUTH}} for kubectl",
+                            procedure.id
+                        ),
+                    });
+                }
+                if let Some(request) = &procedure.http_request {
+                    if request.get("authentication").is_some()
+                        && request
+                            .get("authentication")
+                            .and_then(|value| value.as_str())
+                            != Some("${K8S_AUTH}")
+                    {
+                        return Err(ArmoryError::InvalidTtp {
+                            ttp_id: ttp.id.clone(),
+                            reason: format!(
+                                "authenticated http_request procedure '{}' must declare authentication: ${{K8S_AUTH}}",
+                                procedure.id
+                            ),
+                        });
+                    }
+                    if request.get("authentication").is_some()
+                        && request
+                            .get("headers")
+                            .and_then(|headers| headers.as_object())
+                            .is_some_and(|headers| {
+                                headers
+                                    .keys()
+                                    .any(|name| name.eq_ignore_ascii_case("authorization"))
+                            })
+                    {
+                        return Err(ArmoryError::InvalidTtp {
+                            ttp_id: ttp.id.clone(),
+                            reason: format!(
+                                "authenticated http_request procedure '{}' must not declare an Authorization header; Authenticate As supplies it",
+                                procedure.id
+                            ),
+                        });
+                    }
+                }
+                if let Some(request) = &procedure.k8s_request {
+                    if request
+                        .get("authentication")
+                        .and_then(|value| value.as_str())
+                        != Some("${K8S_AUTH}")
+                    {
+                        return Err(ArmoryError::InvalidTtp {
+                            ttp_id: ttp.id.clone(),
+                            reason: format!(
+                                "k8s_request procedure '{}' must declare authentication: ${{K8S_AUTH}}",
+                                procedure.id
+                            ),
+                        });
+                    }
+                }
+                if procedure.command.contains("kubectl ")
+                    && !procedure.command.contains("${K8S_AUTH}")
+                    && procedure.is_local_command != Some(true)
+                {
+                    return Err(ArmoryError::InvalidTtp {
+                        ttp_id: ttp.id.clone(),
+                        reason: format!(
+                            "non-local kubectl procedure '{}' must include ${{K8S_AUTH}}",
+                            procedure.id
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn ttps_from_dir(dir: &Path) -> Result<Vec<Ttp>, ArmoryError> {
+        if !dir.exists() {
+            return Err(ArmoryError::DirNotFound(dir.display().to_string()));
+        }
+
+        let mut ttps = Vec::new();
+
+        for entry in WalkDir::new(dir).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+
+            let file_path = entry.path();
+            let is_yaml = file_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"))
+                .unwrap_or(false);
+            if !is_yaml {
+                continue;
+            }
+
+            let raw = fs::read_to_string(file_path).map_err(|source| ArmoryError::ReadFile {
+                path: file_path.display().to_string(),
+                source,
+            })?;
+
+            let raw_ttp: RawTtp =
+                serde_yaml::from_str(&raw).map_err(|source| ArmoryError::ParseYaml {
+                    path: file_path.display().to_string(),
+                    source,
+                })?;
+
+            if let Some(ttp) = raw_ttp.into_ttp(file_path) {
+                ttps.push(ttp);
+            }
+        }
+
+        Ok(ttps)
+    }
+
+    #[cfg(feature = "bundled-armory")]
+    fn ttps_from_bundled() -> Result<Vec<Ttp>, ArmoryError> {
+        let mut ttps = Vec::new();
+
+        for filename in BundledTtps::iter() {
+            let file = BundledTtps::get(filename.as_ref()).expect("file listed but not found");
+            let raw = std::str::from_utf8(file.data.as_ref())
+                .map_err(|_| ArmoryError::InvalidUtf8(filename.to_string()))?;
+            let raw_ttp: RawTtp =
+                serde_yaml::from_str(raw).map_err(|source| ArmoryError::ParseYaml {
+                    path: filename.to_string(),
+                    source,
+                })?;
+            if let Some(ttp) = raw_ttp.into_ttp(Path::new(filename.as_ref())) {
+                ttps.push(ttp);
+            }
+        }
+
+        Ok(ttps)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expands_http_request_template_for_every_grounding_tool() {
+        let tool = |id: &str| Ttp {
+            tool_slot: Some("http-request".to_string()),
+            ..Ttp::new(id, id, "Execution")
+        };
+        let mut ttps = vec![
+            tool("wget"),
+            tool("curl"),
+            tool("new-http-client"),
+            Ttp {
+                procedures: vec![Procedure {
+                    http_request: Some(serde_json::json!({
+                        "method": "GET",
+                        "url": "https://example.test"
+                    })),
+                    ..Procedure::new("proc-2", "")
+                }],
+                ..Ttp::new("request", "Request", "Discovery")
+            },
+        ];
+
+        Armory::expand_slot_procedures(&mut ttps);
+
+        let mut groundings: Vec<_> = ttps[3]
+            .procedures
+            .iter()
+            .map(|procedure| (procedure.id.as_str(), procedure.tool.as_deref()))
+            .collect();
+        groundings.sort_unstable();
+        assert_eq!(
+            groundings,
+            vec![
+                ("curl", Some("curl")),
+                ("new-http-client", Some("new-http-client")),
+                ("wget", Some("wget")),
+            ]
+        );
+        assert!(ttps[3]
+            .procedures
+            .iter()
+            .all(|procedure| procedure.http_request.is_some()));
+    }
+
+    #[test]
+    fn rejects_legacy_token_authentication_for_kubernetes_procedures() {
+        let ttp = Ttp {
+            params: vec![
+                crate::TtpParam {
+                    name: "K8S_AUTH".to_string(),
+                    param_type: "K8sAuth".to_string(),
+                    description: String::new(),
+                    required: true,
+                    default: String::new(),
+                    options: vec![],
+                },
+                crate::TtpParam {
+                    name: "TOKEN".to_string(),
+                    param_type: "ServiceAccount".to_string(),
+                    description: String::new(),
+                    required: false,
+                    default: String::new(),
+                    options: vec![],
+                },
+            ],
+            procedures: vec![Procedure::new(
+                "kubectl",
+                "kubectl get pods --token=${TOKEN}",
+            )],
+            ..Ttp::new("legacy-auth", "Legacy Auth", "Discovery")
+        };
+
+        assert!(matches!(
+            Armory::validate_k8s_auth(&[ttp]),
+            Err(ArmoryError::InvalidTtp { reason, .. }) if reason.contains("Authenticate As")
+        ));
+    }
+
+    #[test]
+    fn allows_explicit_tokens_for_non_kubernetes_apis() {
+        let ttp = Ttp {
+            params: vec![crate::TtpParam {
+                name: "TOKEN".to_string(),
+                param_type: "ServiceAccount".to_string(),
+                description: String::new(),
+                required: true,
+                default: String::new(),
+                options: vec![],
+            }],
+            procedures: vec![Procedure::new(
+                "ran-ws",
+                "ran-ws --url wss://node:10250/exec --token ${TOKEN}",
+            )],
+            ..Ttp::new("kubelet-auth", "Kubelet Auth", "Execution")
+        };
+
+        assert!(Armory::validate_k8s_auth(&[ttp]).is_ok());
+    }
+
+    #[test]
+    fn rejects_k8s_request_without_explicit_authentication_marker() {
+        let ttp = Ttp {
+            params: vec![crate::TtpParam {
+                name: "K8S_AUTH".to_string(),
+                param_type: "K8sAuth".to_string(),
+                description: String::new(),
+                required: true,
+                default: String::new(),
+                options: vec![],
+            }],
+            procedures: vec![Procedure {
+                k8s_request: Some(serde_json::json!({
+                    "api_server": "https://cluster.example",
+                    "api": "/api/v1",
+                    "resource": "pods"
+                })),
+                ..Procedure::new("k8s-request", "")
+            }],
+            ..Ttp::new("hidden-auth", "Hidden Auth", "Discovery")
+        };
+
+        assert!(matches!(
+            Armory::validate_k8s_auth(&[ttp]),
+            Err(ArmoryError::InvalidTtp { reason, .. })
+                if reason.contains("authentication: ${K8S_AUTH}")
+        ));
+    }
+
+    #[test]
+    fn rejects_kubernetes_ttp_without_declared_auth_parameter() {
+        let ttp = Ttp {
+            procedures: vec![Procedure::new("kubectl", "kubectl ${K8S_AUTH} get pods")],
+            ..Ttp::new("implicit-auth", "Implicit Auth", "Discovery")
+        };
+
+        assert!(matches!(
+            Armory::validate_k8s_auth(&[ttp]),
+            Err(ArmoryError::InvalidTtp { reason, .. })
+                if reason.contains("explicitly declare a K8S_AUTH parameter")
+        ));
+    }
+
+    #[test]
+    fn allows_local_active_client_procedure_without_unused_auth_parameter() {
+        let ttp = Ttp {
+            procedures: vec![Procedure {
+                is_local_command: Some(true),
+                ..Procedure::new("k8s-client", "k8sSelfSubjectRulesReview(default)")
+            }],
+            ..Ttp::new("native-review", "Native Review", "Discovery")
+        };
+
+        assert!(Armory::validate_k8s_auth(&[ttp]).is_ok());
+    }
+
+    #[test]
+    fn rejects_ambient_kubectl_for_missing_auth_marker_not_parameter() {
+        let ttp = Ttp {
+            procedures: vec![Procedure::new("kubectl", "kubectl get pods")],
+            ..Ttp::new("ambient-kubectl", "Ambient kubectl", "Discovery")
+        };
+
+        assert!(matches!(
+            Armory::validate_k8s_auth(&[ttp]),
+            Err(ArmoryError::InvalidTtp { reason, .. })
+                if reason.contains("must include ${K8S_AUTH}")
+                    && !reason.contains("parameter")
+        ));
+    }
+
+    #[test]
+    fn create_listener_cleans_up_the_port_it_bound() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../armory/TTPs");
+        let armory = Armory::load_from_dir(path).expect("repository armory should load");
+
+        let ttp = armory
+            .get_ttp("create-listener")
+            .expect("create-listener should be in the armory");
+        // Without this the accept loop survives a campaign reset and holds the
+        // port, so the next Create Listener on it cannot bind.
+        let cleanup = ttp
+            .cleanup
+            .as_ref()
+            .expect("create-listener must release its port on cleanup");
+        assert_eq!(cleanup.command, "c2.stop-listener(${PROTOCOL}/${PORT})");
+        assert_eq!(
+            cleanup.operation,
+            ProcedureOperation::StopListener {
+                listener: "${PROTOCOL}/${PORT}".to_string(),
+            }
+        );
+        assert_eq!(cleanup.is_local_command, Some(true));
+    }
+
+    #[test]
+    fn kill_session_uses_the_typed_session_control_operation() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../armory/TTPs");
+        let armory = Armory::load_from_dir(path).expect("repository armory should load");
+        let ttp = armory
+            .get_ttp("kill-session")
+            .expect("kill-session should be in the armory");
+
+        assert_eq!(
+            ttp.requires.get("kind").and_then(|value| value.as_str()),
+            Some("C2")
+        );
+        assert_eq!(ttp.params[0].param_type, "Session");
+        assert_eq!(
+            ttp.procedures[0].operation,
+            ProcedureOperation::KillSession {
+                session: "${SessionID}".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn redis_token_read_runs_from_outside_its_target() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../armory/TTPs");
+        let armory = Armory::load_from_dir(path).expect("repository armory should load");
+
+        let ttp = armory
+            .get_ttp("extract-serviceaccount-token-via-cve-2026-47701")
+            .expect("Redis token-read TTP should be in the armory");
+        let procedure = ttp.procedures.first().expect("one procedure");
+
+        assert_eq!(procedure.run_on_target, Some(false));
+        assert!(procedure.command.contains("redis-cli -h ${TARGET}"));
+    }
+
+    #[test]
+    fn redis_rce_propagates_nested_command_failures() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../armory/TTPs");
+        let armory = Armory::load_from_dir(path).expect("repository armory should load");
+
+        let ttp = armory
+            .get_ttp("exploit-redis-cve-2022-0543")
+            .expect("Redis RCE TTP should be in the armory");
+        let command = &ttp.procedures.first().expect("one procedure").command;
+
+        assert!(command.contains("redis-cli -e -h ${TARGET}"));
+        assert!(command.contains("local ok, reason, status = f:close()"));
+        assert!(command.contains("return redis.error_reply('nested command failed'"));
+    }
+
+    #[test]
+    fn chroot_escape_targets_pods_with_an_active_session() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../armory/TTPs");
+        let armory = Armory::load_from_dir(path).expect("repository armory should load");
+
+        let ttp = armory
+            .get_ttp("escape-container-via-chroot")
+            .expect("chroot escape TTP should be in the armory");
+
+        assert_eq!(
+            ttp.requires.get("kind").and_then(|value| value.as_str()),
+            Some("Pod")
+        );
+        assert_eq!(
+            ttp.requires
+                .get("activeSession")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(ttp.procedures[0].command, "chroot ${HOST_PATH}");
+    }
+
+    #[test]
+    fn preserves_kubernetes_http_request_procedure_variants() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../armory/TTPs");
+        let armory = Armory::load_from_dir(path).expect("repository armory should load");
+
+        for ttp_id in ["check-token-permissions", "get-roles"] {
+            let ttp = armory.get_ttp(ttp_id).expect("Kubernetes discovery TTP");
+            assert_eq!(
+                ttp.procedures.len(),
+                3,
+                "{ttp_id} must retain kubectl plus every grounded HTTP procedure"
+            );
+            assert!(
+                ttp.procedures
+                    .iter()
+                    .any(|procedure| procedure.command.contains("kubectl ")),
+                "{ttp_id} must retain its kubectl procedure"
+            );
+            assert!(
+                ttp.procedures.iter().any(|procedure| {
+                    procedure
+                        .http_request
+                        .as_ref()
+                        .and_then(|request| request.get("authentication"))
+                        .and_then(|value| value.as_str())
+                        == Some("${K8S_AUTH}")
+                }),
+                "{ttp_id} must retain its authenticated HTTP request procedure"
+            );
+            for tool in ["curl", "wget"] {
+                assert!(
+                    ttp.procedures.iter().any(|procedure| {
+                        procedure.id == tool && procedure.tool.as_deref() == Some(tool)
+                    }),
+                    "{ttp_id} must ground its HTTP request through {tool}"
+                );
+            }
+        }
+
+        let node_proxy = armory
+            .get_ttp("get-pods-via-node-proxy")
+            .expect("node proxy discovery TTP");
+        let procedure = node_proxy.procedures.first().expect("node proxy procedure");
+        assert_eq!(procedure.id, "proc-1", "positional procedure ID is stable");
+        let request = procedure
+            .k8s_request
+            .as_ref()
+            .expect("node proxy remains a structured HTTP operation");
+        assert_eq!(
+            request.get("use_ca").and_then(|value| value.as_str()),
+            Some("${USE_CA}")
+        );
+        assert_eq!(
+            node_proxy
+                .params
+                .iter()
+                .find(|parameter| parameter.name == "USE_CA")
+                .map(|parameter| parameter.default.as_str()),
+            Some("true")
+        );
+        assert_eq!(
+            request.get("ca_path").and_then(|value| value.as_str()),
+            Some("${CA_PATH}")
+        );
+
+        let kubelet = armory
+            .get_ttp("get-pods-via-kubelet")
+            .expect("kubelet discovery TTP");
+        let request = kubelet.procedures[0]
+            .http_request
+            .as_ref()
+            .expect("kubelet remains a structured HTTP operation");
+        assert_eq!(
+            request.get("use_ca").and_then(|value| value.as_str()),
+            Some("${USE_CA}")
+        );
+    }
+
+    #[test]
+    fn ranplant_callback_keeps_listener_host_grounding() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../armory/TTPs");
+        let armory = Armory::load_from_dir(path).expect("repository armory should load");
+        let ttp = armory
+            .get_ttp("start-ranplant-session")
+            .expect("Ranplant session action");
+        let listener = ttp
+            .params
+            .iter()
+            .find(|parameter| parameter.name == "LISTENER")
+            .expect("listener host parameter");
+
+        assert_eq!(listener.default, "${LISTENER}");
+        assert!(ttp.procedures[0].command.contains("--host \"${LISTENER}\""));
+        assert!(!ttp.procedures[0].command.contains("172.16.0.5"));
+    }
+
+    /// Redirector TTPs must declare typed control operations. The command text
+    /// remains useful for display and effects, but it does not select runtime
+    /// behavior.
+    #[test]
+    fn redirector_ttps_dispatch_to_c2_control_commands() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../armory/TTPs");
+        let armory = Armory::load_from_dir(path).expect("repository armory should load");
+
+        let create = armory
+            .get_ttp("create-redirector")
+            .expect("Create Redirector TTP");
+        assert_eq!(create.tactic, "Resource Development");
+        assert_eq!(
+            create
+                .params
+                .iter()
+                .find(|p| p.name == "PLAY_ID")
+                .map(|p| p.default.as_str()),
+            Some("${IXIMIUZ_PLAY_ID}"),
+            "the launcher-provided playground ID should be the redirector default"
+        );
+        // Targets the listener it forwards into, so selecting one is what offers
+        // the action.
+        assert_eq!(
+            create.requires.get("kind").and_then(|v| v.as_str()),
+            Some("Listener")
+        );
+        // labctl runs operator-side, where the target-binary tool gate cannot see
+        // it, so the requirement has to be declared explicitly.
+        assert_eq!(
+            create.requires.get("c2.has-tool").and_then(|v| v.as_str()),
+            Some("labctl")
+        );
+        let procedure = create.procedures.first().expect("one procedure");
+        assert_eq!(
+            procedure.command,
+            "c2.port-forward(${PLAY_ID}, ${RPORT}, ${LISTENER})"
+        );
+        assert_eq!(
+            procedure.operation,
+            ProcedureOperation::StartRedirector {
+                play_id: "${PLAY_ID}".to_string(),
+                remote_port: "${RPORT}".to_string(),
+                listener: "${LISTENER}".to_string(),
+            }
+        );
+        assert_eq!(
+            procedure.is_local_command,
+            Some(true),
+            "labctl runs on the operator host"
+        );
+        assert_eq!(
+            create.effects,
+            ["c2.port-forward(${PLAY_ID}, ${RPORT}, ${LISTENER})"],
+            "the effect must match an event-sourced parser arm or it logs as unparsed"
+        );
+        assert_eq!(
+            create
+                .params
+                .iter()
+                .find(|p| p.name == "LISTENER")
+                .map(|p| p.param_type.as_str()),
+            Some("Listener"),
+            "the listener parameter must render as a listener combobox"
+        );
+
+        let stop = armory
+            .get_ttp("stop-redirector")
+            .expect("Stop Redirector TTP");
+        assert_eq!(
+            stop.requires.get("kind").and_then(|v| v.as_str()),
+            Some("Redirector"),
+            "stopping targets the redirector itself"
+        );
+        let procedure = stop.procedures.first().expect("one procedure");
+        assert_eq!(procedure.command, "c2.stop-port-forward(${RedirectorID})");
+        assert_eq!(
+            procedure.operation,
+            ProcedureOperation::StopRedirector {
+                redirector: "${RedirectorID}".to_string(),
+            }
+        );
+        assert_eq!(procedure.is_local_command, Some(true));
+        assert_eq!(stop.effects, ["c2.stop-port-forward(${RedirectorID})"]);
+        assert_eq!(
+            stop.params
+                .iter()
+                .find(|p| p.name == "RedirectorID")
+                .map(|p| p.param_type.as_str()),
+            Some("Redirector")
+        );
+    }
+
+    #[test]
+    fn valid_accounts_ttp_is_canonical() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../armory/TTPs");
+        let armory = Armory::load_from_dir(path).expect("repository armory should load");
+
+        let canonical = armory
+            .get_ttp(VALID_ACCOUNTS_KUBECONFIG_ID)
+            .expect("canonical Valid Accounts TTP");
+        assert_eq!(canonical.name, "Execute into pod via Valid Account");
+        assert_eq!(canonical.tactic, "Initial Access");
+        assert_eq!(canonical.techniques, ["Valid Accounts", "T1078"]);
+        assert_eq!(
+            canonical.requires.get("kind").and_then(|v| v.as_str()),
+            Some("Pod")
+        );
+        assert_eq!(
+            canonical
+                .requires
+                .get("rbacPermissions")
+                .and_then(|v| v.as_array())
+                .and_then(|permissions| permissions.first())
+                .and_then(|permission| permission.as_object())
+                .and_then(|permission| permission.get("verb"))
+                .and_then(|verb| verb.as_str()),
+            Some("create")
+        );
+        assert_eq!(
+            canonical
+                .requires
+                .get("rbacPermissions")
+                .and_then(|v| v.as_array())
+                .and_then(|permissions| permissions.first())
+                .and_then(|permission| permission.as_object())
+                .and_then(|permission| permission.get("resourceType"))
+                .and_then(|resource| resource.as_str()),
+            Some("pods/exec")
+        );
+        assert!(!canonical.requires.contains_key("activeKubeconfig"));
+
+        assert_eq!(
+            armory
+                .ttps()
+                .iter()
+                .filter(|ttp| ttp.id == VALID_ACCOUNTS_KUBECONFIG_ID)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn sliver_design_sketches_are_disabled_and_not_offered_by_enabled_ttps() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../armory/TTPs");
+        let armory = Armory::load_from_dir(path).expect("repository armory should load");
+
+        for id in [
+            "connect-to-sliver",
+            "generate-implant",
+            "deploy-sliver-implant",
+        ] {
+            let ttp = armory.get_ttp(id).expect("Sliver design sketch");
+            assert_eq!(ttp.status, "disabled", "{id} must remain disabled");
+        }
+
+        for ttp in armory
+            .ttps()
+            .iter()
+            .filter(|ttp| !ttp.status.eq_ignore_ascii_case("disabled"))
+        {
+            assert!(
+                ttp.procedures.iter().all(|procedure| {
+                    !procedure.id.eq_ignore_ascii_case("sliver")
+                        && !procedure
+                            .tool
+                            .as_deref()
+                            .is_some_and(|tool| tool.eq_ignore_ascii_case("sliver"))
+                }),
+                "enabled TTP {} exposes a Sliver procedure",
+                ttp.id
+            );
+        }
+    }
+
+    #[test]
+    fn entity_backed_kubernetes_name_params_are_semantically_typed() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../armory/TTPs");
+        let armory = Armory::load_from_dir(path).expect("repository armory should load");
+        for (action_id, param_name, param_type) in [
+            (
+                "deploy-container-and-mount-sa-token",
+                "ServiceAccount",
+                "ServiceAccount",
+            ),
+            (
+                "deploy-container-and-mount-sa-token",
+                "Namespace",
+                "Namespace",
+            ),
+            (
+                "create-new-service-account-token",
+                "SERVICEACCOUNT",
+                "ServiceAccount",
+            ),
+            ("disable-psa-on-namespace", "NAMESPACE", "Namespace"),
+            ("deploy-container", "Namespace", "Namespace"),
+            ("deploy-container", "ServiceAccount", "ServiceAccount"),
+            ("deploy-container", "NodeName", "Node"),
+            ("delete-kubernetes-events", "NAMESPACE", "Namespace"),
+            ("get-pods-via-node-proxy", "NODE", "Node"),
+            ("check-token-permissions", "NS", "Namespace"),
+        ] {
+            let ttp = armory
+                .get_ttp(action_id)
+                .unwrap_or_else(|| panic!("repository armory must contain action {action_id}"));
+            let param = ttp
+                .params
+                .iter()
+                .find(|param| param.name == param_name)
+                .unwrap_or_else(|| panic!("{action_id} must declare {param_name}"));
+            assert_eq!(param.param_type, param_type, "{action_id}.{param_name}");
+        }
+    }
+
+    #[test]
+    fn configured_ids_disable_matching_ttps() {
+        let mut armory = Armory::from_ttps(vec![
+            Ttp::new("built-in-action", "Built-in Action", "Discovery"),
+            Ttp::new("custom-action", "Custom Action", "Discovery"),
+        ]);
+
+        armory.disable_ttps(&["built-in-action".to_string()]);
+
+        assert_eq!(
+            armory.get_ttp("built-in-action").unwrap().status,
+            "disabled"
+        );
+        assert_ne!(armory.get_ttp("custom-action").unwrap().status, "disabled");
+    }
+
+    #[test]
+    fn local_kubeconfig_read_uses_the_generic_local_shell_procedure() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../armory/TTPs");
+        let armory = Armory::load_from_dir(path).expect("repository armory should load");
+
+        let ttp = armory
+            .get_ttp("read-local-kubeconfig")
+            .expect("local kubeconfig TTP");
+        assert_eq!(ttp.effects, ["executor::file:kubeconfig"]);
+        let procedure = ttp.procedures.first().expect("local read procedure");
+        assert_eq!(procedure.command, "cat \"${PATH}\"");
+        assert_eq!(procedure.is_local_command, Some(true));
+        assert!(matches!(procedure.operation, ProcedureOperation::Shell));
+    }
+
+    #[test]
+    fn execute_in_shell_exposes_only_command_inputs() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../armory/TTPs");
+        let armory = Armory::load_from_dir(path).expect("repository armory should load");
+        let ttp = armory
+            .get_ttp("execute-in-shell")
+            .expect("Execute in Shell TTP");
+
+        assert_eq!(
+            ttp.params
+                .iter()
+                .map(|param| param.name.as_str())
+                .collect::<Vec<_>>(),
+            ["COMMAND", "ARGS", "BACKGROUND"]
+        );
+        let procedure = ttp.procedures.first().expect("shell procedure");
+        assert_eq!(procedure.id, "shell");
+        assert_eq!(procedure.tool.as_deref(), Some("sh"));
+    }
+
+    #[cfg(feature = "bundled-armory")]
+    #[test]
+    fn configured_ids_disable_bundled_ttps() {
+        let mut armory = Armory::load(None).expect("bundled armory should load");
+
+        armory.disable_ttps(&["read-local-kubeconfig".to_string()]);
+
+        assert_eq!(
+            armory.get_ttp("read-local-kubeconfig").unwrap().status,
+            "disabled"
+        );
+    }
+
+    #[test]
+    fn local_ip_discovery_defaults_to_hostname_before_interfaces() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../armory/TTPs");
+        let armory = Armory::load_from_dir(path).expect("repository armory should load");
+
+        let ttp = armory
+            .get_ttp("get-local-ip-address")
+            .expect("local IP discovery TTP");
+        assert_eq!(ttp.tactic, "Discovery");
+        assert!(ttp.effects.iter().any(|e| e == "executor::sys.ip"));
+
+        // Order is the fallback mechanism: the runtime defaults to
+        // `procedures[0]` and a `NextProcedure` retry indexes into the list.
+        // `hostname` is the default and the interface query is its fallback.
+        assert_eq!(ttp.procedures.len(), 2);
+
+        let primary = &ttp.procedures[0];
+        assert_eq!(primary.id, "hostname");
+        assert_eq!(primary.tool.as_deref(), Some("hostname"));
+        assert_eq!(primary.command, "hostname -i");
+
+        let fallback = &ttp.procedures[1];
+        assert_eq!(fallback.id, "ip");
+        assert_eq!(fallback.tool.as_deref(), Some("ip"));
+        assert_eq!(
+            fallback.command,
+            "ip -o -4 addr show scope global | awk \'{print $4}\' | cut -d/ -f1"
+        );
+        // `$4` is an awk field reference, not a Ran parameter placeholder.
+        assert!(!fallback.command.contains("${"));
+    }
+}

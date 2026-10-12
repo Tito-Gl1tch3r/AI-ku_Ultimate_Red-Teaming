@@ -1,0 +1,435 @@
+package scanner
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strings"
+	"time"
+)
+
+// reflectMarker is the branded, human-recognizable canary base injected into the
+// parameter's value. It carries a unique random suffix per request so a value
+// that merely happens to sit on the page can't be mistaken for a reflection of
+// OUR injected input — but the constant "rootdrreflect" prefix means you can spot
+// exactly which value Reconner injected when you view the page source.
+const reflectMarker = "rootdrreflect"
+
+// randomCanary returns an unmistakable, unique token (letters+hex only, so it is
+// never URL-encoded and survives verbatim into HTML). It always contains the
+// reflectMarker prefix so the injected value is identifiable in the page source.
+func randomCanary() string {
+	b := make([]byte, 6)
+	_, _ = rand.Read(b)
+	return reflectMarker + hex.EncodeToString(b)
+}
+
+var reflectClient = &http.Client{
+	Timeout:   8 * time.Second,
+	Transport: sharedHTTPTransport,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
+// checkParamReflection injects a unique canary into `param` and reports whether it
+// is reflected VERBATIM anywhere in the HTML-rendered body — INCLUDING inside
+// <script>/<style> blocks, which xss_context.go's CtxJSString/CtxJSExpr/CtxCSS
+// analysis is specifically built to prove executable (a JS-context reflection is
+// often the most exploitable kind, not a case to discard). An earlier version
+// stripped <script>/<style> before checking, on the theory that it "ruled out
+// JS-only echoes" — but the canary is a random per-request token, never a
+// coincidental JS identifier, so a verbatim match inside a script block is
+// exactly as real a reflection as one in the surrounding markup. Stripping it
+// made every JS/CSS-context-only reflected parameter invisible to
+// parameters.is_reflected, and therefore invisible to verify.go's final
+// catch-all reflected-XSS pass, which filters strictly on that flag — a silent
+// false negative for the entire JS-context reflected-XSS class whenever the
+// main DAST pass hadn't already tested that exact insertion point.
+// checkParamReflection also reports whether the response is an HTML document at
+// all (htmlSink) so the caller can decide to escalate a non-reflected-but-HTML
+// param to a real browser (SPA/DOM reflection). It retries once on a
+// transient/WAF failure; a random per-request canary rules out coincidental
+// matches.
+func checkParamReflection(rawURL, param string) (reflected, htmlSink bool) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false, false
+	}
+
+	canary := randomCanary()
+	q := parsed.Query()
+	q.Set(param, canary)
+	parsed.RawQuery = q.Encode()
+
+	var body []byte
+	var ctype string
+	var nosniff bool
+	ok := false
+	for attempt := 0; attempt < 2; attempt++ { // one retry: WAF/edge can drop the first probe
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		req, err := http.NewRequestWithContext(ctx, "GET", parsed.String(), nil)
+		if err != nil {
+			cancel()
+			return false, false
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+		resp, err := reflectClient.Do(req)
+		if err != nil {
+			cancel()
+			continue
+		}
+		body, _ = io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+		ctype = resp.Header.Get("Content-Type")
+		nosniff = strings.EqualFold(strings.TrimSpace(resp.Header.Get("X-Content-Type-Options")), "nosniff")
+		resp.Body.Close()
+		cancel()
+		ok = true
+		break
+	}
+	if !ok {
+		return false, false
+	}
+
+	// The reflection only matters if a browser would render this response as an HTML
+	// document — a canary echoed into application/json (or other non-HTML) is not an
+	// HTML-context reflected parameter. nosniff makes a body-signature guess
+	// non-authoritative. Mirrors the DAST/verifier Content-Type gate and stops
+	// JSON-API reflections (the ably.com clientId case) inflating the count.
+	htmlSink = browserRendersAsHTML(ctype, string(body), nosniff)
+	if !htmlSink {
+		return false, false
+	}
+
+	// Count a reflection that appears VERBATIM anywhere in the returned body,
+	// script/style blocks included (see the function doc comment above).
+	return strings.Contains(string(body), canary), true
+}
+
+// redirectClass is the verdict of an open-redirect probe.
+type redirectClass int
+
+const (
+	redirectNone     redirectClass = iota // param never triggers a redirect
+	redirectInternal                      // redirects, but final host is same-origin → CANDIDATE
+	redirectExternal                      // final host is attacker-controlled → VERIFIED FINDING
+)
+
+// openRedirectResult carries the verdict plus the provenance (the full redirect
+// chain) so the finding can show exactly how it was proven.
+type openRedirectResult struct {
+	class    redirectClass
+	testURL  string
+	finalLoc string
+	chain    string // human-readable hop-by-hop chain (provenance)
+}
+
+const evilRedirectHost = "evil.com"
+
+var openRedirectPayloads = []string{
+	"https://evil.com",
+	"//evil.com",
+	"https://evil.com/",
+	"//evil.com/%2F..",
+	"/\\evil.com",
+	"\\/\\/evil.com",
+	"https:/evil.com",
+	"https://target.example@evil.com",
+	"//evil.com/%2e%2e",
+	"https://evil.com%2f",
+	"%2f%2fevil.com",
+	"/%2f/evil.com",
+	"/%5cevil.com",
+	"%2f%5cevil.com",
+	"///evil.com",
+	"https:%2f%2fevil.com",
+}
+
+// checkOpenRedirectURL is the legacy query-string entry point used by focused
+// checks and tests. Keep it on the same request-shape-aware verifier as the
+// production discovery module so both paths have identical redirect semantics
+// and neither follows an injected destination outside scope.
+func checkOpenRedirectURL(rawURL, param string) (openRedirectResult, bool) {
+	return checkOpenRedirectPoint(context.Background(), insertionPoint{
+		URL: rawURL, Param: param, Method: http.MethodGet, Location: "query",
+	}, nil)
+}
+
+// checkOpenRedirectPoint is the request-shape-aware open-redirect verifier. It
+// supports query, form, JSON, multipart, GraphQL, path, cookie and header
+// insertion points, preserves authentication and required sibling fields, and
+// never follows the browser onto evil.com: observing a Location/meta/JS target
+// whose parsed final host is our injected host is already the proof.
+func checkOpenRedirectPoint(ctx context.Context, ip insertionPoint, auth map[string]string) (openRedirectResult, bool) {
+	return checkOpenRedirectPointWithPayloads(ctx, ip, auth, openRedirectPayloads)
+}
+
+func checkOpenRedirectPointWithPayloads(ctx context.Context, ip insertionPoint, auth map[string]string, payloads []string) (openRedirectResult, bool) {
+	origin, err := url.Parse(ip.URL)
+	if err != nil {
+		return openRedirectResult{}, false
+	}
+	originHost := strings.ToLower(strings.TrimPrefix(origin.Hostname(), "www."))
+	var candidate *openRedirectResult
+	for _, payload := range payloads {
+		reqCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+		req, err := buildInjectedRequest(reqCtx, ip, payload, auth)
+		if err != nil {
+			cancel()
+			continue
+		}
+		testDesc := fmt.Sprintf("%s %s [%s=%s]", req.Method, req.URL.String(), ip.Param, payload)
+		res, redirected := followRedirectRequest(reqCtx, req, originHost, auth)
+		cancel()
+		if !redirected {
+			continue
+		}
+		res.testURL = testDesc
+		res.chain = fmt.Sprintf("method=%s location=%s param=%s payload=%s\n%s",
+			strings.ToUpper(ip.Method), insertionLocation(ip), ip.Param, payload, res.chain)
+		if res.class == redirectExternal {
+			return res, true
+		}
+		if candidate == nil {
+			copy := res
+			candidate = &copy
+		}
+	}
+	if candidate != nil {
+		return *candidate, true
+	}
+	return openRedirectResult{}, false
+}
+
+func followRedirectRequest(ctx context.Context, first *http.Request, originHost string, auth map[string]string) (openRedirectResult, bool) {
+	client := &http.Client{
+		Timeout:       8 * time.Second,
+		Transport:     sharedHTTPTransport,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	cur := first
+	var chain strings.Builder
+	redirected := false
+	for hop := 0; hop < 8; hop++ {
+		resp, err := client.Do(cur)
+		if err != nil {
+			break
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+		resp.Body.Close()
+		base := cur.URL
+		loc := strings.TrimSpace(resp.Header.Get("Location"))
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 && loc != "" {
+			redirected = true
+			fmt.Fprintf(&chain, "  %d %s -> %s\n", resp.StatusCode, cur.URL.String(), loc)
+			host := hostFromLocation(loc, base)
+			if host != "" && isInjectedRedirectHost(host) && isExternalRedirectHost(host, originHost) {
+				return openRedirectResult{class: redirectExternal, finalLoc: loc, chain: chain.String()}, true
+			}
+			nextRef, err := url.Parse(loc)
+			if err != nil {
+				break
+			}
+			next := base.ResolveReference(nextRef)
+			nextHost := strings.ToLower(strings.TrimPrefix(next.Hostname(), "www."))
+			if nextHost != "" && nextHost != originHost {
+				// Do not send scanner traffic to an unscoped third-party redirect.
+				break
+			}
+			method := http.MethodGet
+			var bodyReader io.ReadCloser
+			if (resp.StatusCode == http.StatusTemporaryRedirect || resp.StatusCode == http.StatusPermanentRedirect) && cur.GetBody != nil {
+				method = cur.Method
+				bodyReader, _ = cur.GetBody()
+			}
+			nextReq, err := http.NewRequestWithContext(ctx, method, next.String(), bodyReader)
+			if err != nil {
+				break
+			}
+			nextReq.Header.Set("User-Agent", "Mozilla/5.0 (compatible; ReconBot/1.0)")
+			for k, v := range auth {
+				nextReq.Header.Set(k, v)
+			}
+			if bodyReader != nil {
+				nextReq.Header.Set("Content-Type", cur.Header.Get("Content-Type"))
+			}
+			cur = nextReq
+			continue
+		}
+
+		if host := metaOrJSRedirectHostFromBody(body, resp.Header.Get("Content-Type"), base); host != "" {
+			redirected = true
+			fmt.Fprintf(&chain, "  %d %s -> client-side %s\n", resp.StatusCode, cur.URL.String(), host)
+			if isInjectedRedirectHost(host) && isExternalRedirectHost(host, originHost) {
+				return openRedirectResult{class: redirectExternal, finalLoc: "client-side redirect -> " + host, chain: chain.String()}, true
+			}
+		}
+		break
+	}
+	if redirected {
+		return openRedirectResult{class: redirectInternal, chain: chain.String()}, true
+	}
+	return openRedirectResult{}, false
+}
+
+// followRedirectChain manually walks Location headers up to 8 hops, returning
+// the final Location value seen, a printable chain, and whether any redirect
+// occurred at all.
+func followRedirectChain(startURL string) (finalLoc, chain string, redirected bool) {
+	client := &http.Client{
+		Timeout:   6 * time.Second,
+		Transport: sharedHTTPTransport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	cur := startURL
+	var b strings.Builder
+	for hop := 0; hop < 8; hop++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+		req, err := http.NewRequestWithContext(ctx, "GET", cur, nil)
+		if err != nil {
+			cancel()
+			break
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+		resp, err := client.Do(req)
+		cancel()
+		if err != nil {
+			break
+		}
+		resp.Body.Close()
+		if resp.StatusCode < 300 || resp.StatusCode >= 400 {
+			break
+		}
+		loc := resp.Header.Get("Location")
+		if loc == "" {
+			break
+		}
+		redirected = true
+		finalLoc = loc
+		fmt.Fprintf(&b, "  %d %s -> %s\n", resp.StatusCode, cur, loc)
+		// Resolve relative Location against current URL to continue the walk.
+		base, err := url.Parse(cur)
+		if err != nil {
+			break
+		}
+		next, err := url.Parse(loc)
+		if err != nil {
+			break
+		}
+		cur = base.ResolveReference(next).String()
+	}
+	return finalLoc, b.String(), redirected
+}
+
+// metaRefreshRe matches <meta http-equiv="refresh" content="0;url=DEST">.
+var metaRefreshRe = regexp.MustCompile(`(?is)<meta[^>]+http-equiv\s*=\s*["']?refresh["']?[^>]+content\s*=\s*["'][^"']*?url\s*=\s*([^"'>\s]+)`)
+
+// jsRedirectRe matches the common client-side redirect assignments:
+// location = "...", location.href = "...", location.replace("..."),
+// location.assign("..."), window.location(.href) = "...".
+var jsRedirectRe = regexp.MustCompile(`(?is)(?:window\s*\.\s*)?location\s*(?:\.\s*href\s*)?(?:=|\.\s*replace\s*\(|\.\s*assign\s*\()\s*["']([^"']+)["']`)
+
+// metaOrJSRedirectHost fetches the (200) page and returns the host a meta-refresh
+// or JS redirect points to — used to catch open redirects that don't use a 3xx
+// Location header. Returns "" if the page performs no client-side redirect. Only
+// the FIRST redirect construct found is considered (that's what the browser acts
+// on), keeping this low-FP: a mere reflected URL elsewhere in the body is ignored.
+func metaOrJSRedirectHost(pageURL string, base *url.URL) string {
+	client := &http.Client{
+		Timeout:   6 * time.Second,
+		Transport: sharedHTTPTransport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", pageURL, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if ct != "" && !strings.Contains(ct, "html") {
+		return "" // only HTML documents run meta/JS redirects
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	return metaOrJSRedirectHostFromBody(body, resp.Header.Get("Content-Type"), base)
+}
+
+func metaOrJSRedirectHostFromBody(body []byte, contentType string, base *url.URL) string {
+	ct := strings.ToLower(contentType)
+	if ct != "" && !strings.Contains(ct, "html") {
+		return ""
+	}
+	dest := ""
+	if m := metaRefreshRe.FindSubmatch(body); m != nil {
+		dest = string(m[1])
+	} else if m := jsRedirectRe.FindSubmatch(body); m != nil {
+		dest = string(m[1])
+	}
+	if dest == "" {
+		return ""
+	}
+	return hostFromLocation(dest, base)
+}
+
+// hostFromLocation resolves a (possibly relative) Location against the request
+// URL and returns its lower-cased host.
+func hostFromLocation(loc string, base *url.URL) string {
+	loc = strings.TrimSpace(loc)
+	if loc == "" {
+		return ""
+	}
+	// Normalise the backslash trick browsers treat as '/'.
+	norm := strings.ReplaceAll(loc, "\\", "/")
+	u, err := url.Parse(norm)
+	if err != nil {
+		return ""
+	}
+	if !u.IsAbs() && u.Host == "" {
+		u = base.ResolveReference(u)
+	}
+	return strings.ToLower(strings.TrimPrefix(u.Hostname(), "www."))
+}
+
+// isInjectedRedirectHost reports whether the final redirect destination is the
+// attacker host WE injected (evil.com or a subdomain of it). This is the guard
+// that separates a REAL open redirect — the app sent the browser to OUR payload
+// host — from an app that always bounces to its OWN fixed external destination
+// (an SSO/login provider, a CDN, an analytics/marketing redirect) regardless of
+// the parameter value. The latter is not a vulnerability, yet the previous code
+// flagged it for every parameter it tested because it only asked "is the final
+// host off-origin?" and never "is it the host I injected?". That mismatch — the
+// code contradicting its own "we only flag when it points at our injected host"
+// comment — was the single biggest open-redirect false-positive source.
+func isInjectedRedirectHost(finalHost string) bool {
+	h := strings.ToLower(strings.TrimPrefix(finalHost, "www."))
+	evil := strings.TrimPrefix(strings.ToLower(evilRedirectHost), "www.")
+	return h == evil || strings.HasSuffix(h, "."+evil)
+}
+
+// isExternalRedirectHost reports whether the final host is off the origin — the
+// definition of a *verified* open redirect.
+func isExternalRedirectHost(finalHost, originHost string) bool {
+	if finalHost == "" {
+		return false
+	}
+	if finalHost == originHost || strings.HasSuffix(finalHost, "."+originHost) {
+		return false // same-origin or a subdomain of it
+	}
+	return true
+}

@@ -1,0 +1,117 @@
+package org.pac4j.oidc.client;
+
+import lombok.Getter;
+import lombok.ToString;
+import lombok.val;
+import org.pac4j.core.client.IndirectClient;
+import org.pac4j.core.context.CallContext;
+import org.pac4j.core.profile.UserProfile;
+import org.pac4j.oidc.config.OidcConfiguration;
+import org.pac4j.oidc.credentials.OidcCredentials;
+import org.pac4j.oidc.credentials.authenticator.OidcAuthenticator;
+import org.pac4j.oidc.credentials.extractor.OidcCredentialsExtractor;
+import org.pac4j.oidc.federation.entity.DefaultEntityConfigurationGenerator;
+import org.pac4j.oidc.logout.OidcLogoutActionBuilder;
+import org.pac4j.oidc.logout.processor.OidcLogoutProcessor;
+import org.pac4j.oidc.profile.OidcProfile;
+import org.pac4j.oidc.profile.creator.OidcProfileCreator;
+import org.pac4j.oidc.redirect.OidcRedirectionActionBuilder;
+
+import java.util.Optional;
+
+import static org.pac4j.core.util.CommonHelper.assertNotNull;
+
+/**
+ * This class is the client to authenticate users with an OpenID Connect 1.0 provider.
+ * By default, this implementation relies on the
+ * "code" response type. (http://openid.net/specs/openid-connect-core-1_0.html).
+ *
+ * @author Michael Remond
+ * @author Jerome Leleu
+ * @since 1.7.0
+ */
+@ToString(callSuper = true)
+public class OidcClient extends IndirectClient {
+
+    @Getter
+    private OidcConfiguration configuration;
+
+    /**
+     * <p>Constructor for OidcClient.</p>
+     */
+    public OidcClient() { }
+
+    /**
+     * <p>Constructor for OidcClient.</p>
+     *
+     * @param configuration a {@link OidcConfiguration} object
+     */
+    public OidcClient(final OidcConfiguration configuration) {
+        setConfiguration(configuration);
+        val federation = configuration.getFederation();
+        if (federation.getEntityConfigurationGenerator() == null) {
+            federation.setEntityConfigurationGenerator(new DefaultEntityConfigurationGenerator(this));
+        }
+    }
+
+    public void setConfiguration(final OidcConfiguration configuration) {
+        assertNotNull("configuration", configuration);
+        this.configuration = configuration;
+        this.configuration.setOidcClient(this);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    protected void beforeInternalInit(final boolean forceReinit) {
+        super.beforeInternalInit(forceReinit);
+        assertNotNull("configuration", configuration);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    protected void internalInit(final boolean forceReinit) {
+        setRedirectionActionBuilderIfUndefined(new OidcRedirectionActionBuilder(this));
+        setCredentialsExtractorIfUndefined(new OidcCredentialsExtractor(configuration, this));
+        setAuthenticatorIfUndefined(new OidcAuthenticator(configuration, this));
+        setProfileCreatorIfUndefined(new OidcProfileCreator(configuration, this));
+        setLogoutProcessorIfUndefined(new OidcLogoutProcessor(configuration, findSessionLogoutHandler()));
+        setLogoutActionBuilderIfUndefined(new OidcLogoutActionBuilder(configuration));
+
+        configuration.init(this.getClass().getSimpleName(), forceReinit);
+
+        val federation = configuration.getFederation();
+        if (federation.getEntityId() == null) {
+            federation.setEntityId(callbackUrl);
+        }
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public Optional<UserProfile> renewUserProfile(final CallContext ctx, final UserProfile profile) {
+        val oidcProfile = (OidcProfile) profile;
+        val refreshToken = oidcProfile.getRefreshToken();
+        if (refreshToken != null) {
+            val credentials = new OidcCredentials();
+            credentials.setRefreshTokenObject(refreshToken);
+            val authenticator = (OidcAuthenticator)getAuthenticator();
+            authenticator.refresh(credentials);
+            credentials.setRefreshedCredentials(true);
+
+            // Create a profile if the refresh grant was successful
+            if (credentials.getAccessToken() != null) {
+                return getUserProfile(ctx, credentials);
+            }
+        }
+
+        return Optional.empty();
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public void notifySessionRenewal(final CallContext ctx, final String oldSessionId) {
+        val sessionLogoutHandler = findSessionLogoutHandler();
+        if (sessionLogoutHandler != null) {
+            sessionLogoutHandler.renewSession(ctx, oldSessionId);
+        }
+    }
+}

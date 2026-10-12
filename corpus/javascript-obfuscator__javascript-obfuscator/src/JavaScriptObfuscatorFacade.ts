@@ -1,0 +1,159 @@
+import 'reflect-metadata';
+
+import { ServiceIdentifiers } from './container/ServiceIdentifiers';
+
+import { TDictionary } from './types/TDictionary';
+import { TInputOptions } from './types/options/TInputOptions';
+import { TObfuscationResultsObject } from './types/TObfuscationResultsObject';
+import { TOptionsPreset } from './types/options/TOptionsPreset';
+
+import { IInversifyContainerFacade } from './interfaces/container/IInversifyContainerFacade';
+import { IJavaScriptObfuscator } from './interfaces/IJavaScriptObfsucator';
+import { IObfuscationResult } from './interfaces/source-code/IObfuscationResult';
+import {
+    IProApiConfig,
+    IProObfuscationResult,
+    IProQuota,
+    TProApiProgressCallback
+} from './interfaces/pro-api/IProApiClient';
+
+import { InversifyContainerFacade } from './container/InversifyContainerFacade';
+import { Options } from './options/Options';
+import { Utils } from './utils/Utils';
+
+class JavaScriptObfuscatorFacade {
+    /**
+     * @type {string | undefined}
+     */
+    public static version: string = process.env.VERSION ?? 'unknown';
+
+    /**
+     * @param {string} sourceCode
+     * @param {TInputOptions} inputOptions
+     * @returns {IObfuscationResult}
+     */
+    public static obfuscate(sourceCode: string, inputOptions: TInputOptions = {}): IObfuscationResult {
+        const inversifyContainerFacade: IInversifyContainerFacade = new InversifyContainerFacade();
+
+        inversifyContainerFacade.load(sourceCode, '', inputOptions);
+
+        const javaScriptObfuscator: IJavaScriptObfuscator = inversifyContainerFacade.get<IJavaScriptObfuscator>(
+            ServiceIdentifiers.IJavaScriptObfuscator
+        );
+        const obfuscationResult: IObfuscationResult = javaScriptObfuscator.obfuscate(sourceCode);
+
+        inversifyContainerFacade.unload();
+
+        return obfuscationResult;
+    }
+
+    /**
+     * @param {TSourceCodesObject} sourceCodesObject
+     * @param {TInputOptions} inputOptions
+     * @returns {TObfuscationResultsObject<TSourceCodesObject>}
+     */
+    public static obfuscateMultiple<TSourceCodesObject extends TDictionary<string>>(
+        sourceCodesObject: TSourceCodesObject,
+        inputOptions: TInputOptions = {}
+    ): TObfuscationResultsObject<TSourceCodesObject> {
+        if (typeof sourceCodesObject !== 'object') {
+            throw new Error('Source codes object should be a plain object');
+        }
+
+        return Object.keys(sourceCodesObject).reduce(
+            (
+                acc: TObfuscationResultsObject<TSourceCodesObject>,
+                sourceCodeIdentifier: keyof TSourceCodesObject,
+                index: number
+            ) => {
+                const identifiersPrefix: string = Utils.getIdentifiersPrefixForMultipleSources(
+                    inputOptions.identifiersPrefix,
+                    index
+                );
+
+                const sourceCode: string = sourceCodesObject[sourceCodeIdentifier];
+                const sourceCodeOptions: TInputOptions = {
+                    ...inputOptions,
+                    identifiersPrefix
+                };
+
+                return {
+                    ...acc,
+                    [sourceCodeIdentifier]: JavaScriptObfuscatorFacade.obfuscate(sourceCode, sourceCodeOptions)
+                };
+            },
+            <TObfuscationResultsObject<TSourceCodesObject>>{}
+        );
+    }
+
+    /**
+     * @param {TOptionsPreset} optionsPreset
+     * @returns {TInputOptions}
+     */
+    public static getOptionsByPreset(optionsPreset: TOptionsPreset): TInputOptions {
+        return Options.getOptionsByPreset(optionsPreset);
+    }
+
+    /**
+     * Obfuscate code using the Pro API (obfuscator.io)
+     * Falls back to the basic obfuscation API when no Pro feature is enabled.
+     * Only available in Node.js environment.
+     *
+     * @param {string} sourceCode - Source code to obfuscate
+     * @param {TInputOptions} inputOptions - Obfuscation options
+     * @param {IProApiConfig} proApiConfig - Pro API configuration including API token
+     * @param {TProApiProgressCallback} onProgress - Optional callback for progress updates (streaming mode only)
+     * @returns {Promise<IProObfuscationResult>} - Promise resolving to obfuscation result
+     * @throws {ApiError} - If the Pro API returns an error
+     */
+    public static async obfuscatePro(
+        sourceCode: string,
+        inputOptions: TInputOptions,
+        proApiConfig: IProApiConfig,
+        onProgress?: TProApiProgressCallback
+    ): Promise<IProObfuscationResult> {
+        if (typeof window !== 'undefined') {
+            const { ApiError } = await import('./pro-api/ApiError');
+
+            throw new ApiError('obfuscatePro is only available in Node.js environment', 500);
+        }
+
+        const { ProApiClient } = await import('./pro-api/ProApiClient');
+
+        const client = new ProApiClient(proApiConfig);
+        const options: TInputOptions = await client.resolveOptions(inputOptions);
+
+        if (!ProApiClient.hasProFeatures(options)) {
+            return JavaScriptObfuscatorFacade.obfuscate(sourceCode, options);
+        }
+
+        return client.obfuscate(sourceCode, options, onProgress);
+    }
+
+    /**
+     * @param {IProApiConfig} proApiConfig
+     * @returns {Promise<IProQuota>}
+     * @throws {ApiError}
+     */
+    public static async getProQuota(proApiConfig: IProApiConfig): Promise<IProQuota> {
+        if (typeof window !== 'undefined') {
+            const { ApiError } = await import('./pro-api/ApiError');
+
+            throw new ApiError('getProQuota is only available in Node.js environment', 500);
+        }
+
+        const { ProApiClient } = await import('./pro-api/ProApiClient');
+
+        return new ProApiClient(proApiConfig).getQuota();
+    }
+}
+
+export { JavaScriptObfuscatorFacade as JavaScriptObfuscator };
+export { ApiError } from './pro-api/ApiError';
+export type {
+    IProApiConfig,
+    IProObfuscationResult,
+    IProQuota,
+    IProQuotaWindow,
+    TProApiProgressCallback
+} from './interfaces/pro-api/IProApiClient';

@@ -1,0 +1,86 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""PyPI ecosystem helper."""
+
+import packaging_legacy.version
+import requests
+
+from . import config
+from .ecosystems_base import (
+    coarse_version_generic,
+    coarse_version_from_ints,
+    EnumerableEcosystem,
+    EnumerateError,
+)
+
+
+class PyPI(EnumerableEcosystem):
+  """PyPI ecosystem helpers."""
+
+  _API_PACKAGE_URL = 'https://pypi.org/pypi/{package}/json'
+
+  def _sort_key(self, version):
+    """Sort key."""
+    # version.parse() handles invalid versions by returning LegacyVersion()
+    return packaging_legacy.version.parse(version)
+
+  def coarse_version(self, version: str):
+    """Coarse version.
+
+    Treats version as dot-separated integers.
+    Maps legacy versions to 0 (sort before valid versions).
+    Epochs are preserved.
+    """
+    # legacy versions are less than non-legacy versions, thus mapped to 0
+    ver = packaging_legacy.version.parse(version)
+    if isinstance(ver, packaging_legacy.version.LegacyVersion):
+      return coarse_version_from_ints([0])
+
+    epoch = ver.epoch
+
+    # parse the epoch-less string
+    if version[0].lower() == 'v':
+      version = version[1:]
+    epochless = version.split('!', 1)[-1]
+
+    return coarse_version_generic(
+        epochless,
+        separators_regex=r'[.]',
+        truncate_regex=r'[+_-]',
+        implicit_split=True,
+        empty_as=None,
+        epoch=epoch)
+
+  def enumerate_versions(self,
+                         package,
+                         introduced,
+                         fixed=None,
+                         last_affected=None,
+                         limits=None):
+    """Enumerate versions."""
+    response = requests.get(
+        self._API_PACKAGE_URL.format(package=package), timeout=config.timeout)
+
+    if response.status_code == 404:
+      raise EnumerateError(f'Package {package} not found')
+    if response.status_code != 200:
+      raise RuntimeError(
+          f'Failed to get PyPI versions for {package} with: {response.text}')
+
+    response = response.json()
+    versions = list(response['releases'].keys())
+    self.sort_versions(versions)
+
+    return self._get_affected_versions(versions, introduced, fixed,
+                                       last_affected, limits)

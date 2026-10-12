@@ -1,0 +1,191 @@
+package org.pac4j.saml.config;
+
+import lombok.val;
+import org.junit.jupiter.api.Test;
+import org.pac4j.core.config.properties.KeystoreProperties;
+import org.pac4j.core.config.properties.ResourceProperties;
+import org.pac4j.core.exception.TechnicalException;
+import org.pac4j.saml.exceptions.SAMLException;
+import org.pac4j.saml.util.SAML2UrlResource;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.FileSystemResource;
+
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
+import java.io.File;
+import java.security.SecureRandom;
+import java.security.cert.X509Certificate;
+import java.time.Period;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * This is {@link SAML2ConfigurationTests}.
+ *
+ * @author Misagh Moayyed
+ */
+public class SAML2ConfigurationTests {
+    @Test
+    public void verifySigningCertExported() {
+        val configuration = new SAML2Configuration();
+        configuration.setForceKeystoreGeneration(true);
+        configuration.setKeystorePath("target/keystore.jks");
+        configuration.setKeystorePassword("pac4j");
+        configuration.setPrivateKeyPassword("pac4j");
+        configuration.getServiceProviderMetadata().setResource(new FileSystemResource("target/out.xml"));
+        configuration.getIdentityProviderMetadata().setResource(new ClassPathResource("idp-metadata.xml"));
+        configuration.init();
+        val signingCertPem = new File("target/saml-signing-cert.pem");
+        assertTrue(signingCertPem.exists());
+        val signingCert = new File("target/saml-signing-cert.crt");
+        assertTrue(signingCert.exists());
+        val signingCertKey = new File("target/saml-signing-cert.key");
+        assertTrue(signingCertKey.exists());
+    }
+
+    @Test
+    public void verifySigningCertNamedExported() {
+        val certNamePart = "id-09 _*#AD";
+        val certNameResult = "id-09_AD";
+        val configuration = new SAML2Configuration();
+        configuration.setForceKeystoreGeneration(true);
+        configuration.setKeystorePath("target/keystore.jks");
+        configuration.setCertificateNameToAppend(certNamePart);
+        configuration.setKeystorePassword("pac4j");
+        configuration.setPrivateKeyPassword("pac4j");
+        configuration.getServiceProviderMetadata().setResource(new FileSystemResource("target/out.xml"));
+        configuration.getIdentityProviderMetadata().setResource(new ClassPathResource("idp-metadata.xml"));
+        configuration.init();
+        val signingCertPem = new File("target/saml-signing-cert-" + certNameResult + ".pem");
+        assertTrue(signingCertPem.exists());
+        val signingCert = new File("target/saml-signing-cert-" + certNameResult + ".crt");
+        assertTrue(signingCert.exists());
+        val signingCertKey = new File("target/saml-signing-cert-" + certNameResult + ".key");
+        assertTrue(signingCertKey.exists());
+    }
+
+    @Test
+    public void verifyIdentityProviderMetadataUrlWithBadSslCert() throws Exception {
+        val metadataUrl = "https://expired.badssl.com/";
+        val configuration = new SAML2Configuration("target/keystore.jks", "pac4j", "pac4j", metadataUrl);
+        configuration.setForceKeystoreGeneration(true);
+        configuration.getServiceProviderMetadata().setResource(new FileSystemResource("target/out.xml"));
+        configuration.init();
+        var metadataResolver = configuration.getIdentityProviderMetadataResolver().resolve();
+        assertNull(metadataResolver);
+        configuration.setSslSocketFactory(disabledSslContext().getSocketFactory());
+        configuration.setHostnameVerifier((s, sslSession) -> true);
+        // a forced reload bypasses the graceful degradation of load() and surfaces the failure
+        assertThrows(TechnicalException.class, () -> configuration.getIdentityProviderMetadataResolver().resolve(true));
+    }
+
+    @Test
+    public void shouldBeAbleToUseAnIdpMetadataResourceWithTheDefaultMetadataResolver() {
+        var configuration = new SAML2Configuration();
+        configuration.setKeystorePath("target/keystore.jks");
+        configuration.setKeystorePassword("pac4j");
+        configuration.setPrivateKeyPassword("pac4j");
+        configuration.getServiceProviderMetadata().setResource(new FileSystemResource("target/out.xml"));
+
+        configuration.getIdentityProviderMetadata().setResource(new ClassPathResource("idp-metadata.xml"));
+        configuration.init();
+
+        var idpMetadataResolver = configuration.getIdentityProviderMetadataResolver();
+        idpMetadataResolver.resolve();
+
+        var result = idpMetadataResolver.getMetadata();
+        assertNotNull(result);
+    }
+
+    @Test
+    public void verifyRequiredSettingsArePresent() {
+        var configurationWithoutKeystore = newValidConfiguration();
+        configurationWithoutKeystore.getKeystore().setResource(null);
+        var keystoreException = assertThrows(SAMLException.class, configurationWithoutKeystore::init);
+        assertEquals("SAML2Configuration is missing required settings: keystore resource/path.", keystoreException.getMessage());
+
+        var configurationWithoutKeystorePassword = newValidConfiguration();
+        configurationWithoutKeystorePassword.getKeystore().setKeystorePassword(null);
+        var keystorePasswordException = assertThrows(SAMLException.class, configurationWithoutKeystorePassword::init);
+        assertEquals("SAML2Configuration is missing required settings: keystore password.", keystorePasswordException.getMessage());
+
+        var configurationWithoutPrivateKeyPassword = newValidConfiguration();
+        configurationWithoutPrivateKeyPassword.getKeystore().setPrivateKeyPassword(null);
+        var privateKeyPasswordException = assertThrows(SAMLException.class, configurationWithoutPrivateKeyPassword::init);
+        assertEquals("SAML2Configuration is missing required settings: private key password.", privateKeyPasswordException.getMessage());
+
+        var configurationWithoutIdentityProviderMetadata = newValidConfiguration();
+        configurationWithoutIdentityProviderMetadata.getIdentityProviderMetadata().setResource(null);
+        var identityProviderMetadataException = assertThrows(SAMLException.class, configurationWithoutIdentityProviderMetadata::init);
+        assertEquals("SAML2Configuration is missing required settings: identity provider metadata resource/path.",
+            identityProviderMetadataException.getMessage());
+    }
+
+    private static SAML2Configuration newValidConfiguration() {
+        var configuration = new SAML2Configuration();
+        configuration.setKeystorePath("target/keystore.jks");
+        configuration.setKeystorePassword("pac4j");
+        configuration.setPrivateKeyPassword("pac4j");
+        configuration.getServiceProviderMetadata().setResource(new FileSystemResource("target/out.xml"));
+        configuration.getIdentityProviderMetadata().setResource(new ClassPathResource("idp-metadata.xml"));
+        return configuration;
+    }
+
+    @Test
+    public void verifyConstructorAppliesKeystoreDefaults() {
+        val keystore = new KeystoreProperties("target/keystore.jks");
+        val configuration = new SAML2Configuration(keystore, new ResourceProperties("https://idp.example.org/metadata"));
+        assertSame(keystore, configuration.getKeystore());
+        assertEquals("saml-signing-cert", keystore.getCertificatePrefix());
+        assertEquals(Period.ofYears(20), keystore.getCertificateExpirationPeriod());
+        assertInstanceOf(SAML2UrlResource.class, configuration.getIdentityProviderMetadata().getResource());
+    }
+
+    @Test
+    public void verifyConstructorKeepsKeystoreSettings() {
+        val keystore = new KeystoreProperties().setCertificatePrefix("my-cert").setCertificateExpirationPeriod(Period.ofYears(1));
+        new SAML2Configuration(keystore, new ResourceProperties("classpath:idp-metadata.xml"));
+        assertEquals("my-cert", keystore.getCertificatePrefix());
+        assertEquals(Period.ofYears(1), keystore.getCertificateExpirationPeriod());
+    }
+
+    @Test
+    @SuppressWarnings("deprecation")
+    public void verifyDeprecatedConstructor() {
+        val keystoreResource = new FileSystemResource("target/keystore.jks");
+        val idpMetadataResource = new ClassPathResource("idp-metadata.xml");
+        val configuration = new SAML2Configuration(keystoreResource, "alias", "PKCS12", "pac4j", "pac4j-pk", idpMetadataResource);
+        val keystore = configuration.getKeystore();
+        assertSame(keystoreResource, keystore.getResource());
+        assertEquals("alias", keystore.getKeyStoreAlias());
+        assertEquals("PKCS12", keystore.getKeyStoreType());
+        assertEquals("pac4j", keystore.getKeystorePassword());
+        assertEquals("pac4j-pk", keystore.getPrivateKeyPassword());
+        assertEquals("saml-signing-cert", keystore.getCertificatePrefix());
+        assertEquals(Period.ofYears(20), keystore.getCertificateExpirationPeriod());
+        assertSame(idpMetadataResource, configuration.getIdentityProviderMetadata().getResource());
+        assertEquals("pac4j-saml", configuration.getProviderName());
+    }
+
+    private static SSLContext disabledSslContext() throws Exception {
+        var trustAllCerts = new TrustManager[]{new X509TrustManager() {
+            @Override
+            public void checkClientTrusted(X509Certificate[] x509Certificates, String s) {
+            }
+
+            @Override
+            public void checkServerTrusted(X509Certificate[] x509Certificates, String s) {
+            }
+
+            @Override
+            public X509Certificate[] getAcceptedIssuers() {
+                return null;
+            }
+        }};
+
+        var sc = SSLContext.getInstance("SSL");
+        sc.init(null, trustAllCerts, new SecureRandom());
+        return sc;
+    }
+}

@@ -1,0 +1,532 @@
+//go:build !wasm
+
+package store
+
+import (
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/praetorian-inc/titus/pkg/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestSQLite_SchemaWithLocationColumns(t *testing.T) {
+	// Arrange
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "test.db")
+
+	store, err := NewSQLite(dbPath)
+	require.NoError(t, err)
+	defer func() { _ = store.Close() }()
+
+	blobID := types.ComputeBlobID([]byte("test content"))
+	err = store.AddBlob(blobID, 12)
+	require.NoError(t, err)
+
+	rule := &types.Rule{
+		ID:           "np.test.1",
+		Name:         "Test Rule",
+		Pattern:      "test",
+		StructuralID: "struct123",
+	}
+	err = store.AddRule(rule)
+	require.NoError(t, err)
+
+	// Create match with location data
+	match := &types.Match{
+		BlobID:       blobID,
+		StructuralID: "match123",
+		RuleID:       "np.test.1",
+		RuleName:     "Test Rule",
+		Location: types.Location{
+			Offset: types.OffsetSpan{Start: 10, End: 20},
+			Source: types.SourceSpan{
+				Start: types.SourcePoint{Line: 5, Column: 3},
+				End:   types.SourcePoint{Line: 7, Column: 15},
+			},
+		},
+		Snippet: types.Snippet{Matching: []byte("test match")},
+	}
+
+	// Act - Add match
+	err = store.AddMatch(match)
+	require.NoError(t, err)
+
+	// Retrieve match
+	matches, err := store.GetMatches(blobID)
+	require.NoError(t, err)
+	require.Len(t, matches, 1)
+
+	// Assert - Verify location data persisted correctly
+	retrieved := matches[0]
+	assert.Equal(t, int64(10), retrieved.Location.Offset.Start)
+	assert.Equal(t, int64(20), retrieved.Location.Offset.End)
+	assert.Equal(t, 5, retrieved.Location.Source.Start.Line)
+	assert.Equal(t, 3, retrieved.Location.Source.Start.Column)
+	assert.Equal(t, 7, retrieved.Location.Source.End.Line)
+	assert.Equal(t, 15, retrieved.Location.Source.End.Column)
+}
+
+func TestSQLite_GetAllMatchesWithLocation(t *testing.T) {
+	// Arrange
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "test.db")
+
+	store, err := NewSQLite(dbPath)
+	require.NoError(t, err)
+	defer func() { _ = store.Close() }()
+
+	blobID1 := types.ComputeBlobID([]byte("content1"))
+	blobID2 := types.ComputeBlobID([]byte("content2"))
+
+	err = store.AddBlob(blobID1, 8)
+	require.NoError(t, err)
+	err = store.AddBlob(blobID2, 8)
+	require.NoError(t, err)
+
+	rule := &types.Rule{
+		ID:           "np.test.1",
+		Name:         "Test Rule",
+		Pattern:      "test",
+		StructuralID: "struct123",
+	}
+	err = store.AddRule(rule)
+	require.NoError(t, err)
+
+	match1 := &types.Match{
+		BlobID:       blobID1,
+		StructuralID: "match1",
+		RuleID:       "np.test.1",
+		Location: types.Location{
+			Offset: types.OffsetSpan{Start: 0, End: 5},
+			Source: types.SourceSpan{
+				Start: types.SourcePoint{Line: 1, Column: 1},
+				End:   types.SourcePoint{Line: 1, Column: 6},
+			},
+		},
+	}
+
+	match2 := &types.Match{
+		BlobID:       blobID2,
+		StructuralID: "match2",
+		RuleID:       "np.test.1",
+		Location: types.Location{
+			Offset: types.OffsetSpan{Start: 10, End: 15},
+			Source: types.SourceSpan{
+				Start: types.SourcePoint{Line: 2, Column: 5},
+				End:   types.SourcePoint{Line: 3, Column: 1},
+			},
+		},
+	}
+
+	err = store.AddMatch(match1)
+	require.NoError(t, err)
+	err = store.AddMatch(match2)
+	require.NoError(t, err)
+
+	// Act
+	allMatches, err := store.GetAllMatches()
+
+	// Assert
+	require.NoError(t, err)
+	require.Len(t, allMatches, 2)
+
+	// Verify both matches have location data
+	for _, m := range allMatches {
+		assert.NotZero(t, m.Location.Source.Start.Line, "Start line should be populated")
+		assert.NotZero(t, m.Location.Source.Start.Column, "Start column should be populated")
+		assert.NotZero(t, m.Location.Source.End.Line, "End line should be populated")
+		assert.NotZero(t, m.Location.Source.End.Column, "End column should be populated")
+	}
+}
+
+func TestSQLite_GetMatchesRuleName(t *testing.T) {
+	// Arrange
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "test.db")
+
+	store, err := NewSQLite(dbPath)
+	require.NoError(t, err)
+	defer func() { _ = store.Close() }()
+
+	blobID := types.ComputeBlobID([]byte("test content"))
+	err = store.AddBlob(blobID, 12)
+	require.NoError(t, err)
+
+	rule := &types.Rule{
+		ID:           "np.test.1",
+		Name:         "Test Rule",
+		Pattern:      "test",
+		StructuralID: "struct123",
+	}
+	err = store.AddRule(rule)
+	require.NoError(t, err)
+
+	// Create match without RuleName — the store should populate it
+	match := &types.Match{
+		BlobID:       blobID,
+		StructuralID: "match123",
+		RuleID:       "np.test.1",
+		Location:     types.Location{Offset: types.OffsetSpan{Start: 0, End: 10}},
+		Snippet:      types.Snippet{Matching: []byte("test")},
+	}
+
+	err = store.AddMatch(match)
+	require.NoError(t, err)
+
+	// Act
+	matches, err := store.GetMatches(blobID)
+
+	// Assert
+	require.NoError(t, err)
+	require.Len(t, matches, 1)
+	assert.Equal(t, "Test Rule", matches[0].RuleName)
+}
+
+func TestSQLite_GetAllMatchesRuleName(t *testing.T) {
+	// Arrange
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "test.db")
+
+	store, err := NewSQLite(dbPath)
+	require.NoError(t, err)
+	defer func() { _ = store.Close() }()
+
+	blobID1 := types.ComputeBlobID([]byte("content1"))
+	blobID2 := types.ComputeBlobID([]byte("content2"))
+
+	err = store.AddBlob(blobID1, 8)
+	require.NoError(t, err)
+	err = store.AddBlob(blobID2, 8)
+	require.NoError(t, err)
+
+	rule1 := &types.Rule{
+		ID:           "np.test.1",
+		Name:         "Test Rule 1",
+		Pattern:      "test1",
+		StructuralID: "struct123",
+	}
+	rule2 := &types.Rule{
+		ID:           "np.test.2",
+		Name:         "Test Rule 2",
+		Pattern:      "test2",
+		StructuralID: "struct456",
+	}
+	err = store.AddRule(rule1)
+	require.NoError(t, err)
+	err = store.AddRule(rule2)
+	require.NoError(t, err)
+
+	// Create matches without RuleName — the store should populate it
+	match1 := &types.Match{
+		BlobID:       blobID1,
+		StructuralID: "match1",
+		RuleID:       "np.test.1",
+		Location:     types.Location{Offset: types.OffsetSpan{Start: 0, End: 5}},
+	}
+	match2 := &types.Match{
+		BlobID:       blobID2,
+		StructuralID: "match2",
+		RuleID:       "np.test.2",
+		Location:     types.Location{Offset: types.OffsetSpan{Start: 0, End: 5}},
+	}
+
+	err = store.AddMatch(match1)
+	require.NoError(t, err)
+	err = store.AddMatch(match2)
+	require.NoError(t, err)
+
+	// Act
+	allMatches, err := store.GetAllMatches()
+
+	// Assert
+	require.NoError(t, err)
+	require.Len(t, allMatches, 2)
+
+	ruleNames := make(map[string]string)
+	for _, m := range allMatches {
+		ruleNames[m.RuleID] = m.RuleName
+	}
+	assert.Equal(t, "Test Rule 1", ruleNames["np.test.1"])
+	assert.Equal(t, "Test Rule 2", ruleNames["np.test.2"])
+}
+
+func TestSQLite_NullLocationValues(t *testing.T) {
+	// Test that matches without location data (finding_id and line/column nulls) work correctly
+	// This ensures backward compatibility
+
+	// Arrange
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "test.db")
+
+	store, err := NewSQLite(dbPath)
+	require.NoError(t, err)
+	defer func() { _ = store.Close() }()
+
+	blobID := types.ComputeBlobID([]byte("test content"))
+	err = store.AddBlob(blobID, 12)
+	require.NoError(t, err)
+
+	rule := &types.Rule{
+		ID:           "np.test.1",
+		Name:         "Test Rule",
+		Pattern:      "test",
+		StructuralID: "struct123",
+	}
+	err = store.AddRule(rule)
+	require.NoError(t, err)
+
+	// Create match WITHOUT location source data (only offsets)
+	match := &types.Match{
+		BlobID:       blobID,
+		StructuralID: "match_no_location",
+		RuleID:       "np.test.1",
+		RuleName:     "Test Rule",
+		Location: types.Location{
+			Offset: types.OffsetSpan{Start: 0, End: 10},
+			Source: types.SourceSpan{}, // Zero values - no line/column data
+		},
+		Snippet: types.Snippet{Matching: []byte("test")},
+	}
+
+	// Act
+	err = store.AddMatch(match)
+	require.NoError(t, err)
+
+	// Retrieve
+	matches, err := store.GetMatches(blobID)
+	require.NoError(t, err)
+	require.Len(t, matches, 1)
+
+	// Assert - Zero values should be preserved
+	retrieved := matches[0]
+	assert.Equal(t, 0, retrieved.Location.Source.Start.Line)
+	assert.Equal(t, 0, retrieved.Location.Source.Start.Column)
+	assert.Equal(t, 0, retrieved.Location.Source.End.Line)
+	assert.Equal(t, 0, retrieved.Location.Source.End.Column)
+}
+
+func TestSQLite_ProvenanceWithCommitMetadata(t *testing.T) {
+	dir := t.TempDir()
+	store, err := New(Config{Path: filepath.Join(dir, "test.db")})
+	require.NoError(t, err)
+	defer func() { _ = store.Close() }()
+
+	blobID := types.ComputeBlobID([]byte("secret content"))
+	err = store.AddBlob(blobID, 14)
+	require.NoError(t, err)
+
+	authorTS := time.Date(2024, 3, 15, 10, 30, 0, 0, time.UTC)
+	committerTS := time.Date(2024, 3, 15, 11, 0, 0, 0, time.UTC)
+
+	prov := types.GitProvenance{
+		RepoPath: "/tmp/repo",
+		BlobPath: "config.yml",
+		Commit: &types.CommitMetadata{
+			CommitID:           "abc123def456",
+			AuthorName:         "John Doe",
+			AuthorEmail:        "john@example.com",
+			AuthorTimestamp:    authorTS,
+			CommitterName:      "Jane Smith",
+			CommitterEmail:     "jane@example.com",
+			CommitterTimestamp: committerTS,
+			Message:            "add config",
+		},
+	}
+
+	err = store.AddProvenance(blobID, prov)
+	require.NoError(t, err)
+
+	provs, err := store.GetAllProvenance(blobID)
+	require.NoError(t, err)
+	require.Len(t, provs, 1)
+
+	got, ok := provs[0].(types.GitProvenance)
+	require.True(t, ok)
+	assert.Equal(t, "/tmp/repo", got.RepoPath)
+	assert.Equal(t, "config.yml", got.BlobPath)
+	require.NotNil(t, got.Commit)
+	assert.Equal(t, "abc123def456", got.Commit.CommitID)
+	assert.Equal(t, "John Doe", got.Commit.AuthorName)
+	assert.Equal(t, "john@example.com", got.Commit.AuthorEmail)
+	assert.Equal(t, authorTS, got.Commit.AuthorTimestamp)
+	assert.Equal(t, "Jane Smith", got.Commit.CommitterName)
+	assert.Equal(t, "jane@example.com", got.Commit.CommitterEmail)
+	assert.Equal(t, committerTS, got.Commit.CommitterTimestamp)
+	assert.Equal(t, "add config", got.Commit.Message)
+}
+
+func TestSQLite_ArchiveProvenance(t *testing.T) {
+	dir := t.TempDir()
+	store, err := New(Config{Path: filepath.Join(dir, "test.db")})
+	require.NoError(t, err)
+	defer func() { _ = store.Close() }()
+
+	blobID := types.ComputeBlobID([]byte("extracted secret content"))
+	err = store.AddBlob(blobID, 24)
+	require.NoError(t, err)
+
+	prov := types.ArchiveProvenance{
+		ArchivePath: "docker://example/app:latest/layer.tar:config.zip",
+		MemberPath:  "config/secrets.yml",
+	}
+	err = store.AddProvenance(blobID, prov)
+	require.NoError(t, err)
+
+	provs, err := store.GetAllProvenance(blobID)
+	require.NoError(t, err)
+	require.Len(t, provs, 1)
+
+	got, ok := provs[0].(types.ArchiveProvenance)
+	require.True(t, ok)
+	assert.Equal(t, prov.ArchivePath, got.ArchivePath)
+	assert.Equal(t, prov.MemberPath, got.MemberPath)
+	assert.Equal(t, "docker://example/app:latest/layer.tar:config.zip:config/secrets.yml", got.Path())
+}
+
+func TestSQLiteStore_AddFinding_PersistsScore(t *testing.T) {
+	tmpDir := t.TempDir()
+	s, err := NewSQLite(filepath.Join(tmpDir, "test.db"))
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	finding := &types.Finding{
+		ID:     "abc",
+		RuleID: "np.aws.1",
+		Groups: [][]byte{[]byte("AKIAIOSFODNN7EXAMPLE")},
+		Score: &types.Score{
+			Final:             85,
+			Base:              60,
+			SuggestedSeverity: "critical",
+			Applied:           []types.ScoreModifier{},
+		},
+	}
+	require.NoError(t, s.AddFinding(finding))
+
+	findings, err := s.GetFindings()
+	require.NoError(t, err)
+	require.Len(t, findings, 1)
+
+	got := findings[0]
+	require.NotNil(t, got.Score, "expected Score to be non-nil after round-trip")
+	assert.Equal(t, 85, got.Score.Final)
+	assert.Equal(t, 60, got.Score.Base)
+	assert.Equal(t, "critical", got.Score.SuggestedSeverity)
+	assert.NotNil(t, got.Score.Applied, "Score.Applied must be non-nil (empty slice)")
+}
+
+func TestSQLiteStore_AddFinding_NilScoreAllowed(t *testing.T) {
+	tmpDir := t.TempDir()
+	s, err := NewSQLite(filepath.Join(tmpDir, "test.db"))
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	finding := &types.Finding{
+		ID:     "xyz",
+		RuleID: "np.test.1",
+		Groups: [][]byte{[]byte("x")},
+		// Score is nil
+	}
+	require.NoError(t, s.AddFinding(finding), "AddFinding with nil Score should not error")
+
+	findings, err := s.GetFindings()
+	require.NoError(t, err)
+	require.Len(t, findings, 1)
+	assert.Nil(t, findings[0].Score, "expected Score to stay nil after round-trip")
+}
+
+func TestSQLiteStore_AddFinding_PersistsOwner(t *testing.T) {
+	tmpDir := t.TempDir()
+	s, err := NewSQLite(filepath.Join(tmpDir, "test.db"))
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	finding := &types.Finding{
+		ID:     "owner-test",
+		RuleID: "np.aws.6",
+		Groups: [][]byte{[]byte("AKIAIOSFODNN7EXAMPLE")},
+		Owner: &types.OwnerInfo{
+			Service:   "aws",
+			User:      "alice",
+			AccountID: "123456789012",
+			ARN:       "arn:aws:iam::123456789012:user/alice",
+		},
+	}
+	require.NoError(t, s.AddFinding(finding))
+
+	findings, err := s.GetFindings()
+	require.NoError(t, err)
+	require.Len(t, findings, 1)
+	require.NotNil(t, findings[0].Owner)
+	assert.Equal(t, "aws", findings[0].Owner.Service)
+	assert.Equal(t, "alice", findings[0].Owner.User)
+	assert.Equal(t, "123456789012", findings[0].Owner.AccountID)
+	assert.Equal(t, "arn:aws:iam::123456789012:user/alice", findings[0].Owner.ARN)
+}
+
+func TestSQLiteStore_AddFinding_NilOwnerAllowed(t *testing.T) {
+	tmpDir := t.TempDir()
+	s, err := NewSQLite(filepath.Join(tmpDir, "test.db"))
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	finding := &types.Finding{
+		ID:     "no-owner",
+		RuleID: "np.test.1",
+		Groups: [][]byte{[]byte("x")},
+	}
+	require.NoError(t, s.AddFinding(finding))
+
+	findings, err := s.GetFindings()
+	require.NoError(t, err)
+	require.Len(t, findings, 1)
+	assert.Nil(t, findings[0].Owner)
+}
+
+func TestSQLiteStore_AddFinding_PersistsResources(t *testing.T) {
+	tmpDir := t.TempDir()
+	s, err := NewSQLite(filepath.Join(tmpDir, "test.db"))
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	finding := &types.Finding{
+		ID:     "resources-test",
+		RuleID: "np.aws.6",
+		Groups: [][]byte{[]byte("AKIAIOSFODNN7EXAMPLE")},
+		Resources: []types.ResourceInfo{
+			{Service: "aws", Type: "s3_bucket", Name: "prod-data"},
+			{Service: "aws", Type: "secret", Name: "db-password"},
+		},
+	}
+	require.NoError(t, s.AddFinding(finding))
+
+	findings, err := s.GetFindings()
+	require.NoError(t, err)
+	require.Len(t, findings, 1)
+	require.Len(t, findings[0].Resources, 2)
+	assert.Equal(t, "s3_bucket", findings[0].Resources[0].Type)
+	assert.Equal(t, "prod-data", findings[0].Resources[0].Name)
+	assert.Equal(t, "secret", findings[0].Resources[1].Type)
+	assert.Equal(t, "db-password", findings[0].Resources[1].Name)
+}
+
+func TestSQLiteStore_AddFinding_NilResourcesAllowed(t *testing.T) {
+	tmpDir := t.TempDir()
+	s, err := NewSQLite(filepath.Join(tmpDir, "test.db"))
+	require.NoError(t, err)
+	defer func() { _ = s.Close() }()
+
+	finding := &types.Finding{
+		ID:     "no-resources",
+		RuleID: "np.test.1",
+		Groups: [][]byte{[]byte("x")},
+	}
+	require.NoError(t, s.AddFinding(finding))
+
+	findings, err := s.GetFindings()
+	require.NoError(t, err)
+	require.Len(t, findings, 1)
+	assert.Nil(t, findings[0].Resources)
+}

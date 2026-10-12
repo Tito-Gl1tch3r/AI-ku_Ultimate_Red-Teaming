@@ -1,0 +1,133 @@
+import {
+  authMethodFromProperties,
+  hasConfirmedAnonymousAccess,
+} from "@entities/node";
+
+function authChip(properties: Record<string, unknown>): string {
+  if (hasConfirmedAnonymousAccess(properties)) return "no-auth";
+  const method = authMethodFromProperties(properties);
+  if (method === "localProcess") return "local-process";
+  return method === "unknown" ? "auth-unknown" : method;
+}
+
+export function getPropertyChips(kind: string, properties: Record<string, unknown>): string[] {
+  const chips: string[] = [];
+
+  switch (kind) {
+    case "AgentInstance": {
+      const fw = properties.framework;
+      if (typeof fw === "string") chips.push(fw);
+      break;
+    }
+    case "MCPServer": {
+      const transport = properties.transport;
+      if (typeof transport === "string") chips.push(transport);
+      chips.push(authChip(properties));
+      const pinning = properties.pinning_status;
+      if (typeof pinning === "string") chips.push(`pinning:${pinning}`);
+      break;
+    }
+    case "MCPTool": {
+      const caps = properties.capability_surface;
+      if (Array.isArray(caps)) {
+        for (const c of caps.slice(0, 2)) {
+          if (typeof c === "string") chips.push(c);
+        }
+      }
+      break;
+    }
+    case "MCPResource":
+    case "VectorPoint": {
+      const scheme = properties.uri_scheme;
+      if (typeof scheme === "string") chips.push(scheme + "://");
+      const sensitivity = properties.sensitivity;
+      chips.push(typeof sensitivity === "string" ? sensitivity : "unknown");
+      break;
+    }
+    case "VectorCollection": {
+      const pointCount = properties.point_count;
+      if (typeof pointCount === "number") chips.push(`${pointCount} points`);
+      const sensitivity = properties.sensitivity;
+      if (typeof sensitivity === "string") chips.push(sensitivity);
+      break;
+    }
+    case "WorkspaceFile": {
+      const entryType = properties.entry_type;
+      if (typeof entryType === "string") chips.push(entryType);
+      const mimeType = properties.mime_type;
+      if (typeof mimeType === "string" && mimeType !== "") chips.push(mimeType);
+      break;
+    }
+    case "ModelArtifact": {
+      const version = properties.version;
+      if (typeof version === "string") chips.push(`v${version}`);
+      const scheme = properties.storage_scheme;
+      if (typeof scheme === "string" && scheme !== "") chips.push(`${scheme}://`);
+      break;
+    }
+    case "ArtifactStore": {
+      const provider = properties.provider;
+      if (typeof provider === "string") chips.push(provider);
+      const scope = properties.scope;
+      if (typeof scope === "string") chips.push(scope);
+      break;
+    }
+    case "Host": {
+      const hostname = properties.hostname;
+      if (typeof hostname === "string") chips.push(hostname);
+      else {
+        const ip = properties.ip;
+        if (typeof ip === "string") chips.push(ip);
+      }
+      const scope = properties.scope;
+      if (typeof scope === "string") chips.push(scope);
+      break;
+    }
+    case "Credential": {
+      const type = properties.type;
+      if (typeof type === "string") chips.push(type);
+      if (
+        properties.exposure_status === "exposed" &&
+        properties.material_status === "observed"
+      ) {
+        chips.push("exposed");
+      } else if (typeof properties.material_status === "string") {
+        chips.push(`material:${properties.material_status}`);
+      }
+      break;
+    }
+    case "A2AAgent": {
+      chips.push(authChip(properties));
+      const signature = properties.signature_verification_status;
+      if (typeof signature === "string") chips.push(`signature:${signature}`);
+      else chips.push("signature:unknown");
+      break;
+    }
+    case "Identity": {
+      const type = properties.type;
+      if (typeof type === "string") chips.push(type);
+      break;
+    }
+    case "InstructionFile": {
+      const type = properties.type;
+      if (typeof type === "string") chips.push(type);
+      const verdict = properties.instruction_verdict;
+      if (verdict === "signal") chips.push("instruction signal");
+      if (verdict === "poisoning") chips.push("instruction poisoning");
+      break;
+    }
+    case "ConfigFile": {
+      const client = properties.client;
+      if (typeof client === "string") chips.push(client);
+      else if (Array.isArray(properties.clients)) {
+        const clients = properties.clients.filter(
+          (value): value is string => typeof value === "string",
+        );
+        if (clients.length > 0) chips.push(clients.join(", "));
+      }
+      break;
+    }
+  }
+
+  return chips;
+}

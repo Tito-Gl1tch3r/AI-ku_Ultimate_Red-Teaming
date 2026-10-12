@@ -1,0 +1,489 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/gorilla/mux"
+	"github.com/recon-platform/internal/auth"
+	"github.com/recon-platform/internal/bounty"
+	"github.com/recon-platform/internal/config"
+	"github.com/recon-platform/internal/database"
+	"github.com/recon-platform/internal/scheduler"
+	"github.com/recon-platform/internal/websocket"
+	"github.com/recon-platform/pkg/logger"
+)
+
+type Handler struct {
+	db       *database.DB
+	hub      *websocket.Hub
+	sched    *scheduler.Scheduler
+	cfg      *config.Config
+	logger   *logger.Logger
+	auth     *auth.Auth
+	updates  *releaseChecker
+	bounty   *bounty.Service
+	telegram *TelegramBot
+}
+
+// SetTelegramBot attaches the runtime after the handler exists. The bot needs
+// the handler's target-management primitives, while the router needs the bot's
+// settings API, so construction is deliberately two-phase to avoid duplicate
+// controller implementations.
+func (h *Handler) SetTelegramBot(bot *TelegramBot) { h.telegram = bot }
+
+// NewHandler builds the single API runtime used by both the HTTP router and the
+// raw OOB listener. Keeping one handler instance ensures every inbound callback
+// uses the same database, scheduler, authentication service, and catalog as the
+// web application.
+func NewHandler(db *database.DB, hub *websocket.Hub, sched *scheduler.Scheduler, cfg *config.Config, log *logger.Logger) *Handler {
+	authService := auth.New(db, cfg)
+	if err := authService.EnsureAdminUser(); err != nil {
+		log.Error("Failed to ensure admin user", "error", err)
+	}
+
+	catalog := bounty.NewService(db, log)
+	if sched != nil {
+		catalog = sched.BountyCatalog()
+	}
+	if hub != nil {
+		hub.SetOwnerLookup(func(targetID string) (int64, bool) {
+			var owner int64
+			if err := db.QueryRow("SELECT owner_id FROM targets WHERE id = ?", targetID).Scan(&owner); err != nil {
+				return 0, false
+			}
+			return owner, true
+		})
+	}
+	return &Handler{
+		db:      db,
+		hub:     hub,
+		sched:   sched,
+		cfg:     cfg,
+		logger:  log,
+		auth:    authService,
+		updates: newReleaseChecker(),
+		bounty:  catalog,
+	}
+}
+
+func NewRouter(db *database.DB, hub *websocket.Hub, sched *scheduler.Scheduler, cfg *config.Config, log *logger.Logger) http.Handler {
+	return NewHandler(db, hub, sched, cfg, log).Router()
+}
+
+// Router wires the web dashboard, authenticated API, reports, WebSocket stream,
+// and public callback endpoints around this handler.
+func (h *Handler) Router() http.Handler {
+
+	r := mux.NewRouter()
+
+	// Static files
+	frontendDir := filepath.Join(".", "frontend", "dist")
+	r.HandleFunc("/ws", h.requireAuth(h.serveWS))
+	r.PathPrefix("/assets/").Handler(http.StripPrefix("/assets/", http.FileServer(http.Dir(filepath.Join(frontendDir, "assets")))))
+	r.HandleFunc("/screenshots/{id}", h.requireAuth(h.serveScreenshot))
+
+	// Blind-XSS out-of-band callback (PUBLIC, no auth — victim browsers must
+	// reach it). {token}.js serves the collector; {token} records the beacon.
+	r.HandleFunc("/bx/{token}.js", h.handleBlindXSSJS).Methods("GET")
+	r.HandleFunc("/bx/{token}", h.handleBlindXSSCallback).Methods("GET")
+
+	// Out-of-band SSRF/RCE callback (PUBLIC, no auth, ANY method — the target
+	// server calls back here when our injected payload fires).
+	r.HandleFunc("/oob/{token}", h.handleOOBCallback)
+
+	// API routes
+	api := r.PathPrefix("/api").Subrouter()
+	api.Use(h.jsonMiddleware)
+	api.Use(h.corsMiddleware)
+	api.Use(h.targetScopeMiddleware) // per-user isolation on every /targets/{id} route
+
+	// Public, dependency-free liveness probe used by Docker/Compose. Keep this
+	// deliberately cheap: a busy SQLite writer or a long-running scan must not
+	// make an otherwise responsive process look dead to the orchestrator.
+	api.HandleFunc("/health", h.handleHealth).Methods("GET")
+
+	// Auth endpoints
+	api.HandleFunc("/auth/login", h.handleLogin).Methods("POST")
+	api.HandleFunc("/auth/logout", h.handleLogout).Methods("POST")
+	api.HandleFunc("/auth/me", h.requireAuth(h.handleMe)).Methods("GET")
+	api.HandleFunc("/auth/change-password", h.requireAuth(h.handleChangePassword)).Methods("POST")
+
+	// User administration (admin-only): add / edit role / enable-disable / reset
+	// password / delete. Guarded so the last active administrator can't be removed.
+	api.HandleFunc("/users", h.requireAdmin(h.handleListUsers)).Methods("GET")
+	api.HandleFunc("/users", h.requireAdmin(h.handleCreateUser)).Methods("POST")
+	api.HandleFunc("/users/{uid}", h.requireAdmin(h.handleUpdateUser)).Methods("PATCH")
+	api.HandleFunc("/users/{uid}", h.requireAdmin(h.handleDeleteUser)).Methods("DELETE")
+
+	// Dashboard
+	api.HandleFunc("/dashboard/stats", h.requireAuth(h.handleDashboardStats)).Methods("GET")
+	api.HandleFunc("/dashboard/charts", h.requireAuth(h.handleDashboardCharts)).Methods("GET")
+
+	// Targets
+	api.HandleFunc("/targets", h.requireAuth(h.handleListTargets)).Methods("GET")
+	api.HandleFunc("/targets", h.requireAuth(h.handleCreateTarget)).Methods("POST")
+	api.HandleFunc("/targets/quick-scan", h.requireAuth(h.handleQuickScan)).Methods("POST")
+	api.HandleFunc("/targets/{id}", h.requireAuth(h.handleGetTarget)).Methods("GET")
+	api.HandleFunc("/targets/{id}", h.requireAuth(h.handleUpdateTarget)).Methods("PUT")
+	api.HandleFunc("/targets/{id}", h.requireAuth(h.handleDeleteTarget)).Methods("DELETE")
+	api.HandleFunc("/targets/bulk-delete", h.requireAuth(h.handleBulkDeleteTarget)).Methods("POST")
+	api.HandleFunc("/targets/import", h.requireAuth(h.handleImportTargets)).Methods("POST")
+	api.HandleFunc("/targets/{id}/export", h.requireAuth(h.handleExportTarget)).Methods("GET")
+	api.HandleFunc("/targets/{id}/artifacts.zip", h.requireAuth(h.handleTargetArtifacts)).Methods("GET")
+	api.HandleFunc("/targets/{id}/scan", h.requireAuth(h.handleStartScan)).Methods("POST")
+	api.HandleFunc("/targets/{id}/assets", h.requireAuth(h.handleListAssets)).Methods("GET")
+	api.HandleFunc("/targets/{id}/assets", h.requireAuth(h.handleAddAsset)).Methods("POST")
+	api.HandleFunc("/targets/{id}/assets/{aid}", h.requireAuth(h.handleUpdateAsset)).Methods("PATCH")
+	api.HandleFunc("/targets/{id}/assets/{aid}", h.requireAuth(h.handleDeleteAsset)).Methods("DELETE")
+	api.HandleFunc("/targets/{id}/assets/{aid}/scan", h.requireAuth(h.handleScanAsset)).Methods("POST")
+	api.HandleFunc("/targets/{id}/pause", h.requireAuth(h.handlePauseScan)).Methods("POST")
+	api.HandleFunc("/targets/{id}/resume", h.requireAuth(h.handleResumeScan)).Methods("POST")
+	api.HandleFunc("/targets/{id}/skip-phase", h.requireAuth(h.handleSkipPhase)).Methods("POST")
+	api.HandleFunc("/targets/{id}/cancel", h.requireAuth(h.handleCancelScan)).Methods("POST")
+	api.HandleFunc("/targets/{id}/stats", h.requireAuth(h.handleTargetStats)).Methods("GET")
+	api.HandleFunc("/targets/{id}/network-services", h.requireAuth(h.handleNetworkServices)).Methods("GET")
+	api.HandleFunc("/targets/{id}/monitor", h.requireAuth(h.handleUpdateMonitor)).Methods("PATCH")
+	api.HandleFunc("/targets/{id}/auth", h.requireAuth(h.handleSetAuth)).Methods("PATCH")
+	api.HandleFunc("/targets/{id}/identities", h.requireAuth(h.handleListIdentities)).Methods("GET")
+	api.HandleFunc("/targets/{id}/identities", h.requireAuth(h.handleCreateIdentity)).Methods("POST")
+	api.HandleFunc("/targets/{id}/identities/{iid}", h.requireAuth(h.handleDeleteIdentity)).Methods("DELETE")
+	api.HandleFunc("/targets/{id}/identities/{iid}/validate", h.requireAuth(h.handleValidateIdentity)).Methods("POST")
+	api.HandleFunc("/targets/{id}/identities/{iid}/refresh", h.requireAuth(h.handleRefreshIdentity)).Methods("POST")
+	api.HandleFunc("/targets/{id}/identities/{iid}/revoke", h.requireAuth(h.handleRevokeIdentity)).Methods("POST")
+	api.HandleFunc("/targets/{id}/identities/import", h.requireAuth(h.handleImportSession)).Methods("POST")
+	api.HandleFunc("/targets/{id}/auth-events", h.requireAuth(h.handleListAuthEvents)).Methods("GET")
+	api.HandleFunc("/targets/{id}/wp-sites", h.requireAuth(h.handleListWPSites)).Methods("GET")
+	api.HandleFunc("/targets/{id}/findings/{fid}/evidence", h.requireAuth(h.handleListEvidence)).Methods("GET")
+	api.HandleFunc("/targets/{id}/findings/{fid}/triage", h.requireAuth(h.handleSetFindingTriage)).Methods("POST", "PATCH")
+	api.HandleFunc("/targets/{id}/replay", h.requireAuth(h.handleReplay)).Methods("POST")
+	api.HandleFunc("/targets/{id}/objects", h.requireAuth(h.handleListObjects)).Methods("GET")
+	api.HandleFunc("/targets/{id}/capture/traffic", h.requireAuth(h.handleIngestTraffic)).Methods("POST")
+	api.HandleFunc("/targets/{id}/captures/preview", h.requireAuth(h.handlePreviewCapture)).Methods("POST")
+	api.HandleFunc("/targets/{id}/captures", h.requireAuth(h.handleImportCapture)).Methods("POST")
+	api.HandleFunc("/targets/{id}/captures", h.requireAuth(h.handleListCaptures)).Methods("GET")
+	api.HandleFunc("/targets/{id}/captures/{cid}/preflight", h.requireAuth(h.handlePreflightCapture)).Methods("POST")
+	api.HandleFunc("/targets/{id}/captures/{cid}", h.requireAuth(h.handleDeleteCapture)).Methods("DELETE")
+	api.HandleFunc("/targets/{id}/captures/{cid}/templates", h.requireAuth(h.handleCaptureTemplates)).Methods("GET")
+	api.HandleFunc("/targets/{id}/captures/{cid}/templates/{tid}/reveal", h.requireAuth(h.handleRevealCaptureTemplate)).Methods("POST")
+	api.HandleFunc("/targets/{id}/captures/{cid}/templates/{tid}", h.requireAuth(h.handleEditCaptureTemplate)).Methods("PUT")
+	api.HandleFunc("/targets/{id}/captures/{cid}/analyze", h.requireAuth(h.handleAnalyzeCapture)).Methods("POST")
+	api.HandleFunc("/targets/{id}/captures/{cid}/runs", h.requireAuth(h.handleCaptureRuns)).Methods("GET")
+	api.HandleFunc("/targets/{id}/captures/{cid}/runs/{rid}/reveal", h.requireAuth(h.handleRevealGuidedReport)).Methods("POST")
+	api.HandleFunc("/targets/{id}/relationships", h.requireAuth(h.handleListRelationships)).Methods("GET")
+	api.HandleFunc("/targets/{id}/actions", h.requireAuth(h.handleListActions)).Methods("GET")
+	api.HandleFunc("/targets/{id}/hypotheses", h.requireAuth(h.handleListHypotheses)).Methods("GET")
+	api.HandleFunc("/targets/{id}/observations", h.requireAuth(h.handleListObservations)).Methods("GET")
+	api.HandleFunc("/targets/{id}/verify-write", h.requireAuth(h.handleVerifyWrite)).Methods("POST")
+	api.HandleFunc("/targets/{id}/finding-groups", h.requireAuth(h.handleListFindingGroups)).Methods("GET")
+	api.HandleFunc("/targets/{id}/workflow-graph", h.requireAuth(h.handleWorkflowGraph)).Methods("GET")
+	api.HandleFunc("/targets/{id}/workflow/run", h.requireAuth(h.handleRunWorkflow)).Methods("POST")
+	api.HandleFunc("/targets/{id}/report", h.requireAuth(h.handleGenerateReport)).Methods("GET")
+	api.HandleFunc("/targets/{id}/report.pdf", h.requireAuth(h.handleGenerateReportPDF)).Methods("GET")
+	api.HandleFunc("/targets/{id}/report.html", h.requireAuth(h.handleGenerateReportHTML)).Methods("GET")
+	api.HandleFunc("/targets/{id}/graph", h.requireAuth(h.handleAssetGraph)).Methods("GET")
+
+	// Findings
+	api.HandleFunc("/targets/{id}/subdomains", h.requireAuth(h.handleListSubdomains)).Methods("GET")
+	api.HandleFunc("/targets/{id}/http-services", h.requireAuth(h.handleListHTTPServices)).Methods("GET")
+	api.HandleFunc("/targets/{id}/js-files", h.requireAuth(h.handleListJSFiles)).Methods("GET")
+	api.HandleFunc("/targets/{id}/js-findings", h.requireAuth(h.handleListJSFindings)).Methods("GET")
+	api.HandleFunc("/targets/{id}/parameters", h.requireAuth(h.handleListParameters)).Methods("GET")
+	api.HandleFunc("/targets/{id}/directory-findings", h.requireAuth(h.handleListDirectoryFindings)).Methods("GET")
+	api.HandleFunc("/targets/{id}/admin-panels", h.requireAuth(h.handleListAdminPanels)).Methods("GET")
+	api.HandleFunc("/targets/{id}/backup-findings", h.requireAuth(h.handleListBackupFindings)).Methods("GET")
+	api.HandleFunc("/targets/{id}/open-redirects", h.requireAuth(h.handleListOpenRedirects)).Methods("GET")
+	api.HandleFunc("/targets/{id}/nuclei-findings", h.requireAuth(h.handleListNucleiFindings)).Methods("GET")
+	api.HandleFunc("/targets/{id}/nuclei-findings/affected", h.requireAuth(h.handleNucleiAffected)).Methods("GET")
+	api.HandleFunc("/targets/{id}/vuln-findings", h.requireAuth(h.handleListVulnFindings)).Methods("GET")
+	// Global findings aggregation (top-level Findings page) across all the caller's targets.
+	api.HandleFunc("/findings", h.requireAuth(h.handleListAllFindings)).Methods("GET")
+	api.HandleFunc("/targets/{id}/monitoring-changes", h.requireAuth(h.handleListMonitoringChanges)).Methods("GET")
+
+	// Tasks
+	api.HandleFunc("/tasks", h.requireAuth(h.handleListTasks)).Methods("GET")
+	api.HandleFunc("/tasks/{id}", h.requireAuth(h.handleGetTask)).Methods("GET")
+	api.HandleFunc("/tasks/{id}/cancel", h.requireAuth(h.handleCancelTask)).Methods("POST")
+	api.HandleFunc("/tasks/{id}/resume", h.requireAuth(h.handleResumeTask)).Methods("POST")
+	api.HandleFunc("/tasks/{id}/logs", h.requireAuth(h.handleGetTaskLogs)).Methods("GET")
+	api.HandleFunc("/tasks/{id}/phases", h.requireAuth(h.handleGetTaskPhases)).Methods("GET")
+
+	// Global search
+	api.HandleFunc("/search", h.requireAuth(h.handleSearch)).Methods("GET")
+
+	// Tool management
+	api.HandleFunc("/tools/status", h.requireAuth(h.handleToolStatus)).Methods("GET")
+	api.HandleFunc("/tools/catalog", h.requireAuth(h.handleToolCatalog)).Methods("GET")
+	api.HandleFunc("/tools/install", h.requireAuth(h.handleToolInstall)).Methods("POST")
+
+	// System
+	api.HandleFunc("/system/settings", h.requireAuth(h.handleGetSettings)).Methods("GET")
+	api.HandleFunc("/system/settings", h.requireAuth(h.handleUpdateSettings)).Methods("PATCH")
+	api.HandleFunc("/system/corpora", h.requireAdmin(h.handleListCorpora)).Methods("GET")
+	api.HandleFunc("/system/corpora/{category}", h.requireAdmin(h.handleMergeCorpus)).Methods("POST")
+	api.HandleFunc("/system/corpora/{category}/custom", h.requireAdmin(h.handleRestoreCorpus)).Methods("DELETE")
+	api.HandleFunc("/system/stats", h.requireAuth(h.handleSystemStats)).Methods("GET")
+	api.HandleFunc("/system/update-templates", h.requireAuth(h.handleUpdateNucleiTemplates)).Methods("POST")
+	api.HandleFunc("/system/update-check", h.requireAuth(h.handleUpdateCheck)).Methods("GET")
+	api.HandleFunc("/system/telegram", h.requireAdmin(h.handleGetTelegram)).Methods("GET")
+	api.HandleFunc("/system/telegram", h.requireAdmin(h.handleUpdateTelegram)).Methods("PATCH")
+	api.HandleFunc("/system/telegram/chats", h.requireAdmin(h.handleAddTelegramChat)).Methods("POST")
+	api.HandleFunc("/system/telegram/chats/{chat}", h.requireAdmin(h.handleUpdateTelegramChat)).Methods("PATCH")
+	api.HandleFunc("/system/telegram/chats/{chat}", h.requireAdmin(h.handleDeleteTelegramChat)).Methods("DELETE")
+	api.HandleFunc("/system/telegram/chats/{chat}/test", h.requireAdmin(h.handleTestTelegramChat)).Methods("POST")
+	api.HandleFunc("/system/telegram/retry", h.requireAdmin(h.handleRetryTelegram)).Methods("POST")
+	api.HandleFunc("/notifications", h.requireAuth(h.handleListNotifications)).Methods("GET")
+	api.HandleFunc("/notifications/read", h.requireAuth(h.handleMarkNotificationsRead)).Methods("POST")
+
+	// Public bug-bounty program catalog and Project import workflow. Provider
+	// sync uses only the public resources behind the official HackerOne,
+	// Bugcrowd, Intigriti and YesWeHack directories; an admin controls forced
+	// refreshes.
+	api.HandleFunc("/bounty/programs", h.requireAuth(h.handleListBountyPrograms)).Methods("GET")
+	api.HandleFunc("/bounty/programs/{programID}", h.requireAuth(h.handleGetBountyProgram)).Methods("GET")
+	api.HandleFunc("/bounty/programs/{programID}/projects", h.requireAuth(h.handleCreateProjectFromProgram)).Methods("POST")
+	api.HandleFunc("/bounty/status", h.requireAuth(h.handleBountySyncStatus)).Methods("GET")
+	api.HandleFunc("/bounty/sync", h.requireAdmin(h.handleSyncBountyCatalog)).Methods("POST")
+	api.HandleFunc("/bounty/favorites", h.requireAuth(h.handleListBountyFavorites)).Methods("GET")
+	api.HandleFunc("/bounty/programs/{programID}/favorite", h.requireAuth(h.handleSetBountyFavorite)).Methods("POST")
+	api.HandleFunc("/bounty/programs/{programID}/favorite", h.requireAuth(h.handleRemoveBountyFavorite)).Methods("DELETE")
+	api.HandleFunc("/targets/{id}/bounty-events", h.requireAuth(h.handleListBountyEvents)).Methods("GET")
+	api.HandleFunc("/targets/{id}/bounty-events/{eventID}", h.requireAuth(h.handleResolveBountyEvent)).Methods("POST")
+
+	// SPA fallback
+	r.PathPrefix("/").HandlerFunc(h.serveSPA(frontendDir))
+
+	return r
+}
+
+func (h *Handler) jsonMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (h *Handler) corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			// The dashboard and API are served from one origin. Reflecting an
+			// arbitrary Origin together with credentials would let an attacker
+			// origin read authenticated API responses. Accept an explicit Origin
+			// only when its authority is the request Host; non-browser clients that
+			// omit Origin continue to work normally.
+			u, err := url.Parse(origin)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || !strings.EqualFold(u.Host, r.Host) {
+				h.writeError(w, http.StatusForbidden, "cross-origin request denied")
+				return
+			}
+			w.Header().Add("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization,X-CSRF-Token")
+		}
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ctxUserIDKey carries the authenticated user's id through the request context so
+// handlers (handleMe, user administration, per-user actions) know who is calling.
+type ctxKey string
+
+const ctxUserIDKey ctxKey = "recon_user_id"
+
+func (h *Handler) currentUserID(r *http.Request) int64 {
+	if v, ok := r.Context().Value(ctxUserIDKey).(int64); ok {
+		return v
+	}
+	return 0
+}
+
+func (h *Handler) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sessionID, err := h.auth.GetSessionFromRequest(r)
+		if err != nil {
+			h.writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+
+		userID, err := h.auth.ValidateSession(sessionID)
+		if err != nil {
+			h.writeError(w, http.StatusUnauthorized, "session expired")
+			return
+		}
+
+		r = r.WithContext(context.WithValue(r.Context(), ctxUserIDKey, userID))
+		next(w, r)
+	}
+}
+
+// userFromSession resolves the caller's account straight from the session cookie
+// (used by middleware that runs BEFORE the per-handler requireAuth closure). ok is
+// false when there is no valid session.
+func (h *Handler) userFromSession(r *http.Request) (*auth.User, bool) {
+	sid, err := h.auth.GetSessionFromRequest(r)
+	if err != nil {
+		return nil, false
+	}
+	uid, err := h.auth.ValidateSession(sid)
+	if err != nil {
+		return nil, false
+	}
+	u, err := h.auth.GetUser(uid)
+	if err != nil {
+		return nil, false
+	}
+	return u, true
+}
+
+// callerScope returns the authenticated caller's user id and whether they are an
+// admin — for scoping list/dashboard queries. Assumes requireAuth already ran
+// (it sets the user id in context). A resolution failure is treated as a
+// non-admin with id 0, which matches no owned rows (fail-closed).
+func (h *Handler) callerScope(r *http.Request) (userID int64, isAdmin bool) {
+	uid := h.currentUserID(r)
+	u, err := h.auth.GetUser(uid)
+	if err != nil {
+		return uid, false
+	}
+	return uid, u.Role == auth.RoleAdmin
+}
+
+// serveWS upgrades the websocket connection scoped to the caller's own
+// identity, so the hub can restrict live event delivery (findings, task/scan
+// activity) to targets the caller actually owns — an admin still sees
+// everything. requireAuth already ran, so a valid session is guaranteed here.
+func (h *Handler) serveWS(w http.ResponseWriter, r *http.Request) {
+	uid, isAdmin := h.callerScope(r)
+	h.hub.ServeWS(w, r, uid, isAdmin)
+}
+
+// targetOwnerID returns the owner user id of a target (0 for legacy/unknown).
+func (h *Handler) targetOwnerID(targetID string) (int64, bool) {
+	var owner int64
+	err := h.db.QueryRow("SELECT owner_id FROM targets WHERE id = ?", targetID).Scan(&owner)
+	if err != nil {
+		return 0, false
+	}
+	return owner, true
+}
+
+// targetScopeMiddleware enforces per-user data isolation: every /api/targets/{id}
+// route (all of which use {id} as the target id) is reachable only by the target's
+// owner or an administrator. Non-owners get 403 — a member can neither see nor act
+// on another member's scans. Other resource routes also use a variable named {id}
+// (notably /tasks/{id}); they must pass through to their resource-specific owner
+// check instead of treating a task id as though it were a target id.
+func (h *Handler) targetScopeMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/targets/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		tid := mux.Vars(r)["id"]
+		if tid == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		u, ok := h.userFromSession(r)
+		if !ok {
+			// Not authenticated — let the handler's requireAuth return 401 uniformly.
+			next.ServeHTTP(w, r)
+			return
+		}
+		if u.Role == auth.RoleAdmin {
+			next.ServeHTTP(w, r)
+			return
+		}
+		owner, found := h.targetOwnerID(tid)
+		if !found || owner != u.ID {
+			h.writeError(w, http.StatusForbidden, "you do not have access to this target")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// requireAdmin wraps requireAuth and additionally rejects non-admin accounts, so
+// user administration is reachable only by administrators.
+func (h *Handler) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return h.requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		u, err := h.auth.GetUser(h.currentUserID(r))
+		if err != nil || u.Role != auth.RoleAdmin {
+			h.writeError(w, http.StatusForbidden, "administrator access required")
+			return
+		}
+		next(w, r)
+	})
+}
+
+func (h *Handler) writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
+}
+
+func (h *Handler) writeError(w http.ResponseWriter, status int, msg string) {
+	h.writeJSON(w, status, map[string]string{"error": msg})
+}
+
+func (h *Handler) writeSuccess(w http.ResponseWriter, data any) {
+	h.writeJSON(w, http.StatusOK, map[string]any{"data": data, "success": true})
+}
+
+func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	h.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (h *Handler) serveSPA(dir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+
+		if strings.HasPrefix(path, "/api/") || strings.HasPrefix(path, "/ws") {
+			h.writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+
+		// Vite copies public files (favicon, manifest, robots.txt) to the dist
+		// root rather than /assets. Serve a real root file when present; only
+		// client-side application routes should fall back to index.html.
+		rel := strings.TrimPrefix(filepath.Clean(path), string(filepath.Separator))
+		if rel != "." && rel != "" && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".." {
+			filePath := filepath.Join(dir, rel)
+			if info, err := os.Stat(filePath); err == nil && !info.IsDir() {
+				http.ServeFile(w, r, filePath)
+				return
+			}
+		}
+
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		http.ServeFile(w, r, filepath.Join(dir, "index.html"))
+	}
+}
+
+func (h *Handler) serveScreenshot(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	var filePath string
+	err := h.db.QueryRow("SELECT file_path FROM screenshots WHERE id = ?", id).Scan(&filePath)
+	if err != nil {
+		h.writeError(w, http.StatusNotFound, "screenshot not found")
+		return
+	}
+
+	w.Header().Del("Content-Type")
+	http.ServeFile(w, r, filePath)
+}

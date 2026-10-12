@@ -1,0 +1,378 @@
+"""Unit tests for apps/historical_urls — collector, analyzer, scanner."""
+
+import subprocess
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# Collector
+# ---------------------------------------------------------------------------
+
+from apps.historical_urls.collector import collect, _run_tool
+
+
+class TestRunTool:
+    def _mock_run(self, stdout="", returncode=0):
+        m = MagicMock()
+        m.returncode = returncode
+        m.stdout = stdout
+        m.stderr = ""
+        return m
+
+    @patch("apps.historical_urls.collector.shutil.which", return_value=None)
+    def test_binary_not_found_returns_empty(self, _which):
+        assert _run_tool("gau", "example.com") == []
+
+    @patch("apps.historical_urls.collector.shutil.which", return_value="/usr/bin/gau")
+    @patch("apps.historical_urls.collector.subprocess.run")
+    def test_nonzero_exit_returns_empty(self, mock_run, _which):
+        mock_run.return_value = self._mock_run(returncode=1)
+        assert _run_tool("gau", "example.com") == []
+
+    @patch("apps.historical_urls.collector.shutil.which", return_value="/usr/bin/gau")
+    @patch("apps.historical_urls.collector.subprocess.run")
+    def test_timeout_returns_empty(self, mock_run, _which):
+        mock_run.side_effect = subprocess.TimeoutExpired("gau", 300)
+        assert _run_tool("gau", "example.com") == []
+
+    @patch("apps.historical_urls.collector.shutil.which", return_value="/usr/bin/gau")
+    @patch("apps.historical_urls.collector.subprocess.run")
+    def test_returns_urls_from_stdout(self, mock_run, _which):
+        mock_run.return_value = self._mock_run(
+            "https://example.com/admin\nhttps://example.com/login\n"
+        )
+        result = _run_tool("gau", "example.com")
+        assert result == ["https://example.com/admin", "https://example.com/login"]
+
+    @patch("apps.historical_urls.collector.shutil.which", return_value="/usr/bin/gau")
+    @patch("apps.historical_urls.collector.subprocess.run")
+    def test_skips_blank_lines(self, mock_run, _which):
+        mock_run.return_value = self._mock_run(
+            "https://example.com/page\n\n\nhttps://example.com/other\n"
+        )
+        result = _run_tool("gau", "example.com")
+        assert len(result) == 2
+
+    @patch("apps.historical_urls.collector.shutil.which", return_value="/usr/bin/gau")
+    @patch("apps.historical_urls.collector.subprocess.run")
+    def test_file_not_found_returns_empty(self, mock_run, _which):
+        mock_run.side_effect = FileNotFoundError
+        assert _run_tool("gau", "example.com") == []
+
+
+class TestCollect:
+    @patch("apps.historical_urls.collector._run_tool")
+    def test_empty_input_returns_empty(self, _mock):
+        assert collect([]) == []
+
+    @patch("apps.historical_urls.collector._run_tool")
+    def test_collects_gau_urls(self, mock_run_tool):
+        mock_run_tool.return_value = [
+            "https://example.com/a", "https://example.com/b",
+        ]
+        result = collect(["example.com"])
+        assert "https://example.com/a" in result
+        assert "https://example.com/b" in result
+
+    @patch("apps.historical_urls.collector._run_tool")
+    def test_deduplicates_across_subdomains(self, mock_run_tool):
+        # gau run against two subdomains returns the same URL → deduped to one.
+        mock_run_tool.return_value = ["https://example.com/page"]
+        result = collect(["a.example.com", "b.example.com"])
+        assert result.count("https://example.com/page") == 1
+
+    @patch("apps.historical_urls.collector._run_tool")
+    def test_runs_gau_once_per_subdomain(self, mock_run_tool):
+        mock_run_tool.return_value = []
+        collect(["a.example.com", "b.example.com"])
+        assert mock_run_tool.call_count == 2  # gau only, one call per subdomain
+
+    @patch("apps.historical_urls.collector._run_tool")
+    def test_both_tools_missing_returns_empty(self, mock_run_tool):
+        mock_run_tool.return_value = []
+        assert collect(["example.com"]) == []
+
+
+# ---------------------------------------------------------------------------
+# Analyzer
+# ---------------------------------------------------------------------------
+
+from apps.historical_urls.analyzer import analyze, _is_noise
+
+
+class TestIsNoise:
+    def test_png_is_noise(self):
+        assert _is_noise("https://example.com/logo.png")
+
+    def test_jpg_is_noise(self):
+        assert _is_noise("https://example.com/photo.jpg")
+
+    def test_woff2_is_noise(self):
+        assert _is_noise("https://example.com/font.woff2")
+
+    def test_css_is_noise(self):
+        assert _is_noise("https://example.com/style.css")
+
+    def test_zip_is_noise(self):
+        assert _is_noise("https://example.com/download.zip")
+
+    def test_html_page_not_noise(self):
+        assert not _is_noise("https://example.com/admin")
+
+    def test_php_page_not_noise(self):
+        assert not _is_noise("https://example.com/index.php")
+
+    def test_api_endpoint_not_noise(self):
+        assert not _is_noise("https://example.com/api/v1/users")
+
+    def test_url_with_query_params_not_noise(self):
+        assert not _is_noise("https://example.com/search?q=test")
+
+    def test_uppercase_extension_is_noise(self):
+        assert _is_noise("https://example.com/IMAGE.PNG")
+
+
+@pytest.mark.django_db
+class TestAnalyze:
+    def _session(self):
+        from apps.core.engine.scans.models import ScanSession
+        return ScanSession.objects.create(domain="example.com", scan_type="full")
+
+    def _make_assets(self, session):
+        """Create subdomain + IP + port + httpx URL for FK lookup tests."""
+        from apps.core.data.assets.models import Subdomain, IPAddress, Port
+        from apps.core.data.web_assets.models import URL
+        sub = Subdomain.objects.create(
+            session=session, domain="example.com",
+            subdomain="www.example.com", source="subfinder",
+        )
+        ip = IPAddress.objects.create(
+            session=session, subdomain=sub,
+            address="1.2.3.4", version=4, source="dnsx",
+        )
+        port = Port.objects.create(
+            session=session, ip_address=ip,
+            address="1.2.3.4", port=443,
+            protocol="tcp", state="open", source="naabu",
+        )
+        URL.objects.create(
+            session=session, port=port, subdomain=sub,
+            url="https://www.example.com", scheme="https",
+            host="www.example.com", port_number=443,
+            status_code=200, source="httpx",
+        )
+        return sub, port
+
+    def test_empty_returns_empty(self):
+        sess = self._session()
+        assert analyze(sess, []) == []
+
+    def test_filters_noise_urls(self):
+        sess = self._session()
+        urls = [
+            "https://example.com/logo.png",
+            "https://example.com/font.woff2",
+            "https://example.com/style.css",
+        ]
+        assert analyze(sess, urls) == []
+
+    def test_passes_valid_url(self):
+        sess = self._session()
+        objs = analyze(sess, ["https://example.com/admin"])
+        assert len(objs) == 1
+        assert objs[0].url == "https://example.com/admin"
+        assert objs[0].source == "historical_urls"
+
+    def test_deduplicates_same_url(self):
+        sess = self._session()
+        objs = analyze(sess, [
+            "https://example.com/page",
+            "https://example.com/page",
+        ])
+        assert len(objs) == 1
+
+    def test_links_subdomain_fk(self):
+        sess = self._session()
+        sub, _ = self._make_assets(sess)
+        objs = analyze(sess, ["https://www.example.com/dashboard"])
+        assert objs[0].subdomain == sub
+
+    def test_links_port_fk_via_httpx_url(self):
+        sess = self._session()
+        _, port = self._make_assets(sess)
+        objs = analyze(sess, ["https://www.example.com/dashboard"])
+        assert objs[0].port == port
+
+    def test_no_fk_for_unknown_host(self):
+        sess = self._session()
+        objs = analyze(sess, ["https://unknown.example.com/page"])
+        assert objs[0].port is None
+        assert objs[0].subdomain is None
+
+    def test_sets_scheme_host_port_number(self):
+        sess = self._session()
+        objs = analyze(sess, ["https://example.com/path"])
+        assert objs[0].scheme == "https"
+        assert objs[0].host == "example.com"
+        assert objs[0].port_number == 443
+
+    def test_http_default_port_80(self):
+        sess = self._session()
+        objs = analyze(sess, ["http://example.com/path"])
+        assert objs[0].port_number == 80
+
+    def test_skips_url_without_scheme(self):
+        sess = self._session()
+        objs = analyze(sess, ["example.com/path"])
+        assert objs == []
+
+    def test_rejects_javascript_scheme(self):
+        sess = self._session()
+        objs = analyze(sess, ["javascript://example.com/%0aalert(1)"])
+        assert objs == []
+
+    def test_rejects_data_scheme(self):
+        sess = self._session()
+        objs = analyze(sess, ["data://example.com/text/html,<script>alert(1)</script>"])
+        assert objs == []
+
+    def test_rejects_ftp_scheme(self):
+        sess = self._session()
+        objs = analyze(sess, ["ftp://example.com/file"])
+        assert objs == []
+
+    def test_accepts_uppercase_http_scheme(self):
+        sess = self._session()
+        objs = analyze(sess, ["HTTPS://example.com/admin"])
+        assert len(objs) == 1
+        assert objs[0].scheme == "https"
+
+    def test_drops_out_of_scope_urls(self):
+        sess = self._session()
+        urls = [
+            "https://example.com/page",
+            "https://cid.karnataka.gov.in/cyber-crime",
+            "https://linkedin.com/company/example",
+            "https://aws.amazon.com/console",
+            "https://sub.example.com/api",
+        ]
+        objs = analyze(sess, urls)
+        hosts = {o.host for o in objs}
+        assert hosts == {"example.com", "sub.example.com"}
+        assert "cid.karnataka.gov.in" not in hosts
+        assert "linkedin.com" not in hosts
+        assert "aws.amazon.com" not in hosts
+
+    def test_keeps_subdomains_of_target(self):
+        sess = self._session()
+        objs = analyze(sess, [
+            "https://app.example.com/login",
+            "https://api.example.com/v1/data",
+        ])
+        assert len(objs) == 2
+
+
+# ---------------------------------------------------------------------------
+# Scanner
+# ---------------------------------------------------------------------------
+
+from apps.historical_urls.scanner import run_historical_urls
+
+
+@pytest.mark.django_db
+class TestScanner:
+    def _session(self):
+        from apps.core.engine.scans.models import ScanSession
+        return ScanSession.objects.create(domain="example.com", scan_type="full")
+
+    def test_no_subdomains_returns_empty_without_calling_collect(self):
+        sess = self._session()
+        with patch("apps.historical_urls.scanner.collect") as mock_collect:
+            result = run_historical_urls(sess)
+        assert result == []
+        mock_collect.assert_not_called()
+
+    def test_includes_root_domain_in_targets(self):
+        from apps.core.data.assets.models import Subdomain
+        sess = self._session()
+        Subdomain.objects.create(
+            session=sess, domain="example.com",
+            subdomain="www.example.com", source="subfinder", is_active=True,
+        )
+        captured = {}
+
+        def fake_collect(targets):
+            captured["targets"] = targets
+            return []
+
+        with patch("apps.historical_urls.scanner.collect", side_effect=fake_collect):
+            run_historical_urls(sess)
+
+        assert "example.com" in captured["targets"]
+
+    def test_includes_subdomains_in_targets(self):
+        from apps.core.data.assets.models import Subdomain
+        sess = self._session()
+        Subdomain.objects.create(
+            session=sess, domain="example.com",
+            subdomain="blog.example.com", source="subfinder", is_active=True,
+        )
+        captured = {}
+
+        def fake_collect(targets):
+            captured["targets"] = targets
+            return []
+
+        with patch("apps.historical_urls.scanner.collect", side_effect=fake_collect):
+            run_historical_urls(sess)
+
+        assert "blog.example.com" in captured["targets"]
+
+    def test_saves_url_rows_to_db_and_returns_them(self):
+        from apps.core.data.assets.models import Subdomain
+        from apps.core.data.web_assets.models import URL
+
+        sess = self._session()
+        Subdomain.objects.create(
+            session=sess, domain="example.com",
+            subdomain="blog.example.com", source="subfinder", is_active=True,
+        )
+        fake_urls = ["https://blog.example.com/old-post", "https://blog.example.com/api/v1"]
+
+        with patch("apps.historical_urls.scanner.collect", return_value=fake_urls):
+            result = run_historical_urls(sess)
+
+        assert URL.objects.filter(session=sess, source="historical_urls").count() == 2
+        assert len(result) == 2
+
+    def test_returns_empty_when_collect_returns_nothing(self):
+        from apps.core.data.assets.models import Subdomain
+        sess = self._session()
+        Subdomain.objects.create(
+            session=sess, domain="example.com",
+            subdomain="sub.example.com", source="subfinder", is_active=True,
+        )
+        with patch("apps.historical_urls.scanner.collect", return_value=[]):
+            result = run_historical_urls(sess)
+        assert result == []
+
+    def test_deduplicates_targets_when_root_domain_is_also_a_subdomain(self):
+        from apps.core.data.assets.models import Subdomain
+        sess = self._session()
+        # apex domain recorded as a subdomain row (subfinder/amass emit this)
+        Subdomain.objects.create(
+            session=sess, domain="example.com",
+            subdomain="example.com", source="subfinder", is_active=True,
+        )
+        captured = {}
+
+        def fake_collect(targets):
+            captured["targets"] = targets
+            return []
+
+        with patch("apps.historical_urls.scanner.collect", side_effect=fake_collect):
+            run_historical_urls(sess)
+
+        assert captured["targets"].count("example.com") == 1

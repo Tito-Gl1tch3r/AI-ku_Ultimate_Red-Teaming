@@ -1,0 +1,1057 @@
+// Copyright 2021 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package vulns contains helper functions for creating OSV vulnerability reports.
+package vulns
+
+import (
+	"bytes"
+	"cmp"
+	"encoding/json"
+	"errors"
+	"io"
+	"io/fs"
+	"log/slog"
+	"maps"
+	"net/url"
+	"os"
+	"path"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	goccyyaml "github.com/goccy/go-yaml"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
+	"github.com/google/osv.dev/vulnfeeds/models"
+	"github.com/google/osv.dev/vulnfeeds/utility"
+	"github.com/google/osv.dev/vulnfeeds/utility/logger"
+	"github.com/ossf/osv-schema/bindings/go/osvschema"
+)
+
+const CVEListBasePath = "cves"
+
+var ErrVulnNotACVE = errors.New("not a CVE")
+
+type CVEListError struct {
+	URL string
+	Err error
+}
+
+// Error returns the string representation of a CVEListError.
+func (e *CVEListError) Error() string {
+	return e.URL + ": " + e.Err.Error()
+}
+
+type QualityCheck int
+
+// String returns the string representation of a QualityCheck.
+func (q QualityCheck) String() string {
+	return [...]string{
+		"QualityUnknown",
+		"Success",
+		"Spaces",
+		"Empty",
+		"Filler",
+	}[q]
+}
+
+// AtLeast returns true if the quality is at least as good as the other quality.
+// Lower values are considered better quality.
+func (q QualityCheck) AtLeast(other QualityCheck) bool {
+	return q <= other
+}
+
+const (
+	// Set of enums for categorizing c.
+	QualityUnknown QualityCheck = iota // Shouldn't happen
+	Success                            // No determinable quality issue
+	Spaces                             // Contains space characters
+	Empty                              // Contains no entry
+	Filler                             // Has been determined to be a filler word
+)
+
+// refTypePriority is a read-only map ReferenceType to priority.
+// When multiple references are associated with the same URL, we deduplicate and only keep the type with the highest priority.
+// Priority (highest to lowest):
+// FIX > INTRODUCED > DETECTION > REPORT > PACKAGE > EVIDENCE > ADVISORY > ARTICLE > DISCUSSION > WEB > GIT
+var refTypePriority = map[osvschema.Reference_Type]int{
+	osvschema.Reference_FIX:        11,
+	osvschema.Reference_INTRODUCED: 10,
+	osvschema.Reference_DETECTION:  9,
+	osvschema.Reference_REPORT:     8,
+	osvschema.Reference_PACKAGE:    7,
+	osvschema.Reference_EVIDENCE:   6,
+	osvschema.Reference_ADVISORY:   5,
+	osvschema.Reference_ARTICLE:    4,
+	osvschema.Reference_DISCUSSION: 3,
+	osvschema.Reference_WEB:        2,
+	osvschema.Reference_GIT:        1,
+}
+
+// AttachExtractedVersionInfo converts the models.VersionInfo struct to OSV GIT and ECOSYSTEM AffectedRanges and AffectedPackage.
+func AttachExtractedVersionInfo(v *Vulnerability, version models.VersionInfo) {
+	// commit holds a commit hash of one of the supported commit types.
+	type commit struct {
+		commitType models.CommitType
+		hash       string
+	}
+	// Collect the commits of the supported types for each repo.
+	repoToCommits := map[string][]commit{}
+
+	unfixed := true
+	for _, ac := range version.AffectedCommits {
+		if ac.Introduced != "" {
+			repoToCommits[ac.Repo] = append(repoToCommits[ac.Repo], commit{commitType: models.Introduced, hash: ac.Introduced})
+		}
+		if ac.Fixed != "" {
+			repoToCommits[ac.Repo] = append(repoToCommits[ac.Repo], commit{commitType: models.Fixed, hash: ac.Fixed})
+			unfixed = false
+		}
+		if ac.Limit != "" {
+			repoToCommits[ac.Repo] = append(repoToCommits[ac.Repo], commit{commitType: models.Limit, hash: ac.Limit})
+		}
+		if ac.LastAffected != "" {
+			repoToCommits[ac.Repo] = append(repoToCommits[ac.Repo], commit{commitType: models.LastAffected, hash: ac.LastAffected})
+		}
+	}
+
+	for _, repo := range slices.Sorted(maps.Keys(repoToCommits)) {
+		commits := repoToCommits[repo]
+		gitRange := osvschema.Range{
+			Type: osvschema.Range_GIT,
+			Repo: repo,
+		}
+		// We're not always able to determine when a vulnerability is introduced, and may need to default to the dawn of time.
+		addedIntroduced := false
+		for _, c := range commits {
+			if c.commitType == models.Introduced {
+				gitRange.Events = append(gitRange.Events, &osvschema.Event{Introduced: c.hash})
+				addedIntroduced = true
+			}
+			if c.commitType == models.Fixed {
+				gitRange.Events = append(gitRange.Events, &osvschema.Event{Fixed: c.hash})
+			}
+			if c.commitType == models.Limit {
+				gitRange.Events = append(gitRange.Events, &osvschema.Event{Limit: c.hash})
+			}
+			// Only add any LastAffectedCommits in the absence of
+			// any FixCommits to maintain schema compliance.
+			if c.commitType == models.LastAffected && unfixed {
+				gitRange.Events = append(gitRange.Events, &osvschema.Event{LastAffected: c.hash})
+			}
+		}
+		if !addedIntroduced {
+			// Prepending not strictly necessary, but seems nicer to have the Introduced first in the list.
+			gitRange.Events = append([]*osvschema.Event{{Introduced: "0"}}, gitRange.GetEvents()...)
+		}
+		v.Affected = append(v.Affected, &osvschema.Affected{Ranges: []*osvschema.Range{&gitRange}})
+	}
+
+	if len(version.AffectedVersions) == 0 {
+		return
+	}
+	var ecosystemAffected *osvschema.Affected
+	// Find an existing affected with package info to add the ecosystem range to.
+	for i := range v.Affected {
+		if v.Affected[i].GetPackage() != nil {
+			ecosystemAffected = v.Affected[i]
+			break
+		}
+	}
+
+	// Adding an ECOSYSTEM version range only makes sense if we have package information.
+	if ecosystemAffected == nil {
+		return
+	}
+
+	versionRange := osvschema.Range{
+		Type: osvschema.Range_ECOSYSTEM,
+	}
+	seenIntroduced := map[string]bool{}
+	seenFixed := map[string]bool{}
+
+	for _, ver := range version.AffectedVersions {
+		var introduced string
+		if ver.Introduced == "" {
+			introduced = "0"
+		} else {
+			introduced = ver.Introduced
+		}
+
+		if _, seen := seenIntroduced[introduced]; !seen {
+			versionRange.Events = append(versionRange.Events, &osvschema.Event{
+				Introduced: introduced,
+			})
+			seenIntroduced[introduced] = true
+		}
+
+		if _, seen := seenFixed[ver.Fixed]; ver.Fixed != "" && !seen {
+			versionRange.Events = append(versionRange.Events, &osvschema.Event{
+				Fixed: ver.Fixed,
+			})
+			seenFixed[ver.Fixed] = true
+		}
+	}
+	ecosystemAffected.Ranges = append(ecosystemAffected.Ranges, &versionRange)
+}
+
+// PackageInfo is an intermediate struct to ease generating Vulnerability structs.
+type PackageInfo struct {
+	PkgName           string             `json:"pkg_name,omitempty"           yaml:"pkg_name,omitempty"`
+	Ecosystem         string             `json:"ecosystem,omitempty"          yaml:"ecosystem,omitempty"`
+	PURL              string             `json:"purl,omitempty"               yaml:"purl,omitempty"`
+	VersionInfo       models.VersionInfo `json:"fixed_version"                yaml:"fixed_version"`
+	EcosystemSpecific map[string]any     `json:"ecosystem_specific,omitempty" yaml:"ecosystem_specific,omitempty"`
+}
+
+// ToJSON serializes the PackageInfo to JSON.
+func (pi *PackageInfo) ToJSON(w io.Writer) error {
+	encoder := json.NewEncoder(w)
+	return encoder.Encode(pi)
+}
+
+type Vulnerability struct {
+	*osvschema.Vulnerability
+}
+
+// AddPkgInfo converts a PackageInfo struct to the corresponding Affected and adds it to the OSV vulnerability object.
+func (v *Vulnerability) AddPkgInfo(pkgInfo PackageInfo) {
+	var affected *osvschema.Affected
+	if pkgInfo.PkgName != "" && pkgInfo.Ecosystem != "" {
+		for _, a := range v.Affected {
+			if a.GetPackage().GetName() == pkgInfo.PkgName && a.GetPackage().GetEcosystem() == pkgInfo.Ecosystem {
+				affected = a
+				break
+			}
+		}
+	}
+
+	if affected == nil {
+		affected = &osvschema.Affected{}
+		if pkgInfo.PkgName != "" && pkgInfo.Ecosystem != "" {
+			affected.Package = &osvschema.Package{
+				Name:      pkgInfo.PkgName,
+				Ecosystem: pkgInfo.Ecosystem,
+				Purl:      pkgInfo.PURL,
+			}
+		}
+		v.Affected = append(v.Affected, affected)
+	}
+
+	if len(pkgInfo.VersionInfo.AffectedVersions) > 0 {
+		var versionRange *osvschema.Range
+		for _, r := range affected.GetRanges() {
+			if r.GetType() == osvschema.Range_ECOSYSTEM {
+				versionRange = r
+				break
+			}
+		}
+
+		isNewRange := false
+		if versionRange == nil {
+			versionRange = &osvschema.Range{
+				Type:   osvschema.Range_ECOSYSTEM,
+				Events: []*osvschema.Event{},
+			}
+			isNewRange = true
+		}
+
+		seenIntroduced := map[string]bool{}
+		seenFixed := map[string]bool{}
+		seenLastAffected := map[string]bool{}
+
+		for _, e := range versionRange.GetEvents() {
+			if e.GetIntroduced() != "" {
+				seenIntroduced[e.GetIntroduced()] = true
+			}
+			if e.GetFixed() != "" {
+				seenFixed[e.GetFixed()] = true
+			}
+			if e.GetLastAffected() != "" {
+				seenLastAffected[e.GetLastAffected()] = true
+			}
+		}
+
+		for _, av := range pkgInfo.VersionInfo.AffectedVersions {
+			var introduced string
+			if av.Introduced == "" {
+				if len(versionRange.GetEvents()) == 0 {
+					introduced = "0"
+				}
+			} else {
+				introduced = av.Introduced
+			}
+
+			if introduced != "" {
+				if _, seen := seenIntroduced[introduced]; !seen {
+					versionRange.Events = append(versionRange.Events, &osvschema.Event{
+						Introduced: introduced,
+					})
+					seenIntroduced[introduced] = true
+				}
+			}
+
+			if _, seen := seenFixed[av.Fixed]; av.Fixed != "" && !seen {
+				versionRange.Events = append(versionRange.Events, &osvschema.Event{
+					Fixed: av.Fixed,
+				})
+				seenFixed[av.Fixed] = true
+			}
+
+			if _, seen := seenLastAffected[av.LastAffected]; av.LastAffected != "" && !seen {
+				versionRange.Events = append(versionRange.Events, &osvschema.Event{
+					LastAffected: av.LastAffected,
+				})
+				seenLastAffected[av.LastAffected] = true
+			}
+		}
+
+		if isNewRange {
+			affected.Ranges = append(affected.Ranges, versionRange)
+		}
+	}
+
+	// Sort affected[].ranges (by type) for stability.
+	// https://ossf.github.io/osv-schema/#requirements
+	slices.SortFunc(affected.GetRanges(), func(a, b *osvschema.Range) int {
+		if n := cmp.Compare(a.GetType(), b.GetType()); n != 0 {
+			return n
+		}
+		// Sort by repo within the same (GIT) typed range.
+		return cmp.Compare(a.GetRepo(), b.GetRepo())
+	})
+
+	spec, err := utility.NewStructpbFromMap(pkgInfo.EcosystemSpecific)
+	if err != nil {
+		logger.Warn("Failed to create EcosystemSpecific struct: %v", err)
+	} else {
+		affected.EcosystemSpecific = spec
+	}
+}
+
+// getBestSeverity finds the best CVSS severity vector from the provided metrics data.
+// It prioritizes newer CVSS versions and "Primary" sources.
+func getBestSeverity(metricsData *models.CVEItemMetrics) (string, string) {
+	// Define search passes. First pass for "Primary", second for any.
+	for _, primaryOnly := range []bool{true, false} {
+		// Inside each pass, prioritize v4.0 over v3.1 over v3.0.
+		for _, metric := range metricsData.CVSSMetricV40 {
+			if (!primaryOnly || metric.Type == "Primary") && metric.CVSSData.VectorString != "" {
+				return metric.CVSSData.VectorString, "CVSS_V4"
+			}
+		}
+		for _, metric := range metricsData.CVSSMetricV31 {
+			if (!primaryOnly || metric.Type == "Primary") && metric.CVSSData.VectorString != "" {
+				return metric.CVSSData.VectorString, "CVSS_V3"
+			}
+		}
+		for _, metric := range metricsData.CVSSMetricV30 {
+			if (!primaryOnly || metric.Type == "Primary") && metric.CVSSData.VectorString != "" {
+				return metric.CVSSData.VectorString, "CVSS_V3"
+			}
+		}
+	}
+
+	return "", ""
+}
+
+// AddSeverity adds CVSS severity information to the OSV vulnerability object.
+// It uses the highest available CVSS score from the underlying CVE record.
+func (v *Vulnerability) AddSeverity(metricsData *models.CVEItemMetrics) {
+	if metricsData == nil {
+		return
+	}
+	bestVectorString, severityType := getBestSeverity(metricsData)
+
+	if bestVectorString == "" {
+		return
+	}
+
+	v.Severity = append(v.Severity, &osvschema.Severity{
+		Type:  osvschema.Severity_Type(osvschema.Severity_Type_value[severityType]),
+		Score: bestVectorString,
+	})
+}
+
+// ToJSON serializes the Vulnerability to JSON.
+func (v *Vulnerability) ToJSON(w io.Writer) error {
+	unstableJSON, err := protojson.Marshal(v.Vulnerability)
+	if err != nil {
+		return err
+	}
+
+	var vuln any
+	if err := json.Unmarshal(unstableJSON, &vuln); err != nil {
+		return err
+	}
+
+	b, err := json.MarshalIndent(vuln, "", "  ")
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(b)
+
+	return err
+}
+
+// ToYAML serializes the Vulnerability to YAML.
+func (v *Vulnerability) ToYAML(w io.Writer) error {
+	// Go via protojson so the OSV schema's field names (e.g. last_affected),
+	// string enums and omitempty are honored. Encoding the protobuf-backed
+	// struct directly with a generic YAML encoder emits lowercased Go field
+	// names that FromYAML (which decodes via protojson) then silently drops.
+	jsonBytes, err := protojson.Marshal(v.Vulnerability)
+	if err != nil {
+		return err
+	}
+
+	yamlBytes, err := goccyyaml.JSONToYAML(jsonBytes)
+	if err != nil {
+		return err
+	}
+
+	_, err = w.Write(yamlBytes)
+
+	return err
+}
+
+// ClassifyReferenceLink infers the OSV schema's reference type for a given URL.
+// See https://ossf.github.io/osv-schema/#references-field
+// It uses tags first before resorting to inference by shape.
+// Supports both NVD-style and CVEList V5 tags.
+func ClassifyReferenceLink(link string, tag string) osvschema.Reference_Type {
+	normalizedTag := strings.ToLower(tag)
+	normalizedTag = strings.ReplaceAll(normalizedTag, " ", "-")
+
+	switch normalizedTag {
+	case "patch", "patch-related", "fix":
+		return osvschema.Reference_FIX
+	case "exploit":
+		return osvschema.Reference_EVIDENCE
+	case "mailing-list", "technical-description", "article", "blog", "news":
+		return osvschema.Reference_ARTICLE
+	case "issue-tracking", "permissions-required", "report", "bug-report":
+		return osvschema.Reference_REPORT
+	case "vendor-advisory", "third-party-advisory", "vdb-entry", "release-notes", "advisory", "security-advisory":
+		return osvschema.Reference_ADVISORY
+	}
+
+	// Check if URL is git repo
+	if strings.HasPrefix(link, "git://") || strings.HasSuffix(link, ".git") {
+		return osvschema.Reference_PACKAGE
+	}
+
+	u, err := url.Parse(link)
+	if err != nil {
+		return osvschema.Reference_WEB
+	}
+
+	pathParts := strings.Split(u.Path, "/")
+
+	// Index 0 will always be "", so the length must be at least 2 to be relevant
+	if len(pathParts) >= 2 {
+		if u.Host == "github.com" {
+			// CVEProject CVEList reference
+			// Example: https://github.com/CVEProject/cvelistV5/blob/7dd48109ee33618242f36ae1d14d80950f2d0e59/cves/2021/45xxx/CVE-2021-45931.json
+			if len(pathParts) >= 3 && pathParts[1] == "CVEProject" {
+				return osvschema.Reference_ADVISORY
+			}
+
+			// Example: https://github.com/google/osv.dev/commit/cd4e934d0527e5010e373e7fed54ef5daefba2f5
+			if len(pathParts) >= 3 && pathParts[len(pathParts)-2] == "commit" {
+				return osvschema.Reference_FIX
+			}
+
+			// Example: https://github.com/advisories/GHSA-fr26-qjc8-mvjx
+			// Example: https://github.com/dpgaspar/Flask-AppBuilder/security/advisories/GHSA-624f-cqvr-3qw4
+			if len(pathParts) >= 3 && pathParts[len(pathParts)-2] == "advisories" {
+				return osvschema.Reference_ADVISORY
+			}
+
+			// Example: https://github.com/Netflix/lemur/issues/117
+			if len(pathParts) >= 3 && pathParts[len(pathParts)-2] == "issues" {
+				return osvschema.Reference_REPORT
+			}
+
+			// Example: https://github.com/tensorflow/tensorflow/pull/66450
+			if len(pathParts) >= 3 && pathParts[len(pathParts)-2] == "pull" {
+				return osvschema.Reference_FIX
+			}
+
+			// Example: https://github.com/git/git/releases/tag/v2.45.2
+			if len(pathParts) >= 3 && pathParts[len(pathParts)-1] == "releases" {
+				return osvschema.Reference_PACKAGE
+			}
+
+			// Example: https://github.com/google/osv-scanner (general repo link)
+			// If it's just a 2-part path (user/repo), consider it a package/project reference
+			if len(pathParts) == 3 && pathParts[1] != "" && pathParts[2] != "" {
+				return osvschema.Reference_PACKAGE
+			}
+		}
+
+		// Support for other Git hosting platforms
+		if u.Host == "gitlab.com" || strings.Contains(u.Host, "gitlab") {
+			// Example: https://gitlab.com/gitlab-org/gitlab/-/commit/9d78aa57285961003ba767ad43642b18973a4678
+			if len(pathParts) >= 3 && pathParts[len(pathParts)-2] == "commit" {
+				return osvschema.Reference_FIX
+			}
+			// Example: https://gitlab.com/gitlab-org/gitlab/-/issues/432139
+			if len(pathParts) >= 3 && pathParts[len(pathParts)-2] == "issues" {
+				return osvschema.Reference_REPORT
+			}
+			// Example: https://gitlab.com/gitlab-org/gitlab/-/merge_requests/162237
+			if len(pathParts) >= 3 && pathParts[len(pathParts)-2] == "merge_requests" {
+				return osvschema.Reference_FIX
+			}
+			// Example: https://gitlab.com/qemu-project/qemu
+			if len(pathParts) >= 3 && pathParts[1] != "" && pathParts[2] != "" && len(pathParts) <= 4 {
+				return osvschema.Reference_PACKAGE
+			}
+		}
+
+		if u.Host == "bitbucket.org" {
+			// Example: https://bitbucket.org/JustWalters/b-b-enhancement/commits/cf9a571dc3f03134444b2c8f2198db9174110365
+			if len(pathParts) >= 3 && pathParts[len(pathParts)-2] == "commits" {
+				return osvschema.Reference_FIX
+			}
+			// Example: https://bitbucket.org/JustWalters/b-b-enhancement/issues/1/last-post-logs-user-out-when-on-global
+			if len(pathParts) >= 3 && pathParts[len(pathParts)-2] == "issues" {
+				return osvschema.Reference_REPORT
+			}
+			// Example: https://bitbucket.org/cstshane/lo5_b
+			if len(pathParts) == 3 && pathParts[1] != "" && pathParts[2] != "" {
+				return osvschema.Reference_PACKAGE
+			}
+		}
+
+		if u.Host == "snyk.io" {
+			//Example: https://snyk.io/vuln/SNYK-PYTHON-TRYTOND-1730329
+			if pathParts[1] == "vuln" {
+				return osvschema.Reference_ADVISORY
+			}
+		}
+
+		if u.Host == "nvd.nist.gov" {
+			//Example: https://nvd.nist.gov/vuln/detail/CVE-2021-23336
+			if len(pathParts) == 4 && pathParts[1] == "vuln" && pathParts[2] == "detail" {
+				return osvschema.Reference_ADVISORY
+			}
+		}
+
+		if u.Host == "www.debian.org" {
+			//Example: https://www.debian.org/security/2021/dsa-4878
+			if pathParts[1] == "security" {
+				return osvschema.Reference_ADVISORY
+			}
+		}
+
+		if u.Host == "usn.ubuntu.com" {
+			//Example: https://usn.ubuntu.com/usn/usn-4661-1
+			if pathParts[1] == "usn" {
+				return osvschema.Reference_ADVISORY
+			}
+		}
+
+		if u.Host == "www.ubuntu.com" {
+			//Example: http://www.ubuntu.com/usn/USN-2915-2
+			if pathParts[1] == "usn" {
+				return osvschema.Reference_ADVISORY
+			}
+		}
+
+		if u.Host == "ubuntu.com" {
+			//Example: https://ubuntu.com/security/notices/USN-5124-1
+			if pathParts[1] == "security" && pathParts[2] == "notices" {
+				return osvschema.Reference_ADVISORY
+			}
+		}
+
+		if u.Host == "rhn.redhat.com" {
+			//Example: http://rhn.redhat.com/errata/RHSA-2016-0504.html
+			if pathParts[1] == "errata" {
+				return osvschema.Reference_ADVISORY
+			}
+		}
+
+		if u.Host == "access.redhat.com" {
+			//Example: https://access.redhat.com/errata/RHSA-2017:1499
+			if pathParts[1] == "errata" {
+				return osvschema.Reference_ADVISORY
+			}
+		}
+
+		if u.Host == "security.gentoo.org" {
+			//Example: https://security.gentoo.org/glsa/202003-45
+			if len(pathParts) >= 2 && pathParts[len(pathParts)-2] == "glsa" {
+				return osvschema.Reference_ADVISORY
+			}
+		}
+
+		if u.Host == "pypi.org" {
+			//Example: "https://pypi.org/project/flask"
+			if pathParts[1] == "project" {
+				return osvschema.Reference_PACKAGE
+			}
+		}
+	}
+
+	if strings.Contains(link, "advisory") || strings.Contains(link, "advisories") {
+		return osvschema.Reference_ADVISORY
+	}
+
+	if strings.Contains(link, "bugzilla") {
+		return osvschema.Reference_REPORT
+	}
+
+	if strings.Contains(link, "blog") {
+		return osvschema.Reference_ARTICLE
+	}
+
+	return osvschema.Reference_WEB
+}
+
+// ExtractReferencedVulns extracts other vulnerability IDs from a CVE's references
+// to place them into the aliases and related fields.
+func ExtractReferencedVulns(id models.CVEID, cveID models.CVEID, references []models.Reference) ([]string, []string) {
+	var aliases []string
+	var related []string
+	if id != cveID {
+		aliases = append(aliases, string(cveID))
+	}
+
+	var GHSAs []string
+	var SNYKs []string
+	for _, reference := range references {
+		u, err := url.Parse(reference.URL)
+		if err == nil {
+			pathParts := strings.Split(u.Path, "/")
+
+			// Index 0 will always be "", so the length must be at least 3 here to be relevant
+			if len(pathParts) >= 3 {
+				if u.Host == "github.com" {
+					// Example: https://github.com/advisories/GHSA-fr26-qjc8-mvjx
+					// Example: https://github.com/dpgaspar/Flask-AppBuilder/security/advisories/GHSA-624f-cqvr-3qw4
+					if pathParts[len(pathParts)-2] == "advisories" {
+						a := pathParts[len(pathParts)-1]
+
+						if string(id) != a && strings.HasPrefix(a, "GHSA-") {
+							GHSAs = append(GHSAs, a)
+						}
+					}
+				}
+
+				if u.Host == "snyk.io" {
+					//Example: https://snyk.io/vuln/SNYK-PYTHON-TRYTOND-1730329
+					if pathParts[1] == "vuln" {
+						a := pathParts[len(pathParts)-1]
+						if string(id) != a && strings.HasPrefix(a, "SNYK-") {
+							SNYKs = append(SNYKs, a)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// A CVE should have only one GHSA as an alias
+	// If multiple GHSAs are associated with a CVE,
+	// it can potentially cause one CVE to be aliased to other CVEs, which is most likely incorrect.
+	GHSAs = Unique(GHSAs)
+	if len(GHSAs) > 1 {
+		related = append(related, GHSAs...)
+	} else {
+		aliases = append(aliases, GHSAs...)
+	}
+	SNYKs = Unique(SNYKs)
+	if len(SNYKs) > 1 {
+		related = append(related, SNYKs...)
+	} else {
+		aliases = append(aliases, SNYKs...)
+	}
+
+	// TODO(jesslowe): Check if references to other CVEs exist in the description and add to related
+
+	return Unique(aliases), Unique(related)
+}
+
+// Unique removes duplicate elements from a slice.
+func Unique[T comparable](s []T) []T {
+	inResult := make(map[T]bool)
+	var result []T
+	for _, str := range s {
+		if _, ok := inResult[str]; !ok {
+			inResult[str] = true
+			result = append(result, str)
+		}
+	}
+
+	return result
+}
+
+// ClassifyReferences annotates reference links based on their tags or their shape.
+// References with the same URL are deduplicated, and only keep the RefType of the highest priority (see refTypePriority).
+func ClassifyReferences(refs []models.Reference) []*osvschema.Reference {
+	references := make([]*osvschema.Reference, 0, len(refs))
+	bestTypes := make(map[string]osvschema.Reference_Type)
+
+	for _, ref := range refs {
+		if ref.URL == "" {
+			continue
+		}
+
+		if len(ref.Tags) > 0 {
+			for _, tag := range ref.Tags {
+				refType := ClassifyReferenceLink(ref.URL, tag)
+				bestType, ok := bestTypes[ref.URL]
+				if !ok || refTypePriority[refType] > refTypePriority[bestType] {
+					bestTypes[ref.URL] = refType
+				}
+			}
+		} else {
+			refType := ClassifyReferenceLink(ref.URL, "")
+			bestType, ok := bestTypes[ref.URL]
+			if !ok || refTypePriority[refType] > refTypePriority[bestType] {
+				bestTypes[ref.URL] = refType
+			}
+		}
+	}
+
+	for refURL, refType := range bestTypes {
+		references = append(references, &osvschema.Reference{
+			Type: refType,
+			Url:  refURL,
+		})
+	}
+
+	slices.SortFunc(references, func(a, b *osvschema.Reference) int {
+		return cmp.Or(
+			cmp.Compare(a.GetType(), b.GetType()),
+			cmp.Compare(a.GetUrl(), b.GetUrl()),
+		)
+	})
+
+	return references
+}
+
+// FromNVDCVE creates a minimal OSV object from a given CVE and id.
+// Leaves affected and version fields empty to be filled in later with AddPkgInfo
+// There are two id fields passed in as one of the users of this field (PyPi) sometimes has a different id than the CVEID
+// and the ExtractReferencedVulns function uses these in a check to add the other ID as an alias.
+func FromNVDCVE(id models.CVEID, cve models.NVDCVE) *Vulnerability {
+	aliases, related := ExtractReferencedVulns(id, cve.ID, cve.References)
+	var withdrawnTime *timestamppb.Timestamp
+	if cve.VulnStatus != nil && *cve.VulnStatus == "Rejected" {
+		withdrawnTime = timestamppb.New(cve.LastModified.Time)
+	}
+
+	v := &Vulnerability{
+		Vulnerability: &osvschema.Vulnerability{
+			Id:         string(id),
+			Details:    models.EnglishDescription(cve.Descriptions),
+			Aliases:    aliases,
+			Related:    related,
+			Published:  timestamppb.New(cve.Published.Time),
+			Modified:   timestamppb.New(cve.LastModified.Time),
+			References: ClassifyReferences(cve.References),
+			Withdrawn:  withdrawnTime,
+		},
+	}
+	v.AddSeverity(cve.Metrics)
+
+	return v
+}
+
+// GetCPEs extracts CPE strings from a slice of models.CPE.
+// Returns array of CPE strings and array of notes.
+func GetCPEs(cpeApplicability []models.CPE, metrics *models.ConversionMetrics) []string {
+	var CPEs []string
+	for _, c := range cpeApplicability {
+		for _, node := range c.Nodes {
+			if node.Operator != "OR" {
+				metrics.AddNotef("Node found without OR operator")
+				continue
+			}
+			for _, match := range node.CPEMatch {
+				CPEs = append(CPEs, match.Criteria)
+			}
+		}
+	}
+
+	return CPEs
+}
+
+// FromYAML deserializes a Vulnerability from a YAML reader.
+func FromYAML(r io.Reader) (*Vulnerability, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+
+	jsonBytes, err := goccyyaml.YAMLToJSON(data)
+	if err != nil {
+		return nil, err
+	}
+
+	return FromJSON(bytes.NewReader(jsonBytes))
+}
+
+// FromJSON deserializes a Vulnerability from a JSON reader.
+func FromJSON(r io.Reader) (*Vulnerability, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if wrapped with top-level "vulnerability" key
+	var wrapper map[string]json.RawMessage
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return nil, err
+	}
+
+	var innerBytes []byte
+	if inner, ok := wrapper["vulnerability"]; ok {
+		innerBytes = inner
+	} else {
+		innerBytes = data
+	}
+
+	var inner osvschema.Vulnerability
+	opts := protojson.UnmarshalOptions{DiscardUnknown: true}
+	if err := opts.Unmarshal(innerBytes, &inner); err != nil {
+		// Fall back to standard json.Unmarshal for Go internal struct formats (seconds/nanos)
+		if err2 := json.Unmarshal(innerBytes, &inner); err2 != nil {
+			return nil, err
+		}
+	}
+
+	return &Vulnerability{Vulnerability: &inner}, nil
+}
+
+// CheckQuality will return true if field text is not a filler text or otherwise empty
+func CheckQuality(text string) QualityCheck {
+	var fillerText = []string{
+		"n/a", // common with mitre vulns
+		"unknown",
+		"unspecified",
+		"not-known",
+		"tbd",
+		"to be determined",
+		"-",
+		"latest",
+	}
+	for _, filler := range fillerText {
+		if strings.EqualFold(strings.TrimSpace(text), filler) {
+			return Filler
+		}
+	}
+	if text == "" {
+		return Empty
+	}
+
+	if strings.Contains(text, " ") {
+		return Spaces
+	}
+
+	return Success
+}
+
+// VulnerabilityMetadata contains lightweight metadata (publication time, last modified time, and severity metrics) for a CVE.
+type VulnerabilityMetadata struct {
+	Published time.Time
+	Modified  time.Time
+	Metrics   *models.CVEItemMetrics
+}
+
+type lightNVDItem struct {
+	CVE struct {
+		ID           models.CVEID           `json:"id"`
+		Published    models.NVDTime         `json:"published"`
+		LastModified models.NVDTime         `json:"lastModified"`
+		Metrics      *models.CVEItemMetrics `json:"metrics"`
+	} `json:"cve"`
+}
+
+type lightNVDSchema struct {
+	Vulnerabilities []lightNVDItem `json:"vulnerabilities"`
+}
+
+// LoadTargetCVEMetadata loads publication dates, last modified dates, and severity metrics for target CVE IDs,
+// avoiding memory-heavy decoding of CPE match configurations, descriptions, and references.
+func LoadTargetCVEMetadata(cvePath string, targetCVEs map[string]bool) map[models.CVEID]VulnerabilityMetadata {
+	type cveMeta struct {
+		id   models.CVEID
+		meta VulnerabilityMetadata
+	}
+
+	metaChan := make(chan cveMeta)
+	var wg sync.WaitGroup
+
+	err := filepath.WalkDir(cvePath, func(filePath string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(d.Name(), ".json") {
+			return nil
+		}
+
+		// Spawning one goroutine per file is acceptable here because the number of files
+		// is small (typically one per year of CVE data).
+		wg.Add(1)
+		go func(p string) {
+			defer wg.Done()
+			file, err := os.Open(p)
+			if err != nil {
+				logger.Error("Failed to open CVE JSON", slog.String("path", p), slog.Any("err", err))
+				return
+			}
+			defer file.Close()
+
+			var nvdcve lightNVDSchema
+			if err := json.NewDecoder(file).Decode(&nvdcve); err != nil {
+				logger.Error("Failed to decode JSON", slog.String("file", p), slog.Any("err", err))
+				return
+			}
+
+			for _, item := range nvdcve.Vulnerabilities {
+				if targetCVEs == nil || targetCVEs[string(item.CVE.ID)] {
+					metaChan <- cveMeta{
+						id: item.CVE.ID,
+						meta: VulnerabilityMetadata{
+							Published: item.CVE.Published.Time,
+							Modified:  item.CVE.LastModified.Time,
+							Metrics:   item.CVE.Metrics,
+						},
+					}
+				}
+			}
+			logger.Info("Loaded "+filepath.Base(p), slog.String("cve", filepath.Base(p)))
+		}(filePath)
+
+		return nil
+	})
+
+	if err != nil {
+		logger.Fatal("Failed to walk CVE path", slog.String("path", cvePath), slog.Any("err", err))
+	}
+
+	go func() {
+		wg.Wait()
+		close(metaChan)
+	}()
+
+	result := make(map[models.CVEID]VulnerabilityMetadata)
+	for item := range metaChan {
+		result[item.id] = item.meta
+	}
+
+	return result
+}
+
+// LoadAllCVEs loads the downloaded CVE's from the NVD database into memory.
+func LoadAllCVEs(cvePath string) map[models.CVEID]models.Vulnerability {
+	return LoadTargetCVEs(cvePath, nil)
+}
+
+// LoadTargetCVEs loads the downloaded CVE's from the NVD database into memory,
+// filtering by a set of target CVE IDs if provided.
+func LoadTargetCVEs(cvePath string, targetCVEs map[string]bool) map[models.CVEID]models.Vulnerability {
+	dir, err := os.ReadDir(cvePath)
+	if err != nil {
+		logger.Fatal("Failed to read dir", slog.String("path", cvePath), slog.Any("err", err))
+	}
+
+	vulnsChan := make(chan models.Vulnerability)
+	var wg sync.WaitGroup
+
+	for _, entry := range dir {
+		if !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+
+		wg.Add(1)
+		go func(filename string) {
+			defer wg.Done()
+			filePath := path.Join(cvePath, filename)
+			file, err := os.Open(filePath)
+			if err != nil {
+				logger.Error("Failed to open CVE JSON", slog.String("path", filePath), slog.Any("err", err))
+				return
+			}
+			defer file.Close()
+
+			var nvdcve models.CVEAPIJSON20Schema
+			if err := json.NewDecoder(file).Decode(&nvdcve); err != nil {
+				logger.Error("Failed to decode JSON", slog.String("file", filename), slog.Any("err", err))
+				return
+			}
+
+			for _, item := range nvdcve.Vulnerabilities {
+				if targetCVEs == nil || targetCVEs[string(item.CVE.ID)] {
+					vulnsChan <- item
+				}
+			}
+			logger.Info("Loaded "+filename, slog.String("cve", filename))
+		}(entry.Name())
+	}
+
+	go func() {
+		wg.Wait()
+		close(vulnsChan)
+	}()
+
+	result := make(map[models.CVEID]models.Vulnerability)
+	for item := range vulnsChan {
+		result[item.CVE.ID] = item
+	}
+
+	return result
+}
+
+func FindSeverity(metricsData []models.Metrics) *osvschema.Severity {
+	bestVectorString, severityType := getBestCVE5Severity(metricsData)
+	if bestVectorString == "" {
+		return nil
+	}
+
+	return &osvschema.Severity{
+		Type:  severityType,
+		Score: bestVectorString,
+	}
+}
+
+func getBestCVE5Severity(metricsData []models.Metrics) (string, osvschema.Severity_Type) {
+	checks := []struct {
+		getVectorString func(models.Metrics) string
+		severityType    osvschema.Severity_Type
+	}{
+		{func(m models.Metrics) string { return m.CVSSv4_0.VectorString }, osvschema.Severity_CVSS_V4},
+		{func(m models.Metrics) string { return m.CVSSv3_1.VectorString }, osvschema.Severity_CVSS_V3},
+		{func(m models.Metrics) string { return m.CVSSv3_0.VectorString }, osvschema.Severity_CVSS_V3},
+	}
+
+	for _, check := range checks {
+		for _, m := range metricsData {
+			if vectorString := check.getVectorString(m); vectorString != "" {
+				return vectorString, check.severityType
+			}
+		}
+	}
+
+	return "", osvschema.Severity_UNSPECIFIED
+}

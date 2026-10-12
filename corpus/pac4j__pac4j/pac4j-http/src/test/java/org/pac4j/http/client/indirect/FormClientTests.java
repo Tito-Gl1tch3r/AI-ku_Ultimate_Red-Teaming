@@ -1,0 +1,145 @@
+package org.pac4j.http.client.indirect;
+
+import lombok.val;
+import org.junit.jupiter.api.Test;
+import org.pac4j.core.context.CallContext;
+import org.pac4j.core.credentials.CredentialSource;
+import org.pac4j.core.credentials.UsernamePasswordCredentials;
+import org.pac4j.core.exception.CredentialsException;
+import org.pac4j.core.exception.TechnicalException;
+import org.pac4j.core.exception.http.FoundAction;
+import org.pac4j.core.exception.http.WithLocationAction;
+import org.pac4j.core.profile.CommonProfile;
+import org.pac4j.core.profile.ProfileHelper;
+import org.pac4j.core.profile.UserProfile;
+import org.pac4j.core.util.Pac4jConstants;
+import org.pac4j.test.util.TestsHelper;
+import org.pac4j.http.credentials.authenticator.test.SimpleTestUsernamePasswordAuthenticator;
+import org.pac4j.test.context.MockWebContext;
+import org.pac4j.test.context.session.MockSessionStore;
+import org.pac4j.test.util.TestsConstants;
+
+import java.util.Optional;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * This class tests the {@link FormClient} class.
+ *
+ * @author Jerome Leleu
+ * @since 1.4.0
+ */
+public final class FormClientTests implements TestsConstants {
+
+    @Test
+    public void testMissingUsernamePasswordAuthenticator() {
+        val formClient = new FormClient(LOGIN_URL, null);
+        formClient.setCallbackUrl(CALLBACK_URL);
+        TestsHelper.expectException(() -> formClient.getCredentials(new CallContext(MockWebContext.create(), new MockSessionStore())),
+            TechnicalException.class, "authenticator cannot be null");
+    }
+
+    @Test
+    public void testMissingProfileCreator() {
+        val formClient = new FormClient(LOGIN_URL, new SimpleTestUsernamePasswordAuthenticator());
+        formClient.setCallbackUrl(CALLBACK_URL);
+        formClient.setProfileCreator(null);
+        TestsHelper.expectException(() -> formClient.getUserProfile(new CallContext(MockWebContext.create(), new MockSessionStore()),
+            new UsernamePasswordCredentials(USERNAME, PASSWORD)), TechnicalException.class, "profileCreator cannot be null");
+    }
+
+    @Test
+    public void testHasDefaultProfileCreator() {
+        val formClient = new FormClient(LOGIN_URL, new SimpleTestUsernamePasswordAuthenticator());
+        formClient.setCallbackUrl(CALLBACK_URL);
+        formClient.init();
+    }
+
+    @Test
+    public void testMissingLoginUrl() {
+        val formClient = new FormClient(null, new SimpleTestUsernamePasswordAuthenticator());
+        formClient.setCallbackUrl(CALLBACK_URL);
+        TestsHelper.initShouldFail(formClient, "loginUrl cannot be blank");
+    }
+
+    private FormClient getFormClient() {
+        val client = new FormClient(LOGIN_URL, new SimpleTestUsernamePasswordAuthenticator());
+        client.setCallbackUrl(CALLBACK_URL);
+        return client;
+    }
+
+    @Test
+    public void testRedirectionUrl() {
+        val formClient = getFormClient();
+        var context = MockWebContext.create();
+        WithLocationAction action = (FoundAction) formClient.getRedirectionAction(new CallContext(context, new MockSessionStore())).get();
+        assertEquals(LOGIN_URL, action.getLocation());
+    }
+
+    @Test
+    public void testGetCredentialsMissingUsername() {
+        val formClient = getFormClient();
+        val context = MockWebContext.create();
+        val action = (FoundAction) TestsHelper.expectException(
+            () -> formClient.getCredentials(new CallContext(context.addRequestParameter(formClient.getUsernameParameter(), USERNAME),
+                new MockSessionStore())));
+        assertEquals(302, action.getCode());
+        assertEquals(LOGIN_URL + "?" + formClient.getUsernameParameter() + "=" + USERNAME + "&"
+                + FormClient.ERROR_PARAMETER + "=" + FormClient.MISSING_FIELD_ERROR, action.getLocation());
+    }
+
+    @Test
+    public void testGetCredentialsMissingPassword() {
+        val formClient = getFormClient();
+        val context = MockWebContext.create().addRequestParameter(formClient.getPasswordParameter(), PASSWORD);
+        val action = (FoundAction) TestsHelper.expectException(
+            () -> formClient.getCredentials(new CallContext(context, new MockSessionStore())));
+        assertEquals(302, action.getCode());
+        assertEquals(LOGIN_URL + "?" + formClient.getUsernameParameter() + "=&" + FormClient.ERROR_PARAMETER + "="
+               + FormClient.MISSING_FIELD_ERROR, action.getLocation());
+    }
+
+    @Test
+    public void testValidateCredentials() {
+        val formClient = getFormClient();
+        val context = MockWebContext.create();
+        val action = (FoundAction) TestsHelper.expectException(
+            () -> formClient.validateCredentials(new CallContext(context, new MockSessionStore()),
+                new UsernamePasswordCredentials(USERNAME, PASSWORD)));
+        assertEquals(302, action.getCode());
+        assertEquals(LOGIN_URL + "?" + formClient.getUsernameParameter() + "=" + USERNAME + "&"
+                + FormClient.ERROR_PARAMETER + "=" + CredentialsException.class.getSimpleName(), action.getLocation());
+    }
+
+    @Test
+    public void testGetRightCredentials() {
+        val formClient = getFormClient();
+        val credentials = (UsernamePasswordCredentials) formClient.getCredentials(new CallContext(MockWebContext.create()
+                .addRequestParameter(formClient.getUsernameParameter(), USERNAME)
+                .addRequestParameter(formClient.getPasswordParameter(), USERNAME), new MockSessionStore())).get();
+        assertEquals(USERNAME, credentials.getUsername());
+        assertEquals(USERNAME, credentials.getPassword());
+        assertEquals(CredentialSource.FORM.name(), credentials.getSource());
+    }
+
+    @Test
+    public void testGetUserProfile() {
+        val formClient = getFormClient();
+        formClient.setProfileCreator((ctx, credentials) -> {
+            var username = ((UsernamePasswordCredentials) credentials).getUsername();
+            UserProfile profile = new CommonProfile();
+            profile.setId(username);
+            profile.addAttribute(Pac4jConstants.USERNAME, username);
+            return Optional.of(profile);
+        });
+        val context = MockWebContext.create();
+        val profile = (CommonProfile) formClient.getUserProfile(new CallContext(context, new MockSessionStore()),
+            new UsernamePasswordCredentials(USERNAME, USERNAME)).get();
+        assertEquals(USERNAME, profile.getId());
+        assertEquals(CommonProfile.class.getName() + Pac4jConstants.TYPED_ID_SEPARATOR + USERNAME, profile.getTypedId());
+        assertTrue(ProfileHelper.isTypedIdOf(profile.getTypedId(), CommonProfile.class));
+        assertEquals(USERNAME, profile.getUsername());
+        assertEquals(1, profile.getAttributes().size());
+    }
+}

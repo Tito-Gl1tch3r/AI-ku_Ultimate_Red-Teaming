@@ -1,0 +1,178 @@
+package org.pac4j.core.logout.handler;
+
+import lombok.Getter;
+import lombok.Setter;
+import lombok.ToString;
+import lombok.extern.slf4j.Slf4j;
+import lombok.val;
+import org.apache.commons.lang3.StringUtils;
+import org.pac4j.core.context.CallContext;
+import org.pac4j.core.context.WebContext;
+import org.pac4j.core.context.session.SessionStore;
+import org.pac4j.core.profile.factory.ProfileManagerFactory;
+import org.pac4j.core.store.ConcurrentMapStore;
+import org.pac4j.core.store.Store;
+
+import java.util.Optional;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Default session logout handler.
+ *
+ * @author Jerome Leleu
+ * @since 2.0.0
+ */
+@ToString
+@Getter
+@Setter
+@Slf4j
+public class DefaultSessionLogoutHandler implements SessionLogoutHandler {
+
+    private Store<String, Object> store = new ConcurrentMapStore<>(30, TimeUnit.MINUTES);
+
+    private boolean destroySession;
+
+    /**
+     * <p>Constructor for DefaultSessionLogoutHandler.</p>
+     */
+    public DefaultSessionLogoutHandler() {}
+
+    /**
+     * <p>Constructor for DefaultSessionLogoutHandler.</p>
+     *
+     * @param store a {@link Store} object
+     */
+    public DefaultSessionLogoutHandler(final Store<String, Object> store) {
+        this.store = store;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public void recordSession(final CallContext ctx, final String key) {
+        val webContext = ctx.webContext();
+        val sessionStore = ctx.sessionStore();
+
+        if (sessionStore == null) {
+            LOGGER.error("No session store available for this web context");
+        } else {
+            val optSessionId = sessionStore.getSessionId(webContext, true);
+            if (optSessionId.isEmpty()) {
+                LOGGER.error("No session identifier retrieved although the session creation has been requested");
+            } else {
+                val sessionId = optSessionId.get();
+                val optTrackableSession = sessionStore.getTrackableSession(webContext);
+
+                if (optTrackableSession.isPresent()) {
+                    val trackableSession = optTrackableSession.get();
+                    LOGGER.debug("key: {} -> trackableSession: {}", key, trackableSession);
+                    LOGGER.debug("sessionId: {}", sessionId);
+                    store.set(key, trackableSession);
+                    store.set(sessionId, key);
+                } else {
+                    LOGGER.debug("No trackable session for the current session store: {}", sessionStore);
+                }
+            }
+        }
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public void destroySession(final CallContext ctx, final String key) {
+        val webContext = ctx.webContext();
+        val sessionStore = ctx.sessionStore();
+
+        val optTrackableSession = store.get(key);
+        if (optTrackableSession.isPresent()) {
+            store.remove(key);
+        }
+
+        if (sessionStore == null) {
+            LOGGER.warn("No session store. Cannot destroy session");
+            return;
+        }
+
+        val optCurrentSessionId = sessionStore.getSessionId(ctx.webContext(), false);
+        if (optCurrentSessionId.isPresent()) {
+
+            val currentSessionId = optCurrentSessionId.get();
+            LOGGER.debug("current sessionId: {}", currentSessionId);
+            val keyForCurrentSession = (String) store.get(currentSessionId).orElse(null);
+            LOGGER.debug("key associated to the current session: {}", key);
+            store.remove(currentSessionId);
+
+            if (StringUtils.equals(key, keyForCurrentSession)) {
+                destroy(webContext, sessionStore, ctx.profileManagerFactory(), "front");
+                return;
+            } else {
+                LOGGER.debug("Unknown/new web session: cannot perform front channel logout");
+            }
+        } else {
+            LOGGER.debug("No web session: cannot perform front channel logout");
+        }
+
+        LOGGER.debug("TrackableSession: {} for key: {}", optTrackableSession, key);
+        if (optTrackableSession.isEmpty()) {
+            LOGGER.debug("No trackable session: cannot perform back channel logout");
+        } else {
+
+            val optNewSessionStore = sessionStore
+                .buildFromTrackableSession(webContext, optTrackableSession.get());
+            if (optNewSessionStore.isPresent()) {
+                val newSessionStore = optNewSessionStore.get();
+                LOGGER.debug("newSesionStore: {}", newSessionStore);
+                val sessionId = newSessionStore.getSessionId(webContext, true).get();
+                LOGGER.debug("new sessionId: {}", sessionId);
+                store.remove(sessionId);
+
+                destroy(webContext, newSessionStore, ctx.profileManagerFactory(), "back");
+            } else {
+                LOGGER.warn("Cannot build new session store from tracked session: cannot perform back channel logout");
+            }
+        }
+    }
+
+    /**
+     * <p>destroy.</p>
+     *
+     * @param webContext a {@link WebContext} object
+     * @param sessionStore a {@link SessionStore} object
+     * @param profileManagerFactory a {@link ProfileManagerFactory} object
+     * @param channel a {@link String} object
+     */
+    protected void destroy(final WebContext webContext, final SessionStore sessionStore,
+                           final ProfileManagerFactory profileManagerFactory, final String channel) {
+        // remove profiles
+        val manager = profileManagerFactory.apply(webContext, sessionStore);
+        manager.removeProfiles();
+        LOGGER.debug("{} channel logout call: destroy the user profiles", channel);
+        // and optionally the web session
+        if (destroySession) {
+            LOGGER.debug("destroy the whole session");
+            val invalidated = sessionStore.destroySession(webContext);
+            if (!invalidated) {
+                LOGGER.error("The session has not been invalidated");
+            }
+        }
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public void renewSession(final CallContext ctx, final String oldSessionId) {
+        val optKey = cleanRecord(oldSessionId);
+        if (optKey.isPresent()) {
+            recordSession(ctx, optKey.get());
+        }
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public Optional<String> cleanRecord(final String sessionId) {
+        val key = (String) store.get(sessionId).orElse(null);
+        store.remove(sessionId);
+        LOGGER.debug("cleaning sessionId: {} -> key: {}", sessionId, key);
+        if (key != null) {
+            store.remove(key);
+        }
+        return Optional.ofNullable(key);
+    }
+}

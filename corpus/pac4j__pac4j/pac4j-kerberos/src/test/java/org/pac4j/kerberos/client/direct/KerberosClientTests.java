@@ -1,0 +1,108 @@
+package org.pac4j.kerberos.client.direct;
+
+import lombok.val;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.pac4j.core.context.CallContext;
+import org.pac4j.core.context.HttpConstants;
+import org.pac4j.core.context.WebContext;
+import org.pac4j.core.profile.CommonProfile;
+import org.pac4j.core.profile.UserProfile;
+import org.pac4j.test.util.TestsHelper;
+import org.pac4j.kerberos.credentials.KerberosCredentials;
+import org.pac4j.kerberos.credentials.authenticator.KerberosAuthenticator;
+import org.pac4j.kerberos.credentials.authenticator.KerberosTicketValidation;
+import org.pac4j.kerberos.credentials.authenticator.KerberosTicketValidator;
+import org.pac4j.test.context.MockWebContext;
+import org.pac4j.test.context.session.MockSessionStore;
+import org.pac4j.test.util.TestsConstants;
+
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.mockito.Mockito.*;
+
+/**
+ *
+ * Tests the Kerberos client with mocked Kerberos authenticator/validator (i.e. no real tickets used)
+ *
+ * @author Garry Boyce
+ * @author Vidmantas Zemleris
+ * @since 2.1.0
+ */
+public class KerberosClientTests implements TestsConstants {
+
+    private KerberosAuthenticator kerberosAuthenticator;
+    private KerberosTicketValidator krbValidator;
+
+    private final static byte[] KERBEROS_TICKET = Base64.getEncoder().encode("Test Kerberos".getBytes(StandardCharsets.UTF_8));
+
+    @BeforeEach
+    public void before() {
+        // mocking
+        this.kerberosAuthenticator = mock(KerberosAuthenticator.class);
+        this.krbValidator = mock(KerberosTicketValidator.class);
+    }
+
+    @Test
+    public void testMissingKerberosAuthenticator() {
+        val kerberosClient = new DirectKerberosClient(null);
+        TestsHelper.initShouldFail(kerberosClient, "authenticator cannot be null");
+    }
+
+    @Test
+    public void testMissingProfileCreator() {
+        val kerberosClient = new DirectKerberosClient(kerberosAuthenticator);
+        kerberosClient.setProfileCreator(null);
+        TestsHelper.initShouldFail(kerberosClient, "profileCreator cannot be null");
+    }
+
+    @Test
+    public void testHasDefaultProfileCreator() {
+        val kerberosClient = new DirectKerberosClient(kerberosAuthenticator);
+        kerberosClient.init();
+    }
+
+    @Test
+    public void testMissingKerberosHeader() {
+        val client = new DirectKerberosClient(new KerberosAuthenticator(krbValidator));
+        val credentials = client.getCredentials(new CallContext(MockWebContext.create(), new MockSessionStore()));
+        assertFalse(credentials.isPresent());
+    }
+
+    @Test
+    public void testMalformedBase64TokenInKerberosHeader() {
+        val context = MockWebContext.create()
+            .addRequestHeader(HttpConstants.AUTHORIZATION_HEADER, "Negotiate not-base64*");
+        val client = new DirectKerberosClient(new KerberosAuthenticator(krbValidator));
+        val credentials = client.getCredentials(new CallContext(context, new MockSessionStore()));
+        assertFalse(credentials.isPresent());
+    }
+
+    @Test
+    public void testWWWAuthenticateNegotiateHeaderIsSetToTriggerSPNEGOWhenNoCredentialsAreFound() {
+        final WebContext context = MockWebContext.create();
+        val client = new DirectKerberosClient(new KerberosAuthenticator(krbValidator));
+        val credentials = client.getCredentials(new CallContext(context, new MockSessionStore()));
+        assertFalse(credentials.isPresent());
+        assertEquals("Negotiate", context.getResponseHeader(HttpConstants.AUTHENTICATE_HEADER).get());
+    }
+
+    @Test
+    public void testAuthentication() {
+        when(krbValidator.validateTicket(any())).thenReturn(new KerberosTicketValidation("garry", null, null, null));
+        val client = new DirectKerberosClient(new KerberosAuthenticator(krbValidator));
+        val context = MockWebContext.create();
+
+        context.addRequestHeader(HttpConstants.AUTHORIZATION_HEADER, "Negotiate " + new String(KERBEROS_TICKET, StandardCharsets.UTF_8));
+        val ctx = new CallContext(context, new MockSessionStore());
+        val credentials = (KerberosCredentials) client.getCredentials(ctx).get();
+        assertEquals(new String(Base64.getDecoder().decode(KERBEROS_TICKET), StandardCharsets.UTF_8),
+            new String(credentials.getKerberosTicket(), StandardCharsets.UTF_8));
+        val authnCredentials = client.validateCredentials(ctx, credentials);
+        UserProfile profile = (CommonProfile) client.getUserProfile(ctx, authnCredentials.get()).get();
+        assertEquals("garry", profile.getId());
+    }
+}

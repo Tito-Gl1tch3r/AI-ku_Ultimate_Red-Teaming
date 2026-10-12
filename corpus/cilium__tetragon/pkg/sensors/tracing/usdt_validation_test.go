@@ -1,0 +1,165 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Tetragon
+
+//go:build !windows
+
+package tracing
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/cilium/tetragon/pkg/k8s/apis/cilium.io/v1alpha1"
+	"github.com/cilium/tetragon/pkg/testutils"
+)
+
+func TestUsdtValidationSetWrongReturnSize1B(t *testing.T) {
+	// Using 1 bytes return argument with usdt set action
+	usdt := testutils.RepoRootPath("contrib/tester-progs/usdt-override")
+	crd := `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "usdts"
+spec:
+  usdts:
+  - path: "` + usdt + `"
+    provider: "tetragon"
+    name: "test_1B"
+    args:
+    - index: 0
+      type: "int32"
+    - index: 1
+      type: "int32"
+    - index: 2
+      type: "int32"
+    selectors:
+    - matchActions:
+      - action: Set
+        argIndex: 0
+        argValue: 240
+`
+
+	err := checkCrd(t, crd)
+	require.Error(t, err)
+}
+
+func TestUsdtValidationSetWrongReturnSize8B(t *testing.T) {
+	// Using 8 bytes return argument with usdt set action
+	usdt := testutils.RepoRootPath("contrib/tester-progs/usdt-override")
+	crd := `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "usdts"
+spec:
+  usdts:
+  - path: "` + usdt + `"
+    provider: "tetragon"
+    name: "test_8B"
+    args:
+    - index: 0
+      type: "int32"
+    - index: 1
+      type: "int32"
+    - index: 2
+      type: "int32"
+    selectors:
+    - matchActions:
+      - action: Set
+        argIndex: 0
+        argValue: 240
+`
+
+	err := checkCrd(t, crd)
+	require.Error(t, err)
+}
+
+func TestUsdtValidationSetArgIndexOutOfBounds(t *testing.T) {
+	usdt := testutils.RepoRootPath("contrib/tester-progs/usdt-override")
+	crd := `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "usdts"
+spec:
+  usdts:
+  - path: "` + usdt + `"
+    provider: "tetragon"
+    name: "test_1B"
+    args:
+    - index: 0
+      type: "int32"
+    selectors:
+    - matchActions:
+      - action: Set
+        argIndex: 1
+        argValue: 240
+`
+
+	err := checkCrd(t, crd)
+	require.ErrorContains(t, err, "set action argument spec index 1 out of bounds")
+}
+
+func TestUsdtValidationProbeArgIndexOutOfBounds(t *testing.T) {
+	usdt := testutils.RepoRootPath("contrib/tester-progs/usdt-override")
+	crd := `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "usdts"
+spec:
+  usdts:
+  - path: "` + usdt + `"
+    provider: "tetragon"
+    name: "test_1B"
+    args:
+    - index: 3
+      type: "int32"
+`
+
+	err := checkCrd(t, crd)
+	require.ErrorContains(t, err, "argument index 3 out of bounds")
+}
+
+func TestUsdtEventConfigCarriesPolicyID(t *testing.T) {
+	spec := &v1alpha1.UsdtSpec{
+		Path:     testutils.RepoRootPath("contrib/tester-progs/usdt"),
+		Provider: "test",
+		Name:     "usdt0",
+	}
+
+	ids, err := addUsdt(spec, &addUsdtIn{policyID: 7}, nil, &usdtHas{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, cleanupUsdtEntries(ids)) })
+	require.NotEmpty(t, ids)
+
+	for _, id := range ids {
+		usdtEntry, err := genericUsdtTableGet(id)
+		require.NoError(t, err)
+		require.Equal(t, uint32(7), usdtEntry.config.PolicyID)
+	}
+}
+
+// The enforcer actions are only implemented for kprobes and tracepoints, so
+// they have to be rejected here rather than silently do nothing.
+func TestUsdtValidationEnforcerAction(t *testing.T) {
+	usdt := testutils.RepoRootPath("contrib/tester-progs/usdt-override")
+	err := checkCrd(t, `
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "usdt-notify-enforcer"
+spec:
+  usdts:
+  - path: "`+usdt+`"
+    provider: "tetragon"
+    name: "test_1B"
+    selectors:
+    - matchActions:
+      - action: NotifyEnforcer
+`)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "enforcer actions are not supported")
+}

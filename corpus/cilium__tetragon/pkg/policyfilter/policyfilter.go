@@ -1,0 +1,74 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Tetragon
+
+//go:build !nok8s
+
+package policyfilter
+
+import (
+	"testing"
+
+	slimv1 "github.com/cilium/tetragon/pkg/k8s/slim/k8s/apis/meta/v1"
+	"github.com/cilium/tetragon/pkg/labels"
+	"github.com/cilium/tetragon/pkg/manager/events"
+	"github.com/cilium/tetragon/pkg/option"
+	"github.com/cilium/tetragon/pkg/podhelpers"
+)
+
+// TestingEnableAndReset enables policy filter for tests (see ResetStateOnlyForTesting)
+func TestingEnableAndReset(t *testing.T) {
+	oldEnablePolicyFilterValue := option.Config.EnablePolicyFilter
+	option.Config.EnablePolicyFilter = true
+	resetStateOnlyForTesting()
+	t.Cleanup(func() {
+		option.Config.EnablePolicyFilter = oldEnablePolicyFilterValue
+		resetStateOnlyForTesting()
+	})
+
+}
+
+// State is the policyfilter state interface
+// It handles two things:
+//   - policies being added and removed
+//   - pod containers being added and deleted.
+type State interface {
+	// AddPolicy adds a policy to the policyfilter state.
+	// This means that:
+	//  - existing containers of pods that match this policy will be added to the policyfilter map (pfMap)
+	//  - from now on, new containers of pods that match this policy will also be added to pfMap
+	// pods are matched with:
+	//  - namespace for namespaced pilicies (if namespace == "", then policy is not namespaced)
+	//  - label selector
+	//  - container field selector
+	AddPolicy(polID PolicyID, namespace string, podSelector *slimv1.LabelSelector,
+		containerSelector *slimv1.LabelSelector, hostSelector *slimv1.LabelSelector) error
+
+	// DelPolicy removes a policy from the state
+	DelPolicy(polID PolicyID) error
+
+	// AddPodContainer informs policyfilter about a new container and its cgroup id in a pod.
+	// The pod might or might not have been encountered before.
+	// This method is intended to update policyfilter state from container hooks
+	AddPodContainer(podID PodID, namespace string, podLabels labels.Labels,
+		containerID string, cgID CgroupID, containerInfo podhelpers.ContainerInfo) error
+
+	// UpdatePod updates the pod state for a pod, where containerIDs contains all the container ids for the given pod.
+	// This method is intended to be used from k8s watchers (where no cgroup information is available)
+	UpdatePod(podID PodID, namespace string, podLabels labels.Labels,
+		containerIDs []string, containerInfo []podhelpers.ContainerInfo) error
+
+	// DelPodContainer informs policyfilter that a container was deleted from a pod
+	DelPodContainer(podID PodID, containerID string) error
+	// DelPod informs policyfilter that a pod has been deleted
+	DelPod(podID PodID) error
+
+	// RegisterPodHandlers wires policyfilter's pod-event handlers into the
+	// supplied events.PodEventSource so the policy filter state stays up to
+	// date with pod lifecycle changes. It returns an error if any handler
+	// registration fails during startup.
+	RegisterPodHandlers(src events.PodEventSource) error
+
+	// Close releases resources allocated by the Manager. Specifically, we close and unpin the
+	// policy filter map.
+	Close() error
+}

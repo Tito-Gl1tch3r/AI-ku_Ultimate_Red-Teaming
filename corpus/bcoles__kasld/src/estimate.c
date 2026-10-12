@@ -1,0 +1,709 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// Estimate resolution: per-lattice meet, bottom test, and the greedy
+// conflict-aware resolver. Arch-independent — operates purely over the
+// quantity definitions and a constraint array. See estimate.h for the
+// model and the README "Inference engine" / "Cross-region derivation"
+// sections for the layered architecture this fits into.
+// ---
+// <bcoles@gmail.com>
+
+#include "include/kasld/estimate.h"
+
+#include <limits.h>
+
+/* Working cap on constraints considered for a single quantity in one
+ * resolve. Far above realistic per-quantity constraint counts. */
+/* ESTIMATE_MAX_WORK is declared in include/kasld/estimate.h alongside the
+ * saturation enum, so callers can size their tests against the same cap. */
+
+/* ------------------------------------------------------------------------
+ * Modular helpers (C_STRIDE folding).
+ *
+ * Stride constraints take the form `q ≡ r (mod m)`. Folding two such
+ * constraints (`q ≡ r1 mod m1`, `q ≡ r2 mod m2`) into one (`q ≡ R mod M`,
+ * where M = lcm(m1, m2)) is the Chinese Remainder Theorem on a non-coprime
+ * pair: unique solution iff (r1 - r2) is divisible by gcd(m1, m2).
+ *
+ * Moduli are capped by callers (estimate_meet sanity-checks) to fit the
+ * extended-Euclidean math comfortably in unsigned long long.
+ * ------------------------------------------------------------------------ */
+
+/* Find (g, x, y) with g = gcd(a, b) and a*x + b*y = g. Signed long long math
+ * so coefficients can be negative. */
+static long long ext_gcd(long long a, long long b, long long *x, long long *y) {
+  if (b == 0) {
+    *x = 1;
+    *y = 0;
+    return a;
+  }
+  long long x1, y1;
+  long long g = ext_gcd(b, a % b, &x1, &y1);
+  *x = y1;
+  *y = x1 - (a / b) * y1;
+  return g;
+}
+
+/* Try to fold (r1 mod m1) and (r2 mod m2) into one (R mod M, where M =
+ * lcm(m1, m2)). Returns 1 on success and sets *out_r, *out_m; returns 0
+ * when the system is inconsistent (no R satisfies both). */
+static int stride_crt(unsigned long r1, unsigned long m1, unsigned long r2,
+                      unsigned long m2, unsigned long *out_r,
+                      unsigned long *out_m) {
+  if (m1 == 0 || m2 == 0)
+    return 0;
+  /* Normalise residues. */
+  r1 %= m1;
+  r2 %= m2;
+  /* Same modulus: must just agree. */
+  if (m1 == m2) {
+    if (r1 != r2)
+      return 0;
+    *out_r = r1;
+    *out_m = m1;
+    return 1;
+  }
+  long long x, y;
+  long long g = ext_gcd((long long)m1, (long long)m2, &x, &y);
+  long long diff = (long long)r2 - (long long)r1;
+  if (diff % g != 0)
+    return 0; /* inconsistent — no solution */
+  /* LCM = m1 * m2 / g. Check overflow before multiplying. */
+  unsigned long long lcm =
+      (unsigned long long)m1 / (unsigned long long)g * (unsigned long long)m2;
+  if (lcm > (unsigned long long)ULONG_MAX)
+    return 0;
+  /* R = (r1 + m1 * ((diff/g) * x mod (m2/g))) mod lcm.
+   *
+   * Reduce (diff/g)*x modulo n = m2/g BEFORE multiplying by m1: that keeps
+   * every intermediate below lcm. The naive r1 + m1*(diff/g)*x multiplies three
+   * cofactors each up to the modulus cap (0xf_ffff_ffff, ~2^36), overflowing
+   * 64 bits; the reduced form never exceeds m1 * (m2/g) = lcm. */
+  unsigned long long n = m2 / (unsigned long long)g;
+  long long dg = diff / g;
+  /* a, b in [0, n): (diff/g) and x reduced mod n, normalized non-negative. */
+  unsigned long long a =
+      (unsigned long long)(((dg % (long long)n) + (long long)n) % (long long)n);
+  unsigned long long b =
+      (unsigned long long)(((x % (long long)n) + (long long)n) % (long long)n);
+  unsigned long long k = (a * b) % n; /* a,b < n: a*b fits u64 */
+  unsigned long long mk = (unsigned long long)m1 * k; /* < m1*(m2/g) = lcm */
+  unsigned long long r1m = (unsigned long long)r1 % lcm;
+  /* R = (mk + r1m) mod lcm, computed without overflowing (both operands
+   * < lcm). */
+  unsigned long long R = (mk >= lcm - r1m) ? mk - (lcm - r1m) : mk + r1m;
+  *out_r = (unsigned long)R;
+  *out_m = (unsigned long)lcm;
+  return 1;
+}
+
+/* The first stride-class element ≥ floor; or 0 if it would overflow.
+ *
+ * Sentinel-vs-value overlap: 0 is both the overflow sentinel AND a legitimate
+ * return when floor=0 and offset≡0 (mod stride). Callers must disambiguate
+ * before treating "0 means no element exists". Two callers exist:
+ * stride_intersects_interval re-checks the residue against the floor modulo;
+ * quantity_slots instead relies on the `first == 0 || first > hi` guard, which
+ * discards the sentinel-0 case along with any element past the range top and so
+ * needs no separate residue re-check. A further caller must do one or the
+ * other, or refactor to a `bool overflowed` out-parameter. */
+static unsigned long stride_first_at_or_above(unsigned long floor,
+                                              unsigned long stride,
+                                              unsigned long offset) {
+  if (stride == 0)
+    return floor;
+  unsigned long off = offset % stride;
+  unsigned long rem = floor % stride;
+  if (rem == off)
+    return floor;
+  unsigned long add = (off >= rem) ? (off - rem) : (stride - (rem - off));
+  if (floor > ULONG_MAX - add)
+    return 0;
+  return floor + add;
+}
+
+/* True iff the stride class has at least one element in [lo, hi]. */
+static int stride_intersects_interval(unsigned long lo, unsigned long hi,
+                                      unsigned long stride,
+                                      unsigned long offset) {
+  if (stride == 0)
+    return 1;
+  unsigned long first = stride_first_at_or_above(lo, stride, offset);
+  /* Disambiguate sentinel-0 from legitimate-0: if the residue at lo does not
+   * match offset's residue, then either (a) the next class member is at some
+   * higher address but stride_first_at_or_above overflowed, or (b) `first`
+   * was returned > 0 above. Case (a) -> no member in any [lo, hi]. */
+  if (first == 0 && (lo % stride) != (offset % stride))
+    return 0;
+  return first <= hi;
+}
+
+/* Does one concrete value satisfy this constraint?
+ *
+ * The finite-set lattice narrows by testing each live candidate, so it needs a
+ * predicate that is TOTAL over the op enum. The switch carries no `default:`
+ * deliberately: a newly added constraint op then fails -Wswitch until someone
+ * states how a finite set answers it. That is the guard the old code lacked —
+ * it handled C_EQUALS and let every other op through untouched, so C_EXCLUDE
+ * and both bounds were silently discarded on a finite set.
+ *
+ * Interval semantics are not expressed here. An interval cannot represent an
+ * interior hole, so LK_INTERVAL keeps its own op-by-op narrowing, including
+ * the end-trim approximation for C_EXCLUDE. */
+static int constraint_admits(const struct constraint *c, unsigned long v) {
+  switch (c->op) {
+  case C_LOWER_BOUND:
+    return v >= c->value;
+  case C_UPPER_BOUND:
+    return v <= c->value;
+  case C_EQUALS:
+    return v == c->value;
+  case C_AT_LEAST_ALIGN:
+    /* A zero alignment constrains nothing; say so rather than divide by it. */
+    return c->value == 0 || (v % c->value) == 0;
+  case C_EXCLUDE:
+    /* Inclusive [value, value2]. A reversed pair is an empty range, which
+     * excludes nothing — this test admits everything for it, as it should. */
+    return v < c->value || v > c->value2;
+  case C_STRIDE:
+    /* q = value (mod value2). A zero modulus is not a residue class. */
+    return c->value2 == 0 || (v % c->value2) == (c->value % c->value2);
+  }
+  return 1; /* not reached; an unhandled op is a -Wswitch build failure */
+}
+
+/* ------------------------------------------------------------------------
+ * Meet — narrow an estimate by one constraint.
+ * ------------------------------------------------------------------------ */
+void estimate_meet(struct estimate *e, const struct quantity_def *qd,
+                   const struct constraint *c) {
+  switch (qd->lattice) {
+  case LK_INTERVAL:
+    switch (c->op) {
+    case C_LOWER_BOUND:
+      if (c->value > e->lo) {
+        e->lo = c->value;
+        e->lo_binding = c->id;
+      }
+      break;
+    case C_UPPER_BOUND:
+      if (c->value < e->hi) {
+        e->hi = c->value;
+        e->hi_binding = c->id;
+      }
+      break;
+    case C_EQUALS:
+      if (c->value > e->lo) {
+        e->lo = c->value;
+        e->lo_binding = c->id;
+      }
+      if (c->value < e->hi) {
+        e->hi = c->value;
+        e->hi_binding = c->id;
+      }
+      break;
+    case C_EXCLUDE:
+      /* Single-interval lattice cannot represent an interior hole. Handle the
+       * cases the interval CAN express; a strictly interior hole is left
+       * uncarved (a documented limitation — the value stays sound, just looser;
+       * carved at read time by quantity_ranges).
+       *  - covers all of [lo, hi]  -> empty: drive to bottom so the resolver
+       *    rejects it as a conflict, rather than silently accepting a no-op
+       * that removes every value while estimate_is_bottom stays false (this
+       * also keeps estimate_is_bottom in step with the empty set
+       * quantity_ranges reports for the same input);
+       *  - covers exactly one end  -> trim that edge. */
+      if (c->value <= e->lo && c->value2 >= e->hi) {
+        e->lo = 1; /* lo > hi is the standard bottom signal */
+        e->hi = 0;
+        e->lo_binding = c->id;
+        e->hi_binding = c->id;
+      } else if (c->value <= e->lo && c->value2 >= e->lo && c->value2 < e->hi) {
+        e->lo = c->value2 + 1;
+        e->lo_binding = c->id;
+      } else if (c->value2 >= e->hi && c->value <= e->hi && c->value > e->lo) {
+        e->hi = c->value - 1;
+        e->hi_binding = c->id;
+      }
+      break;
+    case C_STRIDE: {
+      /* Stride annotation: q ≡ value (mod value2). Reject moduli that
+       * exceed the safe extended-Euclidean range or are zero. */
+      unsigned long m = c->value2;
+      unsigned long r = c->value;
+      if (m == 0)
+        break;
+#if __SIZEOF_LONG__ >= 8
+      /* Reject moduli beyond the safe extended-Euclidean range. Only reachable
+       * on 64-bit: 0xf_ffff_ffff exceeds a 32-bit unsigned long. */
+      if (m > 0xffffffffful)
+        break;
+#endif
+      if (e->stride == 0) {
+        e->stride = m;
+        e->stride_offset = r % m;
+      } else {
+        unsigned long combined_r, combined_m;
+        if (!stride_crt(e->stride_offset, e->stride, r % m, m, &combined_r,
+                        &combined_m)) {
+          /* Force bottom: the existing and new stride classes are disjoint,
+           * so no q can satisfy both. Drive lo > hi to signal bottom via
+           * the standard interval test. */
+          e->lo = 1;
+          e->hi = 0;
+          break;
+        }
+        e->stride = combined_m;
+        e->stride_offset = combined_r;
+      }
+      break;
+    }
+    default:
+      break;
+    }
+    break;
+
+  case LK_MAXALIGN:
+    /* "q divisible by value": combining requires divisibility by both; for
+     * powers of two that is the max.
+     *
+     * C_EQUALS states the granularity ITSELF rather than a floor under it --
+     * a source that read the kernel's own placement constant, not one that
+     * reasoned about what the base must at least satisfy. It raises `lo` on
+     * the same max rule and additionally closes `hi`, which is what separates
+     * "at least this coarse" from "exactly this". Recording it has to be
+     * independent of whether `lo` moved: the granularity a kernel is built
+     * with is usually the architecture's own minimum, so the value that
+     * settles the question is typically the one already standing.
+     *
+     * Every other op is ignored here, as it always has been: an alignment
+     * admits no interval arithmetic, and a rule with something else to say
+     * about it has said the wrong thing. */
+    if (c->op == C_AT_LEAST_ALIGN && c->value > e->lo) {
+      e->lo = c->value;
+      e->lo_binding = c->id;
+    } else if (c->op == C_EQUALS) {
+      if (c->value > e->lo) {
+        e->lo = c->value;
+        e->lo_binding = c->id;
+      }
+      /* A meet on the ceiling too, not an assignment. Overwriting it would let
+       * a later statement RAISE a proven ceiling, which no meet may do, and
+       * would silently absorb a disagreement between two sources about the
+       * granularity. Taking the tighter leaves the pair to meet in the middle
+       * -- and where they cannot, lo passes hi and the estimate reads bottom,
+       * which is how the resolver is told to drop one of them. */
+      if (e->hi == 0 || c->value < e->hi) {
+        e->hi = c->value;
+        e->hi_binding = c->id;
+        e->hi_conf = c->conf;
+      }
+    }
+    break;
+
+  case LK_FINSET: {
+    /* Keep every live candidate the constraint admits and drop the rest. One
+     * uniform narrowing for all ops, so none can be ignored by omission: a
+     * C_EQUALS naming no candidate empties the set (bottom), a bound trims the
+     * ends, and a C_EXCLUDE removes an interior candidate exactly — the finite
+     * set represents holes that the interval lattice has to approximate.
+     *
+     * `stride` stays 0 here: a C_STRIDE narrows the live set directly, leaving
+     * no residue annotation to carry (see struct estimate). The shift is safe
+     * unguarded because n_candidates is bounded at compile time by
+     * KASLD_FINSET_MAX_CANDIDATES. */
+    unsigned long mask = 0;
+    for (int i = 0; i < qd->n_candidates; i++)
+      if ((e->lo & (1ul << i)) && constraint_admits(c, qd->candidates[i]))
+        mask |= 1ul << i;
+    if (mask != e->lo) {
+      e->lo = mask;
+      e->lo_binding = c->id;
+    }
+    break;
+  }
+  }
+
+  /* Propagate the binding constraint's confidence to whichever edge it just set
+   * (ids are monotonic from 1, so this only matches an edge this call bound;
+   * an edge left pointing at an earlier constraint keeps that one's conf).
+   * Lets cross-quantity rules cap a derived constraint at its input's trust. */
+  if (e->lo_binding == c->id)
+    e->lo_conf = c->conf;
+  if (e->hi_binding == c->id)
+    e->hi_conf = c->conf;
+}
+
+int estimate_is_bottom(const struct estimate *e,
+                       const struct quantity_def *qd) {
+  switch (qd->lattice) {
+  case LK_INTERVAL:
+    if (e->lo > e->hi)
+      return 1;
+    /* With a stride annotation, also bottom when no element of the residue
+     * class lies in the interval. */
+    if (e->stride &&
+        !stride_intersects_interval(e->lo, e->hi, e->stride, e->stride_offset))
+      return 1;
+    return 0;
+  case LK_MAXALIGN:
+    /* A floor alone can never contradict: the max of powers of two is always a
+     * valid alignment. A stated granularity can, and does so exactly when a
+     * floor has been proven past it -- two sources disagreeing about the grid
+     * the kernel placed on. The resolver's own priority order then keeps the
+     * stronger and records the other as a conflict, rather than either being
+     * silently absorbed by the max. */
+    return e->hi != 0 && e->lo > e->hi;
+  case LK_FINSET:
+    return e->lo == 0; /* no candidates remain */
+  }
+  return 0;
+}
+
+int estimate_finset_value(const struct quantity_def *qd,
+                          const struct estimate *e, unsigned long *out) {
+  if (qd->lattice != LK_FINSET)
+    return 0;
+  unsigned long mask =
+      e->lo; /* live-candidate bitmask, one bit per candidate */
+  if (mask == 0 || (mask & (mask - 1)) != 0)
+    return 0; /* zero, or more than one, candidate still live */
+  for (int i = 0; i < qd->n_candidates; i++) {
+    if (mask == (1ul << i)) {
+      *out = qd->candidates[i];
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* ------------------------------------------------------------------------
+ * Greedy resolver.
+ * ------------------------------------------------------------------------ */
+
+/* Priority order for greedy acceptance: confidence DESC, then independent
+ * corroboration (lineage_count) DESC, then intrinsic content (value, value2,
+ * op) for capture-order-independent determinism, with id as the final
+ * tiebreak. Returns <0 if a should come before b. */
+static int prio_before(const struct constraint *a, const struct constraint *b) {
+  if (a->conf != b->conf)
+    return (int)b->conf - (int)a->conf; /* higher conf first */
+  if (a->lineage_count != b->lineage_count)
+    return (int)b->lineage_count - (int)a->lineage_count; /* more sources */
+  /* Tie-break on intrinsic content, NOT emission id: id reflects component
+   * capture order, which is non-deterministic under parallel execution — so an
+   * equal-(conf,lineage) conflict would otherwise resolve differently between a
+   * parallel run and a sequential (--verbose) one. value-then-value2-then-op is
+   * a total, capture-order-independent order; the direction is arbitrary
+   * (equal-confidence conflicts have no more-correct side — confidence is the
+   * real lever), but it makes the resolved estimate a pure function of the
+   * constraint SET.
+   *
+   * value2 is part of that content, not bookkeeping: it is the second operand
+   * of the two ops that take one — the exclusion's upper edge and the stride's
+   * modulus — so C_EXCLUDE [a, x] and [a, y] differ in what they remove while
+   * agreeing on every earlier key. Ordering them by id alone would hand that
+   * pair back to capture order, which is the one thing this comparison exists
+   * to keep out. What remains tied after value2 agrees on op, value and value2
+   * as well, so the two meet identically and only the binding id recorded
+   * against the edge can differ; id settles that and keeps the order total. */
+  if (a->value != b->value)
+    return (a->value < b->value) ? -1 : 1;
+  if (a->value2 != b->value2)
+    return (a->value2 < b->value2) ? -1 : 1;
+  if (a->op != b->op)
+    return (int)a->op - (int)b->op;
+  if (a->id != b->id)
+    return (a->id < b->id) ? -1 : 1;
+  return 0;
+}
+
+void estimate_resolve(enum kasld_quantity q, enum kasld_confidence floor,
+                      const struct constraint *cs, int n_cs,
+                      struct resolve_result *out) {
+  const struct quantity_def *qd = &quantities[q];
+
+  out->saturation = 0;
+
+  /* Gather indices of in-scope constraints (this quantity, conf >= floor).
+   * On overflow the first ESTIMATE_MAX_WORK are kept silently, in INSERTION
+   * order — the priority sort below would otherwise lose the higher-priority
+   * candidates beyond the cap. Surface a saturation bit so --verbose can
+   * report it. */
+  int idx[ESTIMATE_MAX_WORK];
+  int m = 0;
+  int in_scope = 0;
+  for (int i = 0; i < n_cs; i++) {
+    if (cs[i].q != q || (int)cs[i].conf < (int)floor)
+      continue;
+    in_scope++;
+    if (m < ESTIMATE_MAX_WORK)
+      idx[m++] = i;
+  }
+  if (in_scope > m)
+    out->saturation |= ESTIMATE_SAT_WORK_FULL;
+
+  /* Insertion sort by priority (small m; stable, in place). */
+  for (int i = 1; i < m; i++) {
+    int cur = idx[i];
+    int j = i - 1;
+    while (j >= 0 && prio_before(&cs[idx[j]], &cs[cur]) > 0) {
+      idx[j + 1] = idx[j];
+      j--;
+    }
+    idx[j + 1] = cur;
+  }
+
+  /* Greedy: start from honest top, accept constraints strongest-first,
+   * skipping any that would force bottom. */
+  qd->init_top(&out->est);
+  out->n_conflicts = 0;
+  for (int k = 0; k < m; k++) {
+    struct estimate trial = out->est;
+    estimate_meet(&trial, qd, &cs[idx[k]]);
+    if (estimate_is_bottom(&trial, qd)) {
+      if (out->n_conflicts < ESTIMATE_MAX_CONFLICTS)
+        out->conflicts[out->n_conflicts++] = cs[idx[k]].id;
+      else
+        out->saturation |= ESTIMATE_SAT_CONFLICTS_FULL;
+    } else {
+      out->est = trial;
+    }
+  }
+}
+
+/* ------------------------------------------------------------------------
+ * quantity_ranges — interval-set value-access for consumers.
+ * ------------------------------------------------------------------------ */
+/* ------------------------------------------------------------------------
+ * Lattice-agnostic value access — see the contract in estimate.h.
+ * ------------------------------------------------------------------------ */
+int quantity_pinned(enum kasld_quantity q, const struct estimate *e,
+                    unsigned long *out) {
+  const struct quantity_def *qd = &quantities[q];
+  unsigned long v = 0;
+  switch (qd->lattice) {
+  case LK_INTERVAL:
+    if (e->lo != e->hi)
+      return 0;
+    v = e->lo;
+    break;
+  case LK_FINSET:
+    if (!estimate_finset_value(qd, e, &v))
+      return 0;
+    break;
+  case LK_MAXALIGN:
+    /* An alignment is a value once both edges name it: a floor that has been
+     * met from above is the granularity itself. Absent a stated ceiling it
+     * stays a bound, which is the ordinary case. */
+    if (e->hi == 0 || e->lo != e->hi)
+      return 0;
+    v = e->lo;
+    break;
+  }
+  if (out)
+    *out = v;
+  return 1;
+}
+
+int quantity_window(enum kasld_quantity q, const struct estimate *e,
+                    unsigned long *lo, unsigned long *hi) {
+  const struct quantity_def *qd = &quantities[q];
+  unsigned long a = 0, b = 0;
+  switch (qd->lattice) {
+  case LK_INTERVAL:
+    if (e->lo > e->hi)
+      return 0; /* bottom */
+    a = e->lo;
+    b = e->hi;
+    break;
+  case LK_FINSET: {
+    /* Candidate tables are not required to be sorted, so scan for both edges
+     * rather than reading the first and last live bits. */
+    int seen = 0;
+    for (int i = 0; i < qd->n_candidates; i++) {
+      if (!(e->lo & (1ul << i)))
+        continue;
+      unsigned long v = qd->candidates[i];
+      if (!seen || v < a)
+        a = v;
+      if (!seen || v > b)
+        b = v;
+      seen = 1;
+    }
+    if (!seen)
+      return 0; /* empty set — bottom */
+    break;
+  }
+  case LK_MAXALIGN:
+    return 0;
+  }
+  if (lo)
+    *lo = a;
+  if (hi)
+    *hi = b;
+  return 1;
+}
+
+int quantity_admits(enum kasld_quantity q, const struct estimate *e,
+                    unsigned long v) {
+  const struct quantity_def *qd = &quantities[q];
+  switch (qd->lattice) {
+  case LK_INTERVAL:
+    if (e->lo > e->hi || v < e->lo || v > e->hi)
+      return 0;
+    if (e->stride && (v % e->stride) != e->stride_offset)
+      return 0;
+    return 1;
+  case LK_FINSET:
+    for (int i = 0; i < qd->n_candidates; i++)
+      if ((e->lo & (1ul << i)) && qd->candidates[i] == v)
+        return 1;
+    return 0;
+  case LK_MAXALIGN:
+    return 0;
+  }
+  return 0;
+}
+
+int quantity_narrowed(enum kasld_quantity q, const struct estimate *e) {
+  const struct quantity_def *qd = &quantities[q];
+  struct estimate top;
+  qd->init_top(&top);
+  switch (qd->lattice) {
+  case LK_INTERVAL:
+    return e->lo > top.lo || e->hi < top.hi || e->stride != top.stride;
+  case LK_FINSET:
+  case LK_MAXALIGN:
+    return e->lo != top.lo;
+  }
+  return 0;
+}
+
+int quantity_ranges(enum kasld_quantity q, const struct estimate *e,
+                    enum kasld_confidence floor, const struct constraint *cs,
+                    int n_cs, struct range *out, int out_max) {
+  const struct quantity_def *qd = &quantities[q];
+
+  if (qd->lattice == LK_MAXALIGN)
+    return 0; /* an alignment is not an address set */
+
+  if (qd->lattice == LK_FINSET) {
+    /* One degenerate range per live candidate, with no read-time carving. The
+     * interval path below carves C_EXCLUDE holes here because a single
+     * interval cannot hold them; a bitmask can, so estimate_meet has already
+     * applied every exclude at or above the floor `e` was resolved at. Carving
+     * again would be a no-op at best and, if handed a different floor than `e`
+     * was resolved at, inconsistent with the mask. */
+    int n = 0;
+    for (int i = 0; i < qd->n_candidates && n < out_max; i++)
+      if (e->lo & (1ul << i)) {
+        out[n].lo = qd->candidates[i];
+        out[n].hi = qd->candidates[i];
+        n++;
+      }
+    return n;
+  }
+
+  /* LK_INTERVAL: carve interior C_EXCLUDE holes out of [lo, hi]. Gather the
+   * holes for q at conf >= floor, clamp to the interval, sort by lo, then sweep
+   * emitting the gaps between them. The floor gate matches estimate_resolve's:
+   * a sub-floor exclude never reached the estimate's edges, so it must not
+   * carve the interior either, or the carved set could drop the true value from
+   * a floored (guaranteed) window. Edge holes at/above floor were already
+   * applied by the lattice (estimate_meet), so re-carving them here is an
+   * idempotent no-op. */
+  struct range holes[ESTIMATE_MAX_WORK];
+  int nh = 0;
+  for (int i = 0; i < n_cs && nh < ESTIMATE_MAX_WORK; i++) {
+    if (cs[i].q != q || cs[i].op != C_EXCLUDE || (int)cs[i].conf < (int)floor)
+      continue;
+    unsigned long a = cs[i].value, b = cs[i].value2;
+    if (b < e->lo || a > e->hi)
+      continue; /* hole entirely outside the interval */
+    if (a < e->lo)
+      a = e->lo;
+    if (b > e->hi)
+      b = e->hi;
+    holes[nh].lo = a;
+    holes[nh].hi = b;
+    nh++;
+  }
+  /* Sort holes by lo (insertion; small nh). */
+  for (int i = 1; i < nh; i++) {
+    struct range cur = holes[i];
+    int j = i - 1;
+    while (j >= 0 && holes[j].lo > cur.lo) {
+      holes[j + 1] = holes[j];
+      j--;
+    }
+    holes[j + 1] = cur;
+  }
+  /* Sweep [lo, hi], emitting gaps. `cur` tracks the next free address. */
+  int n = 0;
+  unsigned long cur = e->lo;
+  for (int i = 0; i < nh; i++) {
+    if (holes[i].lo > cur) {
+      if (n >= out_max)
+        return n;
+      out[n].lo = cur;
+      out[n].hi = holes[i].lo - 1;
+      n++;
+    }
+    if (holes[i].hi == ULONG_MAX) {
+      cur = ULONG_MAX;
+      /* nothing above; mark exhausted */
+      return n;
+    }
+    if (holes[i].hi + 1 > cur)
+      cur = holes[i].hi + 1;
+  }
+  if (cur <= e->hi && n < out_max) {
+    out[n].lo = cur;
+    out[n].hi = e->hi;
+    n++;
+  }
+  return n;
+}
+
+unsigned long quantity_slots(enum kasld_quantity q, const struct estimate *e,
+                             enum kasld_confidence floor,
+                             const struct constraint *cs, int n_cs,
+                             unsigned long align) {
+  if (align == 0)
+    return 0;
+  struct range rs[ESTIMATE_MAX_WORK];
+  int n = quantity_ranges(q, e, floor, cs, n_cs, rs, ESTIMATE_MAX_WORK);
+
+  /* Effective slot pitch: when a stride annotation is present and is a
+   * multiple of the requested align, slots step by `stride` (each stride
+   * class element is one allowed slot). Otherwise step by `align`. */
+  unsigned long step = align;
+  if (e->stride && e->stride > align && (e->stride % align) == 0)
+    step = e->stride;
+
+  unsigned long slots = 0;
+  for (int i = 0; i < n; i++) {
+    if (step == e->stride) {
+      /* Stride-pitched: count residue-class members in [lo, hi]. */
+      unsigned long first =
+          stride_first_at_or_above(rs[i].lo, e->stride, e->stride_offset);
+      if (first == 0 || first > rs[i].hi)
+        continue;
+      slots += (rs[i].hi - first) / e->stride + 1;
+    } else {
+      /* Whole-slot pitch over the closed range [lo, hi]: the `+ 1` counts the
+       * floor itself, so a pin (lo == hi) is one candidate and a range
+       * narrower than one slot is one candidate rather than none.
+       *
+       * A carved hole can leave a sub-range whose floor is off the slot grid,
+       * in which case this counts one placement more than exist. That
+       * direction is deliberate: the count feeds the residual-entropy
+       * headline, where over-stating what survives is the conservative error
+       * and under-stating it would claim more of KASLR is defeated than the
+       * evidence shows. */
+      slots += (rs[i].hi - rs[i].lo) / step + 1;
+    }
+  }
+  return slots;
+}

@@ -1,0 +1,2116 @@
+//! User space probes.
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    error::Error,
+    ffi::{CStr, CString, OsStr, OsString},
+    fmt::{self, Write},
+    fs,
+    io::{self, BufRead as _, Cursor, Read as _},
+    iter,
+    num::NonZeroU32,
+    os::{
+        fd::{AsFd as _, BorrowedFd},
+        unix::ffi::{OsStrExt as _, OsStringExt as _},
+    },
+    path::{Path, PathBuf},
+    slice,
+    sync::LazyLock,
+};
+
+use aya_obj::generated::{
+    bpf_attach_type::BPF_TRACE_UPROBE_MULTI, bpf_link_type, bpf_prog_type::BPF_PROG_TYPE_KPROBE,
+};
+use libc::{EINVAL, ENOTSUP, EOPNOTSUPP};
+use object::{Object as _, ObjectSection as _, ObjectSymbol as _, Symbol};
+use thiserror::Error;
+
+use crate::{
+    VerifierLogLevel,
+    programs::{
+        FdLink, LinkError, PerfLinkInner, ProgramData, ProgramError, ProgramType,
+        define_link_wrapper, load_program_with_attach_type, load_program_without_attach_type,
+        probe::{
+            self, ManyProbeLinks, OsStringExt as _, Probe, ProbeEventArgs, ProbeKind,
+            ProbeLinkIdInner, ProbeLinkInner,
+        },
+    },
+    sys::{SyscallError, bpf_link_create_uprobe_multi},
+    util::{KernelVersion, MMap},
+};
+
+const LD_SO_CACHE_FILE: &str = "/etc/ld.so.cache";
+
+static LD_SO_CACHE: LazyLock<Result<LdSoCache, io::Error>> =
+    LazyLock::new(|| LdSoCache::load(LD_SO_CACHE_FILE));
+const LD_SO_CACHE_HEADER_OLD: &str = "ld.so-1.7.0\0";
+const LD_SO_CACHE_HEADER_NEW: &str = "glibc-ld.so.cache1.1";
+
+/// An user space probe.
+///
+/// User probes are eBPF programs that can be attached to any userspace
+/// function. They can be of two kinds:
+///
+/// - `uprobe`: get attached to the *start* of the target functions
+/// - `uretprobe`: get attached to the *return address* of the target functions
+#[derive(Debug)]
+#[doc(alias = "BPF_PROG_TYPE_KPROBE")]
+pub struct UProbe {
+    pub(crate) data: ProgramData<UProbeLink>,
+    pub(crate) kind: ProbeKind,
+    pub(crate) attach_mode: AttachMode,
+}
+
+pub(crate) struct UProbeAttachTarget<'a> {
+    path: &'a OsStr,
+    offset: u64,
+    pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AttachMode {
+    Single,
+    Multi,
+    Unknown,
+}
+
+/// The location in the target object file to which the uprobe is to be
+/// attached.
+#[derive(Debug, Clone, Copy)]
+pub enum UProbeAttachLocation<'a> {
+    /// The location of the target function in the target object file.
+    Symbol(&'a str),
+    /// The location of the target function in the target object file, offset by
+    /// the given number of bytes.
+    SymbolOffset(&'a str, u64),
+    /// The offset in the target object file, in bytes.
+    AbsoluteOffset(u64),
+}
+
+impl<'a> From<&'a str> for UProbeAttachLocation<'a> {
+    fn from(s: &'a str) -> Self {
+        Self::Symbol(s)
+    }
+}
+
+impl From<u64> for UProbeAttachLocation<'static> {
+    fn from(offset: u64) -> Self {
+        Self::AbsoluteOffset(offset)
+    }
+}
+
+impl<T> From<&T> for UProbeAttachLocation<'_>
+where
+    T: Copy,
+    Self: From<T>,
+{
+    fn from(value: &T) -> Self {
+        Self::from(*value)
+    }
+}
+
+/// The type returned when constructing a [`UProbeAttachLocation`] fails.
+#[derive(Debug, Error)]
+pub enum UProbeAttachLocationError {
+    /// The instruction address is not in the containing section.
+    #[error(
+        "instruction address {instruction_address:#x} is not in section: \
+        before section address {section_address:#x}"
+    )]
+    AddressNotInSection {
+        /// The instruction's virtual address.
+        instruction_address: u64,
+        /// The containing section's virtual address.
+        section_address: u64,
+    },
+
+    /// The computed file offset does not fit in [`u64`].
+    #[error(
+        "computed file offset overflows u64: \
+        {instruction_address:#x} - {section_address:#x} + {section_offset:#x}"
+    )]
+    FileOffsetOverflow {
+        /// The instruction's virtual address.
+        instruction_address: u64,
+        /// The containing section's virtual address.
+        section_address: u64,
+        /// The containing section's file offset.
+        section_offset: u64,
+    },
+}
+
+impl UProbeAttachLocation<'static> {
+    /// Returns an attach location from an ELF virtual address.
+    ///
+    /// The kernel expects uprobes and uretprobes to be attached by object file
+    /// offset. If you have already resolved the instruction to an ELF virtual
+    /// address, pass that address together with the virtual address and file
+    /// offset of the section that contains it.
+    ///
+    /// This returns [`UProbeAttachLocation::AbsoluteOffset`] using the same
+    /// address translation used for uprobe attachment:
+    ///
+    /// ```text
+    /// file_offset = instruction_address - section_address + section_offset
+    /// ```
+    ///
+    /// The arguments correspond to ELF values as follows:
+    ///
+    /// - `instruction_address`: the instruction virtual address, typically a
+    ///   symbol's `st_value`.
+    /// - `section_address`: the containing section's virtual address
+    ///   (`sh_addr`).
+    /// - `section_offset`: the containing section's file offset (`sh_offset`).
+    ///
+    /// `instruction_address` must be greater than or equal to
+    /// `section_address`. The caller must pass the `section_address` and
+    /// `section_offset` for the section containing `instruction_address`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UProbeAttachLocationError::AddressNotInSection`] if
+    /// `instruction_address` is less than `section_address`.
+    ///
+    /// Returns [`UProbeAttachLocationError::FileOffsetOverflow`] if the
+    /// computed file offset does not fit in [`u64`].
+    pub fn from_virtual_address(
+        instruction_address: u64,
+        section_address: u64,
+        section_offset: u64,
+    ) -> Result<Self, UProbeAttachLocationError> {
+        let section_relative_offset = instruction_address.checked_sub(section_address).ok_or(
+            UProbeAttachLocationError::AddressNotInSection {
+                instruction_address,
+                section_address,
+            },
+        )?;
+        let file_offset = section_relative_offset.checked_add(section_offset).ok_or(
+            UProbeAttachLocationError::FileOffsetOverflow {
+                instruction_address,
+                section_address,
+                section_offset,
+            },
+        )?;
+
+        Ok(Self::AbsoluteOffset(file_offset))
+    }
+}
+
+/// Describes a single attachment point along with its optional cookie.
+#[derive(Debug, Clone, Copy)]
+pub struct UProbeAttachPoint<'a> {
+    /// The actual target location.
+    pub location: UProbeAttachLocation<'a>,
+    /// Optional cookie available via `bpf_get_attach_cookie()`.
+    pub cookie: Option<u64>,
+}
+
+impl<'a, L: Into<UProbeAttachLocation<'a>>> From<L> for UProbeAttachPoint<'a> {
+    fn from(location: L) -> Self {
+        Self {
+            location: location.into(),
+            cookie: None,
+        }
+    }
+}
+
+impl From<&Self> for UProbeAttachPoint<'_> {
+    fn from(point: &Self) -> Self {
+        *point
+    }
+}
+
+/// Specifies which processes a uprobe should fire for.
+#[derive(Debug, Clone, Copy)]
+pub enum UProbeScope {
+    /// Fire for any process that hits the attach point.
+    AllProcesses,
+    /// Fire only when the calling process/thread hits the attach point.
+    CallingProcess,
+    /// Fire only when the given process hits the attach point.
+    OneProcess(NonZeroU32),
+}
+
+enum ResolvedPoints {
+    One {
+        offset: u64,
+        cookie: Option<u64>,
+    },
+    // Keep these as separate arrays to match the uprobe_multi kernel ABI,
+    // which takes offsets and cookies separately. This is private internal
+    // state, so keeping the arrays aligned is controlled here and avoids
+    // splitting a point-oriented representation before link_create.
+    Many {
+        offsets: Vec<u64>,
+        cookies: Option<Vec<u64>>,
+    },
+}
+
+enum PendingOffset<'a> {
+    Absolute(u64),
+    Symbol { symbol: &'a str, additional: u64 },
+}
+
+impl ResolvedPoints {
+    fn offsets(&self) -> &[u64] {
+        match self {
+            Self::One { offset, cookie: _ } => slice::from_ref(offset),
+            Self::Many {
+                offsets,
+                cookies: _,
+            } => offsets,
+        }
+    }
+
+    fn cookies(&self) -> Option<&[u64]> {
+        match self {
+            Self::One { offset: _, cookie } => cookie.as_ref().map(slice::from_ref),
+            Self::Many {
+                offsets: _,
+                cookies,
+            } => cookies.as_deref(),
+        }
+    }
+}
+
+// Resolve points without losing their caller-defined order.
+fn resolve_points<'a, I>(
+    path: &Path,
+    first: I::Item,
+    rest: I,
+) -> Result<ResolvedPoints, UProbeError>
+where
+    I: IntoIterator,
+    I::Item: Into<UProbeAttachPoint<'a>>,
+{
+    let first = first.into();
+    let mut rest = rest.into_iter();
+    let Some(second) = rest.next() else {
+        // Keep the single-point path allocation-free.
+        let UProbeAttachPoint { location, cookie } = first;
+        let (symbol, additional) = match location {
+            UProbeAttachLocation::Symbol(symbol) => (Some(symbol), 0),
+            UProbeAttachLocation::SymbolOffset(symbol, additional) => (Some(symbol), additional),
+            UProbeAttachLocation::AbsoluteOffset(offset) => (None, offset),
+        };
+        let offset = match symbol {
+            Some(symbol) => {
+                let offset =
+                    resolve_symbol(path, symbol).map_err(|error| UProbeError::SymbolError {
+                        symbol: symbol.to_string(),
+                        error: Box::new(error),
+                    })?;
+                offset + additional
+            }
+            None => additional,
+        };
+        return Ok(ResolvedPoints::One { offset, cookie });
+    };
+
+    let points = iter::once(first)
+        .chain(iter::once(second.into()))
+        .chain(rest.map(Into::into));
+    let (lower, _) = points.size_hint();
+    // Preserve caller order across mixed absolute and symbolic locations so the resolved offsets
+    // remain aligned with cookies.
+    let mut pending_offsets = Vec::with_capacity(lower);
+    // `bpf_link_create()` expects either no cookie array at all or a full `u64`
+    // array aligned with the requested attach points (`cnt == offsets.len()`).
+    // Once any point has a cookie, fill in `0` for points that do not.
+    let mut cookies: Option<Vec<u64>> = None;
+    for UProbeAttachPoint { location, cookie } in points {
+        let index = pending_offsets.len();
+        let offset = match location {
+            UProbeAttachLocation::Symbol(symbol) => PendingOffset::Symbol {
+                symbol,
+                additional: 0,
+            },
+            UProbeAttachLocation::SymbolOffset(symbol, additional) => {
+                PendingOffset::Symbol { symbol, additional }
+            }
+            UProbeAttachLocation::AbsoluteOffset(offset) => PendingOffset::Absolute(offset),
+        };
+
+        pending_offsets.push(offset);
+        match (&mut cookies, cookie) {
+            (Some(values), Some(cookie)) => values.push(cookie),
+            (Some(values), None) => values.push(0),
+            (slot @ None, Some(cookie)) => {
+                let mut values = vec![0; index];
+                values.push(cookie);
+                *slot = Some(values);
+            }
+            (None, None) => {}
+        }
+    }
+
+    // Resolve unique symbols together so the target and optional debug object are each mapped and
+    // scanned at most once per attach call.
+    let offsets = resolve_pending_offsets(path, pending_offsets)?;
+
+    Ok(ResolvedPoints::Many { offsets, cookies })
+}
+
+impl UProbe {
+    /// The type of the program according to the kernel.
+    pub const PROGRAM_TYPE: ProgramType = ProgramType::KProbe;
+
+    /// Loads the program inside the kernel.
+    pub fn load(&mut self) -> Result<(), ProgramError> {
+        let Self {
+            data,
+            kind: _,
+            attach_mode,
+        } = self;
+        match attach_mode {
+            AttachMode::Multi => {
+                load_program_with_attach_type(BPF_PROG_TYPE_KPROBE, BPF_TRACE_UPROBE_MULTI, data)
+            }
+            AttachMode::Single | AttachMode::Unknown => {
+                load_program_without_attach_type(BPF_PROG_TYPE_KPROBE, data)
+            }
+        }
+    }
+
+    /// Returns [`ProbeKind::Entry`] if the program is a `uprobe`, or
+    /// [`ProbeKind::Return`] if the program is a `uretprobe`.
+    pub const fn kind(&self) -> ProbeKind {
+        self.kind
+    }
+
+    /// Attaches the program to one or more locations.
+    ///
+    /// `points` accepts any `IntoIterator` of attachment points. For a single
+    /// point, pass a one-element array such as `["malloc"]`, `[0x10]`, or
+    /// `[UProbeAttachPoint { .. }]`. Each point can carry an optional cookie
+    /// exposed to eBPF through `bpf_get_attach_cookie()`. Empty input is
+    /// rejected with [`UProbeError::EmptyPoints`].
+    ///
+    /// Symbol offsets are added to the address of the target function.
+    /// Absolute offsets must already be target object file offsets; use
+    /// [`UProbeAttachLocation::from_virtual_address()`] to construct one from an
+    /// ELF virtual address.
+    ///
+    /// Symbol locations are resolved from `target` for each call. Aya does not
+    /// cache ELF symbol tables between calls, but resolves multiple symbol
+    /// locations in the same call as a batch. For repeated symbol-based
+    /// attachments, callers can avoid reparsing the object by resolving locations
+    /// externally and passing [`UProbeAttachLocation::AbsoluteOffset`] values
+    /// instead.
+    ///
+    /// On the multi-attach path, if any point has a cookie, Aya passes a full
+    /// cookie array to the kernel; points without cookies are filled with `0`.
+    /// `0` is also what `bpf_get_attach_cookie()` returns when the kernel has
+    /// no cookie for a point.
+    ///
+    /// `target` can be an absolute or relative path to a binary or library, or
+    /// a library name (for example `"libc"`). `scope` specifies which processes
+    /// should trigger the uprobe.
+    ///
+    /// For handles created via `Ebpf::load*`, `attach_mode` is initialized
+    /// from the ELF section kind (`uprobe` or `uprobe.multi`). Handles created
+    /// via `from_pin` or `from_program_info` start in unknown mode, so this
+    /// method first attempts the multi path and falls back to the per-point
+    /// path on mode-related failures.
+    ///
+    /// Callers that must select or generate the ELF section before loading can use
+    /// [`is_uprobe_multi_supported`](crate::sys::is_uprobe_multi_supported) with the
+    /// [`UProbeMultiFeature`](crate::sys::UProbeMultiFeature) required by their intended
+    /// scope before choosing `uprobe.multi`.
+    ///
+    /// The returned value can be used to detach, see [`UProbe::detach`].
+    ///
+    /// The cookie is supported since kernel 5.15, and it is made available to
+    /// the eBPF program via the `bpf_get_attach_cookie()` helper.
+    ///
+    /// On the legacy per-point attach path, each point is attached separately and
+    /// one logical link id manages all of them.
+    pub fn attach<'a, T, I>(
+        &mut self,
+        points: I,
+        target: T,
+        scope: UProbeScope,
+    ) -> Result<UProbeLinkId, ProgramError>
+    where
+        T: AsRef<Path>,
+        I: IntoIterator,
+        I::Item: Into<UProbeAttachPoint<'a>>,
+    {
+        let target = target.as_ref();
+        let mut points = points.into_iter();
+        let Some(first) = points.next() else {
+            return Err(UProbeError::EmptyPoints {
+                target: target.to_path_buf(),
+            }
+            .into());
+        };
+
+        let (proc_map_pid, perf_event_pid, multi_link_pid) = match scope {
+            // For BPF_TRACE_UPROBE_MULTI link_create, pid=0 means no PID filter
+            // (all processes), so pass 0 for the multi-attach path.
+            UProbeScope::AllProcesses => (None, None, 0),
+            UProbeScope::CallingProcess => {
+                let pid = std::process::id();
+                // /proc/0/maps does not exist, so use the real pid for ProcMap
+                // resolution. Preserve pid=0 only for the legacy single-attach
+                // perf_event_open path, where it means calling process/thread.
+                // For uprobe_multi links, pid=0 means all processes; pass the
+                // real pid to scope the link to this process.
+                (Some(pid), Some(0), pid)
+            }
+            UProbeScope::OneProcess(pid) => {
+                let pid = pid.get();
+                (Some(pid), Some(pid), pid)
+            }
+        };
+        // Keep ProcMap in this scope so resolve_attach_target_basename can return
+        // a path borrowed from the maps buffer without cloning the matched path.
+        // This keeps the borrow alive until attach uses it.
+        let proc_map;
+        // /proc/<pid>/maps entries are matched by basename, so only bare-basename
+        // targets can benefit from the lookup; paths with a directory separator
+        // are passed through unchanged.
+        let resolved_path = if is_basename_only(target) {
+            proc_map = proc_map_pid.map(ProcMap::new).transpose()?;
+            resolve_attach_target_basename(target, proc_map.as_ref())?
+        } else {
+            target
+        };
+        let resolved = resolve_points(resolved_path, first, points)?;
+        match self.attach_mode {
+            AttachMode::Single => self.attach_single_impl(resolved_path, &resolved, perf_event_pid),
+            AttachMode::Multi => self.attach_multi_impl(resolved_path, &resolved, multi_link_pid),
+            AttachMode::Unknown => {
+                let multi_result = self.attach_multi_impl(resolved_path, &resolved, multi_link_pid);
+                match multi_result {
+                    Ok(link_id) => {
+                        self.attach_mode = AttachMode::Multi;
+                        Ok(link_id)
+                    }
+                    Err(multi_error) if should_fallback_to_single(&multi_error) => {
+                        match self.attach_single_impl(resolved_path, &resolved, perf_event_pid) {
+                            Ok(link_id) => {
+                                self.attach_mode = AttachMode::Single;
+                                Ok(link_id)
+                            }
+                            Err(single_error) => Err(UProbeError::AttachModeSelectionFailed {
+                                multi_error: Box::new(multi_error),
+                                single_error: Box::new(single_error),
+                            }
+                            .into()),
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        }
+    }
+
+    /// Creates a program handle from a pinned entry on bpffs.
+    ///
+    /// Existing links are not populated. To work with existing links, use
+    /// [`crate::programs::links::PinnedLink`].
+    ///
+    /// This constructor starts in unknown mode because it does not know
+    /// whether the original program came from an `uprobe` or `uprobe.multi`
+    /// section. As a result, [`Self::attach`] performs runtime mode selection.
+    ///
+    /// On drop, any managed links are detached and the program is unloaded. This will not result in
+    /// the program being unloaded from the kernel if it is still pinned.
+    pub fn from_pin<P: AsRef<Path>>(path: P, kind: ProbeKind) -> Result<Self, ProgramError> {
+        let data = ProgramData::from_pinned_path(path, VerifierLogLevel::default())?;
+        Ok(Self {
+            data,
+            kind,
+            attach_mode: AttachMode::Unknown,
+        })
+    }
+
+    fn attach_single_impl(
+        &mut self,
+        path: &Path,
+        resolved: &ResolvedPoints,
+        pid: Option<u32>,
+    ) -> Result<UProbeLinkId, ProgramError> {
+        let Self {
+            data,
+            kind,
+            attach_mode: _,
+        } = self;
+        let path = path.as_os_str();
+        match resolved {
+            ResolvedPoints::One { offset, cookie } => probe::attach::<Self, UProbeLink>(
+                data,
+                ProbeEventArgs {
+                    target: UProbeAttachTarget {
+                        path,
+                        offset: *offset,
+                        pid,
+                    },
+                    kind: *kind,
+                },
+                *cookie,
+            ),
+            ResolvedPoints::Many { offsets, cookies } => {
+                let prog_fd = data.fd()?;
+                let prog_fd = prog_fd.as_fd();
+                // Attach the first point separately because its backend determines whether
+                // the homogeneous link collection is fd-backed or perf-backed.
+                let Some(&first_offset) = offsets.first() else {
+                    return Err(UProbeError::EmptyPoints {
+                        target: PathBuf::from(path),
+                    }
+                    .into());
+                };
+                let attach_error = |index, resolved_offset, attach_error| {
+                    ProgramError::from(UProbeError::LegacyPerfAttachPointError {
+                        index,
+                        resolved_offset,
+                        attach_error: Box::new(attach_error),
+                    })
+                };
+                let first_cookie = cookies
+                    .as_ref()
+                    .and_then(|cookies| cookies.first().copied());
+                let first_link = probe::attach_impl::<Self>(
+                    prog_fd,
+                    ProbeEventArgs {
+                        target: UProbeAttachTarget {
+                            path,
+                            offset: first_offset,
+                            pid,
+                        },
+                        kind: *kind,
+                    },
+                    first_cookie,
+                )
+                .map_err(|error| attach_error(0, first_offset, error))?;
+                let mut links = ManyProbeLinks::from_first_link(first_link, offsets.len());
+
+                for (index, offset) in offsets.iter().copied().enumerate().skip(1) {
+                    let cookie = cookies
+                        .as_ref()
+                        .and_then(|cookies| cookies.get(index).copied());
+                    match links.attach_point::<Self>(
+                        prog_fd,
+                        ProbeEventArgs {
+                            target: UProbeAttachTarget { path, offset, pid },
+                            kind: *kind,
+                        },
+                        cookie,
+                    ) {
+                        Ok(()) => {}
+                        Err(error) => {
+                            // Explicitly detach links attached before this failure.
+                            links.detach();
+                            return Err(attach_error(index, offset, error));
+                        }
+                    }
+                }
+
+                data.links
+                    .insert(UProbeLink::from(ProbeLinkInner::Many(links)))
+            }
+        }
+    }
+
+    fn attach_multi_impl(
+        &mut self,
+        path: &Path,
+        resolved: &ResolvedPoints,
+        pid: u32,
+    ) -> Result<UProbeLinkId, ProgramError> {
+        let Self {
+            data,
+            kind,
+            attach_mode: _,
+        } = self;
+        let prog_fd = data.fd()?;
+        let prog_fd = prog_fd.as_fd();
+        let path_cstr = CString::new(path.as_os_str().as_bytes()).map_err(|error| {
+            ProgramError::IOError(io::Error::new(io::ErrorKind::InvalidInput, error))
+        })?;
+
+        let link = try_attach_uprobe_multi_link(
+            prog_fd,
+            &path_cstr,
+            resolved.offsets(),
+            pid,
+            *kind,
+            resolved.cookies(),
+        )?;
+        data.links
+            .insert(UProbeLink::from(ProbeLinkInner::from(link)))
+    }
+}
+
+impl Probe for UProbe {
+    type AttachTarget<'a> = UProbeAttachTarget<'a>;
+
+    const PMU: &'static str = "uprobe";
+
+    type Error = UProbeError;
+
+    fn into_common_target(target: Self::AttachTarget<'_>) -> (&OsStr, u64, Option<u32>) {
+        let UProbeAttachTarget { path, offset, pid } = target;
+        (path, offset, pid)
+    }
+
+    fn file_error(filename: PathBuf, io_error: io::Error) -> Self::Error {
+        UProbeError::FileError { filename, io_error }
+    }
+
+    fn write_offset<W: Write>(w: &mut W, _: ProbeKind, offset: u64) -> fmt::Result {
+        write!(w, ":{offset:#x}")
+    }
+}
+
+fn is_basename_only(target: &Path) -> bool {
+    target.file_name() == Some(target.as_os_str())
+}
+
+// Resolves a bare basename (a single normal path component) to a concrete
+// path via /proc/<pid>/maps and ld.so.cache.
+fn resolve_attach_target_basename<'a, 'b, 'c, T>(
+    target: &'a Path,
+    proc_map: Option<&'b ProcMap<T>>,
+) -> Result<&'c Path, UProbeError>
+where
+    'a: 'c,
+    'b: 'c,
+    T: AsRef<[u8]>,
+{
+    proc_map
+        .and_then(|proc_map| {
+            proc_map
+                .find_library_path_by_name(target)
+                .map_err(|source| {
+                    let ProcMap { pid, data: _ } = proc_map;
+                    let pid = *pid;
+                    UProbeError::ProcMap { pid, source }
+                })
+                .transpose()
+        })
+        .or_else(|| {
+            LD_SO_CACHE
+                .as_ref()
+                .map_err(|io_error| UProbeError::InvalidLdSoCache { io_error })
+                .map(|cache| cache.resolve(target))
+                .transpose()
+        })
+        .unwrap_or_else(|| {
+            Err(UProbeError::InvalidTarget {
+                path: target.to_owned(),
+            })
+        })
+}
+
+define_link_wrapper!(
+    UProbeLink,
+    UProbeLinkId,
+    ProbeLinkInner,
+    ProbeLinkIdInner,
+    UProbe,
+);
+
+impl From<PerfLinkInner> for UProbeLink {
+    fn from(link: PerfLinkInner) -> Self {
+        Self::from(ProbeLinkInner::from(link))
+    }
+}
+
+impl TryFrom<UProbeLink> for FdLink {
+    type Error = LinkError;
+
+    fn try_from(value: UProbeLink) -> Result<Self, Self::Error> {
+        match value.into_inner() {
+            ProbeLinkInner::One(PerfLinkInner::Fd(link)) => Ok(link),
+            ProbeLinkInner::One(PerfLinkInner::PerfLink(_)) | ProbeLinkInner::Many(_) => {
+                // FdLink and PerfLink clean up on drop, including each link in Many.
+                Err(LinkError::InvalidLink)
+            }
+        }
+    }
+}
+
+impl TryFrom<FdLink> for UProbeLink {
+    type Error = LinkError;
+
+    fn try_from(fd_link: FdLink) -> Result<Self, Self::Error> {
+        let info = crate::sys::bpf_link_get_info_by_fd(fd_link.fd.as_fd())?;
+        if info.type_ == bpf_link_type::BPF_LINK_TYPE_PERF_EVENT as u32
+            || info.type_ == bpf_link_type::BPF_LINK_TYPE_UPROBE_MULTI as u32
+        {
+            return Ok(Self::new(ProbeLinkInner::from(fd_link)));
+        }
+        Err(LinkError::InvalidLink)
+    }
+}
+
+impl UProbeLink {
+    /// Returns the underlying fd-backed links when available.
+    ///
+    /// A single [`UProbeLink`] may correspond to multiple [`FdLink`] values
+    /// when [`UProbe::attach`] falls back to the legacy single-point attach
+    /// path for multiple attachment points.
+    ///
+    /// If the underlying link representation is not fd-backed, the original
+    /// [`UProbeLink`] is returned.
+    pub fn into_fd_links(self) -> Result<Vec<FdLink>, Self> {
+        self.into_inner().into_fd_links().map_err(Self::from)
+    }
+}
+
+fn find_symbol_in_object<'a>(obj: &'a object::File<'a>, symbol: &str) -> Option<Symbol<'a, 'a>> {
+    obj.dynamic_symbols()
+        .chain(obj.symbols())
+        .find(|sym| sym.name().is_ok_and(|name| name == symbol))
+}
+
+fn resolve_symbol(path: &Path, symbol: &str) -> Result<u64, ResolveSymbolError> {
+    let data = MMap::map_copy_read_only(path)?;
+    let obj = object::read::File::parse(data.as_ref())?;
+
+    if let Some(sym) = find_symbol_in_object(&obj, symbol) {
+        symbol_translated_address(&obj, sym, symbol)
+    } else {
+        let debug_path = find_debug_path_in_object(&obj, path, symbol)?;
+        let debug_data = MMap::map_copy_read_only(&debug_path).map_err(|error| {
+            ResolveSymbolError::DebuglinkAccessError(debug_path.into_owned(), error)
+        })?;
+        let debug_obj = object::read::File::parse(debug_data.as_ref())?;
+
+        verify_build_ids(&obj, &debug_obj, symbol)?;
+
+        let sym = find_symbol_in_object(&debug_obj, symbol)
+            .ok_or_else(|| ResolveSymbolError::Unknown(symbol.to_string()))?;
+        symbol_translated_address(&debug_obj, sym, symbol)
+    }
+}
+
+fn resolve_pending_offsets(
+    path: &Path,
+    pending_offsets: Vec<PendingOffset<'_>>,
+) -> Result<Vec<u64>, UProbeError> {
+    // Resolve each requested symbol once. Duplicate attach points share the
+    // resolved base offset before their per-point additional offsets are
+    // applied below.
+    let mut resolved_symbols = pending_offsets
+        .iter()
+        .filter_map(|offset| match offset {
+            PendingOffset::Absolute(_) => None,
+            PendingOffset::Symbol {
+                symbol,
+                additional: _,
+            } => Some((*symbol, None)),
+        })
+        .collect::<HashMap<_, _>>();
+
+    if let Some(first_symbol) = pending_offsets.iter().find_map(|offset| match offset {
+        PendingOffset::Absolute(_) => None,
+        PendingOffset::Symbol {
+            symbol,
+            additional: _,
+        } => Some(*symbol),
+    }) {
+        let symbol_error = |fallback_symbol: &str, error: ResolveSymbolError| {
+            let symbol = match &error {
+                ResolveSymbolError::Unknown(symbol)
+                | ResolveSymbolError::NotInSection(symbol)
+                | ResolveSymbolError::SectionFileRangeNone(symbol, _)
+                | ResolveSymbolError::BuildIdMismatch(symbol) => symbol.as_str(),
+                _ => fallback_symbol,
+            }
+            .to_owned();
+            UProbeError::SymbolError {
+                symbol,
+                error: Box::new(error),
+            }
+        };
+
+        let data = MMap::map_copy_read_only(path)
+            .map_err(|error| symbol_error(first_symbol, ResolveSymbolError::Io(error)))?;
+        let obj = object::read::File::parse(data.as_ref())
+            .map_err(|error| symbol_error(first_symbol, ResolveSymbolError::Object(error)))?;
+        resolve_symbols_in_object(&obj, &mut resolved_symbols)
+            .map_err(|error| symbol_error(first_symbol, error))?;
+
+        let unresolved_first_symbol = pending_offsets.iter().find_map(|offset| match offset {
+            PendingOffset::Absolute(_) => None,
+            PendingOffset::Symbol {
+                symbol,
+                additional: _,
+            } if resolved_symbols.get(symbol).is_some_and(Option::is_none) => Some(*symbol),
+            PendingOffset::Symbol {
+                symbol: _,
+                additional: _,
+            } => None,
+        });
+
+        if let Some(unresolved_first_symbol) = unresolved_first_symbol {
+            let debug_path = find_debug_path_in_object(&obj, path, unresolved_first_symbol)
+                .map_err(|error| symbol_error(unresolved_first_symbol, error))?;
+            let data = MMap::map_copy_read_only(&debug_path).map_err(|e| {
+                symbol_error(
+                    unresolved_first_symbol,
+                    ResolveSymbolError::DebuglinkAccessError(debug_path.clone().into_owned(), e),
+                )
+            })?;
+            let debug_obj = object::read::File::parse(data.as_ref()).map_err(|error| {
+                symbol_error(unresolved_first_symbol, ResolveSymbolError::Object(error))
+            })?;
+            verify_build_ids(&obj, &debug_obj, unresolved_first_symbol)
+                .map_err(|error| symbol_error(unresolved_first_symbol, error))?;
+            resolve_symbols_in_object(&debug_obj, &mut resolved_symbols)
+                .map_err(|error| symbol_error(unresolved_first_symbol, error))?;
+        }
+    }
+
+    pending_offsets
+        .into_iter()
+        .map(|offset| match offset {
+            PendingOffset::Absolute(offset) => Ok(offset),
+            PendingOffset::Symbol { symbol, additional } => {
+                let offset = resolved_symbols
+                    .get(symbol)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| UProbeError::SymbolError {
+                        symbol: symbol.to_string(),
+                        error: Box::new(ResolveSymbolError::Unknown(symbol.to_string())),
+                    })?;
+                Ok(offset + additional)
+            }
+        })
+        .collect()
+}
+
+fn resolve_symbols_in_object(
+    obj: &object::File<'_>,
+    symbols: &mut HashMap<&str, Option<u64>>,
+) -> Result<(), ResolveSymbolError> {
+    if symbols.is_empty() {
+        return Ok(());
+    }
+
+    let mut remaining = symbols.values().filter(|offset| offset.is_none()).count();
+
+    for sym in obj.dynamic_symbols().chain(obj.symbols()) {
+        let Ok(symbol_name) = sym.name() else {
+            continue;
+        };
+
+        let Some(offset) = symbols.get_mut(symbol_name) else {
+            continue;
+        };
+        if offset.is_some() {
+            continue;
+        }
+
+        *offset = Some(symbol_translated_address(obj, sym, symbol_name)?);
+        remaining -= 1;
+        if remaining == 0 {
+            return Ok(());
+        }
+    }
+
+    Ok(())
+}
+
+fn try_attach_uprobe_multi_link(
+    prog_fd: BorrowedFd<'_>,
+    path: &CStr,
+    offsets: &[u64],
+    pid: u32,
+    kind: ProbeKind,
+    cookies: Option<&[u64]>,
+) -> Result<PerfLinkInner, ProgramError> {
+    let link_fd = bpf_link_create_uprobe_multi(
+        prog_fd,
+        path,
+        offsets,
+        None,
+        cookies,
+        pid,
+        matches!(kind, ProbeKind::Return),
+    )
+    .map_err(|io_error| {
+        let errno = io_error.raw_os_error();
+        let is_unsupported = match errno {
+            Some(code) if code == ENOTSUP || code == EOPNOTSUPP => true,
+            // Multi-uprobe landed in Linux 6.6, older kernels may return EINVAL
+            // for the unknown attach type (see BPF_TRACE_UPROBE_MULTI in
+            // https://github.com/torvalds/linux/blob/ffc253263/include/uapi/linux/bpf.h#L1042).
+            Some(code) if code == EINVAL => {
+                KernelVersion::current().is_ok_and(|kv| kv < KernelVersion::new(6, 6, 0))
+            }
+            _ => false,
+        };
+
+        if is_unsupported {
+            ProgramError::UProbeError(UProbeError::MultiLinkNotSupported)
+        } else {
+            ProgramError::SyscallError(SyscallError {
+                call: "bpf_link_create",
+                io_error,
+            })
+        }
+    })?;
+    Ok(PerfLinkInner::Fd(FdLink::new(link_fd)))
+}
+
+// In AttachMode::Unknown we probe whether the loaded program should attach via
+// BPF_TRACE_UPROBE_MULTI or the legacy single-point perf path.
+//
+// Fallback is appropriate in two cases:
+// - MultiLinkNotSupported: try_attach_uprobe_multi_link() uses this for
+//   kernels that do not implement multi-uprobe links, including older kernels
+//   (< 6.6) that may report the unknown attach type as EINVAL.
+// - bpf_link_create(...)=EINVAL: on kernels that do support multi-uprobe links,
+//   a handle loaded from pin/program info can still hit EINVAL when the loaded
+//   program expects the legacy per-point attach path rather than the multi
+//   attach type. In that case we intentionally retry via the per-point path
+//   instead of surfacing the mode-probing error.
+//
+// Other errors indicate a real multi-attach failure and are propagated.
+fn should_fallback_to_single(error: &ProgramError) -> bool {
+    match error {
+        ProgramError::UProbeError(UProbeError::MultiLinkNotSupported) => true,
+        ProgramError::SyscallError(SyscallError {
+            call: "bpf_link_create",
+            io_error,
+        }) => io_error.raw_os_error() == Some(EINVAL),
+        _ => false,
+    }
+}
+
+/// The type returned when attaching an [`UProbe`] fails.
+#[derive(Debug, Error)]
+pub enum UProbeError {
+    /// Automatic attach-mode selection failed in both multi and legacy perf paths.
+    #[error(
+        "automatic uprobe attach-mode selection failed: multi={multi_error}; \
+         legacy perf={single_error}"
+    )]
+    // Box the nested ProgramError values to avoid the recursive
+    // `ProgramError -> UProbeError -> ProgramError` type.
+    AttachModeSelectionFailed {
+        /// Error returned by the multi-uprobe path.
+        multi_error: Box<ProgramError>,
+        /// Error returned by the legacy perf path.
+        single_error: Box<ProgramError>,
+    },
+
+    /// There was an error parsing `/etc/ld.so.cache`.
+    #[error("error reading `{}` file", LD_SO_CACHE_FILE)]
+    InvalidLdSoCache {
+        /// the original [`io::Error`].
+        #[source]
+        io_error: &'static io::Error,
+    },
+
+    /// The target program could not be found.
+    #[error("could not resolve uprobe target `{path}`")]
+    InvalidTarget {
+        /// path to target.
+        path: PathBuf,
+    },
+
+    /// There was an error resolving the target symbol.
+    #[error("error resolving symbol")]
+    SymbolError {
+        /// symbol name.
+        symbol: String,
+        /// the original error.
+        #[source]
+        error: Box<dyn Error + Send + Sync>,
+    },
+
+    /// There was an error accessing `filename`.
+    #[error("`{filename}`")]
+    FileError {
+        /// The file name
+        filename: PathBuf,
+        /// The [`io::Error`] returned from the file operation
+        #[source]
+        io_error: io::Error,
+    },
+
+    /// There was an error fetching the memory map for `pid`.
+    #[error("error fetching libs for {pid}")]
+    ProcMap {
+        /// The pid.
+        pid: u32,
+        /// The [`ProcMapError`] that caused the error.
+        #[source]
+        source: ProcMapError,
+    },
+
+    /// The kernel does not support native multi-uprobe links.
+    #[error("native multi-uprobe links are not supported by the running kernel")]
+    MultiLinkNotSupported,
+
+    /// No attach points were provided.
+    #[error("no uprobe attach points provided for target `{target}`")]
+    EmptyPoints {
+        /// Target provided by the caller.
+        target: PathBuf,
+    },
+
+    /// The legacy perf attach path failed for a specific point.
+    #[error(
+        "legacy perf attach failed at point #{index}, resolved offset \
+         {resolved_offset:#x}: {attach_error}"
+    )]
+    // Box the nested ProgramError values to avoid the recursive
+    // `ProgramError -> UProbeError -> ProgramError` type.
+    LegacyPerfAttachPointError {
+        /// Index of the attach point within the caller input slice.
+        index: usize,
+        /// Resolved file offset used by the failing perf attach operation.
+        resolved_offset: u64,
+        /// Original error returned by the attach syscall path.
+        #[source]
+        attach_error: Box<ProgramError>,
+    },
+}
+
+/// Error reading from /proc/pid/maps.
+#[derive(Debug, Error)]
+pub enum ProcMapError {
+    /// Unable to read /proc/pid/maps.
+    #[error(transparent)]
+    ReadFile(#[from] io::Error),
+
+    /// Error parsing a line of /proc/pid/maps.
+    #[error("could not parse {}", line.display())]
+    ParseLine {
+        /// The line that could not be parsed.
+        line: OsString,
+    },
+}
+
+/// An entry parsed from /proc/`pid`/maps.
+///
+/// This contains information about a mapped portion of memory
+/// for the process, ranging from address to `address_end`.
+#[cfg_attr(test, derive(Debug, PartialEq))]
+struct ProcMapEntry<'a> {
+    #[cfg_attr(not(test), expect(dead_code, reason = "parsed but not exposed"))]
+    address: u64,
+    #[cfg_attr(not(test), expect(dead_code, reason = "parsed but not exposed"))]
+    address_end: u64,
+    #[cfg_attr(not(test), expect(dead_code, reason = "parsed but not exposed"))]
+    perms: &'a OsStr,
+    #[cfg_attr(not(test), expect(dead_code, reason = "parsed but not exposed"))]
+    offset: u64,
+    #[cfg_attr(not(test), expect(dead_code, reason = "parsed but not exposed"))]
+    dev: &'a OsStr,
+    #[cfg_attr(not(test), expect(dead_code, reason = "parsed but not exposed"))]
+    inode: u32,
+    path: Option<&'a OsStr>,
+}
+
+/// Split a byte slice on ASCII whitespace up to `n` times.
+///
+/// The last item yielded contains the remainder of the slice and may itself
+/// contain whitespace.
+fn split_ascii_whitespace_n(s: &[u8], mut n: usize) -> impl Iterator<Item = &[u8]> {
+    let mut s = s.trim_ascii_end();
+
+    iter::from_fn(move || {
+        if n == 0 {
+            None
+        } else {
+            s = s.trim_ascii_start();
+
+            n -= 1;
+            Some(if n == 0 {
+                s
+            } else if let Some(i) = s.iter().position(u8::is_ascii_whitespace) {
+                let (next, rest) = s.split_at(i);
+                s = rest;
+                next
+            } else {
+                n = 0;
+                s
+            })
+        }
+    })
+}
+
+impl<'a> ProcMapEntry<'a> {
+    fn parse(line: &'a [u8]) -> Result<Self, ProcMapError> {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let err = || ProcMapError::ParseLine {
+            line: OsString::from_vec(line.to_vec()),
+        };
+
+        let mut parts =
+            // address, perms, offset, dev, inode, path = 6.
+            split_ascii_whitespace_n(line, 6)
+            .filter(|part| !part.is_empty());
+
+        let mut next = || parts.next().ok_or_else(err);
+
+        let (start, end) = {
+            let addr = next()?;
+            let mut addr_parts = addr.split(|b| *b == b'-');
+            let mut next = || {
+                addr_parts
+                    .next()
+                    .ok_or(())
+                    .and_then(|part| {
+                        let s =
+                            std::str::from_utf8(part).map_err(|std::str::Utf8Error { .. }| ())?;
+                        let n = u64::from_str_radix(s, 16)
+                            .map_err(|std::num::ParseIntError { .. }| ())?;
+                        Ok(n)
+                    })
+                    .map_err(|()| err())
+            };
+            let start = next()?;
+            let end = next()?;
+            if let Some(_part) = addr_parts.next() {
+                return Err(err());
+            }
+            (start, end)
+        };
+
+        let perms = next()?;
+        let perms = OsStr::from_bytes(perms);
+        let offset = next()?;
+        let offset = std::str::from_utf8(offset).map_err(|std::str::Utf8Error { .. }| err())?;
+        let offset =
+            u64::from_str_radix(offset, 16).map_err(|std::num::ParseIntError { .. }| err())?;
+        let dev = next()?;
+        let dev = OsStr::from_bytes(dev);
+        let inode = next()?;
+        let inode = std::str::from_utf8(inode).map_err(|std::str::Utf8Error { .. }| err())?;
+        let inode = inode
+            .parse()
+            .map_err(|std::num::ParseIntError { .. }| err())?;
+
+        let path = parts.next().map(OsStr::from_bytes);
+
+        if let Some(_part) = parts.next() {
+            return Err(err());
+        }
+
+        Ok(Self {
+            address: start,
+            address_end: end,
+            perms,
+            offset,
+            dev,
+            inode,
+            path,
+        })
+    }
+}
+
+/// The memory maps of a process.
+///
+/// This is read from /proc/`pid`/maps.
+///
+/// The information here may be used to resolve addresses to paths.
+struct ProcMap<T> {
+    pid: u32,
+    data: T,
+}
+
+impl ProcMap<Vec<u8>> {
+    fn new(pid: u32) -> Result<Self, UProbeError> {
+        let filename = PathBuf::from(format!("/proc/{pid}/maps"));
+        let data = fs::read(&filename)
+            .map_err(|io_error| UProbeError::FileError { filename, io_error })?;
+        Ok(Self { pid, data })
+    }
+}
+
+impl<T: AsRef<[u8]>> ProcMap<T> {
+    fn libs(&self) -> impl Iterator<Item = Result<ProcMapEntry<'_>, ProcMapError>> {
+        let Self { pid: _, data } = self;
+
+        // /proc/<pid>/maps ends with '\n', so split() yields a trailing empty slice without this.
+        data.as_ref()
+            .trim_ascii()
+            .split(|&b| b == b'\n')
+            .map(ProcMapEntry::parse)
+    }
+
+    // Find the full path of a library by its name.
+    //
+    // This isn't part of the public API since it's really only useful for
+    // attaching uprobes.
+    fn find_library_path_by_name(&self, lib: &Path) -> Result<Option<&Path>, ProcMapError> {
+        let lib = lib.as_os_str();
+        let lib = lib.strip_suffix(OsStr::new(".so")).unwrap_or(lib);
+
+        for entry in self.libs() {
+            let ProcMapEntry {
+                address: _,
+                address_end: _,
+                perms: _,
+                offset: _,
+                dev: _,
+                inode: _,
+                path,
+            } = entry?;
+            if let Some(path) = path {
+                let path = Path::new(path);
+                if let Some(filename) = path.file_name()
+                    && let Some(suffix) = filename.strip_prefix(lib)
+                    && (suffix.is_empty()
+                        || suffix.starts_with(OsStr::new(".so"))
+                        || suffix.starts_with(OsStr::new("-")))
+                {
+                    return Ok(Some(path));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CacheEntry {
+    key: OsString,
+    value: OsString,
+    _flags: i32,
+}
+
+#[derive(Debug)]
+pub(crate) struct LdSoCache {
+    entries: Vec<CacheEntry>,
+}
+
+impl LdSoCache {
+    fn load<T: AsRef<Path>>(path: T) -> Result<Self, io::Error> {
+        let data = fs::read(path)?;
+        Self::parse(&data)
+    }
+
+    fn parse(data: &[u8]) -> Result<Self, io::Error> {
+        let mut cursor = Cursor::new(data);
+
+        let read_u32 = |cursor: &mut Cursor<_>| -> Result<u32, io::Error> {
+            let mut buf = [0u8; size_of::<u32>()];
+            cursor.read_exact(&mut buf)?;
+
+            Ok(u32::from_ne_bytes(buf))
+        };
+
+        let read_i32 = |cursor: &mut Cursor<_>| -> Result<i32, io::Error> {
+            let mut buf = [0u8; size_of::<i32>()];
+            cursor.read_exact(&mut buf)?;
+
+            Ok(i32::from_ne_bytes(buf))
+        };
+
+        // Check for new format
+        let mut buf = [0u8; LD_SO_CACHE_HEADER_NEW.len()];
+        cursor.read_exact(&mut buf)?;
+        let header = std::str::from_utf8(&buf).map_err(|std::str::Utf8Error { .. }| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid ld.so.cache header")
+        })?;
+
+        let new_format = header == LD_SO_CACHE_HEADER_NEW;
+
+        // Check for old format
+        if !new_format {
+            cursor.set_position(0);
+            let mut buf = [0u8; LD_SO_CACHE_HEADER_OLD.len()];
+            cursor.read_exact(&mut buf)?;
+            let header = std::str::from_utf8(&buf).map_err(|std::str::Utf8Error { .. }| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid ld.so.cache header")
+            })?;
+
+            if header != LD_SO_CACHE_HEADER_OLD {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid ld.so.cache header",
+                ));
+            }
+        }
+
+        let num_entries = read_u32(&mut cursor)?;
+
+        if new_format {
+            cursor.consume(6 * size_of::<u32>());
+        }
+
+        let offset = if new_format {
+            0
+        } else {
+            cursor.position() as usize + num_entries as usize * 12
+        };
+
+        let entries = iter::repeat_with(|| {
+            let flags = read_i32(&mut cursor)?;
+            let k_pos = read_u32(&mut cursor)? as usize;
+            let v_pos = read_u32(&mut cursor)? as usize;
+
+            if new_format {
+                cursor.consume(12);
+            }
+
+            let read_str = |pos| {
+                use std::os::unix::ffi::OsStrExt as _;
+                OsStr::from_bytes(
+                    unsafe { CStr::from_ptr(cursor.get_ref()[offset + pos..].as_ptr().cast()) }
+                        .to_bytes(),
+                )
+                .to_owned()
+            };
+
+            let key = read_str(k_pos);
+            let value = read_str(v_pos);
+
+            Ok::<_, io::Error>(CacheEntry {
+                key,
+                value,
+                _flags: flags,
+            })
+        })
+        .take(num_entries as usize)
+        .collect::<Result<_, _>>()?;
+
+        Ok(Self { entries })
+    }
+
+    fn resolve(&self, lib: &Path) -> Option<&Path> {
+        let Self { entries } = self;
+
+        let lib = lib.as_os_str();
+        let lib = lib.strip_suffix(OsStr::new(".so")).unwrap_or(lib);
+
+        entries
+            .iter()
+            .find_map(|CacheEntry { key, value, _flags }| {
+                let suffix = key.strip_prefix(lib)?;
+                suffix
+                    .starts_with(OsStr::new(".so"))
+                    .then_some(Path::new(value.as_os_str()))
+            })
+    }
+}
+
+#[derive(Error, Debug)]
+enum ResolveSymbolError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+
+    #[error("error parsing ELF")]
+    Object(#[from] object::Error),
+
+    #[error("unknown symbol `{0}`")]
+    Unknown(String),
+
+    #[error("symbol `{0}` does not appear in section")]
+    NotInSection(String),
+
+    #[error("symbol `{0}` in section `{1:?}` which has no offset")]
+    SectionFileRangeNone(String, Result<String, object::Error>),
+
+    #[error("failed to access debuglink file `{0}`: `{1}`")]
+    DebuglinkAccessError(PathBuf, io::Error),
+
+    #[error("symbol `{0}` not found, mismatched build IDs in main and debug files")]
+    BuildIdMismatch(String),
+}
+
+fn construct_debuglink_path<'a>(filename: &'a [u8], main_path: &Path) -> Cow<'a, Path> {
+    let filename_str = OsStr::from_bytes(filename);
+    let debuglink_path = Path::new(filename_str);
+
+    if debuglink_path.is_relative() {
+        // If the debug path is relative, resolve it against the parent of the main path
+        main_path.parent().map_or_else(
+            || debuglink_path.into(), // Use original if no parent
+            |parent| parent.join(debuglink_path).into(),
+        )
+    } else {
+        // If the path is not relative, just use original
+        debuglink_path.into()
+    }
+}
+
+fn verify_build_ids<'a>(
+    main_obj: &'a object::File<'a>,
+    debug_obj: &'a object::File<'a>,
+    symbol_name: &str,
+) -> Result<(), ResolveSymbolError> {
+    let main_build_id = main_obj.build_id().ok().flatten();
+    let debug_build_id = debug_obj.build_id().ok().flatten();
+
+    match (debug_build_id, main_build_id) {
+        (Some(debug_build_id), Some(main_build_id)) => {
+            // Only perform a comparison if both build IDs are present
+            if debug_build_id != main_build_id {
+                return Err(ResolveSymbolError::BuildIdMismatch(symbol_name.to_owned()));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn find_debug_path_in_object<'a>(
+    obj: &object::File<'a>,
+    main_path: &Path,
+    symbol: &str,
+) -> Result<Cow<'a, Path>, ResolveSymbolError> {
+    match obj.gnu_debuglink() {
+        Ok(Some((filename, _))) => Ok(construct_debuglink_path(filename, main_path)),
+        Ok(None) => Err(ResolveSymbolError::Unknown(symbol.to_string())),
+        Err(err) => Err(ResolveSymbolError::Object(err)),
+    }
+}
+
+fn symbol_translated_address(
+    obj: &object::File<'_>,
+    sym: Symbol<'_, '_>,
+    symbol_name: &str,
+) -> Result<u64, ResolveSymbolError> {
+    let needs_addr_translation = matches!(
+        obj.kind(),
+        object::ObjectKind::Dynamic | object::ObjectKind::Executable
+    );
+    if needs_addr_translation {
+        let index = sym
+            .section_index()
+            .ok_or_else(|| ResolveSymbolError::NotInSection(symbol_name.to_string()))?;
+        let section = obj.section_by_index(index)?;
+        let (offset, _size) = section.file_range().ok_or_else(|| {
+            ResolveSymbolError::SectionFileRangeNone(
+                symbol_name.to_string(),
+                section.name().map(str::to_owned),
+            )
+        })?;
+        Ok(sym.address() - section.address() + offset)
+    } else {
+        Ok(sym.address())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::FromRawFd as _;
+
+    use assert_matches::assert_matches;
+    use object::{
+        Architecture, BinaryFormat, Endianness, SymbolKind, SymbolScope,
+        write::{SectionKind, StandardSection, Symbol, SymbolFlags, SymbolSection},
+    };
+    use rstest::rstest;
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::programs::{FdLinkId, Link as _};
+
+    fn mock_fd_link(raw_fd: i32) -> FdLink {
+        let fd = unsafe { crate::MockableFd::from_raw_fd(raw_fd) };
+        FdLink::new(fd)
+    }
+
+    #[test]
+    fn test_resolve_points_one_preserves_cookie() {
+        let mut points = iter::once(UProbeAttachPoint {
+            location: UProbeAttachLocation::AbsoluteOffset(0x42),
+            cookie: Some(0x42),
+        });
+        match resolve_points(Path::new("/proc/self/exe"), points.next().unwrap(), points).unwrap() {
+            ResolvedPoints::One {
+                offset: 0x42,
+                cookie: Some(0x42),
+            } => {}
+            ResolvedPoints::One { .. } => panic!("unexpected points"),
+            ResolvedPoints::Many { .. } => panic!("unexpected points"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_points_many_fills_missing_cookies_with_zero() {
+        let mut points = [
+            UProbeAttachPoint {
+                location: UProbeAttachLocation::AbsoluteOffset(0x11),
+                cookie: Some(0x22),
+            },
+            UProbeAttachPoint {
+                location: UProbeAttachLocation::AbsoluteOffset(0x33),
+                cookie: None,
+            },
+        ]
+        .into_iter();
+        match resolve_points(Path::new("/proc/self/exe"), points.next().unwrap(), points).unwrap() {
+            ResolvedPoints::Many { offsets, cookies } => {
+                assert_eq!(offsets, vec![0x11, 0x33]);
+                assert_eq!(cookies, Some(vec![0x22, 0]));
+            }
+            ResolvedPoints::One { .. } => panic!("unexpected points"),
+        }
+    }
+
+    fn create_elf_with_text_symbols(
+        symbols: &[(&[u8], u64)],
+    ) -> Result<Vec<u8>, object::write::Error> {
+        let mut obj =
+            object::write::Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        let text_section = obj.section_id(StandardSection::Text);
+        obj.append_section_data(text_section, &[0; 0x40], 1);
+
+        for &(name, value) in symbols {
+            obj.add_symbol(Symbol {
+                name: name.to_vec(),
+                value,
+                size: 1,
+                kind: SymbolKind::Text,
+                scope: SymbolScope::Linkage,
+                weak: false,
+                section: SymbolSection::Section(text_section),
+                flags: SymbolFlags::None,
+            });
+        }
+
+        obj.write()
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "`mkdir` not available when isolation is enabled")]
+    fn test_resolve_points_many_resolves_mixed_offsets_in_order() {
+        let mut bytes =
+            create_elf_with_text_symbols(&[(b"first", 0x10), (b"second", 0x24)]).unwrap();
+        crate::sys::TEST_MMAP_RET.with(|ret| *ret.borrow_mut() = bytes.as_mut_ptr().cast());
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("symbols.elf");
+        fs::write(&path, &bytes).unwrap();
+        // Mix duplicate symbols, per-point additional offsets, and an absolute
+        // offset to verify that batch resolution preserves the original point
+        // order.
+        let mut points = [
+            UProbeAttachLocation::SymbolOffset("first", 0x4),
+            UProbeAttachLocation::AbsoluteOffset(0x88),
+            UProbeAttachLocation::Symbol("second"),
+            UProbeAttachLocation::SymbolOffset("first", 0x8),
+        ]
+        .into_iter();
+
+        match resolve_points(&path, points.next().unwrap(), points).unwrap() {
+            ResolvedPoints::Many { offsets, cookies } => {
+                assert_eq!(offsets, vec![0x14, 0x88, 0x24, 0x18]);
+                assert_eq!(cookies, None);
+            }
+            ResolvedPoints::One { .. } => panic!("unexpected points"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_symbols_in_object_preserves_resolved_symbols() {
+        let mut bytes =
+            create_elf_with_text_symbols(&[(b"first", 0x10), (b"second", 0x24)]).unwrap();
+        let align_bytes = aligned_slice(&mut bytes);
+        let obj = object::File::parse(&*align_bytes).unwrap();
+        let mut symbols = HashMap::from([("first", Some(0x42)), ("second", None)]);
+
+        resolve_symbols_in_object(&obj, &mut symbols).unwrap();
+        assert_eq!(symbols["first"], Some(0x42));
+        assert_eq!(symbols["second"], Some(0x24));
+    }
+
+    #[test]
+    fn test_uprobe_link_into_fd_links_single() {
+        let fd = crate::MockableFd::mock_signed_fd();
+        let link = UProbeLink::from(ProbeLinkInner::from(mock_fd_link(fd)));
+
+        let fd_links = link.into_fd_links().unwrap();
+        assert_eq!(
+            fd_links
+                .into_iter()
+                .map(|link| link.id())
+                .collect::<Vec<_>>(),
+            vec![FdLinkId(fd)]
+        );
+    }
+
+    #[test]
+    fn test_uprobe_link_into_fd_links_many() {
+        let first_fd = crate::MockableFd::mock_signed_fd();
+        let second_fd = first_fd + 1;
+        let link = UProbeLink::from(ProbeLinkInner::Many(ManyProbeLinks::Fd(vec![
+            mock_fd_link(first_fd),
+            mock_fd_link(second_fd),
+        ])));
+
+        let fd_links = link.into_fd_links().unwrap();
+        assert_eq!(
+            fd_links
+                .into_iter()
+                .map(|link| link.id())
+                .collect::<Vec<_>>(),
+            vec![FdLinkId(first_fd), FdLinkId(second_fd)]
+        );
+    }
+
+    // Only run this test on with libc dynamically linked so that it can
+    // exercise resolving the path to libc via the current process's memory map.
+    #[test]
+    #[cfg_attr(
+        any(miri, not(target_os = "linux"), target_feature = "crt-static"),
+        ignore = "requires dynamic linkage of libc"
+    )]
+    fn test_resolve_attach_target_basename() {
+        // Look up the current process's pid.
+        let pid = std::process::id();
+        let proc_map = ProcMap::new(pid).expect("failed to get proc map");
+
+        // Now let's resolve the path to libc. It should exist in the current process's memory map and
+        // then in the ld.so.cache.
+        assert_matches!(
+            resolve_attach_target_basename("libc".as_ref(), Some(&proc_map)),
+            Ok(path) => {
+                // Make sure we got a path that contains libc.
+                assert_matches!(
+                    path.to_str(),
+                    Some(path) if path.contains("libc"), "path: {}", path.display()
+                );
+            }
+        );
+    }
+
+    #[rstest]
+    #[case::shared_object_basename("libssl.so", true)]
+    #[case::binary_basename("bash", true)]
+    #[case::versioned_shared_object_basename("foo.so.1", true)]
+    #[case::absolute_path("/usr/bin/bash", false)]
+    #[case::root_absolute_path("/aa", false)]
+    #[case::current_dir_relative_path("./bin/foo", false)]
+    #[case::current_dir_relative_file("./aa", false)]
+    #[case::subdir_relative_path("subdir/lib.so", false)]
+    #[case::parent_dir_relative_path("../lib/foo", false)]
+    #[case::root_dir("/", false)]
+    #[case::current_dir(".", false)]
+    #[case::parent_dir("..", false)]
+    #[case::trailing_separator("foo/", false)]
+    fn test_is_basename_only(#[case] input: &str, #[case] expected: bool) {
+        assert_eq!(is_basename_only(Path::new(input)), expected);
+    }
+
+    #[test]
+    fn test_uprobe_attach_location_from_virtual_address() {
+        assert_matches!(
+            UProbeAttachLocation::from_virtual_address(0x601300, 0x35ff00, 0x15ff00),
+            Ok(UProbeAttachLocation::AbsoluteOffset(0x401300))
+        );
+    }
+
+    #[test]
+    fn test_uprobe_attach_location_from_virtual_address_errors_on_underflow() {
+        assert_matches!(
+            UProbeAttachLocation::from_virtual_address(1, 2, 0),
+            Err(UProbeAttachLocationError::AddressNotInSection {
+                instruction_address: 1,
+                section_address: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn test_uprobe_attach_location_from_virtual_address_errors_on_overflow() {
+        assert_matches!(
+            UProbeAttachLocation::from_virtual_address(u64::MAX, 0, 1),
+            Err(UProbeAttachLocationError::FileOffsetOverflow {
+                instruction_address: u64::MAX,
+                section_address: 0,
+                section_offset: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn test_relative_path_with_parent() {
+        let filename = b"debug_info";
+        let main_path = Path::new("/usr/lib/main_binary");
+        let expected = Path::new("/usr/lib/debug_info");
+
+        let result = construct_debuglink_path(filename, main_path);
+        assert_eq!(
+            result, expected,
+            "The debug path should resolve relative to the main path's parent"
+        );
+    }
+
+    #[test]
+    fn test_relative_path_without_parent() {
+        let filename = b"debug_info";
+        let main_path = Path::new("main_binary");
+        let expected = Path::new("debug_info");
+
+        let result = construct_debuglink_path(filename, main_path);
+        assert_eq!(
+            result, expected,
+            "The debug path should be the original path as there is no parent"
+        );
+    }
+
+    #[test]
+    fn test_absolute_path() {
+        let filename = b"/absolute/path/to/debug_info";
+        let main_path = Path::new("/usr/lib/main_binary");
+        let expected = Path::new("/absolute/path/to/debug_info");
+
+        let result = construct_debuglink_path(filename, main_path);
+        assert_eq!(
+            result, expected,
+            "The debug path should be the same as the input absolute path"
+        );
+    }
+
+    #[expect(
+        clippy::little_endian_bytes,
+        reason = "ELF debuglink fields are encoded as little-endian"
+    )]
+    fn create_elf_with_debuglink(
+        debug_filename: &[u8],
+        crc: u32,
+    ) -> Result<Vec<u8>, object::write::Error> {
+        let mut obj =
+            object::write::Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+
+        let section_name = b".gnu_debuglink";
+
+        let section_id = obj.add_section(vec![], section_name.to_vec(), SectionKind::Note);
+
+        let mut debuglink_data = Vec::new();
+
+        debuglink_data.extend_from_slice(debug_filename);
+        debuglink_data.push(0); // Null terminator
+
+        while debuglink_data.len() % 4 != 0 {
+            debuglink_data.push(0);
+        }
+
+        debuglink_data.extend(&crc.to_le_bytes());
+
+        obj.append_section_data(section_id, &debuglink_data, 4 /* align */);
+
+        obj.write()
+    }
+
+    #[expect(
+        clippy::little_endian_bytes,
+        reason = "ELF note headers are encoded as little-endian"
+    )]
+    fn create_elf_with_build_id(build_id: &[u8]) -> Result<Vec<u8>, object::write::Error> {
+        let mut obj =
+            object::write::Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+
+        let section_name = b".note.gnu.build-id";
+
+        let section_id = obj.add_section(vec![], section_name.to_vec(), SectionKind::Note);
+
+        let mut note_data = Vec::new();
+        let build_id_name = b"GNU";
+
+        note_data.extend(&(build_id_name.len() as u32 + 1).to_le_bytes());
+        note_data.extend(&(build_id.len() as u32).to_le_bytes());
+        note_data.extend(&3u32.to_le_bytes());
+
+        note_data.extend_from_slice(build_id_name);
+        note_data.push(0); // Null terminator
+        note_data.extend_from_slice(build_id);
+
+        obj.append_section_data(section_id, &note_data, 4 /* align */);
+
+        obj.write()
+    }
+
+    fn aligned_slice(vec: &mut Vec<u8>) -> &mut [u8] {
+        let alignment = 8;
+
+        let original_size = vec.len();
+        let total_size = original_size + alignment - 1;
+
+        if vec.capacity() < total_size {
+            vec.reserve(total_size - vec.capacity());
+        }
+
+        if vec.len() < total_size {
+            vec.resize(total_size, 0);
+        }
+
+        let ptr = vec.as_ptr().addr();
+
+        let aligned_ptr = ptr.next_multiple_of(alignment);
+
+        let offset = aligned_ptr - ptr;
+
+        if offset > 0 {
+            let tmp = vec.len();
+            vec.copy_within(0..tmp - offset, offset);
+        }
+
+        &mut vec[offset..offset + original_size]
+    }
+
+    #[test]
+    fn test_find_debug_path_success() {
+        let debug_filepath = b"main.debug";
+        let mut main_bytes = create_elf_with_debuglink(debug_filepath, 0x123 /* fake CRC */)
+            .expect("got main_bytes");
+        let align_bytes = aligned_slice(&mut main_bytes);
+        let main_obj = object::File::parse(&*align_bytes).expect("got main obj");
+
+        let main_path = Path::new("/path/to/main");
+
+        assert_matches!(
+            find_debug_path_in_object(&main_obj, main_path, "symbol"),
+            Ok(path) => {
+                assert_eq!(&*path, "/path/to/main.debug", "path: {}", path.display());
+            }
+        );
+    }
+
+    #[test]
+    fn test_verify_build_ids_same() {
+        let build_id = b"test_build_id";
+        let mut main_bytes = create_elf_with_build_id(build_id).expect("got main_bytes");
+        let align_bytes = aligned_slice(&mut main_bytes);
+        let main_obj = object::File::parse(&*align_bytes).expect("got main obj");
+        let debug_build_id = b"test_build_id";
+        let mut debug_bytes = create_elf_with_build_id(debug_build_id).expect("got debug bytes");
+        let align_bytes = aligned_slice(&mut debug_bytes);
+        let debug_obj = object::File::parse(&*align_bytes).expect("got debug obj");
+
+        assert_matches!(
+            verify_build_ids(&main_obj, &debug_obj, "symbol_name"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_verify_build_ids_different() {
+        let build_id = b"main_build_id";
+        let mut main_bytes = create_elf_with_build_id(build_id).expect("got main_bytes");
+        let align_bytes = aligned_slice(&mut main_bytes);
+        let main_obj = object::File::parse(&*align_bytes).expect("got main obj");
+        let debug_build_id = b"debug_build_id";
+        let mut debug_bytes = create_elf_with_build_id(debug_build_id).expect("got debug bytes");
+        let align_bytes = aligned_slice(&mut debug_bytes);
+        let debug_obj = object::File::parse(&*align_bytes).expect("got debug obj");
+
+        assert_matches!(
+            verify_build_ids(&main_obj, &debug_obj, "symbol_name"),
+            Err(ResolveSymbolError::BuildIdMismatch(symbol_name)) if symbol_name == "symbol_name"
+        );
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct ExpectedProcMapEntry {
+        address: u64,
+        address_end: u64,
+        perms: &'static str,
+        offset: u64,
+        dev: &'static str,
+        inode: u32,
+        path: Option<&'static str>,
+    }
+
+    #[rstest]
+    #[case::bracketed_name(
+        b"7ffd6fbea000-7ffd6fbec000  r-xp  00000000  00:00  0  [vdso]",
+        ExpectedProcMapEntry {
+            address: 0x7ffd6fbea000,
+            address_end: 0x7ffd6fbec000,
+            perms: "r-xp",
+            offset: 0,
+            dev: "00:00",
+            inode: 0,
+            path: Some("[vdso]"),
+        })]
+    #[case::absolute_path(
+        b"7f1bca83a000-7f1bca83c000  rw-p  00036000  fd:01  2895508  /usr/lib64/ld-linux-x86-64.so.2",
+        ExpectedProcMapEntry {
+            address: 0x7f1bca83a000,
+            address_end: 0x7f1bca83c000,
+            perms: "rw-p",
+            offset: 0x00036000,
+            dev: "fd:01",
+            inode: 2895508,
+            path: Some("/usr/lib64/ld-linux-x86-64.so.2"),
+        })]
+    #[case::no_path(
+        b"7f1bca5f9000-7f1bca601000  rw-p  00000000  00:00  0",
+        ExpectedProcMapEntry {
+            address: 0x7f1bca5f9000,
+            address_end: 0x7f1bca601000,
+            perms: "rw-p",
+            offset: 0,
+            dev: "00:00",
+            inode: 0,
+            path: None,
+        })]
+    #[case::relative_path_token(
+        b"7f1bca5f9000-7f1bca601000  rw-p  00000000  00:00  0  deadbeef",
+        ExpectedProcMapEntry {
+            address: 0x7f1bca5f9000,
+            address_end: 0x7f1bca601000,
+            perms: "rw-p",
+            offset: 0,
+            dev: "00:00",
+            inode: 0,
+            path: Some("deadbeef"),
+        })]
+    #[case::deleted_suffix_in_path(
+        b"7f1bca83a000-7f1bca83c000  rw-p  00036000  fd:01  2895508  /usr/lib/libc.so.6 (deleted)",
+        ExpectedProcMapEntry {
+            address: 0x7f1bca83a000,
+            address_end: 0x7f1bca83c000,
+            perms: "rw-p",
+            offset: 0x00036000,
+            dev: "fd:01",
+            inode: 2895508,
+            path: Some("/usr/lib/libc.so.6 (deleted)"),
+        })]
+    // The path field is the remainder of the line. It may contain whitespace and arbitrary tokens.
+    #[case::path_remainder_with_spaces(
+        b"71064dc000-71064df000 ---p 00000000 00:00 0  [page size compat] extra",
+        ExpectedProcMapEntry {
+            address: 0x71064dc000,
+            address_end: 0x71064df000,
+            perms: "---p",
+            offset: 0,
+            dev: "00:00",
+            inode: 0,
+            path: Some("[page size compat] extra"),
+        })]
+    #[case::bracketed_name_with_spaces(
+        b"724a0000-72aab000 rw-p 00000000 00:00 0 [anon:dalvik-zygote space] (deleted) extra",
+        ExpectedProcMapEntry {
+            address: 0x724a0000,
+            address_end: 0x72aab000,
+            perms: "rw-p",
+            offset: 0,
+            dev: "00:00",
+            inode: 0,
+            path: Some("[anon:dalvik-zygote space] (deleted) extra"),
+        })]
+    #[case::memfd_deleted(
+        b"5ba3b000-5da3b000 r--s 00000000 00:01 1033 /memfd:jit-zygote-cache (deleted)",
+        ExpectedProcMapEntry {
+            address: 0x5ba3b000,
+            address_end: 0x5da3b000,
+            perms: "r--s",
+            offset: 0,
+            dev: "00:01",
+            inode: 1033,
+            path: Some("/memfd:jit-zygote-cache (deleted)"),
+        })]
+    #[case::ashmem_with_spaces(
+        b"6cd539c000-6cd559c000 rw-s 00000000 00:01 7215 /dev/ashmem/CursorWindow: /data/user/0/package/databases/kitefly.db (deleted)",
+        ExpectedProcMapEntry {
+            address: 0x6cd539c000,
+            address_end: 0x6cd559c000,
+            perms: "rw-s",
+            offset: 0,
+            dev: "00:01",
+            inode: 7215,
+            path: Some("/dev/ashmem/CursorWindow: /data/user/0/package/databases/kitefly.db (deleted)"),
+        })]
+    fn test_parse_proc_map_entry_ok(
+        #[case] line: &'static [u8],
+        #[case] expected: ExpectedProcMapEntry,
+    ) {
+        use std::ffi::OsStr;
+
+        let ExpectedProcMapEntry {
+            address,
+            address_end,
+            perms,
+            offset,
+            dev,
+            inode,
+            path,
+        } = expected;
+
+        assert_matches!(ProcMapEntry::parse(line), Ok(entry) if entry == ProcMapEntry {
+            address,
+            address_end,
+            perms: OsStr::new(perms),
+            offset,
+            dev: OsStr::new(dev),
+            inode,
+            path: path.map(OsStr::new),
+        });
+    }
+
+    #[rstest]
+    #[case::bad_address(b"zzzz-7ffd6fbea000  r-xp  00000000  00:00  0  [vdso]")]
+    #[case::bad_offset(b"7f1bca5f9000-7f1bca601000  r-xp  zzzz  00:00  0  [vdso]")]
+    #[case::bad_inode(b"7f1bca5f9000-7f1bca601000  r-xp  00000000  00:00  zzzz  [vdso]")]
+    #[case::bad_address_range(b"7f1bca5f90007ffd6fbea000  r-xp  00000000  00:00  0  [vdso]")]
+    #[case::missing_fields(b"7f1bca5f9000-7f1bca601000  r-xp  00000000")]
+    #[case::bad_address_delimiter(b"7f1bca5f9000-7f1bca601000-deadbeef  rw-p  00000000  00:00  0")]
+    fn test_parse_proc_map_entry_err(#[case] line: &'static [u8]) {
+        assert_matches!(
+            ProcMapEntry::parse(line),
+            Err(ProcMapError::ParseLine { line: _ })
+        );
+    }
+
+    #[test]
+    fn test_proc_map_find_lib_by_name() {
+        let proc_map_libs = ProcMap {
+            pid: 0xdead,
+            data: b"
+7fc4a9800000-7fc4a98ad000	r--p	00000000	00:24	18147308	/usr/lib64/libcrypto.so.3.0.9
+",
+        };
+
+        assert_matches!(
+            proc_map_libs.find_library_path_by_name(Path::new("libcrypto.so.3.0.9")),
+            Ok(Some(path)) => {
+                assert_eq!(path, "/usr/lib64/libcrypto.so.3.0.9", "path: {}", path.display());
+            }
+        );
+    }
+
+    #[test]
+    fn test_proc_map_find_lib_by_partial_name() {
+        let proc_map_libs = ProcMap {
+            pid: 0xdead,
+            data: b"
+7fc4a9800000-7fc4a98ad000	r--p	00000000	00:24	18147308	/usr/lib64/libcrypto.so.3.0.9
+",
+        };
+
+        assert_matches!(
+            proc_map_libs.find_library_path_by_name(Path::new("libcrypto")),
+            Ok(Some(path)) => {
+                assert_eq!(path, "/usr/lib64/libcrypto.so.3.0.9", "path: {}", path.display());
+            }
+        );
+    }
+
+    #[test]
+    fn test_proc_map_with_multiple_lib_entries() {
+        let proc_map_libs = ProcMap {
+            pid: 0xdead,
+            data: b"
+7f372868000-7f3722869000	r--p	00000000	00:24	18097875	/usr/lib64/ld-linux-x86-64.so.2
+7f3722869000-7f372288f000	r-xp	00001000	00:24	18097875	/usr/lib64/ld-linux-x86-64.so.2
+7f372288f000-7f3722899000	r--p	00027000	00:24	18097875	/usr/lib64/ld-linux-x86-64.so.2
+7f3722899000-7f372289b000	r--p	00030000	00:24	18097875	/usr/lib64/ld-linux-x86-64.so.2
+7f372289b000-7f372289d000	rw-p	00032000	00:24	18097875	/usr/lib64/ld-linux-x86-64.so.2
+",
+        };
+
+        assert_matches!(
+            proc_map_libs.find_library_path_by_name(Path::new("ld-linux-x86-64.so.2")),
+            Ok(Some(path)) => {
+                assert_eq!(path, "/usr/lib64/ld-linux-x86-64.so.2", "path: {}", path.display());
+            }
+        );
+    }
+}

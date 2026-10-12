@@ -1,0 +1,947 @@
+"""
+Domain security scanner for OpenEASD — PASSIVE domain/email/RDAP intelligence.
+
+Checks (all passive — public resolvers / third-party RDAP, no packets to the
+target's own systems, so this tool needs no DomainAuthorization):
+  - DNS: A/AAAA, NS, MX, DNSSEC, CAA, Wildcard
+  - Email: SPF, DMARC, DKIM, TLS-RPT, BIMI
+  - RDAP: domain expiry, transfer/delete/update locks, domain status
+
+The ACTIVE probes that touch the target directly — AXFR zone transfer, lame
+delegation (a direct SOA query to each nameserver), SMTP open-relay, and the
+MTA-STS policy fetch — live in ``apps.domain_probe``.
+
+All private helpers live inline in this module so that test mocks targeting
+``apps.domain_security.scanner.*`` patch the functions that are actually called.
+"""
+
+import datetime
+import logging
+import time
+import urllib.parse
+
+import dns.resolver
+# Import DNS exception classes directly so they remain bound to real exception
+# types even when tests patch the `dns` module-level reference.
+from dns.resolver import NXDOMAIN as _DNS_NXDOMAIN, NoAnswer as _DNS_NoAnswer, NoNameservers as _DNS_NoNameservers
+import requests
+from django.conf import settings
+from django.utils import timezone as django_tz
+
+from apps.core.data.findings.models import Finding
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+RDAP_URL = "https://rdap.org/domain/{}"
+IANA_BOOTSTRAP_URL = "https://data.iana.org/rdap/dns.json"
+DKIM_SELECTORS = ["default", "google", "mail", "dkim", "selector1", "selector2", "k1", "smtp"]
+
+_DNS_TIMEOUT = getattr(settings, "SCANNER_DNS_TIMEOUT", 5)
+_HTTP_TIMEOUT = getattr(settings, "SCANNER_HTTP_TIMEOUT", 10)
+
+
+# ---------------------------------------------------------------------------
+# DNS helpers
+# ---------------------------------------------------------------------------
+
+class _DnsResult(list):
+    """A list of DNS answers that also records whether the lookup *resolved*.
+
+    ``resolved`` is True when we got a definitive answer — the records, or an
+    authoritative "no such record" (NXDOMAIN / NoAnswer). It is False when the
+    lookup itself FAILED (timeout / SERVFAIL / NoNameservers / network): in that
+    case an empty result means "unknown", NOT "missing". Checks that flag a
+    record as missing gate on ``resolved`` (via ``_resolved(records)``) so a
+    failed lookup never fabricates a "No A record / SPF missing" HIGH finding
+    (the false positives seen on live domains when the resolver was rate-limited).
+    It subclasses ``list`` so every existing caller — and every test that mocks
+    _resolve/_get_txt_record with a plain list — keeps working unchanged
+    (``_resolved`` defaults to True for a plain list).
+    """
+
+    def __new__(cls, items=(), resolved=True):
+        obj = super().__new__(cls, items)
+        return obj
+
+    def __init__(self, items=(), resolved=True):
+        super().__init__(items)
+        self.resolved = resolved
+
+    # Equality is intentionally by LIST CONTENT only — ``resolved`` is transient
+    # lookup metadata (read via _resolved(), never compared). Defined explicitly
+    # so the semantics are unambiguous and equality is not silently inherited.
+    __eq__ = list.__eq__
+    __ne__ = list.__ne__
+    __hash__ = None  # same as list — unhashable
+
+
+def _resolved(records) -> bool:
+    """Did the lookup that produced ``records`` actually resolve? Plain lists
+    (e.g. test mocks) default to True, so only a _DnsResult(resolved=False)
+    signals a failed lookup."""
+    return getattr(records, "resolved", True)
+
+
+def _resolve(domain, record_type):
+    """Resolve a DNS record → a _DnsResult (empty on absence OR failure; carries
+    ``.resolved``). One retry rides out a transient blip / resolver rate-limiting."""
+    for attempt in range(2):
+        try:
+            return _DnsResult(dns.resolver.resolve(domain, record_type, lifetime=_DNS_TIMEOUT), resolved=True)
+        except (_DNS_NoAnswer, _DNS_NXDOMAIN):
+            return _DnsResult([], resolved=True)  # authoritative: record absent
+        except Exception as e:  # NoNameservers / timeout / network — lookup failed
+            if attempt == 0:
+                continue
+            logger.debug(f"[domain_security] DNS {record_type} lookup failed for {domain}: {e}")
+            return _DnsResult([], resolved=False)
+    return _DnsResult([], resolved=False)  # unreachable; explicit for clarity
+
+
+def _check_caa(session, domain) -> list:
+    """Check for CAA records restricting certificate issuance."""
+    findings = []
+    caa_records = _resolve(domain, "CAA")
+
+    if _resolved(caa_records) and not caa_records:
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="dns",
+            severity="medium",
+            check_id="domain_security:caa_missing",
+            title="No CAA records found",
+            description=(
+                f"{domain} has no Certification Authority Authorization (CAA) records. "
+                "Any Certificate Authority can issue SSL/TLS certificates for this domain."
+            ),
+            remediation=(
+                'Add CAA records to restrict certificate issuance. Example: '
+                '0 issue "letsencrypt.org" or 0 issue "digicert.com"'
+            ),
+        ))
+    else:
+        for record in caa_records:
+            record_str = record.to_text()
+            if '0 issue ";"' in record_str or "0 issue ;" in record_str:
+                findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="dns",
+                    severity="high",
+                    check_id="domain_security:caa_blocks_issuance",
+                    title="CAA record blocks all certificate issuance",
+                    description=(
+                        f'{domain} has a CAA record "0 issue ;" which prevents any CA '
+                        "from issuing certificates. This will break HTTPS renewals."
+                    ),
+                    remediation="Update CAA records to allow your CA to issue certificates.",
+                    extra={"caa_records": [r.to_text() for r in caa_records]},
+                ))
+                break
+
+    return findings
+
+
+def _check_wildcard(session, domain) -> list:
+    """Check if wildcard DNS is enabled (*.domain resolves)."""
+    findings = []
+    test_subdomain = f"openeasd-wildcard-probe.{domain}"
+
+    try:
+        answers = dns.resolver.resolve(test_subdomain, "A", lifetime=_DNS_TIMEOUT)
+        if answers:
+            findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="dns",
+                severity="medium",
+                check_id="domain_security:wildcard_dns",
+                title="Wildcard DNS is enabled",
+                description=(
+                    f"*.{domain} resolves to an IP address. Any subdomain — including "
+                    "non-existent or abandoned ones — will resolve, widening the attack "
+                    "surface for subdomain takeover and phishing."
+                ),
+                remediation=(
+                    "Disable wildcard DNS unless explicitly required. "
+                    "Use explicit subdomain records instead."
+                ),
+                extra={"resolves_to": [r.address for r in answers]},
+            ))
+    except (_DNS_NoAnswer, _DNS_NXDOMAIN, _DNS_NoNameservers):
+        pass  # No wildcard — expected
+    except Exception as e:
+        logger.debug(f"[domain_security] Wildcard probe failed for {domain}: {e}")
+
+    return findings
+
+
+def _check_dnssec(session, domain) -> list:
+    """Full DNSSEC check: DNSKEY at domain + DS record at parent zone (chain of trust).
+
+    Three failure modes:
+    - Not configured: no DNSKEY, no DS → high
+    - Broken chain: DNSKEY present but DS not published at parent → high
+    - Signing removed: DS published but DNSKEY gone → high (causes resolution failures)
+    """
+    has_dnskey = False
+    has_ds = False
+
+    try:
+        resp = dns.resolver.resolve(domain, "DNSKEY", lifetime=_DNS_TIMEOUT)
+        has_dnskey = len(resp) > 0
+    except Exception:
+        pass
+
+    try:
+        resp = dns.resolver.resolve(domain, "DS", lifetime=_DNS_TIMEOUT)
+        has_ds = len(resp) > 0
+    except Exception:
+        pass
+
+    if not has_dnskey and not has_ds:
+        return [Finding(
+            session=session, source="domain_security", target=domain,
+            check_type="dnssec", severity="medium",
+            check_id="domain_security:dnssec_missing",
+            title="DNSSEC not enabled",
+            description=(
+                f"{domain} has no DNSSEC configured. DNS responses can be forged — "
+                "an attacker can silently redirect users to malicious servers. "
+                "DNSSEC authenticates DNS answers and is required or recommended by "
+                "many security and compliance frameworks."
+            ),
+            remediation=(
+                "Enable DNSSEC at your domain registrar:\n"
+                "1. Enable DNSSEC signing in your DNS provider settings\n"
+                "2. Retrieve the DS record from your DNS provider\n"
+                "3. Publish the DS record at your registrar\n"
+                "The chain of trust must run: Root → TLD → your domain."
+            ),
+        )]
+
+    if has_dnskey and not has_ds:
+        return [Finding(
+            session=session, source="domain_security", target=domain,
+            check_type="dnssec", severity="medium",
+            check_id="domain_security:dnssec_ds_missing",
+            title="DNSSEC chain of trust broken — DS record not published",
+            description=(
+                f"{domain} has DNSKEY records but the DS record is not published at the "
+                "parent zone. The chain of trust is incomplete — DNSSEC validation fails "
+                "for validating resolvers, which may fall back to unvalidated responses."
+            ),
+            remediation=(
+                "Publish the DS record at your registrar to complete the chain of trust:\n"
+                "1. Retrieve the DS record from your DNS provider\n"
+                "2. Add it under DNSSEC settings at your registrar\n"
+                "Without the DS record, DNSSEC provides no protection."
+            ),
+            extra={"has_dnskey": True, "has_ds": False},
+        )]
+
+    if has_ds and not has_dnskey:
+        return [Finding(
+            session=session, source="domain_security", target=domain,
+            check_type="dnssec", severity="high",
+            check_id="domain_security:dnssec_dnskey_missing",
+            title="DNSSEC misconfigured — DS published but DNSKEY missing",
+            description=(
+                f"{domain} has a DS record at the parent zone but no DNSKEY at the domain. "
+                "DNSSEC validation fails for all validating resolvers, making the domain "
+                "unreachable for users on DNSSEC-enforcing networks."
+            ),
+            remediation=(
+                "Either re-enable DNSSEC signing on your DNS provider so DNSKEY records "
+                "are published, or remove the DS record from your registrar if you intend "
+                "to disable DNSSEC. A DS record without a matching DNSKEY causes outages."
+            ),
+            extra={"has_dnskey": False, "has_ds": True},
+        )]
+
+    return []  # both present — DNSSEC correctly configured
+
+
+def _check_dns(session, domain) -> list:
+    """Run all DNS checks and return list of DomainFinding objects (not yet saved)."""
+    findings = []
+
+    # A / AAAA — only flag "does not resolve" when BOTH lookups succeeded and
+    # returned nothing. A failed lookup (timeout/SERVFAIL/rate-limit) must not be
+    # misread as "missing" — that produced false HIGH findings on live domains.
+    a_records = _resolve(domain, "A")
+    aaaa_records = _resolve(domain, "AAAA")
+    if _resolved(a_records) and _resolved(aaaa_records) and not a_records and not aaaa_records:
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="dns",
+            severity="high",
+            check_id="domain_security:no_a_record",
+            title="No A or AAAA record found",
+            description=f"{domain} does not resolve to any IP address.",
+            remediation="Add an A or AAAA record pointing to your server.",
+        ))
+
+    # NS records
+    ns_records = _resolve(domain, "NS")
+    if _resolved(ns_records) and not ns_records:
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="dns",
+            severity="high",
+            check_id="domain_security:no_ns",
+            title="No NS records found",
+            description=f"{domain} has no nameserver records.",
+            remediation="Configure NS records with your domain registrar.",
+        ))
+
+    # MX records
+    mx_records = _resolve(domain, "MX")
+    if _resolved(mx_records) and not mx_records:
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="dns",
+            severity="medium",
+            check_id="domain_security:no_mx",
+            title="No MX records found",
+            description=f"{domain} has no mail exchange records.",
+            remediation="Add MX records if you intend to receive email on this domain.",
+        ))
+
+    # DNSSEC
+    findings += _check_dnssec(session, domain)
+
+    # CAA records
+    findings += _check_caa(session, domain)
+
+    # Wildcard DNS
+    findings += _check_wildcard(session, domain)
+
+    # Zone Transfer (AXFR) and lame delegation are ACTIVE probes (they query the
+    # target's nameservers directly) → apps.domain_probe, not here. Keeping them
+    # out keeps domain_security strictly passive: public resolvers + RDAP only,
+    # no packets to the target's own infrastructure.
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Email helpers
+# ---------------------------------------------------------------------------
+
+def _get_txt_record(domain):
+    """Return TXT record strings for a domain → a _DnsResult (empty on absence OR
+    failure; carries ``.resolved`` so SPF/DMARC "missing" findings don't fire on a
+    failed TXT lookup). One retry on a transient failure."""
+    for attempt in range(2):
+        try:
+            answers = dns.resolver.resolve(domain, "TXT", lifetime=_DNS_TIMEOUT)
+            return _DnsResult(
+                [b"".join(r.strings).decode("utf-8", errors="ignore") for r in answers],
+                resolved=True,
+            )
+        except (_DNS_NoAnswer, _DNS_NXDOMAIN):
+            return _DnsResult([], resolved=True)  # authoritative: no TXT records
+        except Exception:
+            if attempt == 0:
+                continue
+            return _DnsResult([], resolved=False)
+    return _DnsResult([], resolved=False)  # unreachable; explicit for clarity
+
+
+_SPF_LOOKUP_LIMIT = 10  # RFC 7208 §4.6.4 — over this, receivers return permerror.
+
+
+def _spf_lookup_count(spf: str) -> int:
+    """Count the DNS-lookup-causing mechanisms in an SPF record (include / a / mx /
+    ptr / exists / redirect). Top-level only — nested includes can push the real
+    total higher, so a count near the limit is still a risk."""
+    count = 0
+    for term in spf.split()[1:]:  # skip the "v=spf1" version token
+        t = term.lstrip("+-~?").lower()
+        if t.startswith(("include:", "exists:", "redirect=")):
+            count += 1
+        elif t == "a" or t.startswith(("a:", "a/")):
+            count += 1
+        elif t == "mx" or t.startswith(("mx:", "mx/")):
+            count += 1
+        elif t == "ptr" or t.startswith("ptr:"):
+            count += 1
+    return count
+
+
+def _check_spf(session, domain) -> list:
+    findings = []
+    txt_records = _get_txt_record(domain)
+    if not _resolved(txt_records):
+        return findings  # TXT lookup failed — can't tell if SPF is missing
+    spf_records = [r for r in txt_records if r.startswith("v=spf1")]
+
+    if not spf_records:
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="email",
+            severity="high",
+            check_id="domain_security:spf_missing",
+            title="SPF record missing",
+            description=f"{domain} has no SPF record. Anyone can spoof email from this domain.",
+            remediation="Add a TXT record: v=spf1 include:<your-mail-provider> -all",
+        ))
+        return findings
+
+    spf = spf_records[0]
+
+    # Policy strength — the trailing `all` qualifier decides what happens to mail
+    # that isn't from an authorised sender.
+    if "+all" in spf:
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="email",
+            severity="critical",
+            check_id="domain_security:spf_all",
+            title="SPF policy allows all senders (+all)",
+            description="SPF +all means any server can send email as this domain.",
+            remediation="Change +all to -all immediately.",
+            extra={"spf_record": spf},
+        ))
+    elif "~all" in spf:
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="email",
+            severity="medium",
+            check_id="domain_security:spf_softfail",
+            title="SPF policy is soft fail (~all)",
+            description="SPF is set to ~all (soft fail). Spoofed emails may still be delivered.",
+            remediation="Change ~all to -all for strict enforcement.",
+            extra={"spf_record": spf},
+        ))
+    elif "?all" in spf:
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="email",
+            severity="medium",
+            check_id="domain_security:spf_neutral",
+            title="SPF policy is neutral (?all)",
+            description=(
+                "SPF ?all provides no protection — receivers treat an unauthorised "
+                "sender's result as neutral, so spoofed mail is not rejected."
+            ),
+            remediation="Change ?all to -all for strict enforcement.",
+            extra={"spf_record": spf},
+        ))
+    elif not any(q in spf for q in ("-all", "~all", "+all", "?all")):
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="email",
+            severity="medium",
+            check_id="domain_security:spf_no_all",
+            title="SPF record has no 'all' mechanism",
+            description=(
+                "The SPF record has no trailing all mechanism, so it defaults to "
+                "neutral (?all) — unauthorised senders are not rejected."
+            ),
+            remediation="Append -all to the SPF record for strict enforcement.",
+            extra={"spf_record": spf},
+        ))
+
+    # RFC 7208 DNS-lookup limit — over 10 lookups, receivers return permerror and
+    # SPF is silently NOT applied (protection fails without any visible error).
+    lookups = _spf_lookup_count(spf)
+    if lookups > _SPF_LOOKUP_LIMIT:
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="email",
+            severity="high",
+            check_id="domain_security:spf_lookup_limit",
+            title="SPF exceeds the 10 DNS-lookup limit",
+            description=(
+                f"The SPF record uses {lookups} DNS-lookup mechanisms; RFC 7208 caps "
+                "this at 10. Over the limit, receivers return permerror and SPF is not "
+                "applied — spoofing protection silently fails."
+            ),
+            remediation="Reduce include/a/mx/redirect mechanisms, or flatten includes.",
+            extra={"spf_record": spf, "lookups": lookups},
+        ))
+    elif lookups >= _SPF_LOOKUP_LIMIT - 2:
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="email",
+            severity="medium",
+            check_id="domain_security:spf_lookup_near_limit",
+            title="SPF is near the 10 DNS-lookup limit",
+            description=(
+                f"The SPF record uses {lookups} top-level DNS-lookup mechanisms. Nested "
+                "includes can push the real total over the RFC 7208 limit of 10, at "
+                "which point SPF fails with permerror."
+            ),
+            remediation="Trim or flatten includes to stay well under 10 lookups.",
+            extra={"spf_record": spf, "lookups": lookups},
+        ))
+
+    return findings
+
+
+def _check_dmarc(session, domain) -> list:
+    findings = []
+    dmarc_records = _get_txt_record(f"_dmarc.{domain}")
+    if not _resolved(dmarc_records):
+        return findings  # TXT lookup failed — can't tell if DMARC is missing
+    dmarc = next((r for r in dmarc_records if r.startswith("v=DMARC1")), None)
+
+    if not dmarc:
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="email",
+            severity="high",
+            check_id="domain_security:dmarc_missing",
+            title="DMARC record missing",
+            description=f"{domain} has no DMARC record. Email spoofing is not prevented.",
+            remediation=f"Add a TXT record at _dmarc.{domain}: v=DMARC1; p=reject; rua=mailto:dmarc@{domain}",
+        ))
+        return findings
+
+    # Parse the record into tags — substring checks ("p=none" in dmarc) are
+    # wrong: "p=none" is a substring of "sp=none", so p=reject; sp=none would be
+    # mis-read as p=none.
+    tags: dict[str, str] = {}
+    for part in dmarc.split(";"):
+        if "=" in part:
+            key, _, val = part.partition("=")
+            tags[key.strip().lower()] = val.strip()
+    policy = tags.get("p", "").lower()
+    subpolicy = tags.get("sp", "").lower()
+    rua = tags.get("rua", "")
+
+    # Policy strength.
+    if policy == "none":
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="email",
+            severity="medium",
+            check_id="domain_security:dmarc_policy_none",
+            title="DMARC policy is none (monitoring only)",
+            description="DMARC p=none means no action is taken on failing emails.",
+            remediation="Change DMARC policy to p=quarantine or p=reject.",
+            extra={"dmarc_record": dmarc},
+        ))
+    elif policy == "quarantine":
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="email",
+            severity="low",
+            check_id="domain_security:dmarc_policy_quarantine",
+            title="DMARC policy is quarantine (not reject)",
+            description="DMARC p=quarantine sends failing emails to spam. p=reject is stronger.",
+            remediation="Consider upgrading DMARC policy to p=reject.",
+            extra={"dmarc_record": dmarc},
+        ))
+
+    # Subdomain policy weaker than the domain policy — subdomains left spoofable.
+    if subpolicy == "none" and policy in ("quarantine", "reject"):
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="email",
+            severity="medium",
+            check_id="domain_security:dmarc_sp_none",
+            title="DMARC subdomain policy is none (sp=none)",
+            description=(
+                f"{domain} enforces DMARC (p={policy}) but sets sp=none, so its "
+                "SUBDOMAINS are unprotected — an attacker can spoof mail from any "
+                "subdomain."
+            ),
+            remediation="Remove sp=none (subdomains inherit p) or set sp=reject.",
+            extra={"dmarc_record": dmarc},
+        ))
+
+    # Partial enforcement — pct<100 applies the policy to only some failing mail.
+    pct_raw = tags.get("pct", "")
+    try:
+        pct = int(pct_raw) if pct_raw else 100
+    except ValueError:
+        pct = 100
+    if pct < 100:
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="email",
+            severity="low",
+            check_id="domain_security:dmarc_pct",
+            title="DMARC is only partially enforced (pct<100)",
+            description=(
+                f"DMARC pct={pct} applies the policy to only {pct}% of failing mail; "
+                "the rest is delivered, diluting protection."
+            ),
+            remediation="Set pct=100 (or omit pct, which defaults to 100).",
+            extra={"dmarc_record": dmarc, "pct": pct},
+        ))
+
+    # No aggregate reporting — no visibility into who is sending as the domain.
+    if not rua:
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="email",
+            severity="low",
+            check_id="domain_security:dmarc_no_rua",
+            title="DMARC has no aggregate reporting (rua)",
+            description=(
+                f"{domain}'s DMARC record has no rua= address, so there is no visibility "
+                "into who is sending — or spoofing — mail as this domain."
+            ),
+            remediation=f"Add rua=mailto:dmarc@{domain} to receive aggregate reports.",
+            extra={"dmarc_record": dmarc},
+        ))
+
+    return findings
+
+
+# Mail-provider fingerprints (in MX / SPF) → that provider's known DKIM
+# selectors. DKIM selectors are provider-specific and not otherwise discoverable
+# from the domain, so inferring the provider lets the check try the RIGHT
+# selector instead of only a generic guess list.
+_DKIM_PROVIDER_SELECTORS = [
+    ("Google Workspace", ("google.com", "googlemail.com", "_spf.google.com"), ["google"]),
+    ("Microsoft 365", ("mail.protection.outlook.com", "spf.protection.outlook.com"), ["selector1", "selector2"]),
+    ("Zoho", ("zoho.com", "zoho.eu", "zohomail"), ["zoho", "zmail"]),
+    ("Amazon SES", ("amazonses.com",), ["amazonses"]),
+    ("SendGrid", ("sendgrid.net",), ["s1", "s2"]),
+    ("Mailchimp/Mandrill", ("mcsv.net", "mandrillapp.com"), ["k1", "k2", "k3", "mandrill"]),
+    ("Fastmail", ("messagingengine.com",), ["fm1", "fm2", "fm3", "mesmtp"]),
+    ("Proofpoint", ("pphosted.com", "ppe-hosted.com"), ["selector1", "selector2"]),
+]
+
+
+def _infer_dkim_selectors(domain):
+    """Guess the mail provider from MX + SPF and return (provider, [selectors]).
+
+    Returns (None, []) when no known provider is matched. Never raises.
+    """
+    try:
+        mx = " ".join(_resolve(domain, "MX")).lower()
+        spf = " ".join(
+            r for r in _get_txt_record(domain) if r.lower().startswith("v=spf1")
+        ).lower()
+    except Exception:  # noqa: BLE001 — inference is best-effort
+        return None, []
+    haystack = f"{mx} {spf}"
+    for provider, fingerprints, selectors in _DKIM_PROVIDER_SELECTORS:
+        if any(fp in haystack for fp in fingerprints):
+            return provider, selectors
+    return None, []
+
+
+def _check_dkim(session, domain) -> list:
+    findings = []
+    provider, inferred = _infer_dkim_selectors(domain)
+    # Try the inferred provider's selectors first, then the generic common list.
+    selectors = inferred + [s for s in DKIM_SELECTORS if s not in inferred]
+    dkim_found = False
+    for selector in selectors:
+        records = _get_txt_record(f"{selector}._domainkey.{domain}")
+        if any("v=DKIM1" in r for r in records):
+            dkim_found = True
+            break
+
+    if not dkim_found:
+        if provider:
+            provider_line = (
+                f" Detected mail provider: {provider} — its known selectors were "
+                "checked along with common ones, so a missing record is more likely genuine."
+            )
+        else:
+            provider_line = (
+                " DKIM uses a per-provider selector that can't always be discovered "
+                "without knowing it, so this may be a lookup limitation rather than a "
+                "definitively missing record."
+            )
+        # Severity is confidence-aware: DKIM selectors are not enumerable, so a
+        # missing record can't be proven. Only elevate to MEDIUM when we detected
+        # the mail provider and checked its real selectors (a miss is then likely
+        # genuine). With just the generic guess-list we can't verify absence, so
+        # keep it LOW and say so in the title — avoids a false "missing DKIM".
+        if provider:
+            severity = "medium"
+            title = f"DKIM not found for detected provider ({provider})"
+        else:
+            severity = "low"
+            title = "DKIM not found on common selectors (could not verify)"
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="email",
+            severity=severity,
+            check_id="domain_security:dkim_unconfirmed",
+            title=title,
+            description=(
+                f"No DKIM record was found for {domain} at the selectors checked."
+                f"{provider_line} Verify against your mail provider's published selector."
+            ),
+            remediation="Configure DKIM signing with your email provider and publish the public key as a TXT record.",
+            extra={"mail_provider": provider, "selectors_checked": selectors},
+        ))
+
+    return findings
+
+
+def _check_tls_rpt(session, domain) -> list:
+    """Check TLS-RPT — enables reporting of TLS failures on inbound email."""
+    findings = []
+    tls_rpt_records = _get_txt_record(f"_smtp._tls.{domain}")
+    has_tls_rpt = any(r.startswith("v=TLSRPTv1") for r in tls_rpt_records)
+
+    if not has_tls_rpt:
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="email",
+            severity="low",
+            check_id="domain_security:tls_rpt_missing",
+            title="TLS-RPT not configured",
+            description=(
+                f"{domain} has no SMTP TLS Reporting (TLS-RPT) record. "
+                "You will not receive reports when TLS negotiation fails for inbound email."
+            ),
+            remediation=(
+                f"Add TXT record at _smtp._tls.{domain}: "
+                f"v=TLSRPTv1; rua=mailto:tls-report@{domain}"
+            ),
+        ))
+
+    return findings
+
+
+def _check_bimi(session, domain) -> list:
+    """Check BIMI — brand logo in email, signals mature email security."""
+    findings = []
+    bimi_records = _get_txt_record(f"default._bimi.{domain}")
+    has_bimi = any(r.startswith("v=BIMI1") for r in bimi_records)
+
+    if not has_bimi:
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="email",
+            severity="info",
+            check_id="domain_security:bimi_missing",
+            title="BIMI not configured",
+            description=(
+                f"{domain} has no BIMI record. BIMI displays your brand logo in email clients "
+                "and requires DMARC p=reject, signalling maximum email security maturity."
+            ),
+            remediation=(
+                "Implement BIMI after setting DMARC p=reject. "
+                f"Add TXT record at default._bimi.{domain}: "
+                "v=BIMI1; l=https://example.com/logo.svg; a=<vmc-url>"
+            ),
+        ))
+
+    return findings
+
+
+def _stamp_control(findings, control):
+    """Tag email findings with the control they concern (spf/dmarc/dkim/…).
+
+    All email findings share check_type="email", so the report keys its
+    per-control business-impact copy on extra["control"] instead. Without this
+    the copy silently doesn't render (the report resolves it via this key).
+    """
+    for f in findings:
+        f.extra = {**(f.extra or {}), "control": control}
+    return findings
+
+
+def _check_email(session, domain) -> list:
+    """Run all email security checks and return list of Finding objects (not yet saved)."""
+    findings = []
+    findings += _stamp_control(_check_spf(session, domain), "spf")
+    findings += _stamp_control(_check_dmarc(session, domain), "dmarc")
+    findings += _stamp_control(_check_dkim(session, domain), "dkim")
+    # MTA-STS (policy fetch) and open-relay are ACTIVE probes → apps.domain_probe.
+    findings += _stamp_control(_check_tls_rpt(session, domain), "tls_rpt")
+    findings += _stamp_control(_check_bimi(session, domain), "bimi")
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# RDAP helpers
+# ---------------------------------------------------------------------------
+
+def _fetch_rdap(domain) -> dict:
+    """
+    Fetch RDAP data for a domain with retry + IANA bootstrap fallback.
+
+    Strategy:
+      1. Try rdap.org (aggregator) — up to 2 retries on transient errors.
+      2. On failure, query the IANA bootstrap registry to find the
+         authoritative RDAP server for the TLD, then query it directly.
+      3. Raise if all attempts fail.
+    """
+    last_exc: Exception = RuntimeError(f"RDAP lookup failed for {domain}")
+
+    # Step 1: rdap.org with retries
+    for attempt in range(3):
+        try:
+            resp = requests.get(RDAP_URL.format(urllib.parse.quote(domain, safe="")), timeout=_HTTP_TIMEOUT)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            last_exc = e
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+
+    logger.warning(f"[domain_security] rdap.org failed for {domain} after 3 attempts: {last_exc}")
+
+    # Step 2: IANA bootstrap fallback
+    tld = domain.rsplit(".", 1)[-1].lower()
+    try:
+        bootstrap = requests.get(IANA_BOOTSTRAP_URL, timeout=_HTTP_TIMEOUT).json()
+        rdap_base = None
+        for tlds, urls in bootstrap.get("services", []):
+            if tld in [t.lower() for t in tlds]:
+                rdap_base = urls[0].rstrip("/")
+                break
+
+        if rdap_base:
+            # Validate the bootstrap URL is an HTTPS URL before using it
+            parsed = urllib.parse.urlparse(rdap_base)
+            if parsed.scheme != "https" or not parsed.netloc:
+                logger.warning(f"[domain_security] IANA bootstrap returned non-HTTPS URL for .{tld}: {rdap_base!r} — skipping")
+                raise ValueError(f"Untrusted RDAP base URL: {rdap_base!r}")
+            logger.info(f"[domain_security] Trying IANA RDAP bootstrap for .{tld}: {rdap_base}")
+            resp = requests.get(f"{rdap_base}/domain/{urllib.parse.quote(domain, safe='')}", timeout=_HTTP_TIMEOUT)
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        last_exc = e
+        logger.warning(f"[domain_security] IANA bootstrap fallback failed for {domain}: {e}")
+
+    raise last_exc
+
+
+def _check_rdap(session, domain) -> list:
+    """Run RDAP checks and return list of DomainFinding objects (not yet saved)."""
+    findings = []
+
+    try:
+        data = _fetch_rdap(domain)
+    except Exception as e:
+        logger.warning(f"[domain_security] All RDAP sources failed for {domain}: {e}")
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="rdap",
+            severity="info",
+            check_id="domain_security:rdap_lookup_failed",
+            title="RDAP lookup failed",
+            description=(
+                f"Could not retrieve RDAP data for {domain} from rdap.org or the "
+                "authoritative RDAP server (IANA bootstrap). "
+                "Expiry, lock status, and registrar checks were skipped."
+            ),
+            remediation="Verify the domain is registered and RDAP is publicly available for its TLD.",
+        ))
+        return findings
+
+    statuses = [s.lower() for s in data.get("status", [])]
+    # Guard eventAction too, not just eventDate: real registrar RDAP payloads
+    # sometimes omit eventAction, and an unguarded e["eventAction"] KeyError would
+    # abort the ENTIRE RDAP check (expiry/lock/registrar), silently losing findings.
+    events = {
+        e["eventAction"]: e["eventDate"]
+        for e in data.get("events", [])
+        if e.get("eventAction") and e.get("eventDate")
+    }
+
+    # Domain expiry
+    expiry_str = events.get("expiration")
+    if expiry_str:
+        try:
+            expiry = datetime.datetime.fromisoformat(expiry_str.replace("Z", "+00:00"))
+            days_left = (expiry - django_tz.now()).days
+            extra = {"expiry_date": expiry_str, "days_left": days_left}
+
+            if days_left <= 7:
+                findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="rdap",
+                    severity="critical",
+                    check_id="domain_security:rdap_expiring",
+                    title=f"Domain expires in {days_left} day(s)",
+                    description=f"{domain} expires on {expiry.date()}. Immediate renewal required.",
+                    remediation="Renew the domain immediately to avoid service disruption.",
+                    extra=extra,
+                ))
+            elif days_left <= 30:
+                findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="rdap",
+                    severity="high",
+                    check_id="domain_security:rdap_expiring",
+                    title=f"Domain expires in {days_left} days",
+                    description=f"{domain} expires on {expiry.date()}.",
+                    remediation="Renew the domain soon to avoid disruption.",
+                    extra=extra,
+                ))
+        except (ValueError, KeyError) as e:
+            logger.debug(f"[domain_security] Could not parse RDAP expiry date {expiry_str!r} for {domain}: {e}")
+
+    # Transfer lock
+    has_transfer_lock = any(s in {"client transfer prohibited", "server transfer prohibited"} for s in statuses)
+    if not has_transfer_lock:
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="rdap",
+            severity="medium",
+            check_id="domain_security:rdap_transfer_lock",
+            title="Domain transfer lock not enabled",
+            description=(
+                f"{domain} does not have a transfer lock (clientTransferProhibited). "
+                "An attacker with registrar account access could initiate an unauthorized domain transfer."
+            ),
+            remediation="Enable 'clientTransferProhibited' lock at your domain registrar.",
+            extra={"statuses": statuses},
+        ))
+
+    # Delete lock
+    has_delete_lock = any(s in {"client delete prohibited", "server delete prohibited"} for s in statuses)
+    if not has_delete_lock:
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="rdap",
+            severity="medium",
+            check_id="domain_security:rdap_delete_lock",
+            title="Domain delete lock not enabled",
+            description=(
+                f"{domain} does not have a delete lock (clientDeleteProhibited). "
+                "The domain could be accidentally or maliciously deleted, causing immediate service outage."
+            ),
+            remediation="Enable 'clientDeleteProhibited' lock at your domain registrar.",
+            extra={"statuses": statuses},
+        ))
+
+    # Update lock
+    has_update_lock = any(s in {"client update prohibited", "server update prohibited"} for s in statuses)
+    if not has_update_lock:
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="rdap",
+            severity="low",
+            check_id="domain_security:rdap_update_lock",
+            title="Domain update lock not enabled",
+            description=(
+                f"{domain} does not have an update lock (clientUpdateProhibited). "
+                "Nameserver and contact records could be modified without an additional authorization step."
+            ),
+            remediation="Enable 'clientUpdateProhibited' lock at your domain registrar.",
+            extra={"statuses": statuses},
+        ))
+
+    # Domain active status
+    if "inactive" in statuses or "pending delete" in statuses:
+        findings.append(Finding(
+            session=session, source="domain_security", target=domain, check_type="rdap",
+            severity="critical",
+            check_id="domain_security:rdap_inactive",
+            title="Domain is inactive or pending deletion",
+            description=f"{domain} status: {', '.join(statuses)}",
+            remediation="Contact your registrar immediately.",
+            extra={"statuses": statuses},
+        ))
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Main orchestrator
+# ---------------------------------------------------------------------------
+
+def run_domain_security(session) -> list:
+    """Run all domain security checks and save findings."""
+    domain = session.domain
+    logger.info(f"[domain_security:{session.id}] Starting checks for {domain}")
+
+    # Fail-graceful like the other passive Domain Posture / intel tools
+    # (breach_check, hudson_rock, dns_history): a DNS/RDAP hiccup must never
+    # propagate and fail the whole scan — skip with zero findings instead.
+    try:
+        findings = []
+        findings += _check_dns(session, domain)
+        findings += _check_email(session, domain)
+        findings += _check_rdap(session, domain)
+    except Exception:  # noqa: BLE001 — never let this tool fail a scan
+        logger.exception("[domain_security:%s] unexpected error — skipping", session.id)
+        return []
+
+    if findings:
+        Finding.objects.bulk_create(findings)
+
+    logger.info(f"[domain_security:{session.id}] {len(findings)} findings for {domain}")
+    return findings

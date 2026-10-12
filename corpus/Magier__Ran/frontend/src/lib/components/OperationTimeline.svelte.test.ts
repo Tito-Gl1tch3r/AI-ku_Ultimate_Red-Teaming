@@ -1,0 +1,409 @@
+import { fireEvent, render, screen } from '@testing-library/svelte';
+import { describe, expect, it, vi } from 'vitest';
+import OperationTimeline from './OperationTimeline.svelte';
+import type {
+	ActionGroup,
+	EntityEntry,
+	SessionEventEntry,
+	TopEntry
+} from '#lib/stores/timelineStore.svelte.js';
+
+function compactTimestamp(date: Date): string {
+	return date.toLocaleTimeString([], {
+		hour: '2-digit',
+		minute: '2-digit',
+		hour12: false
+	});
+}
+
+function fullTimestamp(date: Date): string {
+	return date.toLocaleString([], { dateStyle: 'medium', timeStyle: 'long' });
+}
+
+function renderTimeline(
+	entries: TopEntry[],
+	handlers: {
+		onfocusentity?: (targetId: string) => void;
+		ontogglegroup?: (cmdId: string) => void;
+		onviewaction?: (cmdId: string) => void;
+	} = {},
+	output: Record<string, unknown> | undefined = undefined
+) {
+	const onfocusentity = handlers.onfocusentity ?? vi.fn();
+	const ontogglegroup = handlers.ontogglegroup ?? vi.fn();
+	const onviewaction = handlers.onviewaction ?? vi.fn();
+	const result = render(OperationTimeline, {
+		props: { entries, onfocusentity, ontogglegroup, onviewaction },
+		context: new Map([['$_campaignState', { getExecutionOutput: () => output }]])
+	});
+	return { ...result, onfocusentity, ontogglegroup, onviewaction };
+}
+
+function actionEntry(overrides: Partial<ActionGroup> = {}): ActionGroup {
+	return {
+		kind: 'action-group',
+		action: {
+			kind: 'ttp-action',
+			id: 'action',
+			ttpId: 'list-pods',
+			ttpName: 'List pods',
+			targetId: 'target',
+			targetName: 'target-pod',
+			status: 'success'
+		},
+		effects: [],
+		collapsed: true,
+		...overrides
+	};
+}
+
+describe('OperationTimeline action interactions', () => {
+	it('shows the latest output line for a pending action', () => {
+		const pending = actionEntry();
+		pending.action.status = 'pending';
+		renderTimeline([pending], {}, { stdout: 'first host\nsecond host', stderr: '' });
+
+		expect(screen.getByText('second host')).toBeInTheDocument();
+	});
+
+	it('shows a successful structured action result as operational detail', () => {
+		const entry = actionEntry();
+		entry.action.detail =
+			'Ranplant session session/new established; superseded and closed source session session/old';
+		renderTimeline([entry]);
+
+		expect(screen.getByText(/closed source session session\/old/)).toBeInTheDocument();
+	});
+
+	it('opens details from the TTP name without toggling the group', async () => {
+		const { onviewaction, ontogglegroup } = renderTimeline([actionEntry()]);
+
+		await fireEvent.click(screen.getByRole('button', { name: 'List pods' }));
+
+		expect(onviewaction).toHaveBeenCalledWith('action');
+		expect(ontogglegroup).not.toHaveBeenCalled();
+	});
+
+	it('names an install-package execution after its resolved package argument', () => {
+		renderTimeline([
+			actionEntry({
+				action: {
+					kind: 'ttp-action',
+					id: 'install',
+					ttpId: 'install-package',
+					ttpName: 'Install Package',
+					ttpTitle: 'Install ${PKG || package}',
+					args: { PKG: 'nmap' },
+					targetId: 'target',
+					targetName: 'target-pod',
+					status: 'success'
+				}
+			})
+		]);
+
+		expect(screen.getByRole('button', { name: 'Install nmap' })).toBeInTheDocument();
+		expect(screen.queryByRole('button', { name: 'Install Package' })).not.toBeInTheDocument();
+	});
+
+	it('still toggles the group when the action row itself is clicked', async () => {
+		const { onviewaction, ontogglegroup } = renderTimeline([actionEntry()]);
+		const row = screen.getByRole('button', { name: 'List pods' }).closest('[aria-expanded]');
+
+		expect(row).not.toBeNull();
+		await fireEvent.click(row!);
+
+		expect(ontogglegroup).toHaveBeenCalledWith('action');
+		expect(onviewaction).not.toHaveBeenCalled();
+	});
+
+	it('focuses a target without opening details or toggling the group', async () => {
+		const { onfocusentity, onviewaction, ontogglegroup } = renderTimeline([actionEntry()]);
+
+		await fireEvent.click(screen.getByRole('button', { name: 'target-pod' }));
+
+		expect(onfocusentity).toHaveBeenCalledWith('target');
+		expect(onviewaction).not.toHaveBeenCalled();
+		expect(ontogglegroup).not.toHaveBeenCalled();
+	});
+
+	it('keeps startup action names as plain text', () => {
+		renderTimeline([
+			actionEntry({
+				action: {
+					kind: 'ttp-action',
+					id: 'startup',
+					ttpId: '',
+					ttpName: 'Read kubeconfig',
+					targetId: '',
+					targetName: '',
+					status: 'success',
+					startup: true,
+					detail: 'developer'
+				}
+			})
+		]);
+
+		expect(screen.getByText('Read kubeconfig')).not.toBeInstanceOf(HTMLButtonElement);
+		expect(screen.queryByRole('button', { name: 'Read kubeconfig' })).not.toBeInTheDocument();
+	});
+
+	it('describes a partial redirector action as reusing the existing redirector', () => {
+		renderTimeline([
+			actionEntry({
+				action: {
+					kind: 'ttp-action',
+					id: 'redirector',
+					ttpId: 'create-redirector',
+					ttpName: 'Create Redirector',
+					targetId: 'listener/tcp/1337',
+					targetName: 'TCP 1337',
+					status: 'partial'
+				},
+				effects: [
+					{
+						kind: 'discovery',
+						id: 'redirector/labctl/play1/1337',
+						entityId: 'redirector/labctl/play1/1337',
+						entityName: 'labctl 1337',
+						entityKind: 'Redirector',
+						outcome: 'created'
+					}
+				],
+				collapsed: false
+			})
+		]);
+
+		expect(screen.getByText('Reusing existing Redirector')).toBeInTheDocument();
+		expect(screen.queryByText('Partial')).not.toBeInTheDocument();
+	});
+
+	it('shows a discovered executable path in expanded action details', async () => {
+		const { onfocusentity } = renderTimeline([
+			actionEntry({
+				effects: [
+					{
+						kind: 'relation',
+						id: 'relation:kubelet-exec:pod-a:node-a',
+						relationName: 'kubelet-exec',
+						sourceId: 'pod-a',
+						sourceName: 'attacker',
+						targetId: 'node-a',
+						targetName: 'worker-a',
+						isExecChannel: true
+					}
+				],
+				collapsed: false
+			})
+		]);
+
+		expect(screen.getByText('Discovered executable path')).toBeInTheDocument();
+		expect(screen.getByText('via kubelet-exec')).toBeInTheDocument();
+
+		await fireEvent.click(screen.getByRole('button', { name: 'worker-a' }));
+		expect(onfocusentity).toHaveBeenCalledWith('node-a');
+	});
+});
+
+describe('OperationTimeline timestamps', () => {
+	it('shows compact timestamps with full hover text for every row type', async () => {
+		const actionTimestamp = new Date(2026, 4, 25, 12, 34, 56);
+		const effectTimestamp = new Date(2026, 4, 25, 12, 35, 57);
+		const standaloneTimestamp = new Date(2026, 4, 25, 12, 36, 58);
+		const entries: TopEntry[] = [
+			{
+				kind: 'discovery',
+				id: 'standalone',
+				entityId: 'standalone',
+				entityName: 'standalone-pod',
+				entityKind: 'Pod',
+				timestamp: standaloneTimestamp
+			},
+			{
+				kind: 'action-group',
+				action: {
+					kind: 'ttp-action',
+					id: 'action',
+					ttpId: 'list-pods',
+					ttpName: 'List pods',
+					targetId: 'target',
+					targetName: 'target-pod',
+					status: 'success',
+					timestamp: actionTimestamp
+				},
+				effects: [
+					{
+						kind: 'discovery',
+						id: 'effect',
+						entityId: 'effect',
+						entityName: 'effect-pod',
+						entityKind: 'Pod',
+						timestamp: effectTimestamp
+					}
+				],
+				collapsed: false
+			}
+		];
+
+		renderTimeline(entries);
+
+		for (const timestamp of [actionTimestamp, effectTimestamp, standaloneTimestamp]) {
+			const full = fullTimestamp(timestamp);
+			const trigger = screen.getByText(compactTimestamp(timestamp));
+			expect(trigger).toHaveAttribute('aria-label', full);
+
+			await fireEvent.mouseEnter(trigger);
+			expect(screen.getByRole('tooltip')).toHaveTextContent(full);
+
+			await fireEvent.mouseLeave(trigger);
+			expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+		}
+	});
+
+	it('keeps the Startup label and shows its full timestamp on hover', async () => {
+		const startupTimestamp = new Date(2026, 4, 25, 12, 37, 59);
+		renderTimeline([
+			{
+				kind: 'action-group',
+				action: {
+					kind: 'ttp-action',
+					id: 'startup',
+					ttpId: '',
+					ttpName: 'Read kubeconfig',
+					targetId: '',
+					targetName: '',
+					status: 'success',
+					startup: true,
+					detail: 'developer',
+					timestamp: startupTimestamp
+				},
+				effects: [],
+				collapsed: true
+			}
+		]);
+
+		const trigger = screen.getByText('Startup');
+		await fireEvent.mouseEnter(trigger);
+		expect(screen.getByRole('tooltip')).toHaveTextContent(fullTimestamp(startupTimestamp));
+	});
+});
+
+describe('OperationTimeline entity verbs', () => {
+	function entityRow(overrides: Partial<EntityEntry> = {}): EntityEntry {
+		return {
+			kind: 'discovery',
+			id: 'listener/tcp/1337',
+			entityId: 'listener/tcp/1337',
+			entityName: 'tcp/1337',
+			entityKind: 'Listener',
+			...overrides
+		};
+	}
+
+	it('says a listener the action bound was created, not discovered', () => {
+		renderTimeline([entityRow({ outcome: 'created' })]);
+
+		expect(screen.getByText('Created listener')).toBeInTheDocument();
+		expect(screen.queryByText('Discovered listener')).not.toBeInTheDocument();
+	});
+
+	it('still says discovered for something the campaign genuinely found', () => {
+		renderTimeline([
+			entityRow({
+				outcome: 'observed',
+				id: 'ns/default/pod/web',
+				entityId: 'ns/default/pod/web',
+				entityName: 'web',
+				entityKind: 'Pod'
+			})
+		]);
+
+		expect(screen.getByText('Discovered pod')).toBeInTheDocument();
+	});
+
+	it('reports gained access even though the entity itself was only updated', () => {
+		renderTimeline([
+			entityRow({
+				kind: 'access-gained',
+				outcome: 'updated',
+				id: 'node/worker-1',
+				entityId: 'node/worker-1',
+				entityName: 'worker-1',
+				entityKind: 'K8sNode'
+			})
+		]);
+
+		expect(screen.getByText('Session established to')).toBeInTheDocument();
+		expect(screen.queryByText('Updated K8sNode')).not.toBeInTheDocument();
+	});
+
+	it('falls back to discovered when a row carries no outcome', () => {
+		renderTimeline([
+			entityRow({
+				id: 'ns/default/pod/web',
+				entityId: 'ns/default/pod/web',
+				entityKind: 'Pod'
+			})
+		]);
+
+		expect(screen.getByText('Discovered pod')).toBeInTheDocument();
+	});
+
+	it('never claims a discovery for an action whose only effect it created', () => {
+		const listenerAction = actionEntry({
+			action: {
+				kind: 'ttp-action',
+				id: 'cmd-listen',
+				ttpId: 'create-listener',
+				ttpName: 'Create Listener',
+				targetId: 'c2/ran',
+				targetName: 'Ran',
+				status: 'success'
+			},
+			effects: [entityRow({ outcome: 'created' })]
+		});
+
+		// Collapsed: the effect is summarised by a badge, never spelled out.
+		const collapsed = renderTimeline([listenerAction]);
+		expect(screen.queryByText(/^Discovered/)).not.toBeInTheDocument();
+		collapsed.unmount();
+
+		// Expanded: the effect is named, with the verb that actually applies.
+		renderTimeline([{ ...listenerAction, collapsed: false }]);
+		expect(screen.getByText('Created listener')).toBeInTheDocument();
+		expect(screen.queryByText(/^Discovered/)).not.toBeInTheDocument();
+	});
+});
+
+describe('session lifecycle rows', () => {
+	function sessionEntry(overrides: Partial<SessionEventEntry> = {}): SessionEventEntry {
+		return {
+			kind: 'session-lost',
+			id: 'session-event/session/node-victim-4444/1',
+			backendId: 'session/node-victim-4444',
+			entityId: 'system/victim',
+			entityName: 'victim',
+			timestamp: new Date('2026-05-25T10:05:00Z'),
+			...overrides
+		};
+	}
+
+	it('names the break and the recovery differently', () => {
+		renderTimeline([
+			sessionEntry({ kind: 'session-restored', id: 'session-event/s/2' }),
+			sessionEntry()
+		]);
+
+		expect(screen.getByText('Lost session to')).toBeTruthy();
+		expect(screen.getByText('Session restored to')).toBeTruthy();
+		expect(screen.getAllByText('victim')).toHaveLength(2);
+	});
+
+	it('focuses the host the session belongs to', async () => {
+		const onfocusentity = vi.fn();
+		renderTimeline([sessionEntry()], { onfocusentity });
+
+		await fireEvent.click(screen.getByRole('button', { name: 'victim' }));
+
+		expect(onfocusentity).toHaveBeenCalledWith('system/victim');
+	});
+});

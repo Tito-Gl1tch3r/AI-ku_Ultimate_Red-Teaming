@@ -1,0 +1,5410 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 - now Marco Neumann (kalink0)
+"""Crush main window — QMainWindow with dockable panels."""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import time
+import fnmatch
+import os
+import re
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Any, Callable, Literal, cast
+import logging
+import shutil
+import tempfile
+
+from PySide6.QtCore import (
+    QObject, QThread, Qt, Signal, QUrl, QSettings, QTimer,
+)
+from PySide6.QtGui import (
+    QCloseEvent,
+    QDragEnterEvent,
+    QDragLeaveEvent,
+    QDragMoveEvent,
+    QDropEvent,
+    QShowEvent,
+    QPalette,
+    QColor,
+    QAction,
+    QActionGroup,
+    QFontMetrics,
+    QGuiApplication,
+)
+from shiboken6 import isValid
+from PySide6.QtWidgets import (
+    QAbstractButton,
+    QApplication,
+    QDialog,
+    QDockWidget,
+    QFileDialog,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QInputDialog,
+    QProgressDialog,
+    QStatusBar,
+    QStackedWidget,
+    QTabBar,
+    QTabWidget,
+    QTextEdit,
+    QToolButton,
+    QWidget,
+    QHBoxLayout,
+    QVBoxLayout,
+    QPushButton,
+)
+
+import crush
+from crush.core import tempdir
+from crush.core.vfs import VFS, VFSNode, DirectoryVFS, FileVFS
+from crush.parsers.hex_fallback import HexFallbackParser
+from crush.ui import extract_dialog, i18n
+from crush.ui.busy_dialog import busy_call
+from crush.parsers.base import ParseResult
+from crush.core.issues import QT_TRANSLATE_NOOP, CatalogText, ParseIssue, render_value
+from crush.core.session import Session
+from crush.ui.log_scope import window_log_scope, WindowLogFilter, WindowStampFilter
+from crush.ui.fs_panel import FilesystemPanel
+from crush.ui.props_panel import PropertiesPanel
+from crush.ui.loading_dialog import LoadingDialog
+from crush.ui.drop_overlay import DropOverlay, local_paths
+from crush.ui.i18n import translate
+
+
+class _LoadSourceWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str, str)  # (English for the log, shown in the UI language)
+    # (was_wrong, reason, needs): was_wrong = a previously supplied password
+    # or key was rejected; reason = why, as the source reported it ("" if
+    # none); needs = "password", or "private key" for a source sealed only
+    # to a certificate.
+    password_required = Signal(bool, str, str)
+    # (sha256, size, path) of the source file, in integrity mode; before
+    # finished, so a window the source is handed to logs it too.
+    hashed = Signal(str, int, str)
+
+    def __init__(
+        self,
+        session: Session,
+        path: str,
+        integrity: bool,
+        itunes_zip_prefix: str | None = None,
+        password: str = "",
+        window_id: str | None = None,
+        embedded_zip: bool = False,
+        as_disk_image: bool = False,
+        private_key: str = "",
+    ) -> None:
+        super().__init__()
+        self._session = session
+        self._path = path
+        self._integrity = integrity
+        self._itunes_zip_prefix = itunes_zip_prefix
+        self._password = password
+        self._window_id = window_id
+        self._embedded_zip = embedded_zip
+        self._as_disk_image = as_disk_image
+        self._private_key = private_key
+
+    def run(self) -> None:
+        with window_log_scope(self._window_id):
+            self._run()
+
+    def _run(self) -> None:
+        from crush.core.passwords import (
+            PasswordRequiredError,
+            PrivateKeyRequiredError,
+            WrongPasswordError,
+        )
+
+        try:
+            if self._itunes_zip_prefix is not None:
+                # The whole ZIP, its backup(s) opened in place: what the ZIP
+                # holds beside a backup is never left out.
+                from crush.core.mounted import ZipWithITunesBackupVFS
+
+                vfs = self._session.add_source_vfs(
+                    ZipWithITunesBackupVFS(self._path, password=self._password)
+                )
+            else:
+                vfs = self._session.add_source(
+                    self._path, password=self._password, embedded_zip=self._embedded_zip,
+                    as_disk_image=self._as_disk_image, private_key=self._private_key,
+                )
+            if self._integrity:
+                self._log_source_hash()
+        except WrongPasswordError as exc:
+            # A rejection doesn't say what opens the source; the window asks
+            # again the way the first prompt did (_disk_image_retry_needs).
+            self.password_required.emit(True, i18n.exception_text(exc), "password")
+            return
+        except PasswordRequiredError as exc:
+            needs = "private key" if isinstance(exc, PrivateKeyRequiredError) else "password"
+            # A disk image says what it is and what opens it; the other
+            # sources' prompt says that already.
+            reason = i18n.exception_text(exc) if self._as_disk_image else ""
+            self.password_required.emit(False, reason, needs)
+            return
+        except Exception as exc:
+            self.failed.emit(str(exc), i18n.exception_text(exc))
+            return
+        self.finished.emit(vfs)
+
+    def _log_source_hash(self) -> None:
+        path = Path(self._path)
+        if not path.is_file():
+            return
+        import hashlib
+
+        hasher = hashlib.sha256()
+        total = 0
+        with path.open("rb") as src:
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                total += len(chunk)
+        digest = hasher.hexdigest()
+        logging.getLogger("crush").info(
+            "INTEGRITY source sha256=%s  size=%d  path=%s", digest, total, path
+        )
+        self.hashed.emit(digest, total, str(path))
+
+
+class _TabMetadata:
+    """A viewer tab's parser metadata, held as a plain Python object (see
+    where _show_result sets the "crush_metadata" property)."""
+
+    __slots__ = ("metadata",)
+
+    def __init__(self, metadata: dict[str, Any]) -> None:
+        self.metadata = metadata
+
+
+class _ClosableTabBar(QTabBar):
+    def mouseReleaseEvent(self, event: object) -> None:  # type: ignore[override]
+        if hasattr(event, "button") and event.button() == Qt.MouseButton.MiddleButton:
+            index = self.tabAt(event.position().toPoint())
+            if index >= 0:
+                self.tabCloseRequested.emit(index)
+                return
+        super().mouseReleaseEvent(event)  # type: ignore[arg-type]
+
+
+class _LogSignalHandler(QObject, logging.Handler):
+    log_line = Signal(str)
+
+    def __init__(self) -> None:
+        QObject.__init__(self)
+        logging.Handler.__init__(self)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        msg = self.format(record)
+        self.log_line.emit(msg)
+
+
+class _DockTitleBar(QWidget):
+    def __init__(self, title: str, dock: QDockWidget) -> None:
+        super().__init__(dock)
+        self._dock = dock
+        self._drag_pos: object = None
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 2, 8, 2)
+        layout.setSpacing(6)
+        label = QLabel(title)
+        layout.addWidget(label)
+        layout.addStretch()
+        dock_btn = QPushButton(translate("_DockTitleBar", "Dock"))
+        dock_btn.setFixedHeight(20)
+        dock_btn.clicked.connect(self._dock_back)
+        layout.addWidget(dock_btn)
+
+    def mousePressEvent(self, event: object) -> None:  # type: ignore[override]
+        if hasattr(event, "button") and event.button() == Qt.MouseButton.LeftButton:
+            if self._dock.isFloating():
+                self._drag_pos = event.globalPosition().toPoint()  # type: ignore[union-attr]
+                return
+        super().mousePressEvent(event)  # type: ignore[arg-type]
+
+    def mouseMoveEvent(self, event: object) -> None:  # type: ignore[override]
+        if self._drag_pos is not None and hasattr(event, "globalPosition"):
+            new_pos = event.globalPosition().toPoint()  # type: ignore[union-attr]
+            delta = new_pos - self._drag_pos  # type: ignore[operator]
+            self._dock.move(self._dock.pos() + delta)
+            self._drag_pos = new_pos
+            return
+        super().mouseMoveEvent(event)  # type: ignore[arg-type]
+
+    def mouseReleaseEvent(self, event: object) -> None:  # type: ignore[override]
+        self._drag_pos = None
+        super().mouseReleaseEvent(event)  # type: ignore[arg-type]
+
+    def _dock_back(self) -> None:
+        mw = self._dock.parent()
+        if hasattr(mw, "_dock_to_default"):
+            mw._dock_to_default(self._dock)  # type: ignore[attr-defined]
+
+
+class _RecentFileButton(QWidget):
+    opened = Signal(str)
+
+    def __init__(self, path: str, as_disk_image: bool = False) -> None:
+        super().__init__()
+        self._path = path
+        self.setToolTip(path)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        p = Path(path)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(12)
+        name = QLabel(f"<b>{p.name}</b>")  # i18n: keep -- markup/layout only
+        directory = QLabel(
+            f"<span style='color:gray'>{p.parent}</span>"  # i18n: keep -- markup/layout only
+        )
+        directory.setSizePolicy(directory.sizePolicy().horizontalPolicy(), directory.sizePolicy().verticalPolicy())
+        layout.addWidget(name)
+        if as_disk_image:
+            layout.addWidget(QLabel(translate("MainWindow", "(disk image)")))
+        layout.addWidget(directory, stretch=1)
+
+    def mousePressEvent(self, event: object) -> None:  # type: ignore[override]
+        if hasattr(event, "button") and event.button() == Qt.MouseButton.LeftButton:
+            self.opened.emit(self._path)
+        else:
+            super().mousePressEvent(event)  # type: ignore[arg-type]
+
+    def enterEvent(self, event: object) -> None:  # type: ignore[override]
+        self.setStyleSheet("background-color: palette(highlight); border-radius: 4px;")
+
+    def leaveEvent(self, event: object) -> None:  # type: ignore[override]
+        self.setStyleSheet("")
+
+
+class _ClickableStatusLabel(QLabel):
+    clicked = Signal()
+
+    def mousePressEvent(self, event: object) -> None:  # type: ignore[override]
+        if hasattr(event, "button") and event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            return
+        super().mousePressEvent(event)  # type: ignore[arg-type]
+
+
+class _ExportWorker(QObject):
+    finished = Signal(str)
+    failed = Signal(str, str)  # (English for the log, shown in the UI language)
+
+    def __init__(
+        self, vfs: VFS, node: VFSNode, dest_dir: str, integrity: bool, window_id: str | None = None
+    ) -> None:
+        super().__init__()
+        self._vfs = vfs
+        self._node = node
+        self._dest_dir = Path(dest_dir)
+        self._integrity = integrity
+        self._hash_lines: list[str] = []
+        self._hash_base: Path | None = None
+        self._rename_lines: list[str] = []
+        self._logger = logging.getLogger(__name__)
+        self._window_id = window_id
+
+    def run(self) -> None:
+        with window_log_scope(self._window_id):
+            self._run()
+
+    def _run(self) -> None:
+        try:
+            root_name, changed = _safe_name(self._node.name or "export")
+            target_root = self._dest_dir / root_name
+            if changed:
+                self._record_rename(self._node.path, target_root)
+            self._hash_base = target_root if self._node.is_dir else target_root.parent
+            if self._node.is_dir:
+                self._export_dir(self._node, target_root)
+            else:
+                target_root.parent.mkdir(parents=True, exist_ok=True)
+                self._export_file(self._node, target_root)
+            self._write_hashes_file(target_root)
+            self._write_renames_file(target_root)
+        except Exception as exc:
+            self.failed.emit(str(exc), i18n.exception_text(exc))
+            return
+        self.finished.emit(str(target_root))
+
+    def _record_rename(self, original_path: str, sanitized_target: Path) -> None:
+        self._rename_lines.append(f"{original_path}\t->\t{sanitized_target}")
+        self._logger.warning(
+            "Export: sanitized name for Windows-safe filesystem compatibility: %s -> %s",
+            original_path, sanitized_target,
+        )
+
+    def _write_renames_file(self, target_root: Path) -> None:
+        if not self._rename_lines:
+            return
+        base = self._hash_base if self._hash_base is not None else target_root.parent
+        header = (
+            "# Names below contained characters invalid on Windows filesystems\n"
+            "# (or were reserved device names) and were sanitized for export.\n"
+            "# original evidence path -> exported filesystem path\n"
+        )
+        (base / "crush-export-renames.txt").write_text(
+            header + "\n".join(self._rename_lines) + "\n", encoding="utf-8"
+        )
+
+    def _export_dir(self, node: VFSNode, target: Path) -> None:
+        target.mkdir(parents=True, exist_ok=True)
+        for child in node.children:
+            safe_child_name, changed = _safe_name(child.name)
+            child_target = target / safe_child_name
+            if changed:
+                self._record_rename(child.path, child_target)
+            if child.is_dir:
+                self._export_dir(child, child_target)
+            else:
+                child_target.parent.mkdir(parents=True, exist_ok=True)
+                self._export_file(child, child_target)
+
+    def _export_file(self, node: VFSNode, target: Path) -> None:
+        if not self._integrity:
+            with self._vfs.open(node) as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            return
+
+        import hashlib
+
+        hasher = hashlib.sha256()
+        total = 0
+        with self._vfs.open(node) as src, open(target, "wb") as dst:
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+                hasher.update(chunk)
+                total += len(chunk)
+        digest = hasher.hexdigest()
+        rel_path = target.name
+        if self._hash_base is not None:
+            try:
+                rel_path = str(target.relative_to(self._hash_base))
+            except Exception:
+                rel_path = target.name
+        self._hash_lines.append(f"{digest}  {total}  {rel_path}")
+        self._logger.info("INTEGRITY export sha256=%s  size=%d  path=%s", digest, total, target)
+
+    def _write_hashes_file(self, target_root: Path) -> None:
+        if not self._integrity or not self._hash_lines:
+            return
+        base = self._hash_base if self._hash_base is not None else target_root.parent
+        hash_path = base / "crush-export-hashes.txt"
+        hash_path.write_text("\n".join(self._hash_lines) + "\n", encoding="utf-8")
+
+
+class _ExportLogarchiveWorker(QObject):
+    finished = Signal(str)
+    failed = Signal(str, str)  # (English for the log, shown in the UI language)
+
+    def __init__(self, vfs: VFS, node: VFSNode, dest_path: str, window_id: str | None = None) -> None:
+        super().__init__()
+        self._vfs = vfs
+        self._node = node
+        self._dest_path = Path(dest_path)
+        self._logger = logging.getLogger(__name__)
+        self._window_id = window_id
+
+    def run(self) -> None:
+        with window_log_scope(self._window_id):
+            self._run()
+
+    def _run(self) -> None:
+        try:
+            from crush.parsers.unified_log_parser import build_logarchive_from_acquisition
+            with tempdir.temporary_directory(prefix="crush_logarchive_") as tmp:
+                tmp_path = Path(tmp) / "build"
+                tmp_path.mkdir()
+                build_logarchive_from_acquisition(self._node, self._vfs, tmp_path)
+                if self._dest_path.exists():
+                    shutil.rmtree(self._dest_path)
+                shutil.copytree(str(tmp_path), str(self._dest_path))
+        except Exception as exc:
+            self.failed.emit(str(exc), i18n.exception_text(exc))
+            return
+        self.finished.emit(str(self._dest_path))
+
+
+class _ExportMultiWorker(QObject):
+    finished = Signal(str)
+    failed = Signal(str, str)  # (English for the log, shown in the UI language)
+
+    def __init__(
+        self,
+        entries: list,  # list of (VFSNode, VFS, str) — (node, vfs, virtual_path)
+        dest_dir: str,
+        integrity: bool,
+        filter_text: str,
+        window_id: str | None = None,
+    ) -> None:
+        super().__init__()
+        self._entries = entries
+        self._dest_dir = Path(dest_dir)
+        self._integrity = integrity
+        self._filter_text = filter_text
+        self._hash_lines: list[str] = []
+        self._rename_lines: list[str] = []
+        self._logger = logging.getLogger(__name__)
+        self._window_id = window_id
+
+    def run(self) -> None:
+        with window_log_scope(self._window_id):
+            self._run()
+
+    def _run(self) -> None:
+        try:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            export_root = self._dest_dir / f"crush-export-{stamp}"
+            export_root.mkdir(parents=True, exist_ok=True)
+            for node, vfs, virtual_path in self._entries:
+                parts = _split_virtual_path(virtual_path)
+                safe_parts = []
+                changed_any = False
+                for part in parts:
+                    safe_part, changed = _safe_name(part)
+                    safe_parts.append(safe_part)
+                    changed_any = changed_any or changed
+                if not safe_parts:
+                    safe_parts = ["_"]
+                target = export_root.joinpath(*safe_parts)
+                if changed_any:
+                    self._record_rename(virtual_path, target)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                self._export_file(node, vfs, target, "/".join(safe_parts))
+            self._write_hashes_file(export_root, stamp)
+            self._write_renames_file(export_root)
+        except Exception as exc:
+            self.failed.emit(str(exc), i18n.exception_text(exc))
+            return
+        self.finished.emit(str(export_root))
+
+    def _record_rename(self, original_path: str, sanitized_target: Path) -> None:
+        self._rename_lines.append(f"{original_path}\t->\t{sanitized_target}")
+        self._logger.warning(
+            "Export: sanitized name for Windows-safe filesystem compatibility: %s -> %s",
+            original_path, sanitized_target,
+        )
+
+    def _write_renames_file(self, export_root: Path) -> None:
+        if not self._rename_lines:
+            return
+        header = (
+            "# Names below contained characters invalid on Windows filesystems\n"
+            "# (or were reserved device names) and were sanitized for export.\n"
+            "# original evidence path -> exported filesystem path\n"
+        )
+        (export_root / "crush-export-renames.txt").write_text(
+            header + "\n".join(self._rename_lines) + "\n", encoding="utf-8"
+        )
+
+    def _export_file(self, node: VFSNode, vfs: VFS, target: Path, rel_path: str) -> None:
+        if not self._integrity:
+            with vfs.open(node) as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            return
+        import hashlib
+        hasher = hashlib.sha256()
+        total = 0
+        with vfs.open(node) as src, open(target, "wb") as dst:
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+                hasher.update(chunk)
+                total += len(chunk)
+        digest = hasher.hexdigest()
+        self._hash_lines.append(f"{digest}  {total}  {rel_path}")
+        self._logger.info("INTEGRITY export sha256=%s  size=%d  path=%s", digest, total, target)
+
+    def _write_hashes_file(self, export_root: Path, stamp: str) -> None:
+        if not self._integrity or not self._hash_lines:
+            return
+        header = [
+            "# crush filtered export",
+            f"# filter: {self._filter_text}",
+            f"# exported: {stamp}",
+            f"# files: {len(self._hash_lines)}",
+            "",
+        ]
+        (export_root / "crush-export-hashes.txt").write_text(
+            "\n".join(header + self._hash_lines) + "\n", encoding="utf-8"
+        )
+
+
+# Bytes read from the start of a file to match it against formats.db
+# signatures (Properties panel and Format Info alike).
+_FORMAT_PEEK_BYTES = 2048
+
+# Characters NTFS/Windows reject outright, plus C0 control characters.
+# Sanitized unconditionally (not only when os.name == "nt") so an export
+# also stays usable on exFAT/NTFS media mounted from Linux or macOS.
+_WINDOWS_INVALID_CHARS_RE = re.compile(r'[<>:"|?*\x00-\x1f]')
+_WINDOWS_RESERVED_STEMS = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(10)),
+    *(f"LPT{i}" for i in range(10)),
+}
+
+
+def _with_reason(prompt: str, reason: str | None) -> str:
+    """Put a rejected password's reason above the retry prompt -- a key in
+    the wrong format must not read the same as a wrong key."""
+    return f"{reason}\n\n{prompt}" if reason else prompt
+
+
+def _safe_name(name: str) -> tuple[str, bool]:
+    """Sanitize a single path component for cross-platform export.
+
+    Returns (sanitized_name, was_changed) — callers must log/record any
+    change themselves so a renamed export entry is never silent (forensic
+    traceability back to the original evidence name).
+    """
+    original = name
+    cleaned = name.replace("/", "_").replace("\\", "_")
+    cleaned = _WINDOWS_INVALID_CHARS_RE.sub("_", cleaned)
+    cleaned = cleaned.strip().rstrip(". ")
+    if cleaned in {"", ".", ".."}:
+        cleaned = "_"
+    elif cleaned.split(".", 1)[0].upper() in _WINDOWS_RESERVED_STEMS:
+        cleaned = f"_{cleaned}"
+    return cleaned, cleaned != original
+
+
+def _split_virtual_path(virtual_path: str) -> list[str]:
+    rel = virtual_path.lstrip("/\\")
+    return [p for p in re.split(r"[\\/]+", rel) if p not in ("", ".")]
+
+
+@dataclass
+class _LoadState:
+    """What handling one loaded source needs, as _load_source left it --
+    taken before a modal dialog, so the handling never reads the next
+    source's state (MainWindow._hold_load_queue)."""
+
+    path: str
+    batch: object | None
+    as_disk_image: bool
+    itunes_zip_prefix: str | None
+    embedded_zip: bool
+    focus_path: str | None
+    source_hash: tuple[str, int, str] | None
+    open_after_load: bool
+    append_to_tree: bool
+    progress: LoadingDialog | None
+    tree_build_started: float | None
+
+
+class MainWindow(QMainWindow):
+    _open_windows: list[MainWindow] = []
+    _AMERICA_INTRO_MS = 650
+    _AMERICA_FINALE_MS = 1000
+    _AMERICA_CHILL_TICK_MS = 50
+    _AMERICA_HOLD_MS = 1800
+    _AMERICA_FADE_MS = 450
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setAcceptDrops(True)
+        self._window_id = uuid.uuid4().hex[:8]
+        self._open_windows.append(self)
+        self.destroyed.connect(self._remove_window_reference)
+        self.session = Session()
+        self._always_hex = False
+        self._pending_open: tuple[VFSNode, VFS] | None = None
+        self._pending_focus_path: str | None = None
+        self._load_queue: list[tuple[str, bool, bool, str | None, str, str | None, bool]] = []
+        self._settings = QSettings("Crush DFIR", "Crush")
+        extract_dialog.apply_saved_temp_dir(self._settings)
+        self._multi_log_windows: list[QWidget] = []
+        self.setWindowTitle(f"Crush {crush.display_version()}")  # i18n: keep -- name + version
+        self.resize(1280, 800)
+        self._build_ui()
+        self._setup_logging()
+        self._apply_saved_theme()
+        self._apply_saved_integrity_mode()
+        self._apply_saved_prescan_workers()
+
+    # ------------------------------------------------------------------
+    # Layout
+    # ------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        self.setDockOptions(
+            QMainWindow.DockOption.AllowTabbedDocks
+            | QMainWindow.DockOption.AllowNestedDocks
+            | QMainWindow.DockOption.AnimatedDocks
+        )
+        self._dock_defaults: dict[QDockWidget, Qt.DockWidgetArea] = {}
+        # Center: tabbed viewer area
+        self._viewer_tabs = QTabWidget()
+        self._viewer_tabs.setTabBar(_ClosableTabBar())
+        self._viewer_tabs.setTabsClosable(True)
+        self._viewer_tabs.setDocumentMode(True)
+        self._viewer_tabs.tabCloseRequested.connect(self._close_tab)
+        self._viewer_tabs.currentChanged.connect(self._on_viewer_tab_changed)
+        # A click on the tab that already is current changes nothing for
+        # currentChanged, but the panel may show a tree selection by then.
+        self._viewer_tabs.tabBarClicked.connect(self._show_tab_properties)
+        # Long VFS paths (issue #47) would otherwise grow the tab past the
+        # viewport and push the native close button off-screen; cap the
+        # width and elide in the middle so the close button always fits.
+        self._viewer_tabs.tabBar().setElideMode(Qt.TextElideMode.ElideMiddle)
+        self._viewer_tabs.setStyleSheet("QTabBar::tab { max-width: 240px; }")
+        self._viewer_tabs.tabBar().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._viewer_tabs.tabBar().customContextMenuRequested.connect(self._show_tab_context_menu)
+
+        self._tab_list_menu = QMenu(self)
+        self._tab_list_menu.aboutToShow.connect(self._populate_tab_list_menu)
+        self._tab_list_menu.triggered.connect(self._on_tab_list_menu_triggered)
+        self._tab_list_button = QToolButton()
+        self._tab_list_button.setText("▾")
+        self._tab_list_button.setToolTip(translate("MainWindow", "Show open tabs"))
+        self._tab_list_button.setAutoRaise(True)
+        self._tab_list_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._tab_list_button.setMenu(self._tab_list_menu)
+        self._viewer_tabs.setCornerWidget(self._tab_list_button, Qt.Corner.TopRightCorner)
+
+        self._empty_view = QWidget()
+        empty_layout = QVBoxLayout(self._empty_view)
+        empty_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_layout.setSpacing(12)
+
+        empty_title = QLabel(translate("MainWindow", "Open something to begin"))
+        empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_font = empty_title.font()
+        title_font.setPointSize(title_font.pointSize() + 6)
+        title_font.setBold(True)
+        empty_title.setFont(title_font)
+        empty_layout.addWidget(empty_title)
+
+        empty_subtitle = QLabel(
+            translate("MainWindow", "Choose a file, archive, folder, or disk image.")
+        )
+        empty_subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_layout.addWidget(empty_subtitle)
+
+        button_row = QHBoxLayout()
+        open_file_button = QPushButton(translate("MainWindow", "Open File…"))
+        open_file_button.clicked.connect(self._open_file)
+        button_row.addWidget(open_file_button)
+        open_folder_button = QPushButton(translate("MainWindow", "Open Folder…"))
+        open_folder_button.clicked.connect(self._open_folder)
+        button_row.addWidget(open_folder_button)
+        open_image_button = QPushButton(translate("MainWindow", "Open Disk Image…"))
+        open_image_button.setToolTip(translate(
+            "MainWindow",
+            "Raw/dd image, split .001 set, acquisition (EWF .E01, SMART .s01, EWF2 .Ex01, "
+            "AFF/AFD) or flash dump — a disk image is only read as one when opened this way "
+            "or dropped on the window's Open as Disk Image zone",
+        ))
+        open_image_button.clicked.connect(self._open_disk_image)
+        button_row.addWidget(open_image_button)
+        empty_layout.addLayout(button_row)
+
+        self._recent_on_welcome = QVBoxLayout()
+        self._recent_on_welcome.setSpacing(4)
+        empty_layout.addSpacing(16)
+        empty_layout.addLayout(self._recent_on_welcome)
+
+        self._central_stack = QStackedWidget()
+        self._central_stack.addWidget(self._empty_view)
+        self._central_stack.addWidget(self._viewer_tabs)
+        self.setCentralWidget(self._central_stack)
+        self._show_empty_view()
+
+        self._drop_overlay = DropOverlay(self)
+        self._drop_overlay.open_requested.connect(self._open_dropped)
+        self._drop_overlay.disk_image_requested.connect(self._open_disk_image_path)
+        self._drop_overlay.refused.connect(lambda reason: self._status.showMessage(reason))
+
+        # Left dock: filesystem panel
+        self._fs_panel = FilesystemPanel(self.session, self, window_id=self._window_id)
+        self._fs_panel.node_activated.connect(self._open_node)
+        self._fs_panel.node_selected.connect(self._on_node_selected)
+        self._fs_panel.open_requested.connect(self._open_node_mode)
+        self._fs_panel.open_external_requested.connect(self._open_external_mode)
+        self._fs_panel.export_requested.connect(self._export_node)
+        self._fs_panel.export_multi_requested.connect(self._export_multi_nodes)
+        self._fs_panel.export_logarchive_requested.connect(self._export_logarchive_node)
+        self._fs_panel.close_source_requested.connect(self._close_source)
+        self._fs_panel.close_source_requested.connect(self._show_empty_view_if_no_sources)
+        self._fs_panel.load_finished.connect(self._show_viewer_tabs)
+        self._fs_panel.background_status.connect(self._on_background_status)
+        self._fs_panel.format_info_requested.connect(self._show_format_info)
+        self._fs_panel.open_in_new_window_requested.connect(self._open_in_new_window)
+        self._fs_panel.open_disk_image_in_new_window_requested.connect(
+            lambda node, vfs: self._open_in_new_window(node, vfs, as_disk_image=True)
+        )
+        self._fs_panel.send_to_peach_batch_requested.connect(self._send_to_peach_batch)
+        self._fs_dock = QDockWidget(translate("MainWindow", "Filesystem"), self)
+        self._fs_dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
+        self._fs_dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+            | QDockWidget.DockWidgetFeature.DockWidgetClosable
+        )
+        self._fs_dock.setWidget(self._fs_panel)
+        self._fs_dock.setMinimumWidth(220)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._fs_dock)
+        self._dock_defaults[self._fs_dock] = Qt.DockWidgetArea.LeftDockWidgetArea
+        self._fs_dock.topLevelChanged.connect(
+            lambda floating, dock=self._fs_dock: self._sync_dock_titlebar(dock, floating)
+        )
+
+        # Right dock: properties panel
+        self._props_panel = PropertiesPanel(self)
+        self._props_panel.format_info_requested.connect(self._show_format_info)
+        self._props_dock = QDockWidget(translate("MainWindow", "Properties"), self)
+        self._props_dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
+        self._props_dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+            | QDockWidget.DockWidgetFeature.DockWidgetClosable
+        )
+        self._props_dock.setWidget(self._props_panel)
+        self._props_dock.setMinimumWidth(200)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._props_dock)
+        self._dock_defaults[self._props_dock] = Qt.DockWidgetArea.RightDockWidgetArea
+        self._props_dock.topLevelChanged.connect(
+            lambda floating, dock=self._props_dock: self._sync_dock_titlebar(dock, floating)
+        )
+
+        # Bottom dock: log panel
+        self._log_view = QTextEdit()
+        self._log_view.setReadOnly(True)
+        self._log_dock = QDockWidget(translate("MainWindow", "Log"), self)
+        self._log_dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
+        self._log_dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+            | QDockWidget.DockWidgetFeature.DockWidgetClosable
+        )
+        self._log_dock.setWidget(self._log_view)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._log_dock)
+        self._dock_defaults[self._log_dock] = Qt.DockWidgetArea.BottomDockWidgetArea
+        self._log_dock.hide()
+        self._log_dock.topLevelChanged.connect(
+            lambda floating, dock=self._log_dock: self._sync_dock_titlebar(dock, floating)
+        )
+
+        # Status bar
+        self._status = QStatusBar()
+        self.setStatusBar(self._status)
+        self._status.showMessage(
+            translate("MainWindow", "Crush {version} — ready").format(
+                version=crush.display_version()
+            )
+        )
+        self._spinner_chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        self._spinner_idx = 0
+        self._spinner_label = QLabel("")
+        self._spinner_label.setVisible(False)
+        self._status.addPermanentWidget(self._spinner_label)
+        self._bg_status = QLabel("")
+        self._bg_status.setVisible(False)
+        self._status.addPermanentWidget(self._bg_status)
+        self._spinner_timer = QTimer(self)
+        self._spinner_timer.setInterval(100)
+        self._spinner_timer.timeout.connect(self._on_spinner_tick)
+
+        self._integrity_label = _ClickableStatusLabel(translate("MainWindow", " \u2696 INTEGRITY "))
+        self._integrity_label.setStyleSheet(
+            "color: white; background-color: #c87000; font-weight: bold;"
+            " padding: 1px 4px; border-radius: 3px;"
+        )
+        self._integrity_label.setToolTip(
+            translate("MainWindow", "Integrity mode active \u2014 files are hashed on open")
+        )
+        self._integrity_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._integrity_label.clicked.connect(self._toggle_integrity_mode)
+        self._integrity_label.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._integrity_label.customContextMenuRequested.connect(self._show_integrity_menu)
+        self._integrity_label.setVisible(False)
+        self._status.addPermanentWidget(self._integrity_label)
+        self._no_integrity_label = _ClickableStatusLabel(translate("MainWindow", " NO INTEGRITY "))
+        self._no_integrity_label.setStyleSheet(
+            "color: white; background-color: #6b6b6b; font-weight: bold;"
+            " padding: 1px 4px; border-radius: 3px;"
+        )
+        self._no_integrity_label.setToolTip(translate("MainWindow", "Integrity mode is off"))
+        self._no_integrity_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._no_integrity_label.clicked.connect(self._toggle_integrity_mode)
+        self._no_integrity_label.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._no_integrity_label.customContextMenuRequested.connect(self._show_integrity_menu)
+        self._no_integrity_label.setVisible(True)
+        self._status.addPermanentWidget(self._no_integrity_label)
+
+        self._rainbow_snapshot_btn = QPushButton(translate("MainWindow", "⏸  Snapshot"))
+        self._rainbow_snapshot_btn.setToolTip(
+            translate("MainWindow", "Pause rainbow and save this colour as a custom theme")
+        )
+        self._rainbow_snapshot_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._rainbow_snapshot_btn.setVisible(False)
+        self._rainbow_snapshot_btn.clicked.connect(self._snapshot_rainbow)
+        self._status.addPermanentWidget(self._rainbow_snapshot_btn)
+
+        self._america_show_btn = QPushButton("")
+        self._america_show_btn.setMinimumWidth(150)
+        self._america_show_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._america_show_btn.setToolTip(translate("MainWindow", "Replay the U-S-A theme show"))
+        self._america_show_btn.setVisible(False)
+        self._america_show_btn.clicked.connect(self._replay_america_show)
+        self._status.addPermanentWidget(self._america_show_btn)
+
+        self._build_menus()
+
+    def _build_menus(self) -> None:
+        menu = self.menuBar()
+
+        file_menu = menu.addMenu(translate("MainWindow", "File"))
+        new_window_action = file_menu.addAction(
+            translate("MainWindow", "New Window"), self._new_window
+        )
+        new_window_action.setShortcut("Ctrl+N")
+        file_menu.addSeparator()
+        file_menu.addAction(translate("MainWindow", "Open file…"), self._open_file)
+        file_menu.addAction(translate("MainWindow", "Open folder…"), self._open_folder)
+        file_menu.addAction(translate("MainWindow", "Open disk image…"), self._open_disk_image)
+        file_menu.addSeparator()
+        self._recent_menu = file_menu.addMenu(translate("MainWindow", "Open Recent"))
+        self._rebuild_recent_menu()
+        file_menu.addSeparator()
+        self._close_window_action = file_menu.addAction(
+            translate("MainWindow", "Close Window"), self.close
+        )
+        self._close_window_action.setShortcut("Ctrl+W")
+        exit_action = file_menu.addAction(translate("MainWindow", "Exit"), QApplication.quit)
+        exit_action.setShortcut("Ctrl+Q")
+
+        view_menu = menu.addMenu(translate("MainWindow", "View"))
+        view_menu.addAction(self._fs_dock.toggleViewAction())
+        view_menu.addAction(self._props_dock.toggleViewAction())
+        view_menu.addAction(self._log_dock.toggleViewAction())
+        view_menu.addSeparator()
+        view_menu.addAction(
+            translate("MainWindow", "Dock Filesystem Panel"),
+            lambda: self._dock_to_default(self._fs_dock),
+        )
+        view_menu.addAction(
+            translate("MainWindow", "Dock Properties Panel"),
+            lambda: self._dock_to_default(self._props_dock),
+        )
+        view_menu.addAction(
+            translate("MainWindow", "Dock Log Panel"), lambda: self._dock_to_default(self._log_dock)
+        )
+        view_menu.addAction(translate("MainWindow", "Reset Panel Layout"), self._reset_panel_layout)
+        self._always_hex_action = QAction(
+            translate("MainWindow", "Always show Hex tab"), self, checkable=True
+        )
+        self._always_hex_action.toggled.connect(self._set_always_hex)
+        view_menu.addAction(self._always_hex_action)
+        view_menu.addAction(translate("MainWindow", "Close all tabs"), self._close_all_tabs)
+        view_menu.addSeparator()
+        theme_menu = view_menu.addMenu(translate("MainWindow", "Theme"))
+        theme_menu.addAction(translate("MainWindow", "System default"), self._set_theme_system)
+        theme_menu.addAction(translate("MainWindow", "Light"), self._set_theme_light)
+        theme_menu.addAction(translate("MainWindow", "Dark"), self._set_theme_dark)
+        theme_menu.addAction(translate("MainWindow", "Geek"), self._set_theme_geek)
+        theme_menu.addAction(translate("MainWindow", "Purple"), self._set_theme_purple)
+        theme_menu.addAction(translate("MainWindow", "Ocean"), self._set_theme_ocean)
+        theme_menu.addAction(translate("MainWindow", "Rainbow"), self._set_theme_rainbow)
+        theme_menu.addAction(translate("MainWindow", "'Merica"), self._set_theme_america)
+        theme_menu.addSeparator()
+        self._custom_theme_action = theme_menu.addAction("", self._set_theme_custom)
+        self._custom_theme_action.setVisible(False)
+        self._build_language_menu(view_menu)
+
+        tools_menu = menu.addMenu(translate("MainWindow", "Tools"))
+        tools_menu.addAction(translate("MainWindow", "BLOB Inspector…"), self._paste_decode)
+        tools_menu.addAction(
+            translate("MainWindow", "Value Inspector…"), self._open_value_inspector
+        )
+        tools_menu.addSeparator()
+        tools_menu.addAction(translate("MainWindow", "Export log…"), self._export_log)
+        tools_menu.addSeparator()
+        self._integrity_mode_action = QAction(
+            translate("MainWindow", "Integrity Mode"), self, checkable=True
+        )
+        self._integrity_mode_action.setToolTip(
+            translate("MainWindow", "Hash every file on open and write hash to log")
+        )
+        self._integrity_mode_action.toggled.connect(self._set_integrity_mode)
+        tools_menu.addAction(self._integrity_mode_action)
+        tools_menu.addAction(
+            translate("MainWindow", "Indexing Threads…"), self._set_prescan_workers
+        )
+        tools_menu.addAction(translate("MainWindow", "Temp Directory…"), self._set_temp_dir)
+        peach_menu = tools_menu.addMenu(translate("MainWindow", "Peach"))
+        peach_menu.addAction(translate("MainWindow", "Open Peach"), self._open_peach_standalone)
+        peach_menu.addAction(translate("MainWindow", "Binary Path…"), self._set_peach_binary_path)
+
+        help_menu = menu.addMenu(translate("MainWindow", "Help"))
+        help_menu.addAction(
+            translate("MainWindow", "Format Reference…"), self._show_format_reference
+        )
+        help_menu.addSeparator()
+        help_menu.addAction(translate("MainWindow", "About Crush"), self._about)
+
+    def _build_language_menu(self, view_menu: QMenu) -> None:
+        """View → Language: English plus every language complete enough to
+        be offered (and the saved one, so the check mark is truthful). No
+        menu while English is the only choice."""
+        saved = i18n.saved_language(self._settings)
+        codes = [lang.code for lang in i18n.available_languages()
+                 if lang.offered or lang.code == saved]
+        if not codes:
+            return
+        language_menu = view_menu.addMenu(translate("MainWindow", "Language"))
+        group = QActionGroup(language_menu)
+        for code in [i18n.SOURCE_LANGUAGE, *codes]:
+            action = QAction(i18n.display_name(code), language_menu, checkable=True)
+            action.setChecked(code == saved)
+            action.triggered.connect(lambda _checked=False, c=code: self._set_language(c))
+            group.addAction(action)
+            language_menu.addAction(action)
+
+    def _set_language(self, code: str) -> None:
+        if code == i18n.saved_language(self._settings):
+            return
+        i18n.save_language(self._settings, code)
+        self._logger.info("UI language set to %s (applies after restart)", code)
+        QMessageBox.information(
+            self,
+            translate("MainWindow", "Language"),
+            translate("MainWindow", "The new language applies after Crush is restarted."),
+        )
+
+    def _new_window(self) -> None:
+        self._spawn_window()
+
+    def _spawn_window(self, step: int = 1) -> MainWindow:
+        """A new, empty window beside this one, shown; *step* places it
+        further on, so several opened at once don't hide each other."""
+        window = MainWindow()
+        window.resize(self.size())
+        offset = 32 * step
+        target = self.frameGeometry().topLeft()
+        target.setX(target.x() + offset)
+        target.setY(target.y() + offset)
+
+        available = self.screen().availableGeometry()
+        max_x = max(available.left(), available.right() - window.width() + 1)
+        max_y = max(available.top(), available.bottom() - window.height() + 1)
+        target.setX(min(max(target.x(), available.left()), max_x))
+        target.setY(min(max(target.y(), available.top()), max_y))
+        window.move(target)
+        window.show()
+        return window
+
+    def _open_in_new_window(self, node: VFSNode, vfs: VFS, as_disk_image: bool = False) -> None:
+        if isinstance(vfs, DirectoryVFS):
+            self._hash_node_if_integrity(node, vfs)
+        path = self._materialize_node_for_external(
+            node, vfs, title=translate("MainWindow", "Open in New Window")
+        )
+        if path is None:
+            if not self._materialize_cancelled:
+                QMessageBox.warning(
+                    self,
+                    translate("MainWindow", "Open in New Window"),
+                    translate(
+                        "MainWindow", "Unable to materialize {name!r} for a new window."
+                    ).format(name=node.name),
+                )
+            return
+        window = MainWindow()
+        window._source_origin = f"{vfs.root().name}{node.path}"
+        window.resize(self.size())
+        window.show()
+        if not isinstance(vfs, DirectoryVFS):
+            # The temp file was materialized in this (source) window's
+            # tracking list; transfer ownership to the new window so its
+            # cleanup runs when that window closes, not this one.
+            self._external_temp_paths.remove(path)
+            window._external_temp_paths = [path]
+        # The explicit action: also opens a ZIP that follows leading bytes
+        # (self-extractor, appended ZIP), which a plain open only notes.
+        window._load_source(str(path), embedded_zip=True, as_disk_image=as_disk_image)
+
+    @classmethod
+    def _remove_window_reference(cls, destroyed: QObject | None = None) -> None:
+        cls._open_windows = [window for window in cls._open_windows if isValid(window)]
+
+    # ------------------------------------------------------------------
+    # Actions
+    # ------------------------------------------------------------------
+
+    def _open_folder(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, translate("MainWindow", "Open folder"))
+        if path:
+            self._load_source(path)
+
+    def _open_file(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            translate("MainWindow", "Open file"),
+            "",
+            translate("MainWindow", "All files") + " (*)",  # i18n: keep -- file filter pattern
+        )
+        batch = object()
+        for path in paths:
+            self._load_source(path, open_after_load=True, append_to_tree=True, batch=batch)
+
+    def _open_disk_image(self) -> None:
+        """The only way a file is read as a disk image: the analyst says it
+        is one. One file: split sets and acquisition segments are joined
+        from whichever segment is picked, and a disk image replaces the
+        tree, so of several only the last would stay."""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            translate("MainWindow", "Open disk image"),
+            "",
+            translate("MainWindow", "All files") + " (*)",  # i18n: keep -- file filter pattern
+        )
+        if path:
+            self._open_disk_image_path(path)
+
+    def _open_disk_image_path(self, path: str) -> None:
+        self._load_source(path, open_after_load=True, append_to_tree=True, as_disk_image=True)
+
+    def _open_dropped(self, paths: list[str]) -> None:
+        # Same load path as "Open file"/"Open folder" (_load_source), so a
+        # dropped item follows the exact same append-vs-replace rule already
+        # in _on_load_finished: a single flat file appends to the current
+        # tree, a folder or archive (anything whose VFS root is a directory)
+        # replaces it -- or, after another item of the same drop, opens in a
+        # new window (batch). A disk image is dropped on the overlay's own
+        # zone (_open_disk_image_path); dropped here, the file's status line
+        # says so when its name or acquisition signature suggests one.
+        batch = object()
+        for path in paths:
+            self._load_source(path, open_after_load=True, append_to_tree=True, batch=batch)
+
+    def _load_source(
+        self,
+        path: str,
+        open_after_load: bool = False,
+        append_to_tree: bool = False,
+        itunes_zip_prefix: str | None = None,
+        password: str = "",
+        focus_path: str | None = None,
+        embedded_zip: bool = False,
+        as_disk_image: bool = False,
+        private_key: str = "",
+        batch: object | None = None,
+    ) -> None:
+        """*batch*: the same object for every path opened in one go (a drop,
+        a multi-selection, the command line). A folder, archive, backup or
+        disk image replaces the tree -- unless an earlier item of its batch
+        is already shown here: then it opens in a new window, so opening
+        several at once never leaves only the last."""
+        if not as_disk_image and itunes_zip_prefix is None and _is_zip_file(path):
+            itunes_zip_prefix = self._maybe_confirm_itunes_backup_zip(path)
+            if itunes_zip_prefix is None:
+                as_disk_image = self._confirm_aff4_as_disk_image(path)
+        elif not as_disk_image and Path(path).is_dir():
+            as_disk_image = self._confirm_sparse_bundle_as_disk_image(path)
+
+        if self._thread_is_running(getattr(self, "_load_thread", None)):
+            self._load_queue.append(
+                (path, open_after_load, append_to_tree, itunes_zip_prefix, password, focus_path,
+                 embedded_zip, as_disk_image, private_key, batch)
+            )
+            self._status.showMessage(translate("MainWindow", "Queued source for loading…"))
+            self._logger.debug("Load queued: %s (open_after_load=%s append=%s)", path, open_after_load, append_to_tree)
+            return
+
+        self._logger.info("Loading source: %s", path)
+        self._logger.debug("Load start: %s (open_after_load=%s append=%s)", path, open_after_load, append_to_tree)
+        self._loading_path = path
+        self._loading_itunes_zip_prefix = itunes_zip_prefix
+        self._loading_embedded_zip = embedded_zip
+        self._loading_as_disk_image = as_disk_image
+        self._loading_focus_path = focus_path
+        self._loading_batch = batch
+        self._open_after_load = open_after_load
+        self._append_to_tree = append_to_tree
+        self._pending_focus_path = focus_path
+        self._loading_source_hash: tuple[str, int, str] | None = None
+        self._tree_build_started = time.monotonic()
+        self._status.showMessage(translate("MainWindow", "Loading: {path}").format(path=path))
+        self._progress = LoadingDialog(translate("MainWindow", "Loading source…"), self)
+        self._progress.show()
+
+        self._load_thread = QThread(self)
+        self._load_worker = _LoadSourceWorker(
+            self.session, path, self.session.integrity_mode, itunes_zip_prefix, password,
+            window_id=self._window_id, embedded_zip=embedded_zip, as_disk_image=as_disk_image,
+            private_key=private_key,
+        )
+        self._load_worker.moveToThread(self._load_thread)
+        self._load_thread.started.connect(self._load_worker.run)
+        self._load_worker.finished.connect(self._on_load_finished)
+        self._load_worker.failed.connect(self._on_load_failed)
+        self._load_worker.password_required.connect(self._on_password_required)
+        self._load_worker.hashed.connect(self._on_source_hashed)
+        self._load_worker.finished.connect(self._load_thread.quit)
+        self._load_worker.failed.connect(self._load_thread.quit)
+        self._load_worker.password_required.connect(self._load_thread.quit)
+        self._load_thread.finished.connect(self._load_worker.deleteLater)
+        self._load_thread.finished.connect(self._on_load_thread_finished)
+        self._load_thread.start()
+
+    def _on_source_hashed(self, digest: str, size: int, path: str) -> None:
+        self._loading_source_hash = (digest, size, path)
+
+    # -- the load queue while a dialog is open ---------------------------------
+    #
+    # A modal dialog runs a nested event loop: the finished load thread's
+    # signal would start the next queued source inside it, overwriting the
+    # state (_loading_*, _progress, ...) of the source the dialog is about.
+    # So the queue holds while one is open, and a load that came due then
+    # starts once the last hold ends -- none lost, none started twice.
+
+    @contextmanager
+    def _hold_load_queue(self) -> Iterator[None]:
+        self._load_queue_holds = getattr(self, "_load_queue_holds", 0) + 1
+        try:
+            yield
+        finally:
+            self._load_queue_holds -= 1
+            if not self._load_queue_holds and getattr(self, "_queued_load_due", False):
+                self._queued_load_due = False
+                self._start_next_queued_load()
+
+    def _capture_load_state(self) -> _LoadState:
+        return _LoadState(
+            path=getattr(self, "_loading_path", ""),
+            batch=getattr(self, "_loading_batch", None),
+            as_disk_image=getattr(self, "_loading_as_disk_image", False),
+            itunes_zip_prefix=getattr(self, "_loading_itunes_zip_prefix", None),
+            embedded_zip=getattr(self, "_loading_embedded_zip", False),
+            focus_path=getattr(self, "_pending_focus_path", None),
+            source_hash=getattr(self, "_loading_source_hash", None),
+            open_after_load=getattr(self, "_open_after_load", False),
+            append_to_tree=getattr(self, "_append_to_tree", False),
+            progress=getattr(self, "_progress", None),
+            tree_build_started=getattr(self, "_tree_build_started", None),
+        )
+
+    def _restore_load_state(self, state: _LoadState) -> None:
+        """The window's loading state back to *state*, for what reads it
+        later on (_on_tree_loaded)."""
+        self._loading_path = state.path
+        self._loading_batch = state.batch
+        self._loading_as_disk_image = state.as_disk_image
+        self._loading_itunes_zip_prefix = state.itunes_zip_prefix
+        self._loading_embedded_zip = state.embedded_zip
+        self._pending_focus_path = state.focus_path
+        self._loading_focus_path = state.focus_path
+        self._loading_source_hash = state.source_hash
+        self._open_after_load = state.open_after_load
+        self._append_to_tree = state.append_to_tree
+        if state.progress is not None:
+            self._progress = state.progress
+        if state.tree_build_started is not None:
+            self._tree_build_started = state.tree_build_started
+
+    def _on_load_finished(self, vfs: VFS) -> None:
+        with self._hold_load_queue():
+            self._show_loaded_source(vfs, self._capture_load_state())
+
+    def _show_loaded_source(self, vfs: VFS, state: _LoadState) -> None:
+        batch = state.batch
+        if (
+            vfs.root().is_dir
+            and batch is not None
+            and batch is getattr(self, "_placed_batch", None)
+            and self._fs_panel._vfs_list
+        ):
+            # A tree of its own after another item opened in the same go:
+            # replacing would leave only the last of them (_load_source).
+            self._hand_over_to_new_window(vfs, state)
+            return
+        self._placed_batch = batch
+        replaces = not (state.append_to_tree and not vfs.root().is_dir)
+        if replaces and self._fs_panel._vfs_list:
+            # Decided here, once loaded, where it is known what replaces the
+            # tree -- the one check for every way of opening.
+            answer = self._ask_replace_sources(vfs, state)
+            if answer == "new_window":
+                self._hand_over_to_new_window(vfs, state, asked=True)
+                return
+            if answer == "cancel":
+                self._cancel_loaded_source(vfs, state)
+                return
+            self._restore_load_state(state)
+        self._logger.debug("Load worker finished; preparing tree build")
+        if state.progress is not None:
+            state.progress.set_text(translate("MainWindow", "Building tree…"))
+        if state.open_after_load and not vfs.root().is_dir:
+            self._pending_open = (vfs.root(), vfs)
+        if getattr(self, "_tree_loaded_connected", False):
+            try:
+                self._fs_panel.load_finished.disconnect(self._on_tree_loaded)
+            except Exception:
+                pass
+            self._tree_loaded_connected = False
+        self._fs_panel.load_finished.connect(self._on_tree_loaded)
+        self._tree_loaded_connected = True
+        self._loading_vfs = vfs
+        self._tree_loaded = False
+        append = state.append_to_tree and not vfs.root().is_dir
+        self._logger.debug("Dispatching to FilesystemPanel (%s)", "append" if append else "load")
+        if append:
+            self._fs_panel.append_vfs(vfs)
+        else:
+            self._close_all_tabs()
+            self._fs_panel.load_vfs(vfs)
+            # What the tree showed is gone from the window: closed, as Close
+            # Source closes it, not left open (files, handles) until the
+            # window closes.
+            for replaced in [s for s in self.session.sources if s is not vfs]:
+                self.session.remove_source(replaced)
+        self._update_window_title()
+        QTimer.singleShot(0, self._ensure_tree_loaded)
+
+    def _replace_sources_box(
+        self, vfs: VFS, path: str
+    ) -> tuple[QMessageBox, dict[QAbstractButton, Literal["replace", "new_window", "cancel"]]]:
+        """The question before *vfs* (opened from *path*) replaces the
+        sources this window shows, and what each of its buttons answers.
+        Replace is the default."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(translate("MainWindow", "Open {name}").format(name=Path(path).name))
+        box.setText(translate("MainWindow", "Close the sources open in this window?"))
+        box.setInformativeText(
+            "\n".join(source.root().name for source in self._fs_panel._vfs_list)
+        )
+        replace = box.addButton(
+            translate("MainWindow", "Replace"), QMessageBox.ButtonRole.AcceptRole
+        )
+        new_window = box.addButton(
+            translate("MainWindow", "New Window"), QMessageBox.ButtonRole.ActionRole
+        )
+        cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(replace)
+        box.setEscapeButton(cancel)
+        return box, {replace: "replace", new_window: "new_window", cancel: "cancel"}
+
+    def _ask_replace_sources(
+        self, vfs: VFS, state: _LoadState
+    ) -> Literal["replace", "new_window", "cancel"]:
+        if state.progress is not None:
+            state.progress.hide()
+        box, answers = self._replace_sources_box(vfs, state.path)
+        box.exec()
+        answer = answers.get(box.clickedButton(), "cancel")
+        if answer == "replace" and state.progress is not None:
+            state.progress.show()
+        return answer
+
+    def _cancel_loaded_source(self, vfs: VFS, state: _LoadState) -> None:
+        """The analyst kept the open sources: the source loaded for it is
+        not shown, and closed."""
+        self.session.remove_source(vfs)
+        if state.progress is not None:
+            state.progress.close()
+        self._pending_focus_path = None
+        path = state.path
+        # Its INTEGRITY line may already be in the log: this says it was
+        # never opened in the end.
+        self._logger.info("Not opened, cancelled to keep the open sources: %s", path)
+        self._status.showMessage(
+            translate("MainWindow", "Opening {path} cancelled: it was not opened").format(
+                path=path
+            )
+        )
+
+    def _hand_over_to_new_window(
+        self, vfs: VFS, state: _LoadState, asked: bool = False
+    ) -> None:
+        """Show a source this window loaded in a window of its own, open as
+        it is -- not loaded (or hashed) a second time. *asked*: the analyst
+        chose it (_ask_replace_sources), rather than it being a later item
+        of an opened batch."""
+        self.session.detach_source(vfs)
+        if state.progress is not None:
+            state.progress.close()
+        self._pending_focus_path = None  # the focus goes with the source
+        path = state.path
+        batch = state.batch
+        if batch is None or batch is not getattr(self, "_handover_batch", None):
+            self._handover_batch = batch
+            self._handover_count = 0
+        self._handover_count += 1
+        window = self._spawn_window(step=self._handover_count)
+        if asked:
+            self._logger.info("Opened in a new window, as chosen: %s", path)
+            self._status.showMessage(
+                translate("MainWindow", "{path} opened in a new window").format(path=path)
+            )
+        else:
+            self._logger.info(
+                "Opened in a new window, as this window shows another source opened with it: %s",
+                path,
+            )
+            self._status.showMessage(
+                translate(
+                    "MainWindow",
+                    "{path} opened in a new window: this window shows another source opened "
+                    "with it",
+                ).format(path=path)
+            )
+        window._adopt_loaded_source(
+            vfs,
+            path,
+            as_disk_image=state.as_disk_image,
+            open_after_load=state.open_after_load,
+            focus_path=state.focus_path,
+            source_hash=state.source_hash,
+        )
+
+    def _adopt_loaded_source(
+        self,
+        vfs: VFS,
+        path: str,
+        *,
+        as_disk_image: bool,
+        open_after_load: bool,
+        focus_path: str | None,
+        source_hash: tuple[str, int, str] | None,
+    ) -> None:
+        """Show a source another window loaded (_hand_over_to_new_window)
+        as if this window had loaded it."""
+        self.session.add_source_vfs(vfs)
+        self._logger.info("Loading source: %s", path)
+        if source_hash is not None:
+            # Hashed while loading, in the window that loaded it; said here
+            # too, where the source is shown.
+            self._logger.info("INTEGRITY source sha256=%s  size=%d  path=%s", *source_hash)
+        self._loading_path = path
+        self._loading_itunes_zip_prefix = None
+        self._loading_embedded_zip = False
+        self._loading_as_disk_image = as_disk_image
+        self._loading_focus_path = focus_path
+        self._loading_batch = None
+        self._loading_source_hash = source_hash
+        self._open_after_load = open_after_load
+        self._append_to_tree = False
+        self._pending_focus_path = focus_path
+        self._tree_build_started = time.monotonic()
+        self._progress = LoadingDialog(translate("MainWindow", "Loading source…"), self)
+        self._progress.show()
+        self._on_load_finished(vfs)
+
+    def _on_load_failed(self, message: str, shown: str) -> None:
+        with self._hold_load_queue():
+            self._report_load_failed(self._capture_load_state(), message, shown)
+
+    def _report_load_failed(self, state: _LoadState, message: str, shown: str) -> None:
+        self._logger.debug("Load worker failed: %s", message)
+        if state.progress is not None:
+            state.progress.close()
+        self._status.showMessage(
+            translate("MainWindow", "Error loading source: {message}").format(message=shown)
+        )
+        self._logger.error("Load error: %s", message)
+
+        path = state.path
+        offer_hex = bool(path) and Path(path).is_file()
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle(translate("MainWindow", "Load error"))
+        box.setText(shown)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        hex_button = (
+            box.addButton(translate("MainWindow", "Open as Hex"), QMessageBox.ButtonRole.ActionRole)
+            if offer_hex
+            else None
+        )
+        box.exec()
+        if hex_button is not None and box.clickedButton() is hex_button:
+            self._open_failed_source_as_hex(path)
+
+    def _open_failed_source_as_hex(self, path: str) -> None:
+        try:
+            data = Path(path).read_bytes()
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                translate("MainWindow", "Open as Hex"),
+                translate("MainWindow", "Could not read {path!r}: {exc}").format(
+                    path=path, exc=exc
+                ),
+            )
+            return
+        from crush.viewers.hex_viewer import HexViewer
+        viewer = HexViewer(data, self)
+        idx = self._viewer_tabs.addTab(
+            viewer, translate("MainWindow", "{name} [Hex]").format(name=Path(path).name)
+        )
+        self._viewer_tabs.setCurrentIndex(idx)
+        self._show_viewer_tabs()
+
+    def _on_tree_loaded(self) -> None:
+        with self._hold_load_queue():
+            self._finish_tree_load(self._capture_load_state(), getattr(self, "_loading_vfs", None))
+
+    def _finish_tree_load(self, state: _LoadState, loaded_vfs: VFS | None) -> None:
+        """What follows a source's tree being shown. Reads only *state* and
+        *loaded_vfs*: dialogs here (the disk image warning, those of the
+        file opened) must not let another source's state in."""
+        self._logger.debug("Tree load finished")
+        self._tree_loaded = True
+        if getattr(self, "_tree_loaded_connected", False):
+            try:
+                self._fs_panel.load_finished.disconnect(self._on_tree_loaded)
+            except Exception:
+                pass
+            self._tree_loaded_connected = False
+        if state.progress is not None:
+            state.progress.close()
+        path = state.path
+        self._logger.info("Loaded: %s", path)
+        notes = [
+            note for note in (
+                getattr(loaded_vfs, "fallback_note", ""), getattr(loaded_vfs, "load_note", ""),
+            ) if note
+        ]
+        if notes:
+            for note in notes:
+                self._logger.warning("%s: %s", path, note)
+            text = "; ".join(render_value(note, localized=True) for note in notes)
+            self._status.showMessage(
+                translate("MainWindow", "Loaded: {loading_path}  — {text}").format(
+                    loading_path=path, text=text
+                )
+            )
+        else:
+            self._status.showMessage(
+                translate("MainWindow", "Loaded: {loading_path}").format(loading_path=path)
+            )
+        from crush.core.vfs import LogicalEvidenceVFS, RawImageVFS
+
+        # Logical evidence asked for as a disk image opens as what it is
+        # (Open Disk Image… is how an AD-encrypted set gets its password),
+        # and is reopened the way it was opened.
+        asked_as_image = state.as_disk_image
+        opened_as_image = isinstance(loaded_vfs, RawImageVFS) or (
+            asked_as_image and isinstance(loaded_vfs, LogicalEvidenceVFS)
+        )
+        self._add_to_recent_files(path, as_disk_image=opened_as_image)
+        if asked_as_image and not opened_as_image:
+            # Asked for explicitly, so a status-bar line alone is too easy to miss.
+            QMessageBox.warning(
+                self,
+                translate("MainWindow", "Open Disk Image"),
+                (
+                    translate(
+                        "MainWindow",
+                        "{name} could not be read as a disk image and was opened as a "
+                        "folder instead.\n\n{reason}",
+                    )
+                    if Path(path).is_dir() else
+                    translate(
+                        "MainWindow",
+                        "{name} could not be read as a disk image and was opened as a "
+                        "single file instead.\n\n{reason}",
+                    )
+                ).format(
+                    name=Path(path).name,
+                    reason=render_value(getattr(loaded_vfs, "fallback_note", ""), localized=True),
+                ),
+            )
+        if state.tree_build_started is not None:
+            elapsed = time.monotonic() - state.tree_build_started
+            if loaded_vfs is not None:
+                root = loaded_vfs.root()
+                try:
+                    file_count = loaded_vfs.file_count(root)
+                    total_size = loaded_vfs.total_size(root)
+                    self._logger.info(
+                        "Load + initial tree render: %.3f s (files: %s, size: %s)",
+                        elapsed,
+                        f"{file_count:,}",
+                        _format_size(total_size),
+                    )
+                except Exception:
+                    self._logger.info("Load + initial tree render: %.3f s", elapsed)
+            else:
+                self._logger.info("Load + initial tree render: %.3f s", elapsed)
+        focus_path = state.focus_path
+        self._pending_focus_path = None
+        focus_handled = False
+        if focus_path and loaded_vfs is not None:
+            from crush.core.vfs import resolve_relative_path
+            vfs = loaded_vfs
+            root = vfs.root()
+            if not root.is_dir:
+                # Not an error worth blocking on -- the single-file case below
+                # already opens it unconditionally; --focus just didn't apply.
+                self._status.showMessage(
+                    translate(
+                        "MainWindow",
+                        "--focus ignored: {path!r} is a single file, not a folder/archive",
+                    ).format(path=path)
+                )
+                self._logger.warning(
+                    "--focus ignored: %r is a single file, not a folder/archive", path,
+                )
+            else:
+                target = resolve_relative_path(root, focus_path)
+                if target is None:
+                    self._status.showMessage(
+                        translate("MainWindow", "--focus: {focus!r} not found in {path!r}").format(
+                            focus=focus_path, path=path
+                        )
+                    )
+                    self._logger.warning("--focus: %r not found in %r", focus_path, path)
+                else:
+                    self._fs_panel._navigate_to_node(target, vfs)
+                    self._open_node(target, vfs)
+                    focus_handled = True
+        if not focus_handled and self._pending_open:
+            node, vfs = self._pending_open
+            self._pending_open = None
+            self._open_node(node, vfs)
+
+    def _ensure_tree_loaded(self) -> None:
+        if not getattr(self, "_tree_loaded", False):
+            self._logger.warning("Tree load signal not received; closing progress dialog.")
+            self._on_tree_loaded()
+
+    def _export_node(self, node: VFSNode, vfs: VFS) -> None:
+        dest_dir = QFileDialog.getExistingDirectory(
+            self, translate("MainWindow", "Export to folder")
+        )
+        if not dest_dir:
+            return
+
+        safe_root_name, _ = _safe_name(node.name or "export")
+        target_root = Path(dest_dir) / safe_root_name
+        if target_root.exists():
+            reply = QMessageBox.question(
+                self,
+                translate("MainWindow", "Overwrite?"),
+                translate("MainWindow", "{target_root} already exists. Overwrite?").format(
+                    target_root=target_root
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        if self._thread_is_running(getattr(self, "_export_thread", None)):
+            QMessageBox.information(
+                self,
+                translate("MainWindow", "Export"),
+                translate("MainWindow", "An export is already running."),
+            )
+            return
+
+        self._status.showMessage(translate("MainWindow", "Exporting…"))
+        self._logger.info("Export requested: %s -> %s", node.path, dest_dir)
+        self._export_progress = QProgressDialog(
+            translate("MainWindow", "Exporting…"), None, 0, 0, self
+        )
+        self._export_progress.setWindowTitle(translate("MainWindow", "Export"))
+        self._export_progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self._export_progress.setCancelButton(None)
+        self._export_progress.setMinimumDuration(0)
+        self._export_progress.show()
+
+        self._export_thread = QThread(self)
+        self._export_worker = _ExportWorker(
+            vfs, node, dest_dir, self.session.integrity_mode, window_id=self._window_id
+        )
+        self._export_worker.moveToThread(self._export_thread)
+        self._export_thread.started.connect(self._export_worker.run)
+        self._export_worker.finished.connect(self._on_export_finished)
+        self._export_worker.failed.connect(self._on_export_failed)
+        self._export_worker.finished.connect(self._export_thread.quit)
+        self._export_worker.failed.connect(self._export_thread.quit)
+        self._export_thread.finished.connect(self._export_worker.deleteLater)
+        self._export_thread.finished.connect(self._on_export_thread_finished)
+        self._export_thread.start()
+
+    def _export_multi_nodes(self, entries: list, filter_text: str) -> None:
+        if not entries:
+            return
+        dest_dir = QFileDialog.getExistingDirectory(
+            self, translate("MainWindow", "Export filtered results to folder")
+        )
+        if not dest_dir:
+            return
+        if self._thread_is_running(getattr(self, "_export_thread", None)):
+            QMessageBox.information(
+                self,
+                translate("MainWindow", "Export"),
+                translate("MainWindow", "An export is already running."),
+            )
+            return
+        n = len(entries)
+        exporting = (
+            translate("MainWindow", "Exporting {n} file…")
+            if n == 1
+            else translate("MainWindow", "Exporting {n} files…")
+        ).format(n=n)
+        self._status.showMessage(exporting)
+        self._logger.info("Multi-export: %d files, filter=%r -> %s", n, filter_text, dest_dir)
+        self._export_progress = QProgressDialog(exporting, None, 0, 0, self)
+        self._export_progress.setWindowTitle(translate("MainWindow", "Export filtered results"))
+        self._export_progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self._export_progress.setCancelButton(None)
+        self._export_progress.setMinimumDuration(0)
+        self._export_progress.show()
+        self._export_thread = QThread(self)
+        self._export_worker = _ExportMultiWorker(
+            entries, dest_dir, self.session.integrity_mode, filter_text,
+            window_id=self._window_id,
+        )
+        self._export_worker.moveToThread(self._export_thread)
+        self._export_thread.started.connect(self._export_worker.run)
+        self._export_worker.finished.connect(self._on_export_finished)
+        self._export_worker.failed.connect(self._on_export_failed)
+        self._export_worker.finished.connect(self._export_thread.quit)
+        self._export_worker.failed.connect(self._export_thread.quit)
+        self._export_thread.finished.connect(self._export_worker.deleteLater)
+        self._export_thread.finished.connect(self._on_export_thread_finished)
+        self._export_thread.start()
+
+    def _on_export_finished(self, dest: str) -> None:
+        if hasattr(self, "_export_progress"):
+            self._export_progress.close()
+        self._status.showMessage(translate("MainWindow", "Exported to: {dest}").format(dest=dest))
+        self._logger.info("Exported to: %s", dest)
+        choice = QMessageBox.question(
+            self,
+            translate("MainWindow", "Export complete"),
+            translate("MainWindow", "Export finished:\n{dest}\n\nOpen location?").format(dest=dest),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if choice == QMessageBox.StandardButton.Yes:
+            target = Path(dest)
+            open_path = target.parent if target.is_file() else target
+            self._open_local_file(open_path)
+
+    def _on_export_failed(self, message: str, shown: str) -> None:
+        if hasattr(self, "_export_progress"):
+            self._export_progress.close()
+        self._status.showMessage(
+            translate("MainWindow", "Export failed: {message}").format(message=shown)
+        )
+        self._logger.error("Export failed: %s", message)
+        QMessageBox.critical(self, translate("MainWindow", "Export failed"), shown)
+
+    def _export_logarchive_node(self, node: VFSNode, vfs: VFS) -> None:
+        dest_dir = QFileDialog.getExistingDirectory(
+            self, translate("MainWindow", "Save .logarchive to folder")
+        )
+        if not dest_dir:
+            return
+
+        if self._thread_is_running(getattr(self, "_logarchive_thread", None)):
+            QMessageBox.information(
+                self,
+                translate("MainWindow", "Export"),
+                translate("MainWindow", "An export is already running."),
+            )
+            return
+
+        safe_base, changed = _safe_name(node.name)
+        archive_name = safe_base if safe_base.endswith(".logarchive") else f"{safe_base}.logarchive"
+        dest_path = Path(dest_dir) / archive_name
+        if changed:
+            self._logger.warning(
+                "Export: sanitized name for Windows-safe filesystem compatibility: %s -> %s",
+                node.path, dest_path,
+            )
+        if dest_path.exists():
+            reply = QMessageBox.question(
+                self,
+                translate("MainWindow", "Overwrite?"),
+                translate("MainWindow", "{dest_path} already exists. Overwrite?").format(
+                    dest_path=dest_path
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        self._status.showMessage(translate("MainWindow", "Building .logarchive…"))
+        self._logger.info("Export logarchive: %s -> %s", node.path, dest_path)
+        self._logarchive_progress = QProgressDialog(
+            translate("MainWindow", "Building .logarchive…"), None, 0, 0, self
+        )
+        self._logarchive_progress.setWindowTitle(translate("MainWindow", "Export .logarchive"))
+        self._logarchive_progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self._logarchive_progress.setCancelButton(None)
+        self._logarchive_progress.setMinimumDuration(0)
+        self._logarchive_progress.show()
+
+        self._logarchive_thread = QThread(self)
+        self._logarchive_worker = _ExportLogarchiveWorker(
+            vfs, node, str(dest_path), window_id=self._window_id
+        )
+        self._logarchive_worker.moveToThread(self._logarchive_thread)
+        self._logarchive_thread.started.connect(self._logarchive_worker.run)
+        self._logarchive_worker.finished.connect(self._on_logarchive_finished)
+        self._logarchive_worker.failed.connect(self._on_logarchive_failed)
+        self._logarchive_worker.finished.connect(self._logarchive_thread.quit)
+        self._logarchive_worker.failed.connect(self._logarchive_thread.quit)
+        self._logarchive_thread.finished.connect(self._logarchive_worker.deleteLater)
+        self._logarchive_thread.start()
+
+    def _on_logarchive_finished(self, dest: str) -> None:
+        if hasattr(self, "_logarchive_progress"):
+            self._logarchive_progress.close()
+        self._status.showMessage(translate("MainWindow", "Saved: {dest}").format(dest=dest))
+        self._logger.info("Logarchive exported to: %s", dest)
+        choice = QMessageBox.question(
+            self,
+            translate("MainWindow", "Export complete"),
+            translate("MainWindow", ".logarchive saved:\n{dest}\n\nOpen location?").format(
+                dest=dest
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if choice == QMessageBox.StandardButton.Yes:
+            self._open_local_file(Path(dest).parent)
+
+    def _on_logarchive_failed(self, message: str, shown: str) -> None:
+        if hasattr(self, "_logarchive_progress"):
+            self._logarchive_progress.close()
+        self._status.showMessage(
+            translate("MainWindow", "Export failed: {message}").format(message=shown)
+        )
+        self._logger.error("Logarchive export failed: %s", message)
+        QMessageBox.critical(self, translate("MainWindow", "Export failed"), shown)
+
+    def _guard_large_open(self, node: VFSNode, vfs: VFS) -> bool:
+        """False when the file should not be loaded here: too big to load
+        safely, and the user chose another action or cancelled."""
+        if node.is_dir or node.size <= 0:
+            return True
+        from crush.ui import large_open
+
+        # Offered unless the file is known to hold nothing to browse (a disk
+        # image isn't among them: it opens via Open Disk Image in New Window).
+        decision = large_open.confirm_large_open(
+            self, node.name, node.size,
+            can_open_as_source=_can_open_as_source(node, vfs) is not False,
+        )
+        if decision is large_open.Decision.PROCEED:
+            return True
+        self._logger.info("Large file %s (%d B): user chose %s", node.path, node.size, decision.value)
+        if decision is large_open.Decision.NEW_WINDOW:
+            self._open_in_new_window(node, vfs)
+        elif decision is large_open.Decision.EXPORT:
+            self._export_node(node, vfs)
+        return False
+
+    def _prepare_entry(self, node: VFSNode, vfs: VFS) -> None:
+        """Before an entry is opened (size check, parser choice, parsing --
+        all on the UI thread), do whatever waiting on its source that takes
+        on a background thread behind a "please wait" dialog: decompressing
+        a 7z up to the entry, say, can take minutes, and the window must not
+        freeze meanwhile. Nothing to do for a file on disk."""
+        if node.is_dir or not vfs.needs_prepare(node):
+            return
+        try:
+            busy_call(
+                self,
+                translate("MainWindow", "Reading {name} from {source}…").format(
+                    name=node.name, source=vfs.root().name
+                ),
+                lambda: vfs.prepare(node),
+            )
+        except RuntimeError as exc:
+            # Opening it reads it again and reports the failure there.
+            self._logger.warning("Could not read %s ahead of opening it: %s", node.path, exc)
+
+    def _open_node(self, node: VFSNode, vfs: VFS) -> None:
+        """Called when the user double-clicks a file in the FS panel."""
+        with window_log_scope(self._window_id):
+            self._prepare_entry(node, vfs)
+            if not self._guard_large_open(node, vfs):
+                return
+            self._open_node_impl(node, vfs)
+
+    def _open_node_impl(self, node: VFSNode, vfs: VFS) -> None:
+        self._hash_node_if_integrity(node, vfs)
+        import crush.parsers  # noqa: F401 — triggers parser registration
+        from crush.core.registry import ParserRegistry
+
+        try:
+            # Choosing a parser reads the file's first bytes.
+            parser = ParserRegistry.best(node, vfs)
+        except OSError as exc:
+            self._warn_unreadable(node, exc)
+            return
+        if parser is None:
+            self._status.showMessage(
+                translate("MainWindow", "No parser found for {name}").format(name=node.name)
+            )
+            return
+
+        try:
+            if parser.PARSE_OFF_UI_THREAD and node.size > _BUSY_BYTES:
+                # Bytes in, plain data out: safe off the UI thread. Other
+                # parsers hand back thread-bound state (sqlite handles, Qt
+                # objects) and stay on the UI thread.
+                result = busy_call(
+                    self,
+                    translate("MainWindow", "Loading {name}…").format(name=node.name),
+                    lambda: parser.parse(node, vfs),
+                )
+            else:
+                result = parser.parse(node, vfs)
+            result = self._enrich_with_format_info(parser, node, vfs, result)
+            possibly_encrypted = result.metadata.get("Possibly Encrypted")
+            hint_text, hint_banner = "", None
+            if not possibly_encrypted:
+                hint_text, hint_banner = self._open_otherwise_hint(
+                    node, vfs, probe_archive=isinstance(parser, HexFallbackParser),
+                )
+            self._show_result(node, result, vfs, hint_banner=hint_banner)
+            self._props_panel.update_properties(node, result.metadata, vfs)
+            if possibly_encrypted:
+                # A normal double-click never auto-prompts for a password (see
+                # pdf_parser.py / realm_parser.py), but that shouldn't mean the
+                # hint is invisible unless the user happens to be looking at
+                # the Properties panel -- surface it in the status bar too.
+                self._status.showMessage(
+                    f"{node.path}  [{parser.DISPLAY_NAME} — {possibly_encrypted}]"  # i18n: keep -- markup/layout only
+                )
+            else:
+                message = f"{node.path}  [{parser.DISPLAY_NAME}]"  # i18n: keep -- markup/layout only
+                if hint_text:
+                    message += f"  — {hint_text}"  # i18n: keep -- layout
+                self._status.showMessage(message)
+        except Exception as exc:
+            self._status.showMessage(translate("MainWindow", "Parse error: {exc}").format(exc=i18n.exception_text(exc)))
+            QMessageBox.warning(self, translate("MainWindow", "Parse error"), i18n.exception_text(exc))
+
+    # Modes that load the whole file into memory. "default" is absent on
+    # purpose: it ends in _open_node(), which asks itself.
+    _RAM_LOADING_MODES = frozenset(
+        {"hex", "text", "protobuf", "mmkv", "mmkv_encrypted",
+         "realm_encrypted", "sqlcipher", "pdf_encrypted"}
+    )
+    # Modes that read one file's content on the UI thread: its source is
+    # read ahead behind a "please wait" dialog first (_prepare_entry).
+    _PREPARED_MODES = _RAM_LOADING_MODES | {"multi_log", "multi_log_add"}
+
+    def _open_node_mode(self, node: VFSNode, vfs: VFS, mode: str) -> None:
+        with window_log_scope(self._window_id):
+            if mode in self._PREPARED_MODES:
+                self._prepare_entry(node, vfs)
+            if mode in self._RAM_LOADING_MODES and not self._guard_large_open(node, vfs):
+                return
+            self._open_node_mode_impl(node, vfs, mode)
+
+    def _open_node_mode_impl(self, node: VFSNode, vfs: VFS, mode: str) -> None:
+        if mode == "hex":
+            self._hash_node_if_integrity(node, vfs)
+            from crush.parsers.base import ParseResult
+            hex_bytes, why = self._read_hex_bytes(vfs, node)
+            if hex_bytes is None:
+                QMessageBox.warning(
+                    self,
+                    translate("MainWindow", "Hex view"),
+                    translate("MainWindow", "Unable to load hex view: {reason}").format(reason=why),
+                )
+                return
+            result = ParseResult(viewer_type="hex", data=hex_bytes)
+            result = self._enrich_with_format_info(None, node, vfs, result)
+            self._show_result(node, result, vfs)
+            self._props_panel.update_properties(node, result.metadata, vfs)
+            return
+        if mode == "text":
+            self._hash_node_if_integrity(node, vfs)
+            from crush.parsers.base import ParseResult
+            try:
+                raw = vfs.read(node)
+            except OSError as exc:
+                self._warn_unreadable(node, exc)
+                return
+            try:
+                text = raw.decode("utf-8")
+            except Exception:
+                text = raw.decode("utf-8", errors="replace")
+            result = ParseResult(viewer_type="text", data=text)
+            result = self._enrich_with_format_info(None, node, vfs, result)
+            self._show_result(node, result, vfs)
+            self._props_panel.update_properties(node, result.metadata, vfs)
+            return
+        if mode == "verify_acquisition":
+            self._verify_acquisition(node, vfs)
+            return
+        if mode == "multi_log":
+            self._hash_node_if_integrity(node, vfs)
+            self._open_multi_log_window(node, vfs)
+            self._status.showMessage(
+                translate("MainWindow", "{path}  [Multi-Log Studio — loading…]").format(
+                    path=node.path
+                )
+            )
+            return
+        if mode == "multi_log_add":
+            self._hash_node_if_integrity(node, vfs)
+            viewer = self._find_multi_log_viewer()
+            if viewer is not None:
+                viewer.add_source(node, vfs)
+                self._status.showMessage(
+                    translate("MainWindow", "Added to Multi-Log Studio: {path}").format(
+                        path=node.path
+                    )
+                )
+            else:
+                self._open_multi_log_window(node, vfs)
+                self._status.showMessage(
+                    translate("MainWindow", "{path}  [Multi-Log Studio — loading…]").format(
+                        path=node.path
+                    )
+                )
+            return
+        if mode == "multi_log_folder":
+            from crush.viewers.multi_log_viewer import (
+                _discover_log_nodes,
+                FolderDiscoveryDialog,
+            )
+            found = _discover_log_nodes(node, vfs)
+            if not found:
+                QMessageBox.information(
+                    self,
+                    translate("MainWindow", "Multi-Log Studio"),
+                    translate("MainWindow", "No log files found in '{name}'.").format(
+                        name=node.name
+                    ),
+                )
+                return
+            dlg = FolderDiscoveryDialog(node.name, found, self)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            selected = dlg.selected_nodes()
+            if not selected:
+                return
+            viewer = self._find_multi_log_viewer()
+            if viewer is None:
+                viewer = self._open_multi_log_window(selected[0], vfs)
+                remaining = selected[1:]
+            else:
+                remaining = selected
+            for n in remaining:
+                viewer.add_source(n, vfs)
+            self._status.showMessage(
+                translate(
+                    "MainWindow", "{path}  [Multi-Log Studio — loading {selected_count} file(s)…]"
+                ).format(path=node.path, selected_count=len(selected))
+            )
+            return
+        if mode == "send_to_peach_folder":
+            from crush.viewers.multi_log_viewer import (
+                _discover_log_nodes,
+                FolderDiscoveryDialog,
+            )
+            found = _discover_log_nodes(node, vfs)
+            if not found:
+                QMessageBox.information(
+                    self,
+                    translate("MainWindow", "Send to Peach"),
+                    translate("MainWindow", "No log files found in '{name}'.").format(
+                        name=node.name
+                    ),
+                )
+                return
+            dlg = FolderDiscoveryDialog(
+                node.name, found, self, title=translate("MainWindow", "Send Logs to Peach")
+            )
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            selected = dlg.selected_nodes()
+            if not selected:
+                return
+            self._send_to_peach_batch([(n, vfs) for n in selected])
+            return
+        if mode == "send_to_peach":
+            self._hash_node_if_integrity(node, vfs)
+            self._send_to_peach(node, vfs)
+            return
+        if mode == "run_analyzer":
+            self._hash_node_if_integrity(node, vfs)
+            self._run_analyzer(node, vfs)
+            return
+        if mode == "send_to_peach_biome":
+            from crush.parsers.segb_parser import discover_segb_nodes
+            from crush.viewers.multi_log_viewer import FolderDiscoveryDialog
+            found = discover_segb_nodes(node, vfs)
+            if not found:
+                QMessageBox.information(
+                    self,
+                    translate("MainWindow", "Send Biome Streams to Peach"),
+                    translate("MainWindow", "No SEGB files found in '{name}'.").format(
+                        name=node.name
+                    ),
+                )
+                return
+            dlg = FolderDiscoveryDialog(
+                node.name, found, self, title=translate("MainWindow", "Send Biome Streams to Peach")
+            )
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            selected = dlg.selected_nodes()
+            if not selected:
+                return
+            self._hash_node_if_integrity(node, vfs)
+            self._send_biome_to_peach(node, vfs, selected)
+            return
+        if mode == "protobuf":
+            self._hash_node_if_integrity(node, vfs)
+            from crush.parsers.protobuf_parser import ProtobufParser
+            parser = ProtobufParser()
+            try:
+                result = parser.parse(node, vfs)
+                result = self._enrich_with_format_info(parser, node, vfs, result)
+                self._show_result(node, result, vfs)
+                self._props_panel.update_properties(node, result.metadata, vfs)
+                self._status.showMessage(
+                    f"{node.path}  [{parser.DISPLAY_NAME}]"  # i18n: keep -- markup/layout only
+                )
+            except Exception as exc:
+                self._status.showMessage(
+                    translate("MainWindow", "Protobuf parse error: {exc}").format(exc=exc)
+                )
+                QMessageBox.warning(self, translate("MainWindow", "Protobuf parse error"), i18n.exception_text(exc))
+            return
+        if mode == "mmkv":
+            self._hash_node_if_integrity(node, vfs)
+            from crush.parsers.mmkv_parser import MMKVParser
+            parser = MMKVParser()
+            try:
+                result = parser.parse(node, vfs)
+                result = self._enrich_with_format_info(parser, node, vfs, result)
+                self._show_result(node, result, vfs)
+                self._props_panel.update_properties(node, result.metadata, vfs)
+                self._status.showMessage(
+                    f"{node.path}  [{parser.DISPLAY_NAME}]"  # i18n: keep -- markup/layout only
+                )
+            except Exception as exc:
+                self._status.showMessage(
+                    translate("MainWindow", "MMKV parse error: {exc}").format(exc=exc)
+                )
+                QMessageBox.warning(self, translate("MainWindow", "MMKV parse error"), i18n.exception_text(exc))
+            return
+        if mode == "mmkv_encrypted":
+            self._hash_node_if_integrity(node, vfs)
+            self._open_encrypted_mmkv(node, vfs)
+            return
+        if mode == "realm_encrypted":
+            self._hash_node_if_integrity(node, vfs)
+            self._open_encrypted_realm(node, vfs)
+            return
+        if mode == "sqlcipher":
+            self._hash_node_if_integrity(node, vfs)
+            self._open_encrypted_sqlite(node, vfs)
+            return
+        if mode == "pdf_encrypted":
+            self._hash_node_if_integrity(node, vfs)
+            self._open_encrypted_pdf(node, vfs)
+            return
+        self._open_node(node, vfs)
+
+    def _verify_acquisition(self, node: VFSNode, vfs: VFS) -> None:
+        """Recompute an acquisition's hashes and compare them to the ones it
+        stored itself. Not run automatically on load: an acquisition can be
+        tens to hundreds of GB, and re-reading all of it on every open would
+        defeat the point of reading it on demand in the first place — this is
+        an explicit, examiner-triggered action.
+        """
+        from crush.core.vfs import LogicalEvidenceVFS
+        from crush.ui.busy_dialog import run_with_busy_dialog
+        from crush.ui.verify_result_dialog import VerifyResultDialog, verify_report_html
+
+        if vfs.acquisition() is None:
+            return
+        title = translate("MainWindow", "Verify Acquisition Hash")
+
+        def _work() -> object:
+            return vfs.verify_acquisition()
+
+        def _on_done(result: object) -> None:
+            if "recorded_files" in result:  # type: ignore[operator]
+                _on_recorded_files_done(result)  # type: ignore[arg-type]
+                return
+            stored: dict[str, str] = result.get("stored") or {}  # type: ignore[attr-defined]
+            match = result.get("match")  # type: ignore[attr-defined]
+            checksum_errors = result.get("checksum_errors") or []  # type: ignore[attr-defined]
+            missing_pages = result.get("missing_page_count") or 0  # type: ignore[attr-defined]
+            # Found while reading, whether or not a hash was stored: chunks whose
+            # own checksum fails, pages the acquisition declares but doesn't hold.
+            findings = []
+            if checksum_errors:
+                findings.append(translate(
+                    "MainWindow", "{count} chunk(s) fail their own checksum."
+                ).format(count=f"{len(checksum_errors):,}"))
+            if missing_pages:
+                findings.append(translate(
+                    "MainWindow",
+                    "{count} page(s) are not in the acquisition's files; they read as the "
+                    "bad-sector marker.",
+                ).format(count=f"{missing_pages:,}"))
+            # What a container records about its own data besides a hash of
+            # the disk (a UDIF image's checksums, an AFF4's stream, chunk and
+            # map hashes), recomputed by the reader -- every one listed.
+            container_checks: list[dict[str, Any]] = (
+                result.get("container_checks") or []  # type: ignore[attr-defined]
+            )
+            container_bad = [c for c in container_checks if not c.get("match")]
+            if container_bad:
+                findings.append(translate(
+                    "MainWindow", "{count} of the container's own checks do not match."
+                ).format(count=f"{len(container_bad):,}"))
+            # Logical evidence also records a hash of each file it holds.
+            files_checked = (
+                (result.get("entry_md5_checked") or 0)  # type: ignore[attr-defined]
+                + (result.get("entry_sha1_checked") or 0)  # type: ignore[attr-defined]
+            )
+            files_bad = sorted(set(
+                list(result.get("entry_md5_mismatched") or [])  # type: ignore[attr-defined]
+                + list(result.get("entry_sha1_mismatched") or [])  # type: ignore[attr-defined]
+            ))
+            if files_bad:
+                findings.append(translate(
+                    "MainWindow", "{count} file(s) do not match their recorded hash."
+                ).format(count=f"{len(files_bad):,}"))
+            if files_checked:
+                if not stored:
+                    tag = (
+                        translate("MainWindow", "{path}  [verify: no stored hash, file hash "
+                                  "MISMATCH]")
+                        if files_bad else
+                        translate("MainWindow", "{path}  [verify: no stored hash, file hashes "
+                                  "match]")
+                    )
+                elif match:
+                    tag = (
+                        translate("MainWindow", "{path}  [verify: MATCH, file hash MISMATCH]")
+                        if files_bad else
+                        translate("MainWindow", "{path}  [verify: MATCH, file hashes match]")
+                    )
+                else:
+                    tag = translate("MainWindow", "{path}  [verify: MISMATCH]")
+                # "match" must not read as "all checked".
+                not_checked = int(
+                    result.get("entry_md5_missing") or 0  # type: ignore[attr-defined]
+                )
+                if not_checked:
+                    tag = translate(
+                        "MainWindow", "{tag} [{count} file(s) without a recorded MD5, not checked]"
+                    ).format(tag=tag, count=f"{not_checked:,}")
+            elif not stored:
+                if container_checks:
+                    tag = (
+                        translate("MainWindow", "{path}  [verify: no stored hash, container "
+                                  "check MISMATCH]")
+                        if container_bad else
+                        translate("MainWindow", "{path}  [verify: no stored hash, container "
+                                  "checks match]")
+                    )
+                else:
+                    tag = translate("MainWindow", "{path}  [verify: no stored hash]")
+            elif match:
+                tag = (
+                    translate("MainWindow", "{path}  [verify: MATCH, container check "
+                              "MISMATCH]")
+                    if container_bad else
+                    translate("MainWindow", "{path}  [verify: MATCH]")
+                )
+            else:
+                tag = translate("MainWindow", "{path}  [verify: MISMATCH]")
+            self._status.showMessage(tag.format(path=node.path))
+            # One block per check, stored and recomputed value on lines of
+            # their own; "no hash recorded" is said plainly, never shown as
+            # a silent success.
+            VerifyResultDialog(
+                self, title,
+                verify_report_html(  # type: ignore[arg-type]
+                    result, findings, holds_files=isinstance(vfs, LogicalEvidenceVFS),
+                ),
+            ).exec()
+
+        def _on_recorded_files_done(result: dict[str, Any]) -> None:
+            # A UFD records a hash of each file of the extraction, not of a disk.
+            files: list[dict[str, Any]] = result.get("recorded_files") or []
+            # An entry with a status wasn't checked at all (a UFDX extraction
+            # that wasn't opened); it has no recorded hash of its own.
+            unchecked = [f["name"] for f in files if f.get("status") is not None]
+            missing = [f["name"] for f in files if not f.get("found") and f.get("status") is None]
+            bad = [f["name"] for f in files if f.get("found") and not f.get("match")]
+            findings = []
+            if unchecked:
+                findings.append(translate(
+                    "MainWindow", "{count} listed extraction(s) could not be checked."
+                ).format(count=f"{len(unchecked):,}"))
+            if bad:
+                findings.append(translate(
+                    "MainWindow", "{count} file(s) do not match their recorded hash."
+                ).format(count=f"{len(bad):,}"))
+            if missing:
+                findings.append(translate(
+                    "MainWindow", "{count} file(s) with a recorded hash were not found."
+                ).format(count=f"{len(missing):,}"))
+            if not files:
+                tag = translate("MainWindow", "{path}  [verify: no stored hash]")
+            elif result.get("match"):
+                tag = translate("MainWindow", "{path}  [verify: MATCH]")
+            else:
+                tag = translate("MainWindow", "{path}  [verify: MISMATCH]")
+            self._status.showMessage(tag.format(path=node.path))
+            VerifyResultDialog(self, title, verify_report_html(result, findings)).exec()
+
+        def _on_error(message: str) -> None:
+            QMessageBox.warning(
+                self, title,
+                translate("MainWindow", "Could not verify: {message}").format(message=message),
+            )
+
+        run_with_busy_dialog(
+            self, translate("MainWindow", "Verifying acquisition hash…"), _work, _on_done,
+            _on_error,
+        )
+
+    def _open_encrypted_sqlite(
+        self, node: VFSNode, vfs: VFS, wrong_reason: str | None = None,
+    ) -> None:
+        """*wrong_reason* is None on the first prompt, else why the previous
+        key/password was rejected (shown in the retry prompt)."""
+        from crush.core.passwords import WrongPasswordError
+        from crush.parsers.sqlite_parser import SQLiteParser
+        from crush.ui.sqlcipher_dialog import SQLCipherCredentialsDialog
+
+        dialog = SQLCipherCredentialsDialog(self, wrong_reason=wrong_reason)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self._status.showMessage(translate("MainWindow", "Load cancelled: password required"))
+            return
+        key_text = dialog.key_text()
+        if not key_text:
+            self._status.showMessage(translate("MainWindow", "Load cancelled: password required"))
+            return
+        raw_key = dialog.is_raw_key()
+        cipher_params = dialog.cipher_params()
+
+        parser = SQLiteParser()
+        try:
+            result = parser.parse(
+                node, vfs, password=key_text, raw_key=raw_key, cipher_params=cipher_params
+            )
+        except WrongPasswordError as exc:
+            self._open_encrypted_sqlite(node, vfs, wrong_reason=i18n.exception_text(exc))
+            return
+        except Exception as exc:
+            self._status.showMessage(
+                translate("MainWindow", "SQLCipher decrypt error: {exc}").format(exc=exc)
+            )
+            QMessageBox.warning(self, translate("MainWindow", "SQLCipher decrypt error"), i18n.exception_text(exc))
+            return
+
+        result = self._enrich_with_format_info(parser, node, vfs, result)
+        self._show_result(node, result, vfs)
+        self._props_panel.update_properties(node, result.metadata, vfs)
+        self._status.showMessage(
+            translate("MainWindow", "{path}  [{DISPLAY_NAME} — decrypted]").format(
+                path=node.path, DISPLAY_NAME=parser.DISPLAY_NAME
+            )
+        )
+
+    def _open_encrypted_realm(
+        self, node: VFSNode, vfs: VFS, wrong_reason: str | None = None,
+    ) -> None:
+        """*wrong_reason* is None on the first prompt, else why the previous
+        key/password was rejected (shown in the retry prompt)."""
+        was_wrong = wrong_reason is not None
+        from crush.core.passwords import WrongPasswordError
+        from crush.parsers.realm_parser import RealmParser
+
+        title = "Incorrect Key" if was_wrong else "Realm Encryption Key"
+        prompt = _with_reason(
+            translate(
+                "MainWindow", "Incorrect key. Please try again (64-byte key as a hex string):"
+            )
+            if was_wrong
+            else translate("MainWindow", "Enter the 64-byte Realm encryption key as a hex string:"),
+            wrong_reason,
+        )
+        key_text, ok = QInputDialog.getText(self, title, prompt, QLineEdit.EchoMode.Normal)
+        if not ok or not key_text:
+            self._status.showMessage(
+                translate("MainWindow", "Load cancelled: encryption key required")
+            )
+            return
+
+        parser = RealmParser()
+        try:
+            result = parser.parse(node, vfs, password=key_text)
+        except WrongPasswordError as exc:
+            self._open_encrypted_realm(node, vfs, wrong_reason=i18n.exception_text(exc))
+            return
+        except Exception as exc:
+            self._status.showMessage(
+                translate("MainWindow", "Realm decrypt error: {exc}").format(exc=exc)
+            )
+            QMessageBox.warning(self, translate("MainWindow", "Realm decrypt error"), i18n.exception_text(exc))
+            return
+
+        result = self._enrich_with_format_info(parser, node, vfs, result)
+        self._show_result(node, result, vfs)
+        self._props_panel.update_properties(node, result.metadata, vfs)
+        self._status.showMessage(
+            translate("MainWindow", "{path}  [{DISPLAY_NAME} — decrypted]").format(
+                path=node.path, DISPLAY_NAME=parser.DISPLAY_NAME
+            )
+        )
+
+    def _open_encrypted_mmkv(
+        self, node: VFSNode, vfs: VFS, wrong_reason: str | None = None,
+    ) -> None:
+        """*wrong_reason* is None on the first prompt, else why the previous
+        key/password was rejected (shown in the retry prompt)."""
+        from crush.core.passwords import WrongPasswordError
+        from crush.parsers.mmkv_parser import MMKVParser
+        from crush.ui.mmkv_key_dialog import MMKVKeyDialog
+
+        dialog = MMKVKeyDialog(self, wrong_reason=wrong_reason)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self._status.showMessage(
+                translate("MainWindow", "Load cancelled: encryption key required")
+            )
+            return
+        key_bytes = dialog.key_bytes()
+        if key_bytes is None:
+            self._status.showMessage(
+                translate("MainWindow", "Load cancelled: encryption key required")
+            )
+            if dialog.is_hex():
+                QMessageBox.warning(
+                    self,
+                    translate("MainWindow", "MMKV decrypt error"),
+                    translate("MainWindow", "Not a valid hex string."),
+                )
+            return
+
+        parser = MMKVParser()
+        try:
+            result = parser.parse(node, vfs, password=key_bytes, aes256=dialog.is_aes256())
+        except WrongPasswordError as exc:
+            self._open_encrypted_mmkv(node, vfs, wrong_reason=i18n.exception_text(exc))
+            return
+        except Exception as exc:
+            self._status.showMessage(
+                translate("MainWindow", "MMKV decrypt error: {exc}").format(exc=exc)
+            )
+            QMessageBox.warning(self, translate("MainWindow", "MMKV decrypt error"), i18n.exception_text(exc))
+            return
+
+        result = self._enrich_with_format_info(parser, node, vfs, result)
+        self._show_result(node, result, vfs)
+        self._props_panel.update_properties(node, result.metadata, vfs)
+        self._status.showMessage(
+            translate("MainWindow", "{path}  [{DISPLAY_NAME} — decrypted]").format(
+                path=node.path, DISPLAY_NAME=parser.DISPLAY_NAME
+            )
+        )
+
+    def _open_encrypted_pdf(
+        self, node: VFSNode, vfs: VFS, wrong_reason: str | None = None,
+    ) -> None:
+        """*wrong_reason* is None on the first prompt, else why the previous
+        key/password was rejected (shown in the retry prompt)."""
+        was_wrong = wrong_reason is not None
+        from crush.core.passwords import WrongPasswordError
+        from crush.parsers.pdf_parser import PDFParser
+
+        title = "Incorrect Password" if was_wrong else "PDF Password"
+        prompt = _with_reason(
+            translate("MainWindow", "Incorrect password. Please try again:")
+            if was_wrong
+            else translate("MainWindow", "Enter the PDF's password:"),
+            wrong_reason,
+        )
+        password, ok = QInputDialog.getText(self, title, prompt, QLineEdit.EchoMode.Password)
+        if not ok or not password:
+            self._status.showMessage(translate("MainWindow", "Load cancelled: password required"))
+            return
+
+        parser = PDFParser()
+        try:
+            result = parser.parse(node, vfs, password=password)
+        except WrongPasswordError as exc:
+            self._open_encrypted_pdf(node, vfs, wrong_reason=i18n.exception_text(exc))
+            return
+        except Exception as exc:
+            self._status.showMessage(
+                translate("MainWindow", "PDF decrypt error: {exc}").format(exc=exc)
+            )
+            QMessageBox.warning(self, translate("MainWindow", "PDF decrypt error"), i18n.exception_text(exc))
+            return
+
+        result = self._enrich_with_format_info(parser, node, vfs, result)
+        self._show_result(node, result, vfs)
+        self._props_panel.update_properties(node, result.metadata, vfs)
+        self._status.showMessage(
+            translate("MainWindow", "{path}  [{DISPLAY_NAME} — decrypted]").format(
+                path=node.path, DISPLAY_NAME=parser.DISPLAY_NAME
+            )
+        )
+
+    def _open_multi_log_window(self, node: VFSNode, vfs: VFS) -> QWidget:
+        """Open *node* in a new, standalone Multi-Log Studio window.
+
+        The window is parented to the main window so Qt destroys it when the
+        application exits, but the ``Qt.Window`` flag makes it appear as an
+        independent top-level window in the OS task bar.
+        """
+        from crush.viewers.multi_log_viewer import MultiLogViewer
+        viewer = MultiLogViewer(node, vfs, parent=None, window_id=self._window_id)
+        viewer.setWindowFlags(Qt.WindowType.Window)
+        viewer.setWindowTitle(
+            translate("MainWindow", "Multi-Log Studio — {name}").format(name=node.name)
+        )
+        viewer.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self._log_dock.show()
+        # Size to 80 % of the available screen area, capped at 1400 × 850.
+        avail = self.screen().availableGeometry()
+        w = min(1400, int(avail.width()  * 0.80))
+        h = min(850,  int(avail.height() * 0.80))
+        viewer.resize(w, h)
+        viewer.show()
+        self._multi_log_windows.append(viewer)
+        return viewer
+
+    def _find_multi_log_viewer(self) -> QWidget | None:
+        """Return the most recently opened Multi-Log Studio window, if any.
+
+        Removes stale entries (closed / destroyed windows) from the tracking
+        list before searching.
+        """
+        from crush.viewers.multi_log_viewer import MultiLogViewer
+        self._multi_log_windows = [
+            w for w in self._multi_log_windows if isValid(w)
+        ]
+        for w in reversed(self._multi_log_windows):
+            if isinstance(w, MultiLogViewer):
+                w.raise_()
+                w.activateWindow()
+                return w
+        return None
+
+    def _open_external_mode(self, node: VFSNode, vfs: VFS, mode: str) -> None:
+        if node.is_dir:
+            if isinstance(vfs, DirectoryVFS) and not node.status and Path(node.path).exists():
+                self._open_local_file(Path(node.path))
+            else:
+                QMessageBox.information(
+                    self,
+                    translate("MainWindow", "Open External"),
+                    translate(
+                        "MainWindow", "Opening directories from archives is not supported yet."
+                    ),
+                )
+            return
+        path = self._materialize_node_for_external(
+            node, vfs, title=translate("MainWindow", "Open External")
+        )
+        if path is None:
+            if not self._materialize_cancelled:
+                QMessageBox.warning(
+                    self,
+                    translate("MainWindow", "Open External"),
+                    translate("MainWindow", "Unable to materialize file."),
+                )
+            return
+        if mode == "choose":
+            self._open_external_with_app(path)
+        else:
+            self._open_local_file(path)
+
+    def _paste_decode(self) -> None:
+        from crush.ui.paste_decode_dialog import PasteDecodeDialog
+        dialog = PasteDecodeDialog(self)
+        dialog.open_bytes_with_format_requested.connect(
+            lambda data, name, fmt, extra_metadata: self._open_bytes_with_format(
+                data, name, fmt, "", extra_metadata
+            )
+        )
+        dialog.show()
+
+    def _open_value_inspector(self) -> None:
+        from crush.viewers.value_inspector import ValueInspector
+        ValueInspector.inspect("", self)
+
+    def _open_bytes_with_format(
+        self,
+        data: bytes,
+        filename_hint: str,
+        parser_display_name: object,
+        source_path: str = "",
+        extra_metadata: dict[str, str] | None = None,
+    ) -> None:
+        """Open *data* in the appropriate viewer, honouring an explicit format choice.
+
+        *extra_metadata* (e.g. the originating table/query, column, and row
+        for a SQLite blob cell opened via "Open as new tab") is merged into
+        the Properties panel's fields — kept separate from *filename_hint*
+        (the tab's short, technical dedup path) since a SQL query can be
+        arbitrarily long and shouldn't bloat the path or tab tooltip.
+        """
+        with window_log_scope(self._window_id):
+            self._open_bytes_with_format_impl(
+                data, filename_hint, parser_display_name, source_path, extra_metadata
+            )
+
+    def _open_bytes_with_format_impl(
+        self,
+        data: bytes,
+        filename_hint: str,
+        parser_display_name: object,
+        source_path: str = "",
+        extra_metadata: dict[str, str] | None = None,
+    ) -> None:
+        import crush.parsers  # noqa: F401 — ensures all parsers are registered
+        from crush.core.registry import ParserRegistry
+        from crush.core.vfs import BytesVFS
+
+        if parser_display_name == "__hex__":
+            from crush.parsers.base import ParseResult
+
+            vfs = BytesVFS(data, name=filename_hint)
+            if source_path:
+                setattr(vfs, "source_path", source_path)
+            node = vfs.root()
+            result = ParseResult(viewer_type="hex", data=data)
+            if extra_metadata:
+                result.metadata.update(extra_metadata)
+                if source_path:
+                    result.metadata["Source file"] = source_path
+                result.metadata["Display format"] = self._display_format_label(result)
+            self._show_result(node, result, vfs)
+            self._props_panel.update_properties(node, result.metadata, vfs)
+            self._status.showMessage(
+                translate("MainWindow", "Opened artifact: {filename_hint}  [Hex]").format(
+                    filename_hint=filename_hint
+                )
+            )
+            return
+        if parser_display_name == "__text__":
+            from crush.parsers.base import ParseResult
+            from crush.core.vfs import BytesVFS
+
+            vfs = BytesVFS(data, name=filename_hint)
+            if source_path:
+                setattr(vfs, "source_path", source_path)
+            node = vfs.root()
+            try:
+                text = data.decode("utf-8")
+            except Exception:
+                text = data.decode("utf-8", errors="replace")
+            result = ParseResult(viewer_type="text", data=text)
+            if extra_metadata:
+                result.metadata.update(extra_metadata)
+                if source_path:
+                    result.metadata["Source file"] = source_path
+                result.metadata["Display format"] = self._display_format_label(result)
+            self._show_result(node, result, vfs)
+            self._props_panel.update_properties(node, result.metadata, vfs)
+            self._status.showMessage(
+                translate("MainWindow", "Opened artifact: {filename_hint}  [Text]").format(
+                    filename_hint=filename_hint
+                )
+            )
+            return
+
+        vfs = BytesVFS(data, name=filename_hint)
+        if source_path:
+            setattr(vfs, "source_path", source_path)
+        node = vfs.root()
+
+        if parser_display_name is None:
+            parser = ParserRegistry.best(node, vfs)
+        else:
+            parser = next(
+                (p for p in ParserRegistry._parsers if p.DISPLAY_NAME == parser_display_name),
+                None,
+            ) or ParserRegistry.best(node, vfs)
+
+        if parser is None:
+            QMessageBox.warning(
+                self,
+                translate("MainWindow", "No parser found"),
+                translate(
+                    "MainWindow", "No parser could handle this data as {filename_hint!r}."
+                ).format(filename_hint=filename_hint),
+            )
+            return
+        try:
+            result = parser.parse(node, vfs)
+            if extra_metadata:
+                result.metadata.update(extra_metadata)
+                if source_path:
+                    result.metadata["Source file"] = source_path
+                result.metadata["Display format"] = self._display_format_label(result)
+            self._show_result(node, result, vfs)
+            self._props_panel.update_properties(node, result.metadata, vfs)
+            self._status.showMessage(
+                translate("MainWindow", "Opened pasted data  [{DISPLAY_NAME}]").format(
+                    DISPLAY_NAME=parser.DISPLAY_NAME
+                )
+            )
+        except Exception as exc:
+            self._status.showMessage(translate("MainWindow", "Parse error: {exc}").format(exc=i18n.exception_text(exc)))
+            QMessageBox.warning(self, translate("MainWindow", "Parse error"), i18n.exception_text(exc))
+
+    def _open_bytes_as_artifact(
+        self, data: bytes, name: str, source_path: str = ""
+    ) -> None:
+        """Open in-memory bytes (e.g. a BLOB cell) as a new tab using the best parser."""
+        with window_log_scope(self._window_id):
+            self._open_bytes_as_artifact_impl(data, name, source_path)
+
+    def _open_bytes_as_artifact_impl(
+        self, data: bytes, name: str, source_path: str = ""
+    ) -> None:
+        import crush.parsers  # noqa: F401 — triggers parser registration
+        from crush.core.registry import ParserRegistry
+        from crush.core.vfs import BytesVFS
+
+        vfs = BytesVFS(data, name=name)
+        if source_path:
+            setattr(vfs, "source_path", source_path)
+        node = vfs.root()
+        parser = ParserRegistry.best(node, vfs)
+        if parser is None:
+            return
+        try:
+            result = parser.parse(node, vfs)
+            self._show_result(node, result, vfs)
+            self._props_panel.update_properties(node, result.metadata, vfs)
+            self._status.showMessage(
+                translate("MainWindow", "Opened artifact: {name}  [{DISPLAY_NAME}]").format(
+                    name=name, DISPLAY_NAME=parser.DISPLAY_NAME
+                )
+            )
+        except Exception as exc:
+            self._status.showMessage(
+                translate("MainWindow", "Artifact parse error: {exc}").format(exc=exc)
+            )
+            QMessageBox.warning(self, translate("MainWindow", "Parse error"), i18n.exception_text(exc))
+
+    def _open_table_as_tab(self, title: str, viewer_data: dict) -> None:
+        """Open an already-resolved table (e.g. from the Realm Views tab) as
+        a new top-level tab — same tab machinery as _open_bytes_as_artifact,
+        just skipping the parse step since the data is already final."""
+        from crush.core.vfs import BytesVFS
+        from crush.parsers.base import ParseResult
+
+        vfs = BytesVFS(b"", name=title)
+        node = vfs.root()
+        # __db_path (if the caller backed this table with a temp SQLite
+        # file, e.g. the Realm Views tab does) has to sit at the top level
+        # of `data`, alongside the table entry, not nested inside it --
+        # TableViewer only ever reads data.get("__db_path").
+        data: dict = {title: viewer_data}
+        db_path = viewer_data.pop("__db_path", None)
+        if db_path:
+            data["__db_path"] = db_path
+        result = ParseResult(
+            viewer_type="table", data=data, viewer_hints={"show_db_tabs": False}
+        )
+        self._show_result(node, result, vfs)
+        self._status.showMessage(
+            translate("MainWindow", "Opened view: {title}").format(title=title)
+        )
+
+    _materialize_cancelled = False
+
+    def _materialize_node_for_external(
+        self, node: VFSNode, vfs: VFS, *, title: str | None = None
+    ) -> Path | None:
+        """Copy *node* to a real file in the temp directory, with a space
+        check first and a cancellable progress dialog while it copies.
+
+        Returns None on failure or when the user cancels; in the cancelled
+        case self._materialize_cancelled is True so callers can skip their
+        error message.
+        """
+        self._materialize_cancelled = False
+        tmp_dir: Path | None = None
+        try:
+            # A node with a status (symbolic link, special file, unreadable
+            # entry) is served from the VFS, never via its path: the path
+            # would follow the link or block on a FIFO.
+            if isinstance(vfs, DirectoryVFS) and not node.status and Path(node.path).exists():
+                return Path(node.path)
+            if not hasattr(self, "_external_temp_paths"):
+                self._external_temp_paths: list[Path] = []
+            if not extract_dialog.confirm_temp_space(
+                self, self._settings, node.size, f"'{node.name}'"
+            ):
+                self._materialize_cancelled = True
+                return None
+            tmp_dir = tempdir.mkdtemp(prefix="crush-open-")
+            suffix = node.extension or ""
+            # A name the OS can't hold (an NTFS stream's "file:stream", which
+            # Windows would write into a stream of "file") gets the export's
+            # replacements; the copy is only a working file.
+            tmp_path = tmp_dir / _safe_name(node.name or f"file{suffix}")[0]
+            outcome = extract_dialog.copy_node_with_progress(
+                self,
+                vfs,
+                node,
+                tmp_path,
+                title=title or translate("MainWindow", "Extracting file"),
+                want_hash=self.session.integrity_mode,
+                window_id=self._window_id,
+            )
+            if outcome.status == "cancelled":
+                self._materialize_cancelled = True
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                return None
+            if outcome.status != "ok":
+                raise OSError(outcome.message or "copy failed")
+            if self.session.integrity_mode:
+                self._logger.info(
+                    "INTEGRITY sha256=%s  size=%d  path=%s",
+                    outcome.sha256, outcome.bytes_copied, node.path,
+                )
+            self._external_temp_paths.append(tmp_path)
+            return tmp_path
+        except Exception as exc:
+            if tmp_dir is not None:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            if hasattr(self, "_logger"):
+                self._logger.error("Open external failed: %s", exc)
+            return None
+
+    def _export_vfs_tree(self, node: VFSNode, vfs: VFS, dest: Path) -> None:
+        """Recursively copy a VFS node's tree onto the real filesystem at *dest*."""
+        if node.is_dir:
+            dest.mkdir(parents=True, exist_ok=True)
+            for child in node.children:
+                self._export_vfs_tree(child, vfs, dest / child.name)
+        else:
+            with vfs.open(node) as src, open(dest, "wb") as out:
+                shutil.copyfileobj(src, out)
+
+    def _materialize_directory_node_for_external(
+        self, node: VFSNode, vfs: VFS
+    ) -> tuple[Path, Path | None] | None:
+        """Resolve a VFS node (file or directory) to a real filesystem path,
+        extracting it to a temp dir first if needed.
+
+        Sibling to _materialize_node_for_external, not a modification of it —
+        that one has its own single-file-specific extraction path and other
+        callers (Open External). This one is generic over files and
+        directories via _export_vfs_tree, needed since AUL sources (a
+        .logarchive bundle, or a diagnostics+uuidtext pair) are always
+        directories, and archive/backup-backed VFSs can't expose those as a
+        real filesystem path directly — and reused as-is for plain log files
+        handed to peach, so callers don't need to branch on node.is_dir.
+
+        Returns (source_path, cleanup_dir). cleanup_dir is None when the node
+        already lives on a real DirectoryVFS (no extraction happened, nothing
+        to clean up); otherwise it's the temp directory the caller should ask
+        the external tool to delete once it's done with source_path.
+        """
+        tmp_dir: Path | None = None
+        try:
+            if isinstance(vfs, DirectoryVFS) and not node.status and Path(node.path).exists():
+                return Path(node.path), None
+
+            if not extract_dialog.confirm_temp_space(
+                self, self._settings, vfs.total_size(node), f"'{node.name}'"
+            ):
+                return None
+            tmp_dir = tempdir.mkdtemp(prefix="crush-open-")
+            source_path = tmp_dir / _safe_name(node.name or "export")[0]
+            self._export_vfs_tree(node, vfs, source_path)
+            return source_path, tmp_dir
+        except Exception as exc:
+            # A partially-written tmp_dir must not survive a failed
+            # extraction -- e.g. running out of disk/tmpfs space partway
+            # through a large source silently left tens of GB behind here
+            # before this cleanup existed, found via a real "No space left
+            # on device" failure during Run Analyzer against a full OS image.
+            if tmp_dir is not None:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            if hasattr(self, "_logger"):
+                self._logger.error("Materialize directory for external failed: %s", exc)
+            return None
+
+    def _materialize_matching_files_for_external(
+        self, node: VFSNode, vfs: VFS, filename_patterns: list[str]
+    ) -> tuple[Path, Path | None] | None:
+        """Like _materialize_directory_node_for_external, but extracts only
+        the files under *node* whose name matches one of *filename_patterns*
+        (fnmatch-style, e.g. "applicationState.db*"), instead of a full
+        recursive copy of node's entire subtree.
+
+        Built for crush-analyze: a module only ever reads a handful of
+        specific files (its own declared `paths`), so copying everything
+        under whatever directory the user happened to right-click can be
+        orders of magnitude more than needed -- extracting a full OS image
+        to find one small SQLite file is exactly the "No space left on
+        device" failure this replaces. filename_patterns is deliberately
+        just the last path segment of each module path (not the full
+        multi-segment glob) -- an over-approximation that only risks
+        pulling in an extra same-named file from an unexpected location,
+        never missing a real one, and it keeps this a simple per-node name
+        match instead of reimplementing LEAPP's own path-glob semantics
+        here too (see crush-analyze's find_files(), which has the same
+        simplification).
+
+        Returns (root_path, cleanup_dir) like the sibling method -- for an
+        already-real DirectoryVFS this returns the real path unchanged
+        (nothing to extract, exactly like the sibling); otherwise
+        root_path and cleanup_dir are the same fresh temp directory.
+        """
+        tmp_dir: Path | None = None
+        try:
+            if isinstance(vfs, DirectoryVFS) and not node.status and Path(node.path).exists():
+                return Path(node.path), None
+
+            tmp_dir = tempdir.mkdtemp(prefix="crush-analyze-")
+            self._export_vfs_tree_matching(node, vfs, tmp_dir, filename_patterns)
+            return tmp_dir, tmp_dir
+        except Exception as exc:
+            if tmp_dir is not None:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            if hasattr(self, "_logger"):
+                self._logger.error("Materialize matching files for external failed: %s", exc)
+            return None
+
+    def _export_vfs_tree_matching(
+        self, node: VFSNode, vfs: VFS, dest: Path, filename_patterns: list[str]
+    ) -> None:
+        """Recursively copies only the files under *node* whose name matches
+        one of filename_patterns onto the real filesystem at dest, mirroring
+        their original relative directory structure (needed so a module's
+        own multi-segment path glob, matched again on the crush-analyze
+        side, still finds them at a plausible nested location)."""
+        if node.is_dir:
+            for child in node.children:
+                self._export_vfs_tree_matching(child, vfs, dest / child.name, filename_patterns)
+        elif any(fnmatch.fnmatch(node.name, pattern) for pattern in filename_patterns):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with vfs.open(node) as src, open(dest, "wb") as out:
+                shutil.copyfileobj(src, out)
+
+    def _resolve_peach_source(
+        self, node: VFSNode, vfs: VFS
+    ) -> tuple[Path, Path | None] | None:
+        """Resolve a single VFS node to a real filesystem path for peach,
+        plus an optional temp dir to ask peach to clean up. None on failure
+        — callers decide how to surface that (single vs. batch report it
+        differently).
+
+        A raw full-FS acquisition's diagnostics/ folder is useless to peach
+        on its own — peach needs uuidtext/ sitting right next to it (its own
+        docs: "Selecting diagnostics alone, with no uuidtext anywhere nearby,
+        fails fast"). uuidtext/ is a *sibling* of diagnostics/ in the VFS
+        tree, not a descendant of the right-clicked node, so the generic
+        materializer below can't see it on its own.
+
+        Deliberately NOT reusing build_logarchive_from_acquisition() here —
+        that flattens diagnostics/'s own children (Persist/Special/...) up a
+        level and keeps uuidtext/ as its own folder alongside them, which is
+        neither of the two layouts peach's docs say it recognizes ("the
+        diagnostics folder itself, with uuidtext next to it as a sibling" or
+        "their common parent folder") — it's built for crush's own bundled
+        unifiedlog_iterator instead, a different consumer with different
+        structural tolerances. Recreate the raw layout peach actually
+        documents instead: diagnostics/ and uuidtext/ untouched, as direct
+        children of one temp parent folder, and hand peach that parent.
+        """
+        from crush.parsers.unified_log_parser import (
+            _find_uuidtext_sibling,
+            is_ios_diagnostics_node,
+        )
+
+        if is_ios_diagnostics_node(node):
+            try:
+                tmp_dir = tempdir.mkdtemp(prefix="crush-open-")
+                self._export_vfs_tree(node, vfs, tmp_dir / "diagnostics")
+                uuidtext_node = _find_uuidtext_sibling(node, vfs)
+                if uuidtext_node is not None:
+                    self._export_vfs_tree(uuidtext_node, vfs, tmp_dir / "uuidtext")
+                elif hasattr(self, "_logger"):
+                    self._logger.warning(
+                        "Send to Peach: no uuidtext sibling found for %s — "
+                        "message strings will not resolve", node.path
+                    )
+                return tmp_dir, tmp_dir
+            except Exception as exc:
+                if hasattr(self, "_logger"):
+                    self._logger.error(
+                        "Send to Peach: materialize failed for %s: %s", node.path, exc
+                    )
+                return None
+
+        return self._materialize_directory_node_for_external(node, vfs)
+
+    def _send_to_peach(self, node: VFSNode, vfs: VFS) -> None:
+        """Hand off a single log source to peach-forensics via a one-shot CLI spawn.
+
+        Offered for AUL sources (a .logarchive bundle or a raw diagnostics
+        folder) and, more broadly, any plain file — mirrors "Open in
+        Multi-Log Studio"'s own long-standing lack of pre-filtering (any
+        file, no extension/content check) rather than trying to guess
+        whether a given file matches one of peach's own TOML text-log
+        configs, which live in peach's per-user data dir and aren't visible
+        to Crush at all. Peach's own manual sourcetype-confirm-before-Load
+        step is the real gate, same as it always is.
+
+        No IPC after launch — peach runs completely independently once
+        started, matching its own design. Directory-backed sources already
+        living on a real filesystem are passed straight through; archive/
+        backup-backed sources are extracted to a temp dir first, with
+        --cleanup-dir telling peach to remove it once peach closes.
+        """
+        resolved = self._resolve_peach_source(node, vfs)
+        if resolved is None:
+            QMessageBox.warning(
+                self,
+                translate("MainWindow", "Send to Peach"),
+                translate("MainWindow", "Unable to materialize source for Peach."),
+            )
+            return
+        source_path, cleanup_dir = resolved
+
+        from crush.core.peach_launcher import launch_peach
+
+        override = self._settings.value("peach_binary_path", "", type=str)
+        try:
+            launch_peach(
+                [source_path],
+                cleanup_dirs=[cleanup_dir] if cleanup_dir else [],
+                override_path=override,
+            )
+            self._status.showMessage(
+                translate("MainWindow", "Sent to Peach: {path}").format(path=node.path)
+            )
+        except (FileNotFoundError, RuntimeError, OSError) as exc:
+            QMessageBox.warning(self, translate("MainWindow", "Send to Peach"), i18n.exception_text(exc))
+
+    # Friendlier labels than crush-analyze's own manifest "name" field,
+    # which is LEAPP's own internal artifact name (e.g. "Application
+    # State"), not written with Crush's UI in mind. Falls back to the
+    # manifest name for any module id not listed here.
+    #
+    # get_installedappsVending and get_package_info both answer "what apps
+    # are/were installed" on Android, from two different sources (Play
+    # Store's own local cache vs. the OS's own /system/packages.xml) -- kept
+    # both, distinctly named, rather than picking one: they can disagree
+    # (e.g. an app installed outside Play Store, or Play Store data that's
+    # since been cleared) and a reader should be able to tell which one a
+    # given result came from.
+    #
+    # Names (context "AnalyzerModule") and relevance texts (context
+    # "AnalyzerKnowledge", disambiguated by module id) are English here and
+    # translated at display; see _analyzer_title / _analyzer_relevance.
+    _ANALYZER_MODULE_DISPLAY_NAMES = {
+        "get_installed_apps": QT_TRANSLATE_NOOP("AnalyzerModule", "Installed Applications (iOS)"),
+        "get_installedappsVending": QT_TRANSLATE_NOOP(
+            "AnalyzerModule", "Installed Applications (Android, Play Store Cache)"
+        ),
+        "get_package_info": QT_TRANSLATE_NOOP(
+            "AnalyzerModule", "Installed Applications (Android, System)"
+        ),
+    }
+
+    # Crush's own curated "what does this result actually tell you" text,
+    # shown in the Properties panel -- the analyzer-module analogue of
+    # formats.db's hand-written forensic_relevance field, not something
+    # pulled from crush-analyze's own manifest (LEAPP's own "description"
+    # field there is a mechanical "what it parses", not this).
+    #
+    # TODO once this grows past a handful of modules: move to a small
+    # dedicated catalog (mirroring crush/data/build_formats_db.py, but a
+    # plain dict/module rather than formats.db's SQLite machinery -- not
+    # worth that for 3 entries) and add a browsable "Analyzer Modules
+    # Reference" dialog (Help menu, alongside "Format Reference…"),
+    # reusing FormatInfoDialog's layout. That's also the natural place to
+    # attach source links per module (e.g. a pointer to the vendored
+    # LEAPP file/upstream commit) instead of only the Properties panel's
+    # existing analyzer.source link, which only appears after a run.
+    _ANALYZER_MODULE_FORENSIC_RELEVANCE = {
+        "get_installed_apps": QT_TRANSLATE_NOOP(
+            "AnalyzerKnowledge",
+            "From applicationState.db's compatibilityInfo per app: bundle ID, bundle "
+            "container path, and sandbox (data) path. Shows which apps were installed and "
+            "where their data lived, which lets you correlate other found artifacts back "
+            "to the app that produced them -- and this state DB can retain an app's entry "
+            "even after the app itself was uninstalled, so it's also a source for apps no "
+            "longer present on the device.",
+            "get_installed_apps",
+        ),
+        "get_installedappsVending": QT_TRANSLATE_NOOP(
+            "AnalyzerKnowledge",
+            "The Play Store client's own local record of what it installed: package name, "
+            "title, first download/last update time, install reason, auto-update setting, "
+            "and the Google account that did the installing. Covers apps Play Store itself "
+            "tracked installing -- an app installed by sideloading, ADB, or a different app "
+            "store is not in this cache, and the cache can be cleared independently of the "
+            "app itself still being installed.",
+            "get_installedappsVending",
+        ),
+        "get_package_info": QT_TRANSLATE_NOOP(
+            "AnalyzerKnowledge",
+            "The OS's own package manager record (/system/packages.xml): install/update "
+            "time, installer and install-originator package, on-disk code path, and "
+            "public/private flags. Present for every installed app regardless of install "
+            "source (Play Store, ADB, sideloading, another app store).",
+            "get_package_info",
+        ),
+    }
+
+    def _analyzer_title(self, analyzer_id: str, fallback_name: str) -> str:
+        """A curated module's name in the UI language; any other module
+        keeps its own (English) name from crush-analyze."""
+        name = self._ANALYZER_MODULE_DISPLAY_NAMES.get(analyzer_id)
+        if name is None:
+            return fallback_name
+        return translate("AnalyzerModule", name)  # i18n: keep -- marked above
+
+    def _analyzer_relevance(self, analyzer_id: str) -> CatalogText | None:
+        text = self._ANALYZER_MODULE_FORENSIC_RELEVANCE.get(analyzer_id)
+        if text is None:
+            return None
+        return CatalogText("AnalyzerKnowledge", text, analyzer_id, knowledge=True)
+
+    def _run_analyzer(self, node: VFSNode, vfs: VFS) -> None:
+        """Runs one bundled crush-analyze module against *node* and shows
+        the result as a new tab. See docs/design/analyzer-runner.md.
+
+        Two blocking steps, each off the UI thread via run_with_busy_dialog:
+        fetching the module list (a subprocess spawn — cached on this window
+        after the first successful fetch, since most sessions never touch
+        this feature and it's not worth doing eagerly at startup) and, once
+        a module is picked, materializing *node* to a real filesystem path
+        (a full recursive extraction for an archive/backup/raw-image-backed
+        source, not just a fast return for an already-real directory) plus
+        the analyzer run itself.
+        """
+        modules = getattr(self, "_analyzer_modules_cache", None)
+        if modules is not None:
+            self._run_analyzer_pick_and_run(node, vfs, modules)
+            return
+
+        from crush.core.analyzer_launcher import list_analyzer_modules
+        from crush.ui.busy_dialog import run_with_busy_dialog
+
+        def _list_done(modules: list[dict]) -> None:
+            self._analyzer_modules_cache = modules
+            self._run_analyzer_pick_and_run(node, vfs, modules)
+
+        def _list_error(message: str) -> None:
+            QMessageBox.warning(
+                self,
+                translate("MainWindow", "Run Analyzer"),
+                translate("MainWindow", "Could not list analyzer modules:\n{message}").format(
+                    message=message
+                ),
+            )
+
+        run_with_busy_dialog(
+            self,
+            translate("MainWindow", "Loading analyzer modules…"),
+            list_analyzer_modules,
+            _list_done,
+            _list_error,
+        )
+
+    def _open_analyzer_result_tab(self, node: VFSNode, result: dict, module_id: str) -> None:
+        """Shared by both the curated and dev-mode Run Analyzer paths --
+        the whole point of contract v1 is one display path for every
+        module, curated or not."""
+        from crush.viewers.analyzer_result_viewer import AnalyzerResultViewer
+        viewer = AnalyzerResultViewer(result, self)
+        analyzer_id = result.get("analyzer", {}).get("id", module_id)
+        fallback_name = result.get("analyzer", {}).get("name", module_id)
+        title = self._analyzer_title(analyzer_id, fallback_name)
+        relevance = self._analyzer_relevance(analyzer_id)
+        viewer.setProperty("crush_analyzer_result", result)
+        viewer.setProperty("crush_analyzer_title", title)
+        viewer.setProperty("crush_analyzer_relevance", relevance)
+        idx = self._viewer_tabs.addTab(viewer, title)
+        self._viewer_tabs.setCurrentIndex(idx)
+        self._show_viewer_tabs()
+        self._props_panel.show_analyzer_result(result, title, relevance)
+        status = result.get("status", "ok")
+        self._status.showMessage(
+            translate("MainWindow", "{path}  [Analyzer: {title} — {status}]").format(
+                path=node.path, title=title, status=status
+            )
+        )
+
+    def _run_analyzer_pick_and_run(
+        self, node: VFSNode, vfs: VFS, modules: list[dict]
+    ) -> None:
+        from crush.core.analyzer_launcher import CURATED_MODULE_IDS
+        from crush.ui.busy_dialog import run_with_busy_dialog
+
+        curated = [m for m in modules if m["id"] in CURATED_MODULE_IDS]
+        if not curated:
+            QMessageBox.information(
+                self,
+                translate("MainWindow", "Run Analyzer"),
+                translate("MainWindow", "No analyzer modules are available."),
+            )
+            return
+
+        labels = [
+            f"{self._analyzer_title(m['id'], m['name'])} ({m['id']})"
+            for m in curated
+        ]
+
+        label, ok = QInputDialog.getItem(
+            self,
+            translate("MainWindow", "Run Analyzer"),
+            translate("MainWindow", "Module:"),
+            labels,
+            0,
+            editable=False,
+        )
+        if not ok:
+            return
+
+        selected = curated[labels.index(label)]
+        module_id = selected["id"]
+        # Only the last path segment of each declared glob -- see
+        # _materialize_matching_files_for_external's docstring for why a
+        # filename-only match is used instead of reproducing the full
+        # multi-segment pattern here too.
+        filename_patterns = [str(p).rsplit("/", 1)[-1] for p in selected.get("paths", ["*"])] or ["*"]
+
+        def _work() -> dict:
+            from crush.core.analyzer_launcher import run_analyzer
+            resolved = self._materialize_matching_files_for_external(node, vfs, filename_patterns)
+            if resolved is None:
+                raise RuntimeError(
+                    translate("MainWindow", "Unable to materialize source for the analyzer.")
+                )
+            source_path, cleanup_dir = resolved
+            try:
+                return run_analyzer(source_path, module_id=module_id)
+            finally:
+                if cleanup_dir is not None:
+                    shutil.rmtree(cleanup_dir, ignore_errors=True)
+
+        def _on_done(result: dict) -> None:
+            self._open_analyzer_result_tab(node, result, module_id)
+
+        def _on_error(message: str) -> None:
+            QMessageBox.warning(
+                self,
+                translate("MainWindow", "Run Analyzer"),
+                translate("MainWindow", "Analyzer failed:\n{message}").format(message=message),
+            )
+
+        run_with_busy_dialog(
+            self,
+            translate("MainWindow", "Running {label}…").format(label=label),
+            _work,
+            _on_done,
+            _on_error,
+        )
+
+    def _send_to_peach_batch(self, items: list[tuple[VFSNode, VFS]]) -> None:
+        """Hand off multiple log sources to peach in a single spawn (multiple
+        --add-source flags), so they land in the same session for
+        correlation — used for both a multi-selection in the tree and the
+        recursive-folder discovery flow.
+
+        Failures on individual items are collected and reported together at
+        the end rather than one dialog per failure; sources that resolved
+        fine are still sent even if others in the batch failed.
+        """
+        from crush.core.peach_launcher import launch_peach
+
+        sources: list[Path] = []
+        cleanup_dirs: list[Path] = []
+        failed: list[str] = []
+
+        for node, vfs in items:
+            resolved = self._resolve_peach_source(node, vfs)
+            if resolved is None:
+                failed.append(node.path)
+                continue
+            source_path, cleanup_dir = resolved
+            sources.append(source_path)
+            if cleanup_dir is not None:
+                cleanup_dirs.append(cleanup_dir)
+
+        if not sources:
+            QMessageBox.warning(
+                self,
+                translate("MainWindow", "Send to Peach"),
+                translate(
+                    "MainWindow", "Unable to materialize any of the selected sources for Peach."
+                ),
+            )
+            return
+
+        override = self._settings.value("peach_binary_path", "", type=str)
+        try:
+            launch_peach(
+                sources,
+                cleanup_dirs=cleanup_dirs,
+                override_path=override,
+            )
+            msg = translate("MainWindow", "Sent {count} source(s) to Peach").format(
+                count=len(sources)
+            )
+            if failed:
+                msg += translate("MainWindow", "  ({count} skipped)").format(count=len(failed))
+            self._status.showMessage(msg)
+            if failed:
+                QMessageBox.warning(
+                    self, translate("MainWindow", "Send to Peach"),
+                    translate(
+                        "MainWindow", "Some sources could not be materialized and were skipped:"
+                    )
+                    + "\n"
+                    + "\n".join(failed),
+                )
+        except (FileNotFoundError, RuntimeError, OSError) as exc:
+            QMessageBox.warning(self, translate("MainWindow", "Send to Peach"), i18n.exception_text(exc))
+
+    def _send_biome_to_peach(
+        self, root: VFSNode, vfs: VFS, selected: list[VFSNode]
+    ) -> None:
+        """Hand off discovered SEGB files to peach as one recursive source,
+        preserving each file's path relative to *root*.
+
+        Unlike _send_to_peach_batch (which flattens each file to its own
+        independent top-level source), keeping the directory structure
+        intact is what lets peach -- and Crush's own SEGB parser via
+        _stream_name() -- derive each file's Biome stream name from its
+        parent directory, regardless of which Biome root it came from.
+
+        The materialized tree is nested one level under a synthetic
+        `biome/streams/` wrapper (rather than handed off as the bare
+        mkdtemp() root) so the path peach receives structurally ends in
+        `.../biome/streams`, matching the suffix peach's own CLI source-kind
+        heuristic (`source_kind_for_path` in peach's app.rs) requires to
+        default the newly-added source to Biome instead of falling back to
+        its AUL default. Peach's actual SEGB detection only inspects each
+        file's last 2-3 path components (`<Stream>/local|remote/<file>`),
+        so this wrapper is purely to satisfy that CLI heuristic -- it
+        doesn't need to reflect where "streams" actually sat under *root*.
+        """
+        tmp_root = tempdir.mkdtemp(prefix="crush-biome-")
+        streams_dir = tmp_root / "biome" / "streams"
+        root_prefix = root.path.replace("\\", "/").rstrip("/") + "/"
+        try:
+            for src_node in selected:
+                node_path = src_node.path.replace("\\", "/")
+                rel = (
+                    node_path[len(root_prefix):]
+                    if node_path.startswith(root_prefix)
+                    else src_node.name
+                )
+                target = streams_dir / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with vfs.open(src_node) as src, open(target, "wb") as out:
+                    shutil.copyfileobj(src, out)
+        except Exception as exc:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+            QMessageBox.warning(
+                self,
+                translate("MainWindow", "Send Biome Streams to Peach"),
+                translate("MainWindow", "Unable to materialize files for Peach: {exc}").format(
+                    exc=exc
+                ),
+            )
+            return
+
+        from crush.core.peach_launcher import launch_peach
+
+        override = self._settings.value("peach_binary_path", "", type=str)
+        try:
+            launch_peach([streams_dir], cleanup_dirs=[tmp_root], override_path=override)
+            self._status.showMessage(
+                translate(
+                    "MainWindow", "Sent {selected_count} Biome file(s) to Peach: {path}"
+                ).format(selected_count=len(selected), path=root.path)
+            )
+        except (FileNotFoundError, RuntimeError, OSError) as exc:
+            QMessageBox.warning(
+                self, translate("MainWindow", "Send Biome Streams to Peach"), str(exc)
+            )
+
+    def _set_temp_dir(self) -> None:
+        current = self._settings.value(extract_dialog.TEMP_DIR_SETTING, "", type=str)
+        text, ok = QInputDialog.getText(
+            self,
+            translate("MainWindow", "Temp Directory"),
+            translate(
+                "MainWindow",
+                "Directory for temporary files: extracted archive members, database "
+                "copies, log conversion, ... Point this at a disk with plenty of free "
+                "space — the OS default (often /tmp) may be RAM-backed.\n"
+                "Leave blank to use the OS default:",
+            ),
+            QLineEdit.EchoMode.Normal,
+            current,
+        )
+        if ok:
+            self._settings.setValue(extract_dialog.TEMP_DIR_SETTING, text.strip())
+            tempdir.configure(text.strip())
+
+    def _set_peach_binary_path(self) -> None:
+        current = self._settings.value("peach_binary_path", "", type=str)
+        text, ok = QInputDialog.getText(
+            self,
+            translate("MainWindow", "Peach Binary Path"),
+            translate("MainWindow", "Path to a peach-forensics executable to use instead of the "
+            "version bundled with Crush (leave blank to use the bundled one):"),
+            QLineEdit.EchoMode.Normal,
+            current,
+        )
+        if ok:
+            self._settings.setValue("peach_binary_path", text.strip())
+
+    def _open_peach_standalone(self) -> None:
+        """Launch peach with no source pre-filled — same binary/override
+        resolution as Send to Peach, just without a file to hand off."""
+        from crush.core.peach_launcher import launch_peach
+
+        override = self._settings.value("peach_binary_path", "", type=str)
+        try:
+            launch_peach([], override_path=override)
+            self._status.showMessage(translate("MainWindow", "Opened Peach"))
+        except (FileNotFoundError, RuntimeError) as exc:
+            QMessageBox.warning(self, translate("MainWindow", "Open Peach"), i18n.exception_text(exc))
+
+    def _open_local_file(self, path: str | Path) -> None:
+        from crush.ui import open_url
+        open_url(QUrl.fromLocalFile(str(path)).toString())
+
+    def _open_external_with_app(self, path: Path) -> None:
+        title = translate("MainWindow", "Choose application")
+        app_path, _ = QFileDialog.getOpenFileName(
+            self, title, "", translate("MainWindow", "Applications") + " (*)"
+        )
+        if not app_path:
+            return
+        try:
+            if sys.platform.startswith("win"):
+                subprocess.Popen([app_path, str(path)], close_fds=True)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-a", app_path, str(path)])
+            else:
+                subprocess.Popen([app_path, str(path)])
+        except Exception as exc:
+            QMessageBox.warning(self, translate("MainWindow", "Open External"), i18n.exception_text(exc))
+
+    def _on_node_selected(self, node: VFSNode, vfs: VFS) -> None:
+        metadata: dict[str, str] = {
+            "Type": "Directory" if node.is_dir else "File",
+        }
+        if node.is_dir:
+            metadata["Files"] = f"{vfs.file_count(node):,}"
+            metadata["Total size"] = _format_size(vfs.total_size(node))
+            # A UFDR holds only part of the extraction: how many of the
+            # folder's files Cellebrite counted there, and how many it holds.
+            # A UFD/UFDX: what it records, on its root and each extraction.
+            from crush.core.ufd import UFDVFS, UFDXVFS
+            from crush.core.vfs import UFDRVFS
+
+            if isinstance(vfs, (UFDRVFS, UFDVFS, UFDXVFS)):
+                metadata.update(vfs.node_info(node) or {})
+        else:
+            metadata["Size"] = _format_size(node.size)
+        if node.status:
+            metadata["Entry status"] = node.status
+        self._props_panel.update_properties(node, metadata, vfs)
+
+    def _wrap_with_encryption_banner(self, view: QWidget, hint: str) -> QWidget:
+        """Prepend a prominent banner above *view* -- used when a parser's
+        metadata carries "Possibly Encrypted" (see pdf_parser.py /
+        realm_parser.py). The Properties panel already lists this metadata
+        too, but that's easy to miss; this puts it directly in the tab
+        content, impossible to miss, without popping up an interrupting
+        dialog on every double-click of an encrypted file."""
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        banner = QLabel(
+            translate("MainWindow", "🔒 This file appears to be encrypted. {hint}").format(
+                hint=hint
+            )
+        )
+        banner.setWordWrap(True)
+        banner.setStyleSheet(
+            "color: white; background-color: #c87000; font-weight: bold;"
+            " padding: 6px 10px;"
+        )
+        layout.addWidget(banner)
+        layout.addWidget(view)
+        return container
+
+    def _open_otherwise_hint(
+        self, node: VFSNode, vfs: VFS, *, probe_archive: bool
+    ) -> tuple[str, _HintBanner | None]:
+        """What the status bar says about how this file or its source opens
+        otherwise (the source's fallback_note, else _open_as_source_hint),
+        and the banner for it: only when the note is about the opened file
+        itself -- a note about a whole source (an AFF4 shown as its ZIP, a
+        sparse bundle shown as its folder) would repeat on every file opened
+        from it, and stays in the status bar. ("", None) when there is
+        nothing to say."""
+        buttons: list[tuple[str, Callable[[], None]]] = []
+        fallback_note = getattr(vfs, "fallback_note", "")
+        if fallback_note:
+            text = render_value(fallback_note, localized=True)
+            if not isinstance(vfs, FileVFS):
+                return text, None
+            # The file opens otherwise: added to this window, as Open Disk
+            # Image… / Open file… would load it.
+            image_path = vfs.disk_image_path
+            if image_path is not None:
+                buttons.append((
+                    translate("MainWindow", "Open as Disk Image"),
+                    lambda: self._load_source(
+                        str(image_path), open_after_load=True, append_to_tree=True,
+                        as_disk_image=True,
+                    ),
+                ))
+            zip_path = vfs.embedded_zip_path
+            if zip_path is not None:
+                buttons.append((
+                    translate("MainWindow", "Open the ZIP Archive"),
+                    lambda: self._load_source(
+                        str(zip_path), open_after_load=True, append_to_tree=True,
+                        embedded_zip=True,
+                    ),
+                ))
+            return text, (text, buttons)
+        hint = _source_hint(node, vfs, probe_archive=probe_archive)
+        if hint is None:
+            return "", None
+        if hint.action == "browse":
+            buttons.append((
+                translate("FilesystemPanel", "Open in New Window"),
+                lambda: self._open_in_new_window(node, vfs),
+            ))
+        elif hint.action == "disk_image":
+            buttons.append((
+                translate("FilesystemPanel", "Open Disk Image in New Window"),
+                lambda: self._open_in_new_window(node, vfs, as_disk_image=True),
+            ))
+        return hint.text, (hint.text, buttons)
+
+    def _wrap_with_hint_banner(self, view: QWidget, banner_spec: _HintBanner) -> QWidget:
+        """Prepend a banner above *view* with the status bar's hint on how
+        this file opens otherwise, and a button for each way offered -- as
+        the encryption banner does, the hint is in the tab itself rather
+        than only in the status bar, where it is easy to miss."""
+        text, buttons = banner_spec
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        bar = QWidget()
+        bar.setObjectName("source_hint_banner")
+        bar.setStyleSheet(
+            "#source_hint_banner { background-color: #2d6aa3; }"
+            " #source_hint_banner QLabel { color: white; font-weight: bold; }"
+        )
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(10, 6, 10, 6)
+        label = QLabel(text)
+        label.setTextFormat(Qt.TextFormat.PlainText)
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        row.addWidget(label, 1)
+        for caption, callback in buttons:
+            button = QPushButton(caption)
+            button.clicked.connect(lambda _checked=False, cb=callback: cb())
+            row.addWidget(button)
+        layout.addWidget(bar)
+        layout.addWidget(view)
+        return container
+
+    def _show_result(
+        self, node: VFSNode, result: ParseResult, vfs: VFS,
+        hint_banner: _HintBanner | None = None,
+    ) -> None:
+        from crush.ui.viewer_factory import make_viewer
+        base_view = make_viewer(result, node, vfs, self)
+        # What nested widgets (e.g. the BLOB Inspector) name as their source.
+        from crush.viewers.open_bytes import SOURCE_PATH_PROPERTY
+        base_view.setProperty(SOURCE_PATH_PROPERTY, node.path)
+        if hasattr(base_view, "open_bytes_requested"):
+            base_view.open_bytes_requested.connect(
+                lambda data, name, source_path=node.path: self._open_bytes_as_artifact(
+                    data, name, source_path
+                )
+            )
+        if hasattr(base_view, "open_bytes_with_format_requested"):
+            base_view.open_bytes_with_format_requested.connect(
+                lambda data, name, fmt, extra_metadata, source_path=node.path: self._open_bytes_with_format(
+                    data, name, fmt, source_path, extra_metadata
+                )
+            )
+        if hasattr(base_view, "open_table_requested"):
+            base_view.open_table_requested.connect(self._open_table_as_tab)
+        possibly_encrypted = result.metadata.get("Possibly Encrypted")
+        if possibly_encrypted:
+            base_view = self._wrap_with_encryption_banner(base_view, possibly_encrypted)
+        elif hint_banner is not None:
+            base_view = self._wrap_with_hint_banner(base_view, hint_banner)
+        widget: QWidget = base_view
+        if self._always_hex:
+            hex_bytes, why = self._read_hex_bytes(vfs, node)
+            if hex_bytes is not None:
+                from crush.viewers.hex_viewer import HexViewer
+                tabbed = QTabWidget()
+                tabbed.addTab(base_view, translate("MainWindow", "View"))
+                tabbed.addTab(HexViewer(hex_bytes, tabbed), translate("MainWindow", "Hex"))
+                widget = tabbed
+            else:
+                tabbed = QTabWidget()
+                tabbed.addTab(base_view, translate("MainWindow", "View"))
+                label = QLabel(
+                    translate("MainWindow", "Unable to load hex view: {reason}").format(reason=why)
+                )
+                label.setWordWrap(True)
+                tabbed.addTab(label, translate("MainWindow", "Hex"))
+                widget = tabbed
+
+        existing_idx = -1
+        for i in range(self._viewer_tabs.count()):
+            w = self._viewer_tabs.widget(i)
+            if w is None:
+                continue
+            if (
+                w.property("crush_path") == node.path
+                and w.property("crush_viewer") == result.viewer_type
+            ):
+                existing_idx = i
+                break
+        if existing_idx >= 0:
+            self._viewer_tabs.setCurrentIndex(existing_idx)
+            return
+        widget.setProperty("crush_path", node.path)
+        widget.setProperty("crush_name", node.name)
+        widget.setProperty("crush_viewer", result.viewer_type)
+        widget.setProperty("crush_display_format", self._display_format_label(result))
+        source_path = self._virtual_source_path(node, vfs)
+        if source_path:
+            widget.setProperty("crush_source_path", source_path)
+        widget.setProperty("crush_vfs", vfs)
+        widget.setProperty("crush_node", node)
+        # Wrapped: a dict as a Qt property comes back as a QVariantMap,
+        # its keys sorted -- the panel's rows would change order.
+        widget.setProperty("crush_metadata", _TabMetadata(result.metadata))
+        idx = self._viewer_tabs.addTab(widget, self._tab_base_label(node))
+        self._viewer_tabs.setCurrentIndex(idx)
+        self._refresh_tab_labels()
+
+    def _close_tab(self, index: int) -> None:
+        self._viewer_tabs.removeTab(index)
+        self._props_panel.clear()
+        self._refresh_tab_labels()
+
+    def _close_all_tabs(self) -> None:
+        self._viewer_tabs.clear()
+        self._props_panel.clear()
+        self._refresh_tab_labels()
+
+    def _close_other_tabs(self, keep_index: int) -> None:
+        keep_widget = self._viewer_tabs.widget(keep_index)
+        for i in range(self._viewer_tabs.count() - 1, -1, -1):
+            if self._viewer_tabs.widget(i) is not keep_widget:
+                self._viewer_tabs.removeTab(i)
+        self._props_panel.clear()
+        self._refresh_tab_labels()
+
+    def _display_format_label(self, result: ParseResult) -> str:
+        """Properties-panel text for how the file is shown (UI language;
+        format names stay as they are)."""
+        if result.viewer_type == "hex":
+            return translate("MainWindow", "Hex")
+        if result.viewer_type == "text":
+            return translate("MainWindow", "Text")
+        if result.viewer_type == "multi_log":
+            return "Multi-Log"
+        if result.viewer_type == "protobuf":
+            return translate("MainWindow", "Protobuf (schema-less)")
+        if result.metadata.get("Format"):
+            return render_value(result.metadata["Format"], localized=True)
+        labels = {
+            "abx": "Android Binary XML (ABX)",
+            "image": translate("MainWindow", "Image"),
+            "leveldb": "LevelDB",
+            "log": translate("MainWindow", "Log"),
+            "media": translate("MainWindow", "Media"),
+            "pdf": "PDF",
+            "realm": "Realm Database",
+            "table": translate("MainWindow", "Table"),
+            "tree": translate("MainWindow", "Tree"),
+            "tree_text": translate("MainWindow", "Tree/Text"),
+        }
+        return labels.get(result.viewer_type, result.viewer_type)
+
+    def _tab_base_label(self, node: VFSNode) -> str:
+        path_name = Path(node.path).name
+        return path_name or node.name or node.path
+
+    def _virtual_source_path(self, node: VFSNode, vfs: VFS) -> str:
+        if not node.path.startswith("/virtual/"):
+            return ""
+        source_path = getattr(vfs, "source_path", "")
+        return str(source_path) if source_path else ""
+
+    def _refresh_tab_labels(self) -> None:
+        path_counts: dict[str, int] = {}
+        for i in range(self._viewer_tabs.count()):
+            widget = self._viewer_tabs.widget(i)
+            if widget is None:
+                continue
+            path = str(widget.property("crush_path") or "")
+            path_counts[path] = path_counts.get(path, 0) + 1
+
+        for i in range(self._viewer_tabs.count()):
+            widget = self._viewer_tabs.widget(i)
+            if widget is None:
+                continue
+            path = str(widget.property("crush_path") or "")
+            label = str(widget.property("crush_name") or Path(path).name or path)
+            display_format = str(widget.property("crush_display_format") or "")
+            if path_counts.get(path, 0) > 1 and display_format:
+                label = f"{label} [{display_format}]"
+            self._viewer_tabs.setTabText(i, label)
+
+            tooltip = [f"Path: {path}"]
+            if display_format:
+                tooltip.append(f"Display format: {display_format}")
+            source_path = str(widget.property("crush_source_path") or "")
+            if source_path:
+                tooltip.append(f"Source: {source_path}")
+            self._viewer_tabs.setTabToolTip(i, "\n".join(tooltip))
+
+    def _show_tab_context_menu(self, pos: object) -> None:
+        tab_bar = self._viewer_tabs.tabBar()
+        index = tab_bar.tabAt(pos)  # type: ignore[arg-type]
+        if index < 0:
+            return
+        menu = QMenu(self)
+        close_action = menu.addAction(translate("MainWindow", "Close"))
+        close_others_action = menu.addAction(translate("MainWindow", "Close Others"))
+        close_others_action.setEnabled(self._viewer_tabs.count() > 1)
+        close_all_action = menu.addAction(translate("MainWindow", "Close All"))
+        action = menu.exec(tab_bar.mapToGlobal(pos))  # type: ignore[arg-type]
+        if action == close_action:
+            self._close_tab(index)
+        elif action == close_others_action:
+            self._close_other_tabs(index)
+        elif action == close_all_action:
+            self._close_all_tabs()
+
+    def _populate_tab_list_menu(self) -> None:
+        self._tab_list_menu.clear()
+        metrics = QFontMetrics(self._tab_list_menu.font())
+        current = self._viewer_tabs.currentIndex()
+        for i in range(self._viewer_tabs.count()):
+            full_label = self._viewer_tabs.tabText(i)
+            elided = metrics.elidedText(full_label, Qt.TextElideMode.ElideMiddle, 500)
+            menu_action = self._tab_list_menu.addAction(elided)
+            menu_action.setToolTip(self._viewer_tabs.tabToolTip(i))
+            menu_action.setData(i)
+            menu_action.setCheckable(True)
+            menu_action.setChecked(i == current)
+
+    def _on_tab_list_menu_triggered(self, action: QAction) -> None:
+        index = action.data()
+        if isinstance(index, int) and 0 <= index < self._viewer_tabs.count():
+            self._viewer_tabs.setCurrentIndex(index)
+
+    def _close_tabs_for_vfs(self, vfs: VFS) -> int:
+        closed = 0
+        for i in range(self._viewer_tabs.count() - 1, -1, -1):
+            w = self._viewer_tabs.widget(i)
+            if w is None:
+                continue
+            if w.property("crush_vfs") is vfs:
+                self._viewer_tabs.removeTab(i)
+                closed += 1
+        if closed:
+            self._refresh_tab_labels()
+        return closed
+
+    def _close_source(self, vfs: VFS) -> None:
+        closed_tabs = self._close_tabs_for_vfs(vfs)
+        self._props_panel.clear()
+        self._fs_panel.close_vfs(vfs)
+        self.session.remove_source(vfs)
+        self._update_window_title()
+        name = vfs.root().name
+        self._status.showMessage(
+            translate("MainWindow", "Closed source: {name} ({closed_tabs} tabs closed)").format(
+                name=name, closed_tabs=closed_tabs
+            )
+        )
+        if not self.session.sources:
+            self._show_empty_view()
+
+    def _show_empty_view(self) -> None:
+        self._rebuild_welcome_recent()
+        self._central_stack.setCurrentWidget(self._empty_view)
+
+    def _rebuild_welcome_recent(self) -> None:
+        while self._recent_on_welcome.count():
+            item = self._recent_on_welcome.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        recent: list[str] = self._settings.value("recent_files", [], type=list)
+        if not recent:
+            return
+        header = QLabel(translate("MainWindow", "Recently opened: "))
+        header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._recent_on_welcome.addWidget(header)
+        container = QWidget()
+        container.setFixedWidth(480)
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(4)
+        images = self._recent_disk_images()
+        for path in recent[:10]:
+            btn = _RecentFileButton(path, as_disk_image=path in images)
+            btn.opened.connect(self._load_recent)
+            container_layout.addWidget(btn)
+        self._recent_on_welcome.addWidget(container, alignment=Qt.AlignmentFlag.AlignHCenter)
+
+    def _show_empty_view_if_no_sources(self, _vfs: VFS) -> None:
+        if not self._fs_panel._vfs_list:
+            self._show_empty_view()
+
+    def _show_viewer_tabs(self) -> None:
+        self._central_stack.setCurrentWidget(self._viewer_tabs)
+    def _update_window_title(self) -> None:
+        sources = self._fs_panel._vfs_list
+        app_title = f"Crush {crush.display_version()}"
+        if not sources:
+            self.setWindowTitle(app_title)
+            return
+
+        source_name = sources[-1].root().name
+        origin = getattr(self, "_source_origin", "")
+        if origin and len(sources) == 1:
+            self.setWindowTitle(
+                translate("MainWindow", "{source_name}  [from {origin}] — {app_title}").format(
+                    source_name=source_name, origin=origin, app_title=app_title
+                )
+            )
+        elif len(sources) == 1:
+            self.setWindowTitle(
+                f"{source_name} — {app_title}"  # i18n: keep -- markup/layout only
+            )
+        else:
+            self.setWindowTitle(
+                f"{source_name} (+{len(sources) - 1}) — {app_title}"  # i18n: keep -- layout only
+            )
+
+    def _enrich_with_format_info(self, parser: object, node: VFSNode, vfs: VFS, result: object) -> object:
+        """Prepend format knowledge-base metadata to a ParseResult without overriding parser data."""
+        try:
+            from crush.core.format_db import FormatDatabase
+            from crush.core.vfs import LogicalEvidenceVFS, RawImageVFS, UFDRVFS
+            from crush.parsers.base import ParseResult
+
+            fmt_meta: dict = {}
+
+            # Anything about this entry its name and bytes don't show (a
+            # symbolic link, one of several same-named entries, a directory
+            # that couldn't be listed) -- set by the VFS while building the
+            # tree, for every source type alike.
+            if node.status:
+                fmt_meta["Entry status"] = node.status
+
+            # A raw disk image/EWF region that isn't a walked file (an
+            # unallocated gap, or a partition whose filesystem is
+            # recognised but has no reader) would otherwise look like an
+            # ordinary, unremarkable file here -- this project's rule is
+            # that unsupported content must always carry an explicit
+            # status instead.
+            if isinstance(vfs, RawImageVFS):
+                vol_info = vfs.volume_info(node)
+                if vol_info is not None:
+                    fmt_meta["Filesystem"] = vol_info["kind"] or "unknown"
+                    fmt_meta["Status"] = vol_info["note"] or ParseIssue("entry.raw_no_reader")
+                    if "original_folder" in vol_info:
+                        fmt_meta["Original folder"] = vol_info["original_folder"]
+
+            # Cellebrite's own recorded MD5/SHA-256/category for this node,
+            # plus an explicit status if its bytes couldn't be located in
+            # the UFDR container -- same "never silent" rule as above.
+            if isinstance(vfs, UFDRVFS):
+                node_info = vfs.node_info(node)
+                if node_info:
+                    fmt_meta.update(node_info)
+
+            # What logical evidence records about the entry: the hashes its
+            # acquisition tool took ("not recorded" when it took none), the
+            # values it stores beside them.
+            if isinstance(vfs, LogicalEvidenceVFS):
+                entry_info = vfs.node_info(node)
+                if entry_info:
+                    fmt_meta.update(entry_info)
+
+            # A parser that reads several formats (images, media, ...) has an
+            # entry per format: the file's bytes pick among them, and when
+            # they don't single one out, that is said -- never another
+            # format's knowledge in its place.
+            db = FormatDatabase.get()
+            peek = vfs.peek(node, _FORMAT_PEEK_BYTES)
+            matches = db.for_parser(type(parser).__name__, peek) if parser else []
+            if not matches:
+                matches = db.top_matches(peek)
+            fmt = matches[0] if len(matches) == 1 else None
+            if len(matches) > 1:
+                fmt_meta["Format (identified)"] = ParseIssue(
+                    "entry.format_not_singled_out",
+                    {"candidates": ", ".join(m.name for m in matches)},
+                )
+            if fmt is not None:
+                fmt_meta["Format"] = fmt.name
+                if fmt.platforms:
+                    fmt_meta["Platforms"] = fmt.platforms.replace(",", ", ")
+                if fmt.forensic_relevance:
+                    fmt_meta["Forensic relevance"] = fmt.relevance_text()
+            if not fmt_meta:
+                return result
+            # Parser metadata takes precedence over format defaults
+            merged = {**fmt_meta, **result.metadata}  # type: ignore[union-attr]
+            return ParseResult(
+                result.viewer_type,  # type: ignore[union-attr]
+                result.data,  # type: ignore[union-attr]
+                result.sub_nodes,  # type: ignore[union-attr]
+                merged,
+                result.text_index,  # type: ignore[union-attr]
+                result.viewer_hints,  # type: ignore[union-attr]
+            )
+        except Exception:
+            return result
+
+    def _show_format_info(self, node: VFSNode, vfs: VFS) -> None:
+        """Show a format info popup and also update the Properties panel."""
+        self._prepare_entry(node, vfs)
+        try:
+            from crush.core.format_db import FormatDatabase
+            from crush.ui.format_info_dialog import FormatInfoDialog
+            peek = vfs.peek(node, _FORMAT_PEEK_BYTES)
+            matches = FormatDatabase.get().top_matches(peek)
+            fmt = matches[0] if len(matches) == 1 else None
+            if not matches:
+                from crush.core.magic import detect_fast_label
+                label = detect_fast_label(peek, node.path or node.name)
+                if label:
+                    fmt = FormatDatabase.get().by_short_name(label)
+            candidates = matches if len(matches) > 1 else []
+            dlg = FormatInfoDialog(node, fmt, self, candidates)
+            dlg.exec()
+            # Also update the Properties panel
+            if fmt:
+                meta: dict = {"Format": fmt.name}
+                if fmt.category:
+                    meta["Category"] = fmt.category_text()
+                if fmt.platforms:
+                    meta["Platforms"] = fmt.platforms.replace(",", ", ")
+                if fmt.forensic_relevance:
+                    meta["Forensic relevance"] = fmt.relevance_text()
+                meta["Parser support"] = (
+                    translate("MainWindow", "Supported")
+                    if fmt.parser_class
+                    else translate("MainWindow", "Not yet supported")
+                )
+                self._props_panel.update_properties(node, meta, vfs)
+                self._props_dock.show()
+                self._props_dock.raise_()
+        except Exception as exc:
+            self._status.showMessage(
+                translate("MainWindow", "Format info error: {exc}").format(exc=exc)
+            )
+
+    def _show_format_reference(self) -> None:
+        from crush.ui.format_reference import FormatReferenceDialog
+        FormatReferenceDialog(self).show()
+
+    def _about(self) -> None:
+        from crush.ui.about_dialog import AboutDialog
+        AboutDialog(self).exec()
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        handle = self.windowHandle()
+        if handle is not None:
+            self._drop_overlay.watch_window(handle)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        # Reached only if the window's own drag events weren't seen
+        # (watch_window): the overlay takes the drag from here on.
+        paths = local_paths(event.mimeData())
+        if paths:
+            self._drop_overlay.activate(paths)
+            event.acceptProposedAction()
+
+    # Should the window stay the drag's target, the overlay (covering it at
+    # the same coordinates) decides: a drag the window takes is never one
+    # that silently drops nothing.
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:
+        self._drop_overlay.dragMoveEvent(event)
+
+    def dragLeaveEvent(self, event: QDragLeaveEvent) -> None:
+        self._drop_overlay.deactivate()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        self._drop_overlay.dropEvent(event)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self._status.showMessage(translate("MainWindow", "Closing…"))
+        if hasattr(self, "_logger"):
+            self._logger.info("Closing application")
+
+        if self._thread_is_running(getattr(self, "_load_thread", None)):
+            self._load_thread.quit()
+            self._load_thread.wait(2000)
+        if self._thread_is_running(getattr(self, "_export_thread", None)):
+            self._export_thread.quit()
+            self._export_thread.wait(2000)
+
+        try:
+            self.session.close()
+        except Exception as exc:
+            if hasattr(self, "_logger"):
+                self._logger.error("Error during shutdown: %s", exc)
+
+        # Best-effort cleanup for temp files created for external open.
+        for tmp_path in getattr(self, "_external_temp_paths", []):
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+                if tmp_path.parent.exists():
+                    tmp_path.parent.rmdir()
+            except Exception:
+                pass
+
+        event.accept()
+
+    def _reset_panel_layout(self) -> None:
+        for dock, area in (
+            (self._fs_dock, Qt.DockWidgetArea.LeftDockWidgetArea),
+            (self._props_dock, Qt.DockWidgetArea.RightDockWidgetArea),
+            (self._log_dock, Qt.DockWidgetArea.BottomDockWidgetArea),
+        ):
+            try:
+                self._dock_to_default(dock)
+                dock.show()
+            except Exception:
+                continue
+
+    def _on_spinner_tick(self) -> None:
+        self._spinner_idx = (self._spinner_idx + 1) % len(self._spinner_chars)
+        self._spinner_label.setText(self._spinner_chars[self._spinner_idx])
+
+    def _on_background_status(self, text: str) -> None:
+        if not text:
+            self._spinner_timer.stop()
+            self._spinner_label.setVisible(False)
+            self._bg_status.setVisible(False)
+            self._bg_status.setText("")
+            self._bg_status.setToolTip("")
+            return
+        self._bg_status.setText(text)
+        self._bg_status.setToolTip(text)
+        self._bg_status.setVisible(True)
+        self._spinner_label.setVisible(True)
+        if not self._spinner_timer.isActive():
+            self._spinner_timer.start()
+
+    def _sync_dock_titlebar(self, dock: QDockWidget, floating: bool) -> None:
+        # On Wayland (native or XWayland) the compositor owns window decorations
+        # including resize handles. A custom title bar strips them entirely.
+        _on_wayland = (
+            QGuiApplication.platformName() == "wayland"
+            or os.environ.get("XDG_SESSION_TYPE") == "wayland"
+            or bool(os.environ.get("WAYLAND_DISPLAY"))
+        )
+        if _on_wayland:
+            if floating:
+                dock.setWindowFlag(Qt.WindowType.Window, True)
+                dock.show()
+            else:
+                dock.setWindowFlag(Qt.WindowType.Window, False)
+            return
+        if floating:
+            dock.setTitleBarWidget(_DockTitleBar(dock.windowTitle(), dock))
+        else:
+            dock.setTitleBarWidget(None)
+
+    def _dock_to_default(self, dock: QDockWidget) -> None:
+        area = self._dock_defaults.get(dock, Qt.DockWidgetArea.LeftDockWidgetArea)
+        if dock.isFloating():
+            dock.setFloating(False)
+        self.addDockWidget(area, dock)
+
+    def _thread_is_running(self, thread: QThread | None) -> bool:
+        if thread is None:
+            return False
+        if not isValid(thread):
+            return False
+        try:
+            return thread.isRunning()
+        except RuntimeError:
+            return False
+
+    def _on_load_thread_finished(self) -> None:
+        self._load_thread = None
+        if getattr(self, "_load_queue_holds", 0):
+            # A dialog about the source just loaded is open: started when
+            # it is answered (_hold_load_queue).
+            if self._load_queue:
+                self._queued_load_due = True
+            return
+        self._start_next_queued_load()
+
+    def _start_next_queued_load(self) -> None:
+        if self._thread_is_running(getattr(self, "_load_thread", None)):
+            return  # its end starts the next one
+        if self._load_queue:
+            (
+                path, open_after_load, append_to_tree, itunes_zip_prefix, password, focus_path,
+                embedded_zip, as_disk_image, private_key, batch,
+            ) = self._load_queue.pop(0)
+            self._load_source(
+                path,
+                open_after_load=open_after_load,
+                append_to_tree=append_to_tree,
+                itunes_zip_prefix=itunes_zip_prefix,
+                password=password,
+                focus_path=focus_path,
+                embedded_zip=embedded_zip,
+                as_disk_image=as_disk_image,
+                private_key=private_key,
+                batch=batch,
+            )
+
+    def _on_password_required(
+        self, was_wrong: bool, reason: str = "", needs: str = "password"
+    ) -> None:
+        with self._hold_load_queue():
+            self._ask_secret_and_retry(self._capture_load_state(), was_wrong, reason, needs)
+
+    def _ask_secret_and_retry(
+        self, state: _LoadState, was_wrong: bool, reason: str, needs: str
+    ) -> None:
+        """Ask for what opens the source of *state* and load it again with
+        that -- *state*'s source, whatever loads while the prompt is open."""
+        if state.progress is not None:
+            state.progress.close()
+
+        if state.as_disk_image:
+            self._ask_disk_image_secret(state, was_wrong, reason, needs)
+            return
+
+        title = "Incorrect Password" if was_wrong else "Password Required"
+        prompt = _with_reason(
+            translate("MainWindow", "Incorrect password. Please try again:")
+            if was_wrong
+            else translate(
+                "MainWindow", "This backup is password-protected. Enter the backup password:"
+            ),
+            reason,
+        )
+        password, ok = QInputDialog.getText(self, title, prompt, QLineEdit.EchoMode.Password)
+        if not ok or not password:
+            self._status.showMessage(translate("MainWindow", "Load cancelled: password required"))
+            return
+
+        self._load_source(
+            state.path,
+            open_after_load=state.open_after_load,
+            append_to_tree=state.append_to_tree,
+            itunes_zip_prefix=state.itunes_zip_prefix,
+            password=password,
+            focus_path=state.focus_path,
+            embedded_zip=state.embedded_zip,
+            as_disk_image=state.as_disk_image,
+            batch=state.batch,
+        )
+
+    def _maybe_confirm_itunes_backup_zip(self, path: str) -> str | None:
+        from crush.core.vfs import detect_itunes_backup_in_zip
+
+        try:
+            prefix = detect_itunes_backup_in_zip(path)
+        except Exception:
+            return None
+        if prefix is None:
+            return None
+
+        answer = QMessageBox.question(
+            self,
+            translate("MainWindow", "iTunes Backup Detected"),
+            translate(
+                "MainWindow",
+                "An iTunes backup structure was detected inside this ZIP file.\n\n"
+                "Open it as an iTunes backup (reconstructed filesystem tree)? Everything "
+                "else the ZIP holds is shown too.\n"
+                'Choosing "No" opens the file as a regular ZIP archive instead, the '
+                "backup as its stored files.",
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        return prefix if answer == QMessageBox.StandardButton.Yes else None
+
+    def _confirm_aff4_as_disk_image(self, path: str) -> bool:
+        """An AFF4 container is stored as a ZIP: ask whether to read the disk
+        it holds (Open Disk Image…) or browse the ZIP's members, the
+        container's own parts -- as for an iTunes backup inside a ZIP."""
+        from crush.core.vfs import is_aff4
+
+        try:
+            if not is_aff4(path):
+                return False
+        except Exception:
+            return False
+        answer = QMessageBox.question(
+            self,
+            translate("MainWindow", "AFF4 Container Detected"),
+            translate(
+                "MainWindow",
+                "This ZIP file is an AFF4 forensic container.\n\n"
+                "Open it as a disk image (the acquired disk it holds)?\n"
+                'Choosing "No" opens it as a regular ZIP archive instead, showing the '
+                "container's own parts (streams, maps, metadata).",
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _confirm_sparse_bundle_as_disk_image(self, path: str) -> bool:
+        """An Apple sparse bundle is a folder: ask whether to read the disk
+        its band files hold (Open Disk Image…) or browse the folder, the
+        bundle's own files -- as for an AFF4 or an iTunes backup in a ZIP."""
+        from crush.core.raw_image import sparse_bundle_kind
+
+        if not sparse_bundle_kind(Path(path)):
+            return False
+        answer = QMessageBox.question(
+            self,
+            translate("MainWindow", "Apple Sparse Bundle Detected"),
+            translate(
+                "MainWindow",
+                "This folder is an Apple sparse bundle, a disk image whose band files "
+                "together hold the disk.\n\n"
+                "Open it as a disk image (the disk it holds)?\n"
+                'Choosing "No" opens it as a regular folder instead, showing the bundle\'s '
+                "own files (Info.plist, token, bands).",
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _ask_disk_image_secret(
+        self, state: _LoadState, was_wrong: bool, reason: str, needs: str
+    ) -> None:
+        """Ask for what opens an encrypted disk image -- its password, or the
+        private key file of a certificate it is sealed to -- and load it
+        again with that."""
+        from crush.ui.disk_image_key_dialog import DiskImageKeyDialog
+
+        needs, self._disk_image_needs = _disk_image_retry_needs(
+            getattr(self, "_disk_image_needs", None), state.path, was_wrong, needs,
+        )
+        dialog = DiskImageKeyDialog(self, reason=reason, was_wrong=was_wrong, needs=needs)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self._status.showMessage(
+                translate("MainWindow", "Load cancelled: password or private key required")
+            )
+            return
+        self._load_source(
+            state.path,
+            open_after_load=state.open_after_load,
+            append_to_tree=state.append_to_tree,
+            password=dialog.password(),
+            focus_path=state.focus_path,
+            embedded_zip=state.embedded_zip,
+            as_disk_image=True,
+            private_key=dialog.private_key(),
+            batch=state.batch,
+        )
+
+    def _on_export_thread_finished(self) -> None:
+        self._export_thread = None
+
+    def _setup_logging(self) -> None:
+        self._raw_logger = logging.getLogger("crush")
+        level_name = os.getenv("CRUSH_LOG_LEVEL", "INFO").upper()
+        level = logging.getLevelName(level_name)
+        if not isinstance(level, int):
+            level = logging.INFO
+        self._raw_logger.setLevel(level)
+        self._log_level = level
+        self._raw_logger.propagate = False
+        # Every self._logger.info/debug/warning/error(...) call in this window
+        # is auto-tagged with this window's id, so the on-screen log pane can
+        # tell its own messages apart from other windows' without touching
+        # each call site individually.
+        self._logger = logging.LoggerAdapter(self._raw_logger, {"window_id": self._window_id})
+
+        self._log_signal_handler = _LogSignalHandler()
+        self._log_signal_handler.setLevel(level)
+        self._log_signal_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        )
+        # These two filters make the on-screen log pane window-specific: the
+        # stamp filter fills in window_id for records that don't already carry
+        # one (worker-thread output via the registry, or a best-effort active-
+        # window guess for other synchronous/GUI-thread callers), and the gate
+        # filter then only lets this window see its own records (plus
+        # unattributable ones).
+        self._log_signal_handler.addFilter(WindowStampFilter())
+        self._log_signal_handler.addFilter(WindowLogFilter(self._window_id))
+        self._log_signal_handler.log_line.connect(self._append_log_line)
+        self._raw_logger.addHandler(self._log_signal_handler)
+
+        self._file_handler: logging.FileHandler | None = None
+        self._set_log_path(self._default_log_path())
+        self._logger.info("Logging started: %s", self._log_path)
+
+    def _default_log_path(self) -> Path:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        return Path(tempfile.gettempdir()) / f"crush-{ts}.log"
+
+    def _set_log_path(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if self._file_handler:
+            self._raw_logger.removeHandler(self._file_handler)
+            self._file_handler.close()
+        self._file_handler = logging.FileHandler(path, encoding="utf-8")
+        self._file_handler.setLevel(getattr(self, "_log_level", logging.INFO))
+        self._file_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        )
+        self._raw_logger.addHandler(self._file_handler)
+        self._log_path = path
+        self._status.showMessage(translate("MainWindow", "Logging to: {path}").format(path=path))
+
+    def _export_log(self) -> None:
+        if not hasattr(self, "_log_path"):
+            QMessageBox.information(
+                self,
+                translate("MainWindow", "Export log"),
+                translate("MainWindow", "No log file yet."),
+            )
+            return
+        suggested = self._log_path.name
+        dest_path, _ = QFileDialog.getSaveFileName(
+            self,
+            translate("MainWindow", "Export log"),
+            suggested,
+            translate("MainWindow", "Log files")
+            + " (*.log);;"  # i18n: keep -- file filter pattern
+            + translate("MainWindow", "All files")
+            + " (*)",  # i18n: keep -- file filter pattern
+        )
+        if not dest_path:
+            return
+        try:
+            shutil.copy2(self._log_path, dest_path)
+            self._status.showMessage(
+                translate("MainWindow", "Log exported to: {dest_path}").format(dest_path=dest_path)
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, translate("MainWindow", "Export log failed"), str(exc))
+
+    _LOG_COLORS = {
+        "ERROR":    "#e74c3c",
+        "CRITICAL": "#c0392b",
+        "WARNING":  "#e67e22",
+        "DEBUG":    "#7f8c8d",
+    }
+
+    def _append_log_line(self, line: str) -> None:
+        import html as _html
+        from PySide6.QtGui import QTextCursor
+        color = None
+        for level, clr in self._LOG_COLORS.items():
+            if f" {level} " in line:
+                color = clr
+                break
+        escaped = _html.escape(line)
+        html_line = (
+            f"<span style='color:{color};font-family:monospace;'>{escaped}</span>"
+            if color else
+            f"<span style='font-family:monospace;'>{escaped}</span>"
+        )
+        cursor = self._log_view.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if not self._log_view.document().isEmpty():
+            cursor.insertBlock()
+        cursor.insertHtml(html_line)
+        self._log_view.setTextCursor(cursor)
+        self._log_view.ensureCursorVisible()
+
+    @staticmethod
+    def _checkbox_qss(pal: QPalette) -> str:
+        """QSS override for QCheckBox/QRadioButton indicators.
+
+        The Fusion style's built-in indicator painting shades its border
+        from palette roles (Light/Midlight/Mid/Dark/Shadow) that every
+        _*_palette() method below leaves mostly unset -- measured directly
+        (render to an offscreen QPixmap, sample the indicator's border vs.
+        fill pixels): border-vs-fill contrast comes out just ~60/255 in the
+        Light theme and ~1-8/255 in Dark/Geek, i.e. the checkbox border is
+        essentially invisible against its own interior in every theme, not
+        just one. Styling the indicator subcontrol directly, from the same
+        palette already tuned per theme, guarantees a clearly bordered box
+        (unchecked) vs. a solid Highlight-filled box (checked) regardless
+        of theme -- a deliberate trade of the native tick-mark glyph (which
+        QSS on this subcontract would otherwise suppress anyway without a
+        bundled checkmark image asset) for guaranteed contrast everywhere.
+        """
+        border = pal.color(QPalette.ColorRole.WindowText).name()
+        base = pal.color(QPalette.ColorRole.Base).name()
+        highlight = pal.color(QPalette.ColorRole.Highlight).name()
+        disabled_border = pal.color(QPalette.ColorRole.Mid).name()
+        disabled_bg = pal.color(QPalette.ColorRole.Window).name()
+        return f"""
+            QCheckBox::indicator, QRadioButton::indicator {{
+                width: 13px;
+                height: 13px;
+                border: 1px solid {border};
+                background: {base};
+            }}
+            QCheckBox::indicator {{ border-radius: 2px; }}
+            QRadioButton::indicator {{ border-radius: 7px; }}
+            QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
+                background: {highlight};
+                border: 1px solid {highlight};
+            }}
+            QCheckBox::indicator:hover, QRadioButton::indicator:hover {{
+                border: 1px solid {highlight};
+            }}
+            QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {{
+                border: 1px solid {disabled_border};
+                background: {disabled_bg};
+            }}
+        """
+
+    def _set_palette_everywhere(self, pal: QPalette) -> None:
+        """Apply *pal* app-wide and directly to the dock widgets, filesystem
+        tree, and properties panel (and their viewports) of every open
+        window.
+
+        QApplication.setPalette() alone doesn't reliably reach these once
+        any app-wide stylesheet has been active, so they're updated
+        explicitly instead of relying on propagation.
+        """
+        app = QApplication.instance()
+        if app is None:
+            return
+        app.setPalette(pal)
+        for window in self._open_windows:
+            if not isValid(window):
+                continue
+            if hasattr(window, "_fs_dock"):
+                window._fs_dock.setPalette(pal)
+            if hasattr(window, "_props_dock"):
+                window._props_dock.setPalette(pal)
+            if hasattr(window, "_log_dock"):
+                window._log_dock.setPalette(pal)
+            if hasattr(window, "_fs_panel"):
+                fs_panel = window._fs_panel
+                fs_panel._tree.setPalette(pal)
+                fs_panel._tree.viewport().setPalette(pal)
+                fs_panel._search_view.setPalette(pal)
+                fs_panel._search_view.viewport().setPalette(pal)
+            if hasattr(window, "_props_panel"):
+                props_panel = window._props_panel
+                props_panel.setPalette(pal)
+                props_panel.viewport().setPalette(pal)
+                props_panel._container.setPalette(pal)
+            if hasattr(window, "_viewer_tabs"):
+                viewer_tabs = window._viewer_tabs
+                viewer_tabs.setPalette(pal)
+                viewer_tabs.tabBar().setPalette(pal)
+                # Individual viewer widgets (hex/text/table/image/... — see
+                # crush/viewers/) frequently set their own explicit palette
+                # or stylesheet at creation time; once a widget has an
+                # explicit (non-inherited) palette, QWidget.setPalette() on
+                # an ancestor no longer cascades down to it. Only walking
+                # the *currently visible* tab keeps this affordable at
+                # animation frequency (every 50ms) -- other tabs catch up
+                # via _on_viewer_tab_changed() when they're actually shown.
+                current = viewer_tabs.currentWidget()
+                if current is not None:
+                    self._propagate_palette_recursive(current, pal)
+            if hasattr(window, "_empty_view"):
+                window._empty_view.setPalette(pal)
+
+    @staticmethod
+    def _propagate_palette_recursive(widget: QWidget, pal: QPalette) -> None:
+        """Force *pal* onto *widget* and every descendant (plus scroll-area
+        viewports), overriding any explicit palette/stylesheet a viewer set
+        on itself when it was created under a different theme.
+        """
+        widget.setPalette(pal)
+        viewport = getattr(widget, "viewport", None)
+        if callable(viewport):
+            vp = viewport()
+            if vp is not None:
+                vp.setPalette(pal)
+        for child in widget.findChildren(QWidget):
+            child.setPalette(pal)
+            child_viewport = getattr(child, "viewport", None)
+            if callable(child_viewport):
+                vp = child_viewport()
+                if vp is not None:
+                    vp.setPalette(pal)
+
+    def _on_viewer_tab_changed(self, index: int) -> None:
+        """Re-apply the live app palette to a viewer tab when it becomes
+        visible, catching it up if it wasn't the current tab during a
+        Rainbow/'Merica tick (see _set_palette_everywhere), and refresh the
+        Properties panel to match the now-active tab.
+
+        Without this, the panel only ever reflected whichever tab was most
+        recently *opened* — switching back to an already-open tab left it
+        showing the previous tab's properties until something in the file
+        tree was clicked.
+        """
+        if index < 0:
+            return
+        widget = self._viewer_tabs.widget(index)
+        if widget is None:
+            return
+        app = QApplication.instance()
+        if app is None:
+            return
+        self._propagate_palette_recursive(widget, app.palette())
+        self._show_tab_properties(index)
+
+    def _show_tab_properties(self, index: int) -> None:
+        """Show the properties of the file (or analyzer result) in viewer
+        tab *index*."""
+        widget = self._viewer_tabs.widget(index) if index >= 0 else None
+        if widget is None:
+            return
+        analyzer_result = widget.property("crush_analyzer_result")
+        if analyzer_result is not None:
+            self._props_panel.show_analyzer_result(
+                analyzer_result,
+                widget.property("crush_analyzer_title"),
+                widget.property("crush_analyzer_relevance"),
+            )
+            return
+
+        node = widget.property("crush_node")
+        vfs = widget.property("crush_vfs")
+        if node is not None and vfs is not None:
+            held = widget.property("crush_metadata")
+            metadata = held.metadata if isinstance(held, _TabMetadata) else {}
+            self._props_panel.update_properties(node, metadata, vfs)
+
+    def _apply_palette(self, pal: QPalette) -> None:
+        """Set the application palette and a matching checkbox/radio-button
+        stylesheet (see _checkbox_qss) -- the two must change together or a
+        theme switch leaves stale indicator colors.
+
+        Only used by the static themes. Rainbow and 'Merica update the
+        palette directly via _set_palette_everywhere() and never touch the
+        stylesheet, since re-applying an app-wide stylesheet at animation
+        frequency (up to every 50ms) causes flicker and swallows clicks.
+
+        Clears any existing stylesheet before reapplying it, rather than
+        just replacing its content in place: once QStyleSheetStyle has
+        polished a widget against a stylesheet, later setPalette() calls on
+        that widget (including the explicit ones in
+        _set_palette_everywhere()) stop taking effect until the stylesheet
+        is actually removed and reapplied -- confirmed by probing
+        QTreeView.palette() after a setStyleSheet() -> setPalette() ->
+        setStyleSheet() sequence, which still reports the *first*
+        stylesheet's colors. Without the clear, switching between two
+        static themes leaves the filesystem tree and properties panel
+        stuck on whichever theme was active when a stylesheet was first
+        applied; only entering Rainbow/'Merica (which clears the
+        stylesheet via _clear_checkbox_qss()) breaks the staleness.
+
+        Skips the stylesheet update while a popup or modal dialog is open:
+        QApplication-wide setStyleSheet() forces a full re-polish of every
+        top-level widget, which splits an in-flight mouse press/release on
+        a dialog button into two unrelated events. The palette itself still
+        updates; the checkbox QSS catches up on the next static-theme switch.
+        """
+        app = QApplication.instance()
+        if app is None:
+            return
+        if app.activePopupWidget() is None and app.activeModalWidget() is None:
+            app.setStyleSheet("")
+        self._set_palette_everywhere(pal)
+        if app.activePopupWidget() is None and app.activeModalWidget() is None:
+            app.setStyleSheet(self._checkbox_qss(pal))
+
+    @staticmethod
+    def _clear_checkbox_qss() -> None:
+        """Drop any checkbox stylesheet left over from a static theme.
+
+        Called once when entering Rainbow or 'Merica, since they never set
+        a stylesheet themselves (see _apply_palette).
+        """
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet("")
+
+    def _set_theme_system(self) -> None:
+        self._stop_animated_themes()
+        app = QApplication.instance()
+        if app is None:
+            return
+        self._apply_palette(self.style().standardPalette())
+        self._settings.setValue("theme", "system")
+        self._logger.info("Theme set to system default")
+
+    def _set_always_hex(self, enabled: bool) -> None:
+        self._always_hex = enabled
+        if hasattr(self, "_logger"):
+            self._logger.info("Always show hex tab: %s", enabled)
+
+    def _integrity_mode_description(self) -> str:
+        return translate(
+            "MainWindow",
+            "Integrity mode does the following:\n"
+            "- Records SHA-256 hashes when files are opened or exported.\n"
+            "- Hashes ZIP/TAR/file sources on open (folders are not hashed).\n"
+            "- Writes those hashes to the log.\n"
+            "- Creates a crush-export-hashes.txt file next to exported data.\n"
+            "- You can turn it off for faster opening of large ZIP/TAR sources and faster browsing.",
+        )
+
+    def _show_integrity_menu(self, pos: object) -> None:
+        sender = self.sender()
+        if sender is None or not hasattr(sender, "mapToGlobal"):
+            return
+        menu = QMenu(self)
+        toggle_action = menu.addAction(translate("MainWindow", "Toggle Integrity Mode"))
+        info_action = menu.addAction(translate("MainWindow", "What is Integrity Mode?"))
+        action = menu.exec(sender.mapToGlobal(pos))  # type: ignore[arg-type]
+        if action == toggle_action:
+            self._toggle_integrity_mode()
+        elif action == info_action:
+            QMessageBox.information(
+                self, translate("MainWindow", "Integrity Mode"), self._integrity_mode_description()
+            )
+
+    def _toggle_integrity_mode(self) -> None:
+        self._integrity_mode_action.setChecked(not self._integrity_mode_action.isChecked())
+
+    def _set_integrity_mode(self, enabled: bool) -> None:
+        self.session.integrity_mode = enabled
+        self._integrity_label.setVisible(enabled)
+        self._no_integrity_label.setVisible(not enabled)
+        self._settings.setValue("integrity_mode", enabled)
+        state = "enabled" if enabled else "disabled"
+        if hasattr(self, "_logger"):
+            self._logger.info("Integrity mode %s", state)
+
+    def _hash_node_if_integrity(self, node: VFSNode, vfs: VFS) -> None:
+        if not self.session.integrity_mode or node.is_dir:
+            return
+        import hashlib
+
+        def _hash() -> tuple[str, int]:
+            hasher = hashlib.sha256()
+            total = 0
+            with vfs.open(node) as src:
+                while chunk := src.read(1024 * 1024):
+                    hasher.update(chunk)
+                    total += len(chunk)
+            return hasher.hexdigest(), total
+
+        try:
+            if node.size > _BUSY_BYTES:
+                digest, total = busy_call(
+                    self, translate("MainWindow", "Hashing {name}…").format(name=node.name), _hash
+                )
+            else:
+                digest, total = _hash()
+            self._logger.info("INTEGRITY sha256=%s  size=%d  path=%s", digest, total, node.path)
+        except Exception as exc:
+            self._logger.warning("INTEGRITY hash failed for %s: %s", node.path, exc)
+
+    def _warn_unreadable(self, node: VFSNode, exc: BaseException) -> None:
+        """*node*'s content couldn't be read: say why (e.g. a UFDR that
+        lists a file but doesn't hold it), in the status bar and a box."""
+        text = translate("MainWindow", "Could not read {path!r}: {exc}").format(
+            path=node.path, exc=i18n.exception_text(exc)
+        )
+        self._status.showMessage(text)
+        QMessageBox.warning(self, translate("MainWindow", "Cannot open file"), text)
+
+    def _read_hex_bytes(self, vfs: VFS, node: VFSNode) -> tuple[bytes | None, str]:
+        """The node's bytes, or None and why they couldn't be read."""
+
+        def _read() -> bytes:
+            with vfs.open(node) as src:
+                return src.read()
+
+        try:
+            if node.size > _BUSY_BYTES:
+                return cast(
+                    bytes,
+                    busy_call(
+                        self,
+                        translate("MainWindow", "Loading {name}…").format(name=node.name),
+                        _read,
+                    ),
+                ), ""
+            return _read(), ""
+        except Exception as exc:
+            if hasattr(self, "_logger"):
+                self._logger.warning("Failed to read hex bytes for %s: %s", node.path, exc)
+            return None, i18n.exception_text(exc)
+
+    def _stop_animated_themes(self) -> None:
+        for window in self._open_windows:
+            if not isValid(window):
+                continue
+            if hasattr(window, "_rainbow_timer"):
+                window._rainbow_timer.stop()
+            if hasattr(window, "_america_timer"):
+                window._america_timer.stop()
+            if hasattr(window, "_rainbow_snapshot_btn"):
+                window._rainbow_snapshot_btn.setVisible(False)
+            if hasattr(window, "_america_show_btn"):
+                window._america_show_btn.setVisible(False)
+
+    def _set_theme_light(self) -> None:
+        self._stop_animated_themes()
+        app = QApplication.instance()
+        if app is None:
+            return
+        self._apply_palette(self._light_palette())
+        self._settings.setValue("theme", "light")
+        self._logger.info("Theme set to light")
+
+    def _set_theme_dark(self) -> None:
+        self._stop_animated_themes()
+        app = QApplication.instance()
+        if app is None:
+            return
+        self._apply_palette(self._dark_palette())
+        self._settings.setValue("theme", "dark")
+        self._logger.info("Theme set to dark")
+
+    def _light_palette(self) -> QPalette:
+        pal = QPalette()
+        pal.setColor(QPalette.ColorRole.Window, QColor(248, 249, 251))
+        pal.setColor(QPalette.ColorRole.WindowText, QColor(25, 25, 25))
+        pal.setColor(QPalette.ColorRole.Base, QColor(255, 255, 255))
+        pal.setColor(QPalette.ColorRole.AlternateBase, QColor(242, 244, 247))
+        pal.setColor(QPalette.ColorRole.ToolTipBase, QColor(255, 255, 255))
+        pal.setColor(QPalette.ColorRole.ToolTipText, QColor(0, 0, 0))
+        pal.setColor(QPalette.ColorRole.Text, QColor(25, 25, 25))
+        pal.setColor(QPalette.ColorRole.Button, QColor(240, 242, 245))
+        pal.setColor(QPalette.ColorRole.ButtonText, QColor(25, 25, 25))
+        if hasattr(QPalette.ColorRole, "Menu"):
+            pal.setColor(QPalette.ColorRole.Menu, QColor(248, 249, 251))
+        if hasattr(QPalette.ColorRole, "MenuText"):
+            pal.setColor(QPalette.ColorRole.MenuText, QColor(25, 25, 25))
+        if hasattr(QPalette.ColorRole, "MenuBar"):
+            pal.setColor(QPalette.ColorRole.MenuBar, QColor(248, 249, 251))
+        if hasattr(QPalette.ColorRole, "MenuBarText"):
+            pal.setColor(QPalette.ColorRole.MenuBarText, QColor(25, 25, 25))
+        pal.setColor(QPalette.ColorRole.Mid, QColor(160, 164, 170))
+        pal.setColor(QPalette.ColorRole.Dark, QColor(190, 194, 200))
+        pal.setColor(QPalette.ColorRole.Shadow, QColor(120, 124, 130))
+        pal.setColor(QPalette.ColorRole.BrightText, QColor(255, 0, 0))
+        pal.setColor(QPalette.ColorRole.Highlight, QColor(56, 120, 255))
+        pal.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
+        return pal
+
+    def _apply_saved_theme(self) -> None:
+        saved_name = self._settings.value("custom_theme_name", "", type=str)
+        if saved_name:
+            self._custom_theme_action.setText(saved_name)
+            self._custom_theme_action.setVisible(True)
+        theme = self._settings.value("theme", "light")
+        if theme == "dark":
+            self._set_theme_dark()
+        elif theme == "geek":
+            self._set_theme_geek()
+        elif theme == "purple":
+            self._set_theme_purple()
+        elif theme == "ocean":
+            self._set_theme_ocean()
+        elif theme == "rainbow":
+            self._set_theme_rainbow()
+        elif theme == "america":
+            self._set_theme_america()
+        elif theme == "custom":
+            self._set_theme_custom()
+        elif theme == "system":
+            self._set_theme_system()
+        else:
+            self._set_theme_light()
+
+    def _apply_saved_integrity_mode(self) -> None:
+        enabled = self._settings.value("integrity_mode", False, type=bool)
+        # setChecked triggers the toggled signal which calls _set_integrity_mode
+        self._integrity_mode_action.setChecked(enabled)
+
+    def _apply_saved_prescan_workers(self) -> None:
+        import os as _os
+        default = min(8, _os.cpu_count() or 4)
+        workers = self._settings.value("prescan_workers", default, type=int)
+        self._fs_panel._prescan_workers = max(1, workers)
+
+    def _add_to_recent_files(self, path: str, as_disk_image: bool = False) -> None:
+        recent: list[str] = self._settings.value("recent_files", [], type=list)
+        if path in recent:
+            recent.remove(path)
+        recent.insert(0, path)
+        recent = recent[:10]
+        self._settings.setValue("recent_files", recent)
+        # Which of them were opened as disk images, so reopening one does
+        # the same -- a disk image is never recognised on its own.
+        images = {p for p in self._recent_disk_images() if p in recent and p != path}
+        if as_disk_image:
+            images.add(path)
+        self._settings.setValue("recent_disk_images", sorted(images))
+        self._rebuild_recent_menu()
+
+    def _recent_disk_images(self) -> set[str]:
+        return set(self._settings.value("recent_disk_images", [], type=list))
+
+    def _load_recent(self, path: str) -> None:
+        self._load_source(path, as_disk_image=path in self._recent_disk_images())
+
+    def _recent_label(self, path: str) -> str:
+        if path in self._recent_disk_images():
+            return translate("MainWindow", "{path}  (disk image)").format(path=path)
+        return path
+
+    def _rebuild_recent_menu(self) -> None:
+        self._recent_menu.clear()
+        recent: list[str] = self._settings.value("recent_files", [], type=list)
+        if not recent:
+            empty = self._recent_menu.addAction(translate("MainWindow", "(empty)"))
+            empty.setEnabled(False)
+        else:
+            for path in recent:
+                action = self._recent_menu.addAction(self._recent_label(path))
+                action.setToolTip(path)
+                action.triggered.connect(lambda checked=False, p=path: self._load_recent(p))
+            self._recent_menu.addSeparator()
+            self._recent_menu.addAction(
+                translate("MainWindow", "Clear Recent"), self._clear_recent_files
+            )
+
+    def _clear_recent_files(self) -> None:
+        self._settings.setValue("recent_files", [])
+        self._settings.setValue("recent_disk_images", [])
+        self._rebuild_recent_menu()
+
+    def _set_prescan_workers(self) -> None:
+        import os as _os
+        default = min(8, _os.cpu_count() or 4)
+        current = self._settings.value("prescan_workers", default, type=int)
+        value, ok = QInputDialog.getInt(
+            self,
+            translate("MainWindow", "Indexing Threads"),
+            translate(
+                "MainWindow",
+                "Number of parallel threads for file type indexing\n(CPU cores: {cores}):",
+            ).format(cores=_os.cpu_count() or "?"),
+            current,
+            1,
+            64,
+            1,
+        )
+        if ok:
+            self._settings.setValue("prescan_workers", value)
+            self._fs_panel._prescan_workers = value
+
+    def _dark_palette(self) -> QPalette:
+        pal = QPalette()
+        pal.setColor(QPalette.ColorRole.Window, QColor(32, 34, 37))
+        pal.setColor(QPalette.ColorRole.WindowText, QColor(220, 220, 220))
+        pal.setColor(QPalette.ColorRole.Base, QColor(24, 26, 29))
+        pal.setColor(QPalette.ColorRole.AlternateBase, QColor(32, 34, 37))
+        pal.setColor(QPalette.ColorRole.ToolTipBase, QColor(255, 255, 255))
+        pal.setColor(QPalette.ColorRole.ToolTipText, QColor(0, 0, 0))
+        pal.setColor(QPalette.ColorRole.Text, QColor(220, 220, 220))
+        pal.setColor(QPalette.ColorRole.Button, QColor(45, 48, 52))
+        pal.setColor(QPalette.ColorRole.ButtonText, QColor(220, 220, 220))
+        if hasattr(QPalette.ColorRole, "Menu"):
+            pal.setColor(QPalette.ColorRole.Menu, QColor(32, 34, 37))
+        if hasattr(QPalette.ColorRole, "MenuText"):
+            pal.setColor(QPalette.ColorRole.MenuText, QColor(220, 220, 220))
+        if hasattr(QPalette.ColorRole, "MenuBar"):
+            pal.setColor(QPalette.ColorRole.MenuBar, QColor(32, 34, 37))
+        if hasattr(QPalette.ColorRole, "MenuBarText"):
+            pal.setColor(QPalette.ColorRole.MenuBarText, QColor(220, 220, 220))
+        pal.setColor(QPalette.ColorRole.Mid, QColor(65, 68, 74))
+        pal.setColor(QPalette.ColorRole.Dark, QColor(20, 22, 25))
+        pal.setColor(QPalette.ColorRole.Shadow, QColor(10, 10, 12))
+        pal.setColor(QPalette.ColorRole.BrightText, QColor(255, 0, 0))
+        pal.setColor(QPalette.ColorRole.Highlight, QColor(64, 128, 255))
+        pal.setColor(QPalette.ColorRole.HighlightedText, QColor(0, 0, 0))
+        return pal
+
+    def _set_theme_geek(self) -> None:
+        self._stop_animated_themes()
+        app = QApplication.instance()
+        if app is None:
+            return
+        self._apply_palette(self._geek_palette())
+        self._settings.setValue("theme", "geek")
+        self._logger.info("Theme set to geek")
+
+    def _geek_palette(self) -> QPalette:
+        green = QColor(0, 204, 68)       # phosphor green
+        green_dim = QColor(0, 140, 46)   # dimmed green for secondary elements
+        green_dark = QColor(0, 60, 20)   # very dark green for backgrounds
+        black = QColor(4, 10, 4)         # near-black with a green tint
+        pal = QPalette()
+        pal.setColor(QPalette.ColorRole.Window, QColor(8, 16, 8))
+        pal.setColor(QPalette.ColorRole.WindowText, green)
+        pal.setColor(QPalette.ColorRole.Base, black)
+        pal.setColor(QPalette.ColorRole.AlternateBase, QColor(10, 22, 10))
+        pal.setColor(QPalette.ColorRole.ToolTipBase, QColor(0, 30, 10))
+        pal.setColor(QPalette.ColorRole.ToolTipText, green)
+        pal.setColor(QPalette.ColorRole.Text, green)
+        pal.setColor(QPalette.ColorRole.Button, QColor(10, 22, 10))
+        pal.setColor(QPalette.ColorRole.ButtonText, green)
+        if hasattr(QPalette.ColorRole, "Menu"):
+            pal.setColor(QPalette.ColorRole.Menu, QColor(8, 16, 8))
+        if hasattr(QPalette.ColorRole, "MenuText"):
+            pal.setColor(QPalette.ColorRole.MenuText, green)
+        if hasattr(QPalette.ColorRole, "MenuBar"):
+            pal.setColor(QPalette.ColorRole.MenuBar, QColor(8, 16, 8))
+        if hasattr(QPalette.ColorRole, "MenuBarText"):
+            pal.setColor(QPalette.ColorRole.MenuBarText, green)
+        pal.setColor(QPalette.ColorRole.Mid, green_dim)
+        pal.setColor(QPalette.ColorRole.Dark, green_dark)
+        pal.setColor(QPalette.ColorRole.Shadow, QColor(0, 30, 10))
+        pal.setColor(QPalette.ColorRole.BrightText, QColor(0, 255, 100))
+        pal.setColor(QPalette.ColorRole.Highlight, QColor(0, 180, 60))
+        pal.setColor(QPalette.ColorRole.HighlightedText, black)
+        return pal
+
+    def _set_theme_purple(self) -> None:
+        self._stop_animated_themes()
+        app = QApplication.instance()
+        if app is None:
+            return
+        self._apply_palette(self._purple_palette())
+        self._settings.setValue("theme", "purple")
+        self._logger.info("Theme set to purple")
+
+    def _purple_palette(self) -> QPalette:
+        lavender = QColor(190, 130, 255)    # bright lavender for primary text
+        violet = QColor(130, 80, 200)       # dimmed violet for secondary elements
+        deep = QColor(40, 10, 70)           # deep purple for backgrounds
+        black = QColor(12, 6, 20)           # near-black with purple tint
+        pal = QPalette()
+        pal.setColor(QPalette.ColorRole.Window, QColor(20, 10, 36))
+        pal.setColor(QPalette.ColorRole.WindowText, lavender)
+        pal.setColor(QPalette.ColorRole.Base, black)
+        pal.setColor(QPalette.ColorRole.AlternateBase, QColor(22, 12, 38))
+        pal.setColor(QPalette.ColorRole.ToolTipBase, QColor(30, 15, 50))
+        pal.setColor(QPalette.ColorRole.ToolTipText, lavender)
+        pal.setColor(QPalette.ColorRole.Text, lavender)
+        pal.setColor(QPalette.ColorRole.Button, QColor(28, 14, 48))
+        pal.setColor(QPalette.ColorRole.ButtonText, lavender)
+        if hasattr(QPalette.ColorRole, "Menu"):
+            pal.setColor(QPalette.ColorRole.Menu, QColor(20, 10, 36))
+        if hasattr(QPalette.ColorRole, "MenuText"):
+            pal.setColor(QPalette.ColorRole.MenuText, lavender)
+        if hasattr(QPalette.ColorRole, "MenuBar"):
+            pal.setColor(QPalette.ColorRole.MenuBar, QColor(20, 10, 36))
+        if hasattr(QPalette.ColorRole, "MenuBarText"):
+            pal.setColor(QPalette.ColorRole.MenuBarText, lavender)
+        pal.setColor(QPalette.ColorRole.Mid, violet)
+        pal.setColor(QPalette.ColorRole.Dark, deep)
+        pal.setColor(QPalette.ColorRole.Shadow, QColor(8, 4, 16))
+        pal.setColor(QPalette.ColorRole.BrightText, QColor(220, 160, 255))
+        pal.setColor(QPalette.ColorRole.Highlight, QColor(150, 80, 230))
+        pal.setColor(QPalette.ColorRole.HighlightedText, black)
+        return pal
+
+    def _set_theme_ocean(self) -> None:
+        self._stop_animated_themes()
+        app = QApplication.instance()
+        if app is None:
+            return
+        self._apply_palette(self._ocean_palette())
+        self._settings.setValue("theme", "ocean")
+        self._logger.info("Theme set to ocean")
+
+    def _ocean_palette(self) -> QPalette:
+        cyan = QColor(0, 210, 200)          # sunlit ocean surface — primary text
+        cyan_dim = QColor(0, 140, 140)      # deeper water — secondary elements
+        navy = QColor(0, 30, 60)            # deep ocean — backgrounds
+        black = QColor(2, 10, 20)           # abyss — near-black with ocean tint
+        pal = QPalette()
+        pal.setColor(QPalette.ColorRole.Window, QColor(4, 18, 38))
+        pal.setColor(QPalette.ColorRole.WindowText, cyan)
+        pal.setColor(QPalette.ColorRole.Base, black)
+        pal.setColor(QPalette.ColorRole.AlternateBase, QColor(6, 22, 44))
+        pal.setColor(QPalette.ColorRole.ToolTipBase, QColor(0, 24, 48))
+        pal.setColor(QPalette.ColorRole.ToolTipText, cyan)
+        pal.setColor(QPalette.ColorRole.Text, cyan)
+        pal.setColor(QPalette.ColorRole.Button, QColor(6, 24, 48))
+        pal.setColor(QPalette.ColorRole.ButtonText, cyan)
+        if hasattr(QPalette.ColorRole, "Menu"):
+            pal.setColor(QPalette.ColorRole.Menu, QColor(4, 18, 38))
+        if hasattr(QPalette.ColorRole, "MenuText"):
+            pal.setColor(QPalette.ColorRole.MenuText, cyan)
+        if hasattr(QPalette.ColorRole, "MenuBar"):
+            pal.setColor(QPalette.ColorRole.MenuBar, QColor(4, 18, 38))
+        if hasattr(QPalette.ColorRole, "MenuBarText"):
+            pal.setColor(QPalette.ColorRole.MenuBarText, cyan)
+        pal.setColor(QPalette.ColorRole.Mid, cyan_dim)
+        pal.setColor(QPalette.ColorRole.Dark, navy)
+        pal.setColor(QPalette.ColorRole.Shadow, QColor(0, 10, 24))
+        pal.setColor(QPalette.ColorRole.BrightText, QColor(100, 240, 255))
+        pal.setColor(QPalette.ColorRole.Highlight, QColor(0, 160, 180))
+        pal.setColor(QPalette.ColorRole.HighlightedText, black)
+        return pal
+
+    def _set_theme_rainbow(self) -> None:
+        self._stop_animated_themes()
+        app = QApplication.instance()
+        if app is None:
+            return
+        self._settings.setValue("theme", "rainbow")
+        self._logger.info("Theme set to rainbow")
+        self._clear_checkbox_qss()
+        if not hasattr(self, "_rainbow_timer"):
+            self._rainbow_timer = QTimer(self)
+            self._rainbow_timer.timeout.connect(self._step_rainbow)
+            self._rainbow_hue = 0.0
+        self._rainbow_timer.start(50)
+        self._rainbow_snapshot_btn.setVisible(True)
+
+    def _step_rainbow(self) -> None:
+        self._rainbow_hue = (self._rainbow_hue + 0.004) % 1.0
+        self._set_palette_everywhere(self._rainbow_palette(self._rainbow_hue))
+
+    def _rainbow_palette(self, hue: float) -> QPalette:
+        text = QColor.fromHsvF(hue, 0.85, 1.0)
+        dim = QColor.fromHsvF((hue + 0.05) % 1.0, 0.6, 0.55)
+        bg = QColor.fromHsvF(hue, 0.25, 0.09)
+        base = QColor.fromHsvF(hue, 0.18, 0.06)
+        highlight = QColor.fromHsvF((hue + 0.5) % 1.0, 0.9, 0.95)
+        pal = QPalette()
+        pal.setColor(QPalette.ColorRole.Window, bg)
+        pal.setColor(QPalette.ColorRole.WindowText, text)
+        pal.setColor(QPalette.ColorRole.Base, base)
+        pal.setColor(QPalette.ColorRole.AlternateBase, QColor.fromHsvF(hue, 0.2, 0.10))
+        pal.setColor(QPalette.ColorRole.ToolTipBase, bg)
+        pal.setColor(QPalette.ColorRole.ToolTipText, text)
+        pal.setColor(QPalette.ColorRole.Text, text)
+        pal.setColor(QPalette.ColorRole.Button, QColor.fromHsvF(hue, 0.20, 0.11))
+        pal.setColor(QPalette.ColorRole.ButtonText, text)
+        if hasattr(QPalette.ColorRole, "Menu"):
+            pal.setColor(QPalette.ColorRole.Menu, bg)
+        if hasattr(QPalette.ColorRole, "MenuText"):
+            pal.setColor(QPalette.ColorRole.MenuText, text)
+        if hasattr(QPalette.ColorRole, "MenuBar"):
+            pal.setColor(QPalette.ColorRole.MenuBar, bg)
+        if hasattr(QPalette.ColorRole, "MenuBarText"):
+            pal.setColor(QPalette.ColorRole.MenuBarText, text)
+        pal.setColor(QPalette.ColorRole.Mid, dim)
+        pal.setColor(QPalette.ColorRole.Dark, QColor.fromHsvF(hue, 0.30, 0.07))
+        pal.setColor(QPalette.ColorRole.Shadow, QColor.fromHsvF(hue, 0.20, 0.04))
+        pal.setColor(QPalette.ColorRole.BrightText, QColor.fromHsvF((hue + 0.08) % 1.0, 1.0, 1.0))
+        pal.setColor(QPalette.ColorRole.Highlight, highlight)
+        pal.setColor(QPalette.ColorRole.HighlightedText, base)
+        return pal
+
+    def _set_theme_america(self) -> None:
+        self._stop_animated_themes()
+        app = QApplication.instance()
+        if app is None:
+            return
+        self._settings.setValue("theme", "america")
+        self._logger.info("Theme set to 'Merica")
+        if not hasattr(self, "_america_timer"):
+            self._america_timer = QTimer(self)
+            self._america_timer.timeout.connect(self._step_america)
+        self._start_america_show()
+
+    def _replay_america_show(self) -> None:
+        self._start_america_show()
+
+    def _start_america_show(self) -> None:
+        self._clear_checkbox_qss()
+        self._america_intro_step = 0
+        self._america_chill_elapsed_ms = 0
+        self._america_timer.setInterval(self._AMERICA_INTRO_MS)
+        self._america_show_btn.setVisible(True)
+        self._step_america()
+        self._america_timer.start()
+
+    def _step_america(self) -> None:
+        chant = (
+            ("U", QColor(178, 34, 52), "white"),
+            ("S", QColor(245, 245, 240), "#172554"),
+            ("A", QColor(35, 71, 143), "white"),
+        )
+        if self._america_intro_step < 9:
+            letter, color, text_color = chant[self._america_intro_step % len(chant)]
+            self._set_palette_everywhere(self._america_show_palette(letter))
+            self._america_show_btn.setText(
+                f" ★ ★ ★   {letter}   ★ ★ ★ "  # i18n: keep -- markup/layout only
+            )
+            self._america_show_btn.setStyleSheet(
+                f"color: {text_color}; background-color: {color.name()};"
+                " font-weight: bold; padding: 2px 8px; border-radius: 3px;"
+            )
+            self._america_intro_step += 1
+            return
+
+        if self._america_intro_step == 9:
+            self._america_show_btn.setText(translate("MainWindow", " ★  'MERICA  ★ "))
+            self._america_show_btn.setStyleSheet(
+                "color: white; background-color: #233f88;"
+                " font-weight: bold; padding: 2px 8px; border-radius: 3px;"
+            )
+            self._america_intro_step += 1
+            self._america_timer.setInterval(self._AMERICA_FINALE_MS)
+            self._set_palette_everywhere(self._america_palette(0.0))
+            return
+        elif self._america_intro_step == 10:
+            self._america_show_btn.setText(translate("MainWindow", " ★  Replay Show  ★ "))
+            self._america_show_btn.setStyleSheet(
+                "color: white; background-color: #233f88;"
+                " font-weight: bold; padding: 2px 8px; border-radius: 3px;"
+            )
+            self._america_intro_step += 1
+            self._america_timer.setInterval(self._AMERICA_CHILL_TICK_MS)
+
+        self._america_chill_elapsed_ms += self._america_timer.interval()
+        phase = self._america_chill_phase(self._america_chill_elapsed_ms)
+        self._set_palette_everywhere(self._america_palette(phase))
+
+    @classmethod
+    def _america_chill_phase(cls, elapsed_ms: int) -> float:
+        segment_ms = cls._AMERICA_HOLD_MS + cls._AMERICA_FADE_MS
+        color_index = (elapsed_ms // segment_ms) % 3
+        segment_elapsed = elapsed_ms % segment_ms
+        if segment_elapsed < cls._AMERICA_HOLD_MS:
+            return float(color_index)
+        fade_progress = (
+            segment_elapsed - cls._AMERICA_HOLD_MS
+        ) / cls._AMERICA_FADE_MS
+        return color_index + fade_progress
+
+    def _america_show_palette(self, letter: str) -> QPalette:
+        if letter == "U":
+            pal = self._america_palette(0.0)
+            pal.setColor(QPalette.ColorRole.Window, QColor(72, 8, 20))
+            pal.setColor(QPalette.ColorRole.Button, QColor(92, 12, 28))
+            return pal
+        if letter == "S":
+            pal = self._light_palette()
+            pal.setColor(QPalette.ColorRole.Highlight, QColor(178, 34, 52))
+            pal.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
+            pal.setColor(QPalette.ColorRole.BrightText, QColor(35, 71, 143))
+            return pal
+        pal = self._america_palette(2.0)
+        pal.setColor(QPalette.ColorRole.Window, QColor(8, 22, 62))
+        pal.setColor(QPalette.ColorRole.Button, QColor(12, 32, 82))
+        return pal
+
+    def _america_palette(self, phase: float) -> QPalette:
+        colors = (
+            QColor(224, 55, 70),
+            QColor(245, 245, 240),
+            QColor(72, 112, 210),
+        )
+        index = int(phase) % len(colors)
+        progress = phase - int(phase)
+        accent = self._blend_color(colors[index], colors[(index + 1) % len(colors)], progress)
+        pal = QPalette()
+        pal.setColor(QPalette.ColorRole.Window, QColor(16, 22, 42))
+        pal.setColor(QPalette.ColorRole.WindowText, accent)
+        pal.setColor(QPalette.ColorRole.Base, QColor(9, 13, 28))
+        pal.setColor(QPalette.ColorRole.AlternateBase, QColor(21, 28, 52))
+        pal.setColor(QPalette.ColorRole.ToolTipBase, QColor(245, 245, 240))
+        pal.setColor(QPalette.ColorRole.ToolTipText, QColor(16, 22, 42))
+        pal.setColor(QPalette.ColorRole.Text, accent)
+        pal.setColor(QPalette.ColorRole.Button, QColor(25, 34, 64))
+        pal.setColor(QPalette.ColorRole.ButtonText, accent)
+        if hasattr(QPalette.ColorRole, "Menu"):
+            pal.setColor(QPalette.ColorRole.Menu, QColor(16, 22, 42))
+        if hasattr(QPalette.ColorRole, "MenuText"):
+            pal.setColor(QPalette.ColorRole.MenuText, accent)
+        if hasattr(QPalette.ColorRole, "MenuBar"):
+            pal.setColor(QPalette.ColorRole.MenuBar, QColor(16, 22, 42))
+        if hasattr(QPalette.ColorRole, "MenuBarText"):
+            pal.setColor(QPalette.ColorRole.MenuBarText, accent)
+        pal.setColor(QPalette.ColorRole.Mid, QColor(130, 138, 160))
+        pal.setColor(QPalette.ColorRole.Dark, QColor(7, 10, 22))
+        pal.setColor(QPalette.ColorRole.Shadow, QColor(3, 5, 12))
+        pal.setColor(QPalette.ColorRole.BrightText, QColor(224, 55, 70))
+        pal.setColor(QPalette.ColorRole.Highlight, QColor(72, 112, 210))
+        pal.setColor(QPalette.ColorRole.HighlightedText, QColor(245, 245, 240))
+        return pal
+
+    @staticmethod
+    def _blend_color(start: QColor, end: QColor, progress: float) -> QColor:
+        progress = max(0.0, min(1.0, progress))
+        return QColor(
+            round(start.red() + (end.red() - start.red()) * progress),
+            round(start.green() + (end.green() - start.green()) * progress),
+            round(start.blue() + (end.blue() - start.blue()) * progress),
+        )
+
+    def _snapshot_rainbow(self) -> None:
+        self._stop_animated_themes()
+        hue = getattr(self, "_rainbow_hue", 0.0)
+        name, ok = QInputDialog.getText(
+            self,
+            translate("MainWindow", "Save Custom Theme"),
+            translate("MainWindow", "Name for your theme:"),
+            text=translate("MainWindow", "My Theme"),
+        )
+        if ok and name.strip():
+            name = name.strip()
+            self._settings.setValue("custom_theme_hue", hue)
+            self._settings.setValue("custom_theme_name", name)
+            self._custom_theme_action.setText(name)
+            self._custom_theme_action.setVisible(True)
+            app = QApplication.instance()
+            if app:
+                self._apply_palette(self._rainbow_palette(hue))
+            self._settings.setValue("theme", "custom")
+            self._logger.info("Custom theme '%s' saved (hue=%.3f)", name, hue)
+        else:
+            self._rainbow_timer.start(50)
+            self._rainbow_snapshot_btn.setVisible(True)
+
+    def _set_theme_custom(self) -> None:
+        self._stop_animated_themes()
+        hue = self._settings.value("custom_theme_hue", 0.0, type=float)
+        app = QApplication.instance()
+        if app:
+            self._apply_palette(self._rainbow_palette(hue))
+        self._settings.setValue("theme", "custom")
+        self._logger.info("Theme set to custom")
+
+
+# Files above this are read/hashed behind a wait dialog on a worker thread so
+# the window keeps repainting; smaller ones are quicker than the dialog itself.
+# A UX cut-off only -- nothing is skipped or shortened on either side of it.
+_BUSY_BYTES = 8 * 1024 * 1024
+
+def _browse_hint() -> str:
+    return translate("MainWindow", "right-click → Open in New Window to browse its contents")
+
+
+def _is_zip_file(path: str) -> bool:
+    """True for an on-disk file with a ZIP signature at offset 0."""
+    from crush.core.vfs import SNIFF_BYTES, archive_kind
+
+    p = Path(path)
+    if not p.is_file():
+        return False
+    with open(p, "rb") as f:
+        return archive_kind(f.read(SNIFF_BYTES)) == "zip"
+
+
+def _peeked_archive_kind(node: VFSNode, vfs: VFS) -> str | None:
+    """Kind of browsable source from the member's first bytes (cached from
+    the tree build for archive members, so this costs no extraction): an
+    archive kind, or "logical_evidence" for an L01 or AD1."""
+    from crush.core.vfs import SNIFF_BYTES, archive_kind, opens_as_logical_evidence
+
+    try:
+        head = vfs.peek(node, SNIFF_BYTES)
+    except (OSError, ValueError):
+        return None
+    if opens_as_logical_evidence(head):
+        return "logical_evidence"
+    return archive_kind(head)
+
+
+# A hint banner: the text, and a (caption, callback) per way offered.
+_HintBanner = tuple[str, list[tuple[str, Callable[[], None]]]]
+
+
+@dataclass(frozen=True)
+class _SourceHint:
+    """How a file opens otherwise: the hint's text, and the action it
+    points at ("browse": Open in New Window, "disk_image": Open Disk Image
+    in New Window, None: nothing Crush can open it with)."""
+
+    text: str
+    action: Literal["browse", "disk_image"] | None
+
+
+def _open_as_source_hint(node: VFSNode, vfs: VFS, *, probe_archive: bool) -> str:
+    """Status-bar text of _source_hint; "" when there is nothing to say."""
+    hint = _source_hint(node, vfs, probe_archive=probe_archive)
+    return hint.text if hint is not None else ""
+
+
+def _source_hint(node: VFSNode, vfs: VFS, *, probe_archive: bool) -> _SourceHint | None:
+    """Hint that this file can be browsed via Open in New Window (decided
+    by content), or read via Open Disk Image in New Window (a hint from its
+    name or container content); None when there is nothing to say.
+    *probe_archive* runs the (costlier) bzip2/xz-TAR check on an on-disk
+    file."""
+    if node.is_dir or isinstance(vfs, FileVFS):
+        return None
+    if _peeked_archive_kind(node, vfs) is not None:
+        return _SourceHint(_browse_hint(), "browse")
+    if isinstance(vfs, DirectoryVFS):
+        from crush.core.vfs import is_browsable_source_file, zip_leading_bytes
+
+        leading = zip_leading_bytes(node.path)
+        if leading is not None:
+            # Open in New Window opens the ZIP after the leading bytes.
+            return _SourceHint(translate(
+                "MainWindow",
+                "contains a ZIP archive after {leading:,} leading bytes — "
+                "right-click → Open in New Window to browse it",
+            ).format(leading=leading), "browse")
+        if probe_archive and is_browsable_source_file(node.path):
+            return _SourceHint(_browse_hint(), "browse")
+    return _disk_image_hint(node, vfs)
+
+
+def _disk_image_retry_needs(
+    remembered: tuple[str, str] | None, path: str, was_wrong: bool, needs: str,
+) -> tuple[str, tuple[str, str]]:
+    """What to ask an encrypted disk image for, and what to remember: the
+    first prompt asks what the reader says opens it ("password", which a
+    key may also do, or "private key" alone); a retry after a rejected
+    password or key asks the same way for the same image -- a rejection
+    doesn't say what opens it, the first prompt did."""
+    if was_wrong and remembered is not None and remembered[0] == path:
+        return remembered[1], remembered
+    return needs, (path, needs)
+
+
+def _regular_file_path(node: VFSNode, vfs: VFS) -> Path | None:
+    """The on-disk path of a regular file in an opened folder, else None.
+    Not for a link (the folder shows links, never follows them) or a
+    special file (reading a FIFO blocks)."""
+    import stat
+
+    if not isinstance(vfs, DirectoryVFS):
+        return None
+    path = Path(node.path)
+    try:
+        return path if stat.S_ISREG(path.lstat().st_mode) else None
+    except OSError:
+        return None
+
+
+def _disk_image_hint(node: VFSNode, vfs: VFS) -> _SourceHint | None:
+    """A disk image is never probed for (see open_vfs); a file whose name or
+    container content says it is one gets pointed at the explicit action.
+    Logical evidence isn't one, and says so. A file in an opened folder is
+    judged exactly as when it is opened (by the image reader's recognition);
+    an archive member by its name and first bytes."""
+    from crush.core.vfs import SNIFF_BYTES, is_logical_evidence, looks_like_disk_image
+
+    try:
+        head = vfs.peek(node, SNIFF_BYTES)
+    except (OSError, ValueError):
+        head = b""
+    if is_logical_evidence(head):
+        # L01 and AD1 open as sources (_peeked_archive_kind); this is Lx01.
+        return _SourceHint(translate(
+            "MainWindow",
+            "EnCase Lx01 logical evidence — holds copies of files, not a disk; Crush doesn't "
+            "read Lx01",
+        ), None)
+    what = looks_like_disk_image(node.name, head, _regular_file_path(node, vfs))
+    if what is not None and what.code == "vfs.disk_image_hint_ad_encrypted":
+        # It may hold logical evidence rather than a disk.
+        return _SourceHint(translate(
+            "MainWindow",
+            "FTK Imager AD-encrypted — holds a disk image or AD1 logical evidence; "
+            "right-click → Open Disk Image in New Window to open it with its password or key",
+        ), "disk_image")
+    if what is not None:
+        return _SourceHint(translate(
+            "MainWindow",
+            "looks like a disk image — right-click → Open Disk Image in New Window to read it",
+        ), "disk_image")
+    return None
+
+
+def _can_open_as_source(node: VFSNode, vfs: VFS) -> bool | None:
+    """Whether open_vfs() would open this file as a browsable source
+    (archive, backup -- a disk image only opens when asked for).
+
+    True/False when that is known: from the file's first bytes, or by
+    checking a file that is on disk as-is. None for an archive member whose
+    first bytes don't tell (a bzip2/xz TAR) -- only extracting it would.
+    """
+    if node.is_dir or isinstance(vfs, FileVFS):
+        # A FileVFS is what open_vfs() fell back to after finding nothing to
+        # browse in this very file, whatever its extension says.
+        return False
+    if _peeked_archive_kind(node, vfs) is not None:
+        return True
+    if isinstance(vfs, DirectoryVFS):
+        from crush.core.vfs import is_browsable_source_file, zip_leading_bytes
+
+        return is_browsable_source_file(node.path) or zip_leading_bytes(node.path) is not None
+    return None
+
+
+def _format_size(size: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    value = float(size)
+    unit_index = 0
+    while value >= 1024 and unit_index < len(units) - 1:
+        value /= 1024
+        unit_index += 1
+    if unit_index == 0:
+        return f"{int(value)} {units[unit_index]}"
+    return f"{value:.1f} {units[unit_index]}"

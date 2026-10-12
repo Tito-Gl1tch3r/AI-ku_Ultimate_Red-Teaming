@@ -1,0 +1,267 @@
+package org.pac4j.mongo.profile.service;
+
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
+import com.mongodb.client.model.Filters;
+import lombok.val;
+import org.apache.shiro.authc.credential.DefaultPasswordService;
+import org.bson.Document;
+import org.bson.types.ObjectId;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.pac4j.core.credentials.UsernamePasswordCredentials;
+import org.pac4j.core.credentials.password.PasswordEncoder;
+import org.pac4j.core.credentials.password.ShiroPasswordEncoder;
+import org.pac4j.core.exception.AccountNotFoundException;
+import org.pac4j.core.exception.BadCredentialsException;
+import org.pac4j.core.exception.MultipleAccountsFoundException;
+import org.pac4j.core.exception.TechnicalException;
+import org.pac4j.core.profile.UserProfile;
+import org.pac4j.core.profile.service.AbstractProfileService;
+import org.pac4j.core.util.Pac4jConstants;
+import org.pac4j.mongo.profile.MongoProfile;
+import org.pac4j.test.mongo.MongoServer;
+import org.pac4j.test.util.TestsConstants;
+import org.pac4j.test.util.TestsHelper;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Tests the {@link MongoProfileService}.
+ *
+ * @author Jerome Leleu
+ * @since 1.8.0
+ */
+public final class MongoProfileServiceTests implements TestsConstants {
+
+    private static final PasswordEncoder PASSWORD_ENCODER = new ShiroPasswordEncoder(new DefaultPasswordService());
+
+    private static final int PORT = 37017;
+    private static final String MONGO_ID = "mongoId";
+    private static final String MONGO_LINKEDID = "mongoLinkedId";
+    private static final String MONGO_LINKEDID2 = "mongoLinkedId2";
+    private static final String MONGO_USER = "mongoUser";
+    private static final String MONGO_PASS = "mongoPass";
+    private static final String MONGO_PASS2 = "mongoPass2";
+
+
+    private static final MongoServer mongoServer = new MongoServer();
+
+    @BeforeAll
+    public static void beforeAll() {
+        mongoServer.start(PORT);
+
+        // create collection
+        val mongo = MongoClients.create(String.format("mongodb://localhost:%d", PORT));
+        val db = mongo.getDatabase("users");
+        db.createCollection("users");
+    }
+
+    @AfterAll
+    public static void afterAll() {
+        mongoServer.stop();
+    }
+
+    @BeforeEach
+    public void setUp() {
+        val mongo = MongoClients.create(String.format("mongodb://localhost:%d", 37017));
+        val db = mongo.getDatabase("users");
+        val users = db.getCollection("users");
+        users.deleteMany(Filters.empty());
+        val password = PASSWORD_ENCODER.encode(PASSWORD);
+        Map<String, Object> properties1 = new HashMap<>();
+        properties1.put(USERNAME, GOOD_USERNAME);
+        properties1.put(PASSWORD, password);
+        properties1.put(FIRSTNAME, FIRSTNAME_VALUE);
+        users.insertOne(new Document(properties1));
+        Map<String, Object> properties2 = new HashMap<>();
+        properties2.put(USERNAME, MULTIPLE_USERNAME);
+        properties2.put(PASSWORD, password);
+        users.insertOne(new Document(properties2));
+        Map<String, Object> properties3 = new HashMap<>();
+        properties3.put(USERNAME, MULTIPLE_USERNAME);
+        properties3.put(PASSWORD, password);
+        users.insertOne(new Document(properties3));
+    }
+
+    @Test
+    public void testNullPasswordEncoder() {
+        val authenticator = new MongoProfileService(getClient(), FIRSTNAME);
+        authenticator.setPasswordEncoder(null);
+        TestsHelper.expectException(authenticator::init, TechnicalException.class, "passwordEncoder cannot be null");
+    }
+
+    @Test
+    public void testNullMongoClient() {
+        val authenticator = new MongoProfileService(null, FIRSTNAME, PASSWORD_ENCODER);
+        TestsHelper.expectException(authenticator::init, TechnicalException.class, "mongoClient cannot be null");
+    }
+
+    @Test
+    public void testNullDatabase() {
+        val authenticator = new MongoProfileService(getClient(), FIRSTNAME, PASSWORD_ENCODER);
+        authenticator.setUsersDatabase(null);
+        TestsHelper.expectException(authenticator::init, TechnicalException.class, "usersDatabase cannot be blank");
+    }
+
+    @Test
+    public void testNullCollection() {
+        val authenticator = new MongoProfileService(getClient(), FIRSTNAME, PASSWORD_ENCODER);
+        authenticator.setUsersCollection(null);
+        TestsHelper.expectException(authenticator::init, TechnicalException.class, "usersCollection cannot be blank");
+    }
+
+    @Test
+    public void testNullUsername() {
+        val authenticator = new MongoProfileService(getClient(), FIRSTNAME, PASSWORD_ENCODER);
+        authenticator.setUsernameAttribute(null);
+        TestsHelper.expectException(authenticator::init, TechnicalException.class, "usernameAttribute cannot be blank");
+    }
+
+    @Test
+    public void testNullPassword() {
+        val authenticator = new MongoProfileService(getClient(), FIRSTNAME, PASSWORD_ENCODER);
+        authenticator.setPasswordAttribute(null);
+        val credentials = new UsernamePasswordCredentials(GOOD_USERNAME, PASSWORD);
+        TestsHelper.expectException(() -> authenticator.validate(null, credentials), TechnicalException.class,
+            "passwordAttribute cannot be blank");
+    }
+
+    private MongoClient getClient() {
+        return MongoClients.create(String.format("mongodb://localhost:%d", PORT));
+    }
+
+    private UsernamePasswordCredentials login(final String username, final String password, final String attribute) {
+        val authenticator = new MongoProfileService(getClient(), attribute);
+        authenticator.setPasswordEncoder(PASSWORD_ENCODER);
+        val credentials = new UsernamePasswordCredentials(username, password);
+        authenticator.validate(null, credentials);
+
+        return credentials;
+    }
+
+    @Test
+    public void testGoodUsernameAttribute() {
+        val credentials = login(GOOD_USERNAME, PASSWORD, FIRSTNAME);
+
+        val profile = credentials.getUserProfile();
+        assertNotNull(profile);
+        assertTrue(profile instanceof MongoProfile);
+        UserProfile dbProfile = (MongoProfile) profile;
+        assertEquals(GOOD_USERNAME, dbProfile.getId());
+        assertEquals(FIRSTNAME_VALUE, dbProfile.getAttribute(FIRSTNAME));
+    }
+
+    @Test
+    public void testGoodUsernameNoAttribute() {
+        val credentials = login(GOOD_USERNAME, PASSWORD, Pac4jConstants.EMPTY_STRING);
+
+        val profile = credentials.getUserProfile();
+        assertNotNull(profile);
+        assertTrue(profile instanceof MongoProfile);
+        UserProfile dbProfile = (MongoProfile) profile;
+        assertEquals(GOOD_USERNAME, dbProfile.getId());
+        assertNull(dbProfile.getAttribute(FIRSTNAME));
+    }
+
+    @Test
+    public void testMultipleUsername() {
+        TestsHelper.expectException(() -> login(MULTIPLE_USERNAME, PASSWORD, Pac4jConstants.EMPTY_STRING),
+            MultipleAccountsFoundException.class, "Too many accounts found for: misagh");
+    }
+
+    @Test
+    public void testBadUsername() {
+        TestsHelper.expectException(() -> login(BAD_USERNAME, PASSWORD, Pac4jConstants.EMPTY_STRING), AccountNotFoundException.class,
+            "No account found for: michael");
+    }
+
+    @Test
+    public void testBadPassword() {
+        TestsHelper.expectException(() -> login(GOOD_USERNAME, PASSWORD + "bad",
+                Pac4jConstants.EMPTY_STRING), BadCredentialsException.class, "Bad credentials for: jle");
+    }
+
+    @Test
+    public void testCreateUpdateFindDelete() {
+        val objectId = new ObjectId();
+        val profile = new MongoProfile();
+        profile.setId(MONGO_ID);
+        profile.setLinkedId(MONGO_LINKEDID);
+        profile.addAttribute(USERNAME, MONGO_USER);
+        profile.addAttribute(FIRSTNAME, objectId.toString());
+        val mongoProfileService = new MongoProfileService(getClient());
+        mongoProfileService.setPasswordEncoder(PASSWORD_ENCODER);
+        // create
+        mongoProfileService.create(profile, MONGO_PASS);
+
+        // check credentials
+        val credentials = new UsernamePasswordCredentials(MONGO_USER, MONGO_PASS);
+        mongoProfileService.validate(null, credentials);
+        val profile1 = credentials.getUserProfile();
+        assertNotNull(profile1);
+
+        // check data
+        val results = getData(mongoProfileService, MONGO_ID);
+        assertEquals(1, results.size());
+        val result = results.get(0);
+        assertEquals(6, result.size());
+        assertEquals(MONGO_ID, result.get(ID));
+        assertEquals(MONGO_LINKEDID, result.get(AbstractProfileService.LINKEDID));
+        assertNotNull(result.get(AbstractProfileService.SERIALIZED_PROFILE));
+        assertTrue(PASSWORD_ENCODER.matches(MONGO_PASS, (String) result.get(PASSWORD)));
+        assertEquals(MONGO_USER, result.get(USERNAME));
+        // findById
+        val profile2 = mongoProfileService.findByLinkedId(MONGO_LINKEDID);
+        assertEquals(MONGO_ID, profile2.getId());
+        assertEquals(MONGO_LINKEDID, profile2.getLinkedId());
+        assertEquals(MONGO_USER, profile2.getUsername());
+        assertEquals(objectId.toString(), profile2.getAttribute(FIRSTNAME));
+        assertEquals(2, profile2.getAttributes().size());
+        // update
+        profile.setLinkedId(MONGO_LINKEDID2);
+        mongoProfileService.update(profile, MONGO_PASS2);
+        val results2 = getData(mongoProfileService, MONGO_ID);
+        assertEquals(1, results2.size());
+        val result2 = results2.get(0);
+        assertEquals(6, result2.size());
+        assertEquals(MONGO_ID, result2.get(ID));
+        assertEquals(MONGO_LINKEDID2, result2.get(AbstractProfileService.LINKEDID));
+        assertNotNull(result2.get(AbstractProfileService.SERIALIZED_PROFILE));
+        assertTrue(PASSWORD_ENCODER.matches(MONGO_PASS2, (String) result2.get(PASSWORD)));
+        assertEquals(MONGO_USER, result2.get(USERNAME));
+        // remove
+        mongoProfileService.remove(profile);
+        val results3 = getData(mongoProfileService, MONGO_ID);
+        assertEquals(0, results3.size());
+    }
+
+    @Test
+    public void testChangeUserAndPasswordAttributes() {
+        val mongoProfileService = new MongoProfileService(getClient(), PASSWORD_ENCODER);
+        mongoProfileService.setUsernameAttribute(ALT_USER_ATT);
+        mongoProfileService.setPasswordAttribute(ALT_PASS_ATT);
+        val objectId = new ObjectId();
+        val profile = new MongoProfile();
+        profile.setId(MONGO_ID);
+        profile.setLinkedId(MONGO_LINKEDID);
+        profile.addAttribute(USERNAME, MONGO_USER);
+        profile.addAttribute(FIRSTNAME, objectId);
+        // create
+        mongoProfileService.create(profile, MONGO_PASS);
+        // check credentials
+        val credentials = new UsernamePasswordCredentials(MONGO_USER, MONGO_PASS);
+        mongoProfileService.validate(null, credentials);
+        assertNotNull(credentials.getUserProfile());
+    }
+
+    private List<Map<String, Object>> getData(final MongoProfileService service, final String id) {
+        return service.read(null, ID, id);
+    }
+}

@@ -1,0 +1,145 @@
+package org.pac4j.saml.metadata;
+
+import net.shibboleth.shared.resolver.CriteriaSet;
+import net.shibboleth.shared.xml.XMLParserException;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.opensaml.core.criterion.EntityIdCriterion;
+import org.pac4j.core.exception.TechnicalException;
+import org.pac4j.saml.config.SAML2Configuration;
+import org.pac4j.saml.util.SAML2UrlResource;
+import org.springframework.core.io.ByteArrayResource;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.UrlResource;
+
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
+import java.net.InetSocketAddress;
+import java.net.Proxy;
+import java.net.URL;
+import java.security.SecureRandom;
+import java.security.cert.X509Certificate;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+@SuppressWarnings("PMD.TooManyStaticImports")
+public class SAML2IdentityProviderMetadataResolverTest {
+
+    private SAML2IdentityProviderMetadataResolver metadataResolver;
+
+    private static SSLContext disabledSslContext() throws Exception {
+        var trustAllCerts = new TrustManager[]{new X509TrustManager() {
+            @Override
+            public void checkClientTrusted(X509Certificate[] x509Certificates, String s) {
+            }
+
+            @Override
+            public void checkServerTrusted(X509Certificate[] x509Certificates, String s) {
+            }
+
+            @Override
+            public X509Certificate[] getAcceptedIssuers() {
+                return null;
+            }
+        }};
+
+        var sc = SSLContext.getInstance("SSL");
+        sc.init(null, trustAllCerts, new SecureRandom());
+        return sc;
+    }
+
+    @BeforeEach
+    public void setUp() {
+        var configuration = new SAML2Configuration();
+        configuration.getIdentityProviderMetadata().setResource(new ClassPathResource("idp-metadata.xml"));
+        metadataResolver = new SAML2IdentityProviderMetadataResolver(configuration);
+    }
+
+    @Test
+    public void resolveMetadataEntityId() throws Exception {
+        var resolver = metadataResolver.resolve();
+        var criteria = new CriteriaSet(new EntityIdCriterion("mmoayyed.example.net"));
+        var entity = resolver.resolveSingle(criteria);
+        assertNotNull(entity);
+        assertEquals(entity.getEntityID(), "mmoayyed.example.net");
+    }
+
+    @Test
+    public void resolveMetadataDocumentAsString() {
+        metadataResolver.init();
+        var metadata = metadataResolver.getMetadata();
+        assertNotNull(metadata);
+    }
+
+    @Test
+    public void resolveMetadataOverUrlWithHostnameVerifier() throws Exception {
+        var configuration = new SAML2Configuration();
+        configuration.getIdentityProviderMetadata().setResource(new UrlResource("https://www.pac4j.org"));
+        configuration.setHostnameVerifier((s, sslSession) -> true);
+        configuration.setSslSocketFactory(disabledSslContext().getSocketFactory());
+        metadataResolver = new SAML2IdentityProviderMetadataResolver(configuration);
+        try {
+            metadataResolver.init();
+        } catch (final TechnicalException e) {
+            assertEquals(XMLParserException.class, e.getCause().getClass());
+        }
+    }
+
+    @Test
+    public void resolveMetadataOverUrl() throws Exception {
+        var configuration = new SAML2Configuration();
+        configuration.getIdentityProviderMetadata().setResource(new UrlResource("https://sso.union.edu/idp/shibboleth"));
+        metadataResolver = new SAML2IdentityProviderMetadataResolver(configuration);
+
+        var resolver = metadataResolver.resolve();
+        assertNotNull(resolver);
+
+        assertFalse(metadataResolver.hasChanged());
+        assertEquals(0, metadataResolver.getLastModified());
+        assertNotNull(metadataResolver.load());
+
+        var addr = new InetSocketAddress("unknown.example.com", 8080);
+        var proxy = new Proxy(Proxy.Type.HTTP, addr);
+        metadataResolver.setProxy(proxy);
+        assertThrows(TechnicalException.class, () -> metadataResolver.internalLoad());
+    }
+
+    @Test
+    public void resolveMetadataFromByteArray() throws Exception {
+        var configuration = new SAML2Configuration();
+        configuration.getIdentityProviderMetadata().setResource(
+                new ByteArrayResource(new ClassPathResource("idp-metadata.xml").getInputStream().readAllBytes()));
+        metadataResolver = new SAML2IdentityProviderMetadataResolver(configuration);
+
+        var resolver = metadataResolver.resolve();
+        assertNotNull(resolver);
+
+        assertFalse(metadataResolver.hasChanged());
+        assertNotNull(metadataResolver.load());
+    }
+
+    @Test
+    public void resolveMetadataConcurrently() throws Exception {
+        var configuration = new SAML2Configuration();
+        configuration.setSslSocketFactory(disabledSslContext().getSocketFactory());
+        configuration.setHostnameVerifier((s, sslSession) -> true);
+        //var resource = new SAML2UrlResource(new URL("https://md.incommon.org/InCommon/InCommon-metadata-idp-only.xml"), configuration);
+        var resource = new SAML2UrlResource(new URL("https://www.casserverpac4j.dev/idp/metadata"), configuration);
+        configuration.getIdentityProviderMetadata().setResource(resource);
+        metadataResolver = new SAML2IdentityProviderMetadataResolver(configuration);
+        var resolver = metadataResolver.resolve();
+        assertNotNull(resolver);
+    }
+
+    @Test
+    public void resolveExpiringMetadata() {
+        var configuration = new SAML2Configuration();
+        configuration.getIdentityProviderMetadata().setResource(new ClassPathResource("expired-idp-metadata.xml"));
+        metadataResolver = new SAML2IdentityProviderMetadataResolver(configuration);
+        metadataResolver.init();
+        assertNull(metadataResolver.getEntityDescriptorElement());
+    }
+
+
+}

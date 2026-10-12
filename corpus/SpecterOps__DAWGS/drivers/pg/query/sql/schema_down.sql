@@ -1,0 +1,129 @@
+-- Drop triggers
+drop trigger if exists delete_node_edges on node;
+drop function if exists delete_node_edges;
+
+-- Drop functions
+drop aggregate if exists cypher_min(jsonb);
+drop aggregate if exists cypher_max(jsonb);
+drop function if exists query_perf;
+drop function if exists lock_details;
+drop function if exists table_sizes;
+drop function if exists jsonb_to_text_array;
+drop function if exists cypher_min_transition(jsonb, jsonb);
+drop function if exists cypher_max_transition(jsonb, jsonb);
+drop function if exists cypher_value_compare(jsonb, jsonb);
+drop function if exists cypher_jsonb_type_rank(jsonb);
+drop function if exists cypher_contains(text, text);
+drop function if exists cypher_starts_with(text, text);
+drop function if exists cypher_ends_with(text, text);
+drop function if exists kind_name(smallint);
+drop function if exists start_node(edgeComposite);
+drop function if exists end_node(edgeComposite);
+drop function if exists get_node;
+drop function if exists node_prop;
+drop function if exists kinds;
+drop function if exists has_kind;
+drop function if exists mt_get_root;
+drop function if exists index_utilization;
+drop function if exists _format_asp_where_clause;
+drop function if exists _format_asp_query;
+drop function if exists asp_harness;
+drop function if exists create_traversal_filter_tables;
+drop function if exists create_traversal_filter_tables(text, text, text);
+drop function if exists create_traversal_filter_tables(text, text);
+drop function if exists create_traversal_filter_tables(int8[], int8[]);
+drop function if exists shortest_path_self_endpoint_error(int8, int8);
+drop function if exists unidirectional_sp_harness(text, text, int4);
+drop function if exists unidirectional_sp_harness(text, text, int4, int8);
+drop function if exists unidirectional_sp_harness(text, text, int4, text, text);
+drop function if exists unidirectional_sp_harness(text, text, int4, text, text, int8);
+drop function if exists unidirectional_sp_harness(text, text, int4, int8[]);
+drop function if exists unidirectional_sp_harness(text, text, int4, int8[], int8);
+drop function if exists unidirectional_sp_harness(text, text, int4, int8[], int8[]);
+drop function if exists unidirectional_sp_harness(text, text, int4, int8[], int8[], int8);
+drop function if exists unidirectional_asp_harness(text, text, int4);
+drop function if exists unidirectional_asp_harness(text, text, int4, text, text);
+drop function if exists unidirectional_asp_harness(text, text, int4, int8[]);
+drop function if exists unidirectional_asp_harness(text, text, int4, int8[], int8[]);
+drop function if exists bidirectional_asp_harness(text, text, text, text, int4);
+drop function if exists bidirectional_asp_harness(text, text, text, text, int4, text, text, text);
+drop function if exists bidirectional_asp_harness(text, text, text, text, int4, text, text);
+drop function if exists bidirectional_asp_harness(text, text, text, text, int4, int8[]);
+drop function if exists bidirectional_asp_harness(text, text, text, text, int4, int8[], int8[]);
+drop function if exists bidirectional_sp_harness(text, text, text, text, int4);
+drop function if exists bidirectional_sp_harness(text, text, text, text, int4, int8);
+drop function if exists bidirectional_sp_harness(text, text, text, text, int4, text, text, text, int8);
+drop function if exists bidirectional_sp_harness(text, text, text, text, int4, text, text, text);
+drop function if exists bidirectional_sp_harness(text, text, text, text, int4, text, text, int8);
+drop function if exists bidirectional_sp_harness(text, text, text, text, int4, text, text);
+drop function if exists bidirectional_sp_harness(text, text, text, text, int4, int8[], int8);
+drop function if exists bidirectional_sp_harness(text, text, text, text, int4, int8[]);
+drop function if exists bidirectional_sp_harness(text, text, text, text, int4, int8[], int8[], int8);
+drop function if exists bidirectional_sp_harness(text, text, text, text, int4, int8[], int8[]);
+drop function if exists _bidirectional_sp_harness(text, text, text, text, int4, text, text, text, int8[], int8[], int8, bool);
+drop function if exists _bidirectional_sp_harness(text, text, text, text, int4, text, text, text, int8[], int8[], bool);
+drop function if exists _bidirectional_sp_harness(text, text, text, text, int4, text, text, int8[], int8[], bool);
+drop function if exists create_bidirectional_shortest_path_tables;
+drop function if exists create_bidirectional_pair_pathspace_indexes;
+drop function if exists _all_shortest_paths;
+drop function if exists all_shortest_paths;
+drop function if exists traversal_step;
+drop function if exists _format_traversal_continuation_termination;
+drop function if exists _format_traversal_query;
+drop function if exists _format_traversal_initial_query;
+drop function if exists expand_traversal_step;
+drop function if exists traverse;
+drop function if exists ordered_edges_to_path(nodeComposite, edgeComposite[], nodeComposite[]);
+drop function if exists edges_to_path;
+drop function if exists traverse_paths;
+
+-- Drop all tables in order of dependency.
+drop table if exists node;
+drop table if exists edge;
+drop table if exists kind;
+drop table if exists graph;
+
+-- Remove custom types
+do
+$$
+  begin
+    drop type pathComposite;
+  exception
+    when undefined_object then null;
+  end
+$$;
+
+do
+$$
+  begin
+    drop type nodeComposite;
+  exception
+    when undefined_object then null;
+  end
+$$;
+
+do
+$$
+  begin
+    drop type edgeComposite;
+  exception
+    when undefined_object then null;
+  end
+$$;
+
+do
+$$
+  begin
+    drop type _traversal_step;
+  exception
+    when undefined_object then null;
+  end
+$$;
+
+-- Pull the tri-gram and intarray extensions.
+drop
+  extension if exists pg_trgm;
+drop
+  extension if exists intarray;
+drop
+  extension if exists pg_stat_statements;

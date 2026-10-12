@@ -1,0 +1,1083 @@
+package modules
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/url"
+	"regexp"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/akha-security/akca/engine/internal/config"
+	"github.com/akha-security/akca/engine/internal/httpclient"
+	"github.com/akha-security/akca/engine/internal/learning"
+	"github.com/akha-security/akca/engine/internal/oast"
+	"github.com/akha-security/akca/engine/internal/payloadgen"
+	"github.com/akha-security/akca/engine/internal/reflection"
+	"github.com/akha-security/akca/engine/internal/safemutation"
+	"github.com/akha-security/akca/engine/internal/scope"
+	"github.com/akha-security/akca/engine/internal/secretscan"
+	"github.com/akha-security/akca/engine/internal/sensor"
+	"github.com/akha-security/akca/engine/internal/storage"
+	"github.com/akha-security/akca/engine/internal/verification"
+)
+
+type HTTPDoer interface {
+	Do(ctx context.Context, method, rawURL string, body []byte, headers map[string]string) (httpclient.RequestResponse, error)
+}
+
+type OASTClient interface {
+	GenerateURL(payloadID, endpointURL, parameter, vulnClass string, findingID int64) (oast.GeneratedURL, error)
+}
+
+type BrowserRenderer interface {
+	Render(ctx context.Context, rawURL string) (string, error)
+}
+
+// BrowserHTMLRenderer verifies executable markup returned by non-GET probes
+// without pretending that a browser can replay an arbitrary captured write.
+// Implementations render the exact response body in an isolated document.
+type BrowserHTMLRenderer interface {
+	RenderHTML(ctx context.Context, source string) (string, error)
+}
+
+type BrowserExpressionEvaluator interface {
+	EvaluatePage(ctx context.Context, rawURL, expression string) (string, error)
+}
+
+type TLSInspector interface {
+	Inspect(ctx context.Context, rawURL string) (TLSInspection, error)
+}
+
+type WebSocketProber interface {
+	Probe(ctx context.Context, rawURL, payload string) (httpclient.RequestResponse, error)
+}
+
+type SmugglingProber interface {
+	Probe(ctx context.Context, rawURL, variant string) (SmugglingProbeResult, error)
+}
+
+type ScanTarget struct {
+	coverage           *targetRun
+	EndpointURL        string
+	Method             string
+	Parameter          string
+	Location           string
+	Profile            reflection.ReflectionProfile
+	Payloads           payloadgen.GenerationResult
+	EndpointType       string
+	RiskTags           []string
+	RecommendedModules []string
+	Priority           int
+	BodyTemplate       string
+	RequestTemplate    reflection.RequestTemplate
+	ObservedResponse   *httpclient.RequestResponse
+	ObservedComplete   bool
+}
+
+type Evidence struct {
+	Module          string                    `json:"module"`
+	Signal          string                    `json:"signal"`
+	Payload         payloadgen.Payload        `json:"payload"`
+	Parameter       string                    `json:"parameter,omitempty"`
+	Location        string                    `json:"location,omitempty"`
+	ResponseMarkers []string                  `json:"response_markers,omitempty"`
+	MethodVariants  []MethodVariantEvidence   `json:"method_variants,omitempty"`
+	Request         httpclient.RequestRecord  `json:"request"`
+	Response        httpclient.ResponseRecord `json:"response"`
+	Verification    verification.Result       `json:"verification"`
+	OASTURL         string                    `json:"oast_url,omitempty"`
+	StoredMarker    string                    `json:"stored_marker,omitempty"`
+	ReplayPlan      []ReplayStep              `json:"replay_plan,omitempty"`
+	DetectedAt      time.Time                 `json:"detected_at"`
+}
+
+type MethodVariantEvidence struct {
+	Method   string                    `json:"method"`
+	Location string                    `json:"location"`
+	Signal   string                    `json:"signal"`
+	Payload  payloadgen.Payload        `json:"payload"`
+	Request  httpclient.RequestRecord  `json:"request"`
+	Response httpclient.ResponseRecord `json:"response"`
+}
+
+type ReplayStep struct {
+	Role                   verification.ObservationRole `json:"role"`
+	IdentityID             string                       `json:"identity_id,omitempty"`
+	Request                httpclient.RequestRecord     `json:"request"`
+	ExpectedNormalizedHash string                       `json:"expected_normalized_hash"`
+}
+
+type ModuleFinding struct {
+	Title       string
+	VulnClass   string
+	Severity    string
+	Description string
+	Endpoint    string
+	Parameter   string
+	Location    string
+	Confidence  verification.ConfidenceLevel
+	Evidence    Evidence
+}
+
+type EventSink func(eventType, message string, payload map[string]interface{}) error
+
+var errDuplicateFinding = errors.New("duplicate canonical finding")
+
+type Runner struct {
+	scanID            string
+	client            HTTPDoer
+	scope             *scope.Engine
+	db                *storage.DB
+	verifier          *verification.Engine
+	oast              OASTClient
+	roles             RoleComparer
+	authResolve       AuthProfileResolver
+	browser           BrowserRenderer
+	tlsInspector      TLSInspector
+	websocket         WebSocketProber
+	smuggling         SmugglingProber
+	runtimeSensor     *sensor.Collector
+	mutationGuard     *safemutation.Guard
+	emit              EventSink
+	cfg               config.ScanConfig
+	storedMu          sync.Mutex
+	stored            map[string]string
+	baselineMu        sync.Mutex
+	baselineCache     map[string]httpclient.RequestResponse
+	secretScanMu      sync.Mutex
+	secretScanCache   map[string][]secretscan.Match
+	sqliBaselineMu    sync.Mutex
+	sqliBaselines     map[string]*sqliBaselineCacheEntry
+	timingMu          sync.Mutex
+	delayedTiming     []delayedTimingProbe
+	noticeMu          sync.Mutex
+	notices           map[string]struct{}
+	oastBlocked       bool
+	tlsMu             sync.Mutex
+	tlsReported       map[string]struct{}
+	moduleSeenMu      sync.Mutex
+	moduleSeen        map[string]struct{}
+	backupOriginMu    sync.Mutex
+	backupOriginLocks map[string]*sync.Mutex
+	findingMu         sync.Mutex
+	findingSeen       map[string]int64
+	budgetExhausted   atomic.Bool
+	probeCount        atomic.Int64
+	executionErrors   atomic.Int64
+	categoryBudgetsMu sync.RWMutex
+	categoryBudgets   map[string]int64
+	categoryUsage     map[string]*atomic.Int64
+	rolloverPool      atomic.Int64
+	moduleBudgetsMu   sync.RWMutex
+	moduleBudgets     map[string]int64
+	moduleUsage       map[string]*atomic.Int64
+
+	adaptiveBudgetMu       sync.Mutex
+	adaptiveBudget         *adaptiveScanBudget
+	remainingRequestBudget *int
+}
+
+// ProbeCount reports vulnerability-module probe attempts independently from
+// crawler and bootstrap traffic, so the CLI can show real payload progress.
+func (r *Runner) ProbeCount() int64 {
+	if r == nil {
+		return 0
+	}
+	return r.probeCount.Load()
+}
+
+// Close releases optional long-lived module resources.
+func (r *Runner) Close() {
+	if r == nil || r.browser == nil {
+		return
+	}
+	if closer, ok := r.browser.(interface{ Close() }); ok {
+		closer.Close()
+	}
+}
+
+func NewRunner(scanID string, client HTTPDoer, scopeEngine *scope.Engine, db *storage.DB,
+	verifier *verification.Engine, oastClient OASTClient, emit EventSink, cfg config.ScanConfig, opts ...RunnerOption) *Runner {
+	r := &Runner{
+		scanID: scanID, client: observeHTTP(client), scope: scopeEngine, db: db,
+		verifier: verifier, oast: oastClient, emit: emit, cfg: cfg,
+		stored:            make(map[string]string),
+		baselineCache:     make(map[string]httpclient.RequestResponse),
+		secretScanCache:   make(map[string][]secretscan.Match),
+		sqliBaselines:     make(map[string]*sqliBaselineCacheEntry),
+		notices:           make(map[string]struct{}),
+		tlsReported:       make(map[string]struct{}),
+		moduleSeen:        make(map[string]struct{}),
+		backupOriginLocks: make(map[string]*sync.Mutex),
+		findingSeen:       make(map[string]int64),
+		moduleBudgets:     make(map[string]int64),
+		moduleUsage:       make(map[string]*atomic.Int64),
+	}
+	if cfg.RequestBudget > 0 {
+		r.categoryBudgets = map[string]int64{
+			"injection":       int64(float64(cfg.RequestBudget) * 0.35),
+			"serverside":      int64(float64(cfg.RequestBudget) * 0.25),
+			"logic_auth":      int64(float64(cfg.RequestBudget) * 0.25),
+			"client_exposure": int64(float64(cfg.RequestBudget) * 0.15),
+		}
+		r.categoryUsage = map[string]*atomic.Int64{
+			"injection":       new(atomic.Int64),
+			"serverside":      new(atomic.Int64),
+			"logic_auth":      new(atomic.Int64),
+			"client_exposure": new(atomic.Int64),
+		}
+	}
+	if guard, ok := client.(interface {
+		ReserveExternal(context.Context, string, string) error
+	}); ok {
+		cfg.NetworkRequestGuard = guard.ReserveExternal
+	}
+	r.tlsInspector = newNetworkTLSInspector(cfg)
+	r.websocket = newNetworkWebSocketProber(cfg, scopeEngine)
+	r.smuggling = newNetworkSmugglingProber(cfg, scopeEngine)
+	r.mutationGuard = safemutation.NewGuardWithFailureSink(safemutation.DefaultPolicy(),
+		func(tx safemutation.Transaction, err error) {
+			if r.emit != nil {
+				_ = r.emit("mutation_cleanup_failed", err.Error(), map[string]interface{}{
+					"operation_id": tx.OperationID, "resource_id": tx.ResourceID,
+					"canary": tx.Canary, "state_before_hash": tx.StateBeforeHash,
+					"state_after_hash": tx.StateAfterHash,
+				})
+			}
+		})
+	for _, opt := range opts {
+		opt(r)
+	}
+	r.loadStoredMarkers()
+	r.loadExistingFindingKeys()
+	return r
+}
+
+func ModuleCategory(module string) string {
+	switch module {
+	case "sqli", "command_injection", "ssti", "nosql", "xss", "blind_xss", "ldap", "xpath",
+		"ldap_xpath_injection", "csti_detection", "client_ssti", "server_side_js_injection",
+		"pdf_injection", "react_rsc_rce", "crlf", "hpp", "prototype_pollution", "llm_injection":
+		return "injection"
+	case "ssrf", "xxe", "insecure_deserialization", "lfi", "file_upload", "nextjs_bypass",
+		"http_smuggling", "smuggling", "cache_poisoning", "cpdos", "proxy_path_confusion":
+		return "serverside"
+	case "idor", "auth_bypass", "cors", "csrf", "broken_auth", "jwt", "oauth", "bfla",
+		"session_fixation", "open_redirect", "route_auth_bypass", "improper_auth",
+		"account_recovery", "tenant_isolation", "webhook_security", "parser_differential",
+		"mass_assignment", "rate_limit", "account_enum", "oauth_flow_audit",
+		"business_logic", "race_condition", "race_condition_sync", "session_lifecycle", "ws_cswsh":
+		return "logic_auth"
+	default:
+		return "client_exposure"
+	}
+}
+
+func moduleCategory(module string) string {
+	return ModuleCategory(module)
+}
+
+// ModuleDefaultProbesPerTarget defines the optimized probe quota for a given module per discovered target.
+func ModuleDefaultProbesPerTarget(module string) int {
+	switch module {
+	case "sqli", "nosql":
+		return 24
+	case "xss", "blind_xss":
+		return 20
+	case "command_injection", "ssti", "server_side_js_injection", "react_rsc_rce":
+		return 16
+	case "ssrf", "xxe":
+		return 12
+	case "insecure_deserialization", "lfi", "file_upload":
+		return 10
+	case "idor", "auth_bypass", "broken_auth", "bfla":
+		return 10
+	case "cors", "csrf", "open_redirect", "crlf", "hpp":
+		return 6
+	case "graphql", "jwt", "oauth":
+		return 8
+	default:
+		return 6
+	}
+}
+
+func (r *Runner) canModuleProbe(module string) bool {
+	if r == nil || r.cfg.RequestBudget <= 0 {
+		return true
+	}
+	// 1. Check granular per-module budget if initialized
+	r.moduleBudgetsMu.RLock()
+	if modBudget, ok := r.moduleBudgets[module]; ok && modBudget > 0 {
+		if usage := r.moduleUsage[module]; usage != nil {
+			if usage.Load() >= modBudget {
+				r.moduleBudgetsMu.RUnlock()
+				// This specific module hit its target-derived budget.
+				// Other modules continue unaffected!
+				return false
+			}
+		}
+	}
+	r.moduleBudgetsMu.RUnlock()
+
+	// 2. Check broad category budget (if global RequestBudget > 0)
+	if r.cfg.RequestBudget <= 0 {
+		return true
+	}
+	cat := moduleCategory(module)
+	usage := r.categoryUsage[cat]
+	if usage == nil {
+		return true
+	}
+	used := usage.Load()
+	r.categoryBudgetsMu.RLock()
+	allocated := r.categoryBudgets[cat]
+	r.categoryBudgetsMu.RUnlock()
+	if used < allocated {
+		return true
+	}
+	if r.rolloverPool.Load() > 0 {
+		return true
+	}
+	return false
+}
+
+func (r *Runner) recordModuleProbeUsage(module string) {
+	if r == nil {
+		return
+	}
+	// Track per-module usage
+	r.moduleBudgetsMu.RLock()
+	if u, ok := r.moduleUsage[module]; ok && u != nil {
+		u.Add(1)
+	}
+	r.moduleBudgetsMu.RUnlock()
+
+	// Track category usage if global budget is set
+	if r.cfg.RequestBudget <= 0 {
+		return
+	}
+	cat := moduleCategory(module)
+	usage := r.categoryUsage[cat]
+	if usage == nil {
+		return
+	}
+	r.categoryBudgetsMu.RLock()
+	allocated := r.categoryBudgets[cat]
+	r.categoryBudgetsMu.RUnlock()
+	cur := usage.Add(1)
+	if cur > allocated {
+		r.rolloverPool.Add(-1)
+	}
+}
+
+// InitModuleBudgetsFromTargets initializes granular per-module budgets proportional
+// to the discovered attack surface (number of targets).
+func (r *Runner) InitModuleBudgetsFromTargets(targets []ScanTarget) {
+	if r == nil || len(targets) == 0 {
+		return
+	}
+	r.moduleBudgetsMu.Lock()
+	defer r.moduleBudgetsMu.Unlock()
+
+	targetCount := int64(len(targets))
+	for _, mod := range ModuleCatalog() {
+		perTarget := int64(ModuleDefaultProbesPerTarget(mod))
+		calculatedBudget := targetCount * perTarget
+		if r.cfg.RequestBudget > 0 {
+			// If an operator specified a global request budget, ensure the module
+			// budget respects its category allocation.
+			cat := moduleCategory(mod)
+			r.categoryBudgetsMu.RLock()
+			catAllocated := r.categoryBudgets[cat]
+			r.categoryBudgetsMu.RUnlock()
+			if catAllocated > 0 && calculatedBudget > catAllocated {
+				calculatedBudget = catAllocated
+			}
+		}
+		r.moduleBudgets[mod] = calculatedBudget
+		if _, exists := r.moduleUsage[mod]; !exists {
+			r.moduleUsage[mod] = new(atomic.Int64)
+		}
+	}
+}
+
+// ReleaseUnusedCategoryBudget releases any unspent requests from a completed category
+// into the shared rollover pool so subsequent categories can utilize them.
+func (r *Runner) ReleaseUnusedCategoryBudget(cat string) {
+	if r == nil || r.cfg.RequestBudget <= 0 {
+		return
+	}
+	usage := r.categoryUsage[cat]
+	if usage == nil {
+		return
+	}
+	used := usage.Load()
+	r.categoryBudgetsMu.RLock()
+	allocated := r.categoryBudgets[cat]
+	r.categoryBudgetsMu.RUnlock()
+	if remaining := allocated - used; remaining > 0 {
+		if usage.CompareAndSwap(used, allocated) {
+			r.rolloverPool.Add(remaining)
+		}
+	}
+}
+
+func (r *Runner) releaseUnusedCategoryBudget(cat string) {
+	r.ReleaseUnusedCategoryBudget(cat)
+}
+
+// AdjustCategoryBudgetsFromTargets dynamically redistributes the remaining request budget
+// among categories based on the actual attack surface discovered (e.g. number of parameter
+// injection targets vs server-side URL targets vs passive endpoint targets).
+func (r *Runner) AdjustCategoryBudgetsFromTargets(targets []ScanTarget) {
+	if r == nil || len(targets) == 0 {
+		return
+	}
+	// Initialize module budgets alongside category adjustments
+	r.InitModuleBudgetsFromTargets(targets)
+
+	if r.cfg.RequestBudget <= 0 {
+		return
+	}
+	r.categoryBudgetsMu.Lock()
+	defer r.categoryBudgetsMu.Unlock()
+
+	counts := map[string]int{
+		"injection":       0,
+		"serverside":      0,
+		"logic_auth":      0,
+		"client_exposure": 0,
+	}
+
+	for _, t := range targets {
+		if t.Parameter != "" {
+			counts["injection"]++
+		}
+		paramLower := strings.ToLower(t.Parameter)
+		if t.Location == "path" || strings.Contains(paramLower, "url") || strings.Contains(paramLower, "file") ||
+			strings.Contains(paramLower, "path") || strings.Contains(paramLower, "dest") || strings.Contains(paramLower, "redirect") {
+			counts["serverside"]++
+		}
+		if t.Parameter == "" || len(t.RecommendedModules) > 0 {
+			counts["logic_auth"]++
+		}
+		counts["client_exposure"]++
+	}
+
+	totalWeighted := counts["injection"] + counts["serverside"] + counts["logic_auth"] + counts["client_exposure"]
+	if totalWeighted == 0 {
+		return
+	}
+
+	// Guarantee a baseline floor of 8% for each category so small surfaces don't starve,
+	// and distribute the remaining 68% proportionally according to discovered targets.
+	const floor = 0.08
+	const allocatable = 1.0 - (floor * 4.0)
+
+	totalBudget := float64(r.cfg.RequestBudget)
+	var allocatedTotal int64
+	for cat, count := range counts {
+		fraction := floor + allocatable*(float64(count)/float64(totalWeighted))
+		catBudget := int64(totalBudget * fraction)
+		r.categoryBudgets[cat] = catBudget
+		allocatedTotal += catBudget
+	}
+	// Give any rounding remainder to injection
+	if diff := int64(r.cfg.RequestBudget) - allocatedTotal; diff > 0 {
+		r.categoryBudgets["injection"] += diff
+	}
+}
+
+func (r *Runner) loadStoredMarkers() {
+	if r.db == nil || !r.cfg.EnableSecondOrderTracking {
+		return
+	}
+	markers, err := r.db.ListSecondOrderMarkers(r.scanID)
+	if err != nil {
+		r.emitOnce("second_order_marker_load_failed", "coverage_gap", "Second-order stored marker cache could not be loaded", map[string]interface{}{
+			"scan_id": r.scanID, "error": err.Error(),
+		})
+		return
+	}
+	if len(markers) == 0 {
+		return
+	}
+	r.storedMu.Lock()
+	defer r.storedMu.Unlock()
+	for _, marker := range markers {
+		if marker.EndpointURL == "" || marker.Parameter == "" || marker.Marker == "" {
+			continue
+		}
+		r.stored[marker.EndpointURL+"::"+marker.Parameter] = marker.Marker
+	}
+}
+
+func (r *Runner) loadExistingFindingKeys() {
+	if r.db == nil || r.scanID == "" {
+		return
+	}
+	_ = r.db.IterateFindings(r.scanID, func(rec storage.FindingRecord) error {
+		f := ModuleFinding{
+			Title: rec.Title, VulnClass: rec.VulnClass, Endpoint: rec.EndpointURL, Parameter: rec.Parameter,
+		}
+		if rec.EvidenceJSON != "" {
+			_ = json.Unmarshal([]byte(rec.EvidenceJSON), &f.Evidence)
+		}
+		key := r.findingKey(f)
+		if key == "" {
+			return nil
+		}
+		r.findingMu.Lock()
+		if r.findingSeen == nil {
+			r.findingSeen = make(map[string]int64)
+		}
+		r.findingSeen[key] = rec.ID
+		r.findingMu.Unlock()
+		return nil
+	})
+}
+
+var (
+	routeNumSegmentRe  = regexp.MustCompile(`^(\d+|[0-9a-fA-F]{8,})$`)
+	routeUUIDSegmentRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+)
+
+func normalizeRoutePattern(path string) string {
+	if path == "" || path == "/" {
+		return path
+	}
+	segments := strings.Split(path, "/")
+	for i, seg := range segments {
+		if seg == "" {
+			continue
+		}
+		if routeUUIDSegmentRe.MatchString(seg) {
+			segments[i] = "{uuid}"
+		} else if routeNumSegmentRe.MatchString(seg) {
+			segments[i] = "{id}"
+		}
+	}
+	return strings.Join(segments, "/")
+}
+
+// endpointModuleOnce prevents endpoint-level modules from running once per
+// discovered parameter. Query values are excluded because these modules act on
+// the route/resource, not on an individual injection surface.
+func (r *Runner) endpointModuleOnce(module string, target ScanTarget) bool {
+	raw := target.EndpointURL
+	method := strings.ToUpper(strings.TrimSpace(target.Method))
+	if parsed, err := url.Parse(raw); err == nil {
+		if originScopedModule(module) {
+			raw = parsed.Scheme + "://" + parsed.Host
+			method = "GET"
+		} else if routePrefixScopedModule(module) {
+			// These probes depend on the concrete application mount/path.  Collapsing
+			// them to the origin lets an early visit to "/" permanently starve every
+			// protected or static sub-route.  One run per first path segment keeps the
+			// request budget bounded while preserving coverage for mounted apps.
+			raw = parsed.Scheme + "://" + parsed.Host + firstRoutePrefix(parsed.Path)
+			method = "GET"
+		} else if module == "cors" {
+			parsed.RawQuery = ""
+			parsed.Fragment = ""
+			raw = parsed.Scheme + "://" + parsed.Host + normalizeRoutePattern(parsed.Path)
+		} else {
+			parsed.RawQuery = ""
+			parsed.Fragment = ""
+			raw = parsed.String()
+		}
+	}
+	key := module + "::" + method + "::" + raw
+	r.moduleSeenMu.Lock()
+	defer r.moduleSeenMu.Unlock()
+	if _, exists := r.moduleSeen[key]; exists {
+		return false
+	}
+	r.moduleSeen[key] = struct{}{}
+	return true
+}
+
+// contentModuleOnce prevents passive response analyzers from re-reading and
+// re-scanning the same concrete URL for every discovered parameter surface.
+func (r *Runner) contentModuleOnce(module string, target ScanTarget) bool {
+	raw := target.EndpointURL
+	if parsed, err := url.Parse(raw); err == nil {
+		parsed.Fragment = ""
+		raw = parsed.String()
+	}
+	key := module + "::" + strings.ToUpper(strings.TrimSpace(target.Method)) + "::" + raw
+	r.moduleSeenMu.Lock()
+	defer r.moduleSeenMu.Unlock()
+	if _, exists := r.moduleSeen[key]; exists {
+		return false
+	}
+	r.moduleSeen[key] = struct{}{}
+	return true
+}
+
+// moduleWorkOnce deduplicates a concrete, method-independent unit of module
+// work. It is intentionally separate from endpointModuleOnce: discovery may
+// reach the same origin/path through many methods and parameters, while probes
+// such as a root archive lookup still address the exact same resource.
+func (r *Runner) moduleWorkOnce(module, work string) bool {
+	key := module + "::work::" + strings.TrimSpace(work)
+	r.moduleSeenMu.Lock()
+	defer r.moduleSeenMu.Unlock()
+	if _, exists := r.moduleSeen[key]; exists {
+		return false
+	}
+	r.moduleSeen[key] = struct{}{}
+	return true
+}
+
+func originScopedModule(module string) bool {
+	switch module {
+	case "actuator", "devops_exposure", "security_headers", "tls_misconfig", "cloud_takeover",
+		"iis_discovery", "firebase_misconfig", "spring_cloud_jolokia", "saas_exposure", "grpc_scan",
+		"cicd_exposure", "git_recovery", "source_code_disclosure", "cloud_storage", "cloud_posture",
+		"cloud_native_exposure", "host_poisoning", "wordpress_fuzz",
+		"framework_debug", "cpdos", "ws_cswsh", "react_rsc_rce",
+		"swagger_exposure", "http_smuggling", "debug_admin", "cors_oast":
+		return true
+	default:
+		return false
+	}
+}
+
+func routePrefixScopedModule(module string) bool {
+	switch module {
+	case "nginx_alias", "nextjs_bypass", "proxy_path_confusion", "backup_archives", "sensitive_file_discovery":
+		return true
+	default:
+		return false
+	}
+}
+
+func firstRoutePrefix(path string) string {
+	path = strings.Trim(path, "/")
+	if path == "" {
+		return "/"
+	}
+	if index := strings.IndexByte(path, '/'); index >= 0 {
+		path = path[:index]
+	}
+	return "/" + path
+}
+
+func originScanTarget(target ScanTarget) (ScanTarget, bool) {
+	parsed, err := url.Parse(target.EndpointURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ScanTarget{}, false
+	}
+	target.EndpointURL = parsed.Scheme + "://" + parsed.Host
+	target.Method = "GET"
+	target.Parameter = ""
+	target.Location = ""
+	target.BodyTemplate = ""
+	target.RequestTemplate = reflection.RequestTemplate{}
+	return target, true
+}
+
+func (r *Runner) safeMutationGuard() *safemutation.Guard {
+	if r.mutationGuard == nil {
+		r.mutationGuard = safemutation.NewGuard(safemutation.DefaultPolicy())
+	}
+	return r.mutationGuard
+}
+
+func (r *Runner) emitOnce(key, eventType, message string, payload map[string]interface{}) {
+	r.noticeMu.Lock()
+	if _, exists := r.notices[key]; exists {
+		r.noticeMu.Unlock()
+		return
+	}
+	r.notices[key] = struct{}{}
+	r.noticeMu.Unlock()
+	if r.emit != nil {
+		_ = r.emit(eventType, message, payload)
+	}
+}
+
+func (r *Runner) oastDeliveryBlocked() bool {
+	r.noticeMu.Lock()
+	defer r.noticeMu.Unlock()
+	return r.oastBlocked
+}
+
+func (r *Runner) blockOASTDelivery() {
+	r.noticeMu.Lock()
+	r.oastBlocked = true
+	r.noticeMu.Unlock()
+}
+
+type RunnerOption func(*Runner)
+
+func WithRoleComparer(rc RoleComparer) RunnerOption {
+	return func(r *Runner) { r.roles = rc }
+}
+
+func WithAuthResolver(ar AuthProfileResolver) RunnerOption {
+	return func(r *Runner) { r.authResolve = ar }
+}
+
+func WithBrowserRenderer(browser BrowserRenderer) RunnerOption {
+	return func(r *Runner) { r.browser = browser }
+}
+
+func WithTLSInspector(inspector TLSInspector) RunnerOption {
+	return func(r *Runner) { r.tlsInspector = inspector }
+}
+
+func WithWebSocketProber(prober WebSocketProber) RunnerOption {
+	return func(r *Runner) { r.websocket = prober }
+}
+
+func WithSmugglingProber(prober SmugglingProber) RunnerOption {
+	return func(r *Runner) { r.smuggling = prober }
+}
+
+func WithRuntimeSensor(collector *sensor.Collector) RunnerOption {
+	return func(r *Runner) { r.runtimeSensor = collector }
+}
+
+func (r *Runner) RunGroupA(ctx context.Context, targets []ScanTarget) ([]ModuleFinding, error) {
+	_ = r.emit("vuln_modules_started", "Injection vulnerability scanning started", map[string]interface{}{
+		"scan_id": r.scanID, "targets": len(targets),
+	})
+
+	workers := r.cfg.PerHostConcurrency
+	if workers <= 0 {
+		workers = 8
+	}
+	if workers > len(targets) {
+		workers = len(targets)
+	}
+
+	var mu sync.Mutex
+	var findings []ModuleFinding
+	var testedCount atomic.Int64
+	var skippedBudgetCount atomic.Int64
+
+	targetCh := make(chan ScanTarget, moduleQueueCapacity(workers, len(targets)))
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if rec := recover(); rec != nil {
+					_ = r.emit("log", fmt.Sprintf("RunGroupA worker recovered from panic: %v", rec), map[string]interface{}{"scan_id": r.scanID})
+				}
+			}()
+			for target := range targetCh {
+				if ctx.Err() != nil {
+					return
+				}
+				if !r.canModuleProbe("sqli") {
+					skippedBudgetCount.Add(1)
+					continue
+				}
+				if !r.scope.IsInScope(target.EndpointURL) {
+					continue
+				}
+				testedCount.Add(1)
+				func() {
+					defer func() {
+						if rec := recover(); rec != nil {
+							_ = r.emit("log", fmt.Sprintf("RunGroupA target %s recovered from panic: %v", target.EndpointURL, rec), map[string]interface{}{"scan_id": r.scanID})
+						}
+					}()
+					var localFindings []ModuleFinding
+					if r.cfg.AllowsModule("xss") {
+						localFindings = append(localFindings, r.runXSS(ctx, target)...)
+					}
+					if r.cfg.AllowsModule("blind_xss") {
+						localFindings = append(localFindings, r.runBlindXSS(ctx, target)...)
+					}
+					if r.cfg.AllowsModule("sqli") {
+						localFindings = append(localFindings, r.runSQLi(ctx, target)...)
+					}
+					if r.cfg.AllowsModule("nosql") {
+						localFindings = append(localFindings, r.runNoSQLi(ctx, target)...)
+					}
+					if r.cfg.AllowsModule("ssti") {
+						localFindings = append(localFindings, r.runSSTI(ctx, target)...)
+					}
+					if r.cfg.AllowsModule("command_injection") {
+						localFindings = append(localFindings, r.runCommandInjection(ctx, target)...)
+					}
+
+					if len(localFindings) > 0 {
+						mu.Lock()
+						findings = append(findings, localFindings...)
+						mu.Unlock()
+					}
+				}()
+			}
+		}()
+	}
+	feedModuleTargets(ctx, targetCh, targets)
+	wg.Wait()
+
+	r.releaseUnusedCategoryBudget("injection")
+	totalTargets := len(targets)
+	tested := int(testedCount.Load())
+	skipped := int(skippedBudgetCount.Load())
+	coveragePct := 100.0
+	if totalTargets > 0 {
+		coveragePct = float64(tested) / float64(totalTargets) * 100.0
+	}
+	_ = r.emit("vuln_modules_finished", "Injection vulnerability scanning finished", map[string]interface{}{
+		"scan_id": r.scanID, "findings": len(findings),
+		"targets_tested": tested, "targets_total": totalTargets,
+		"coverage_percentage": fmt.Sprintf("%.1f%%", coveragePct),
+	})
+	if skipped > 0 {
+		r.emitOnce("group_budget_starved:group_a", "coverage_gap",
+			fmt.Sprintf("Injection scan group was budget-starved: tested %d of %d targets (%.1f%% coverage)", tested, totalTargets, coveragePct),
+			map[string]interface{}{
+				"scan_id": r.scanID, "group": "group_a",
+				"targets_tested": tested, "targets_total": totalTargets,
+				"coverage_pct": coveragePct,
+			},
+		)
+	}
+	findings = append(findings, r.flushDelayedTimingVerifications(ctx)...)
+	return findings, nil
+}
+
+// moduleQueueCapacity keeps large target sets from being duplicated in a
+// channel buffer. The source slice is already resident; only a small working
+// set needs to be queued for active workers.
+func moduleQueueCapacity(workers, targets int) int {
+	capacity := workers * 2
+	if capacity < 1 {
+		capacity = 1
+	}
+	if capacity > 256 {
+		capacity = 256
+	}
+	if targets > 0 && capacity > targets {
+		capacity = targets
+	}
+	return capacity
+}
+
+func feedModuleTargets(ctx context.Context, targetCh chan<- ScanTarget, targets []ScanTarget) {
+	defer close(targetCh)
+	for _, target := range targets {
+		select {
+		case targetCh <- target:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (r *Runner) persistFinding(f ModuleFinding, eventContext ...string) error {
+	if r.db == nil || f.Confidence == verification.Suppressed || !findingProofEligible(f) {
+		return nil
+	}
+	if f.Confidence == verification.Confirmed {
+		r.recordLearning(f.Endpoint, f.VulnClass, learning.OutcomeWorked)
+	}
+	ev, _ := json.Marshal(f.Evidence)
+	evJSON := string(ev)
+	key, existingID, duplicate := r.claimFinding(f)
+	if duplicate {
+		if existingID > 0 {
+			_ = r.db.SaveEvidenceForFinding(r.scanID, existingID, f.VulnClass+"_variant_signal", evJSON)
+			_ = r.saveVerificationObservations(existingID, f)
+		}
+		return errDuplicateFinding
+	}
+	desc := f.Description + "\n\nevidence: " + evJSON
+	conf := f.Evidence.Verification.Score
+	if conf <= 0 {
+		conf = confidenceScore(f.Confidence)
+	}
+	findingID, err := r.db.SaveFinding(r.scanID, f.Title, f.Severity, f.VulnClass, desc, f.Endpoint, f.Parameter, conf, evJSON)
+	if err != nil {
+		r.releaseFindingKey(key)
+		return err
+	}
+	r.finishFindingKey(key, findingID)
+	module := f.Evidence.Module
+	signal := f.Evidence.Signal
+	if len(eventContext) > 0 && eventContext[0] != "" {
+		module = eventContext[0]
+	}
+	if len(eventContext) > 1 && eventContext[1] != "" {
+		signal = eventContext[1]
+	}
+	r.emitFindingDetected(f, module, signal, findingID)
+	if err := r.db.SaveEvidenceForFinding(r.scanID, findingID, f.VulnClass+"_signal", evJSON); err != nil {
+		return err
+	}
+	if err := r.saveVerificationObservations(findingID, f); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *Runner) claimFinding(f ModuleFinding) (string, int64, bool) {
+	key := r.findingKey(f)
+	if key == "" {
+		return "", 0, false
+	}
+	r.findingMu.Lock()
+	defer r.findingMu.Unlock()
+	if r.findingSeen == nil {
+		r.findingSeen = make(map[string]int64)
+	}
+	if existingID, exists := r.findingSeen[key]; exists {
+		return key, existingID, true
+	}
+	r.findingSeen[key] = 0
+	return key, 0, false
+}
+
+func (r *Runner) finishFindingKey(key string, findingID int64) {
+	if key == "" {
+		return
+	}
+	r.findingMu.Lock()
+	if r.findingSeen == nil {
+		r.findingSeen = make(map[string]int64)
+	}
+	r.findingSeen[key] = findingID
+	r.findingMu.Unlock()
+}
+
+func (r *Runner) releaseFindingKey(key string) {
+	if key == "" {
+		return
+	}
+	r.findingMu.Lock()
+	delete(r.findingSeen, key)
+	r.findingMu.Unlock()
+}
+
+func (r *Runner) saveVerificationObservations(findingID int64, f ModuleFinding) error {
+	for _, observation := range f.Evidence.Verification.Observations {
+		record := storage.VerificationObservationRecord{
+			ID: observation.ID, FindingID: findingID, ScanID: observation.ScanID,
+			Module: observation.Module, Endpoint: observation.Endpoint, Parameter: observation.Parameter,
+			Location: observation.Location, Role: string(observation.Role), Attempt: observation.Attempt,
+			IdentityID: observation.IdentityID, RequestID: observation.RequestID,
+			RequestMethod: observation.RequestMethod, RequestURL: observation.RequestURL,
+			RequestHash: observation.RequestHash, ResponseHash: observation.ResponseHash,
+			NormalizedHash: observation.NormalizedHash, StatusCode: observation.StatusCode,
+			ContentType: observation.ContentType, DurationMs: observation.DurationMs,
+			StateBeforeHash: observation.StateBeforeHash, StateAfterHash: observation.StateAfterHash,
+			OASTPayloadID: observation.OASTPayloadID, RuntimeTraceID: observation.RuntimeTraceID,
+			RuntimeSink: observation.RuntimeSink, RuntimeSafe: observation.RuntimeSafe,
+			CreatedAt: observation.CreatedAt,
+		}
+		if err := r.db.SaveVerificationObservation(findingID, record); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Runner) findingKey(f ModuleFinding) string {
+	module := strings.ToLower(strings.TrimSpace(f.Evidence.Module))
+	if module == "" {
+		module = strings.ToLower(strings.TrimSpace(f.VulnClass))
+	}
+	if module == "" {
+		module = strings.ToLower(strings.TrimSpace(f.Title))
+	}
+	endpoint := canonicalFindingEndpoint(f.Endpoint)
+	if endpoint == "" && f.Evidence.Request.URL != "" {
+		endpoint = canonicalFindingEndpoint(f.Evidence.Request.URL)
+	}
+	if endpoint == "" {
+		return ""
+	}
+	method := strings.ToUpper(strings.TrimSpace(f.Evidence.Request.Method))
+	if method == "" {
+		method = "GET"
+	}
+	parameter := strings.ToLower(strings.TrimSpace(f.Parameter))
+	if parameter == "" {
+		parameter = strings.ToLower(strings.TrimSpace(f.Evidence.Parameter))
+	}
+	location := strings.ToLower(strings.TrimSpace(f.Location))
+	if location == "" {
+		location = strings.ToLower(strings.TrimSpace(f.Evidence.Location))
+	}
+	if module == "security_headers" || module == "tls_misconfig" {
+		if u, err := url.Parse(endpoint); err == nil && u.Scheme != "" && u.Host != "" {
+			endpoint = u.Scheme + "://" + u.Host
+		}
+		parameter = ""
+	}
+	if module == "cookie_security" {
+		if u, err := url.Parse(endpoint); err == nil && u.Scheme != "" && u.Host != "" {
+			endpoint = u.Scheme + "://" + u.Host
+		}
+		if parameter == "" && f.Evidence.Payload.Value != "" {
+			parameter = strings.ToLower(f.Evidence.Payload.Value)
+		}
+	}
+	signal := strings.ToLower(strings.TrimSpace(f.Evidence.Signal))
+	if collapsePayloadVariants(module, parameter) {
+		signal = ""
+	}
+	return strings.Join([]string{r.scanID, module, method, endpoint, parameter, location, signal}, "\x1f")
+}
+
+func collapsePayloadVariants(module, parameter string) bool {
+	if strings.TrimSpace(parameter) == "" {
+		return false
+	}
+	return module != ""
+}
+
+func canonicalFindingEndpoint(raw string) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return strings.TrimSpace(raw)
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Host = strings.ToLower(parsed.Host)
+	parsed.Fragment = ""
+	if parsed.RawQuery != "" {
+		parsed.RawQuery = parsed.Query().Encode()
+	}
+	return parsed.String()
+}
+
+func (r *Runner) recordLearning(endpointURL, family string, outcome learning.Outcome) {
+	if r.db == nil || endpointURL == "" || family == "" {
+		return
+	}
+	host := hostFromModuleURL(endpointURL)
+	if host == "" {
+		return
+	}
+	store := learning.NewStore(r.db)
+	_ = store.RecordOutcome(host, endpointURL, family, outcome)
+	_ = store.RecordOutcome(host, "", family, outcome)
+}
+
+func confidenceScore(level verification.ConfidenceLevel) float64 {
+	switch level {
+	case verification.Confirmed:
+		return 0.95
+	case verification.HighConfidence:
+		return 0.8
+	case verification.Potential:
+		return 0.6
+	default:
+		return 0.45
+	}
+}

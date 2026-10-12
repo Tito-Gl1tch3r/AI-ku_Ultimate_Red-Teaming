@@ -1,0 +1,2260 @@
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use armory::Ttp;
+use c2::{C2Event, C2EventBus, C2EventRecvError, SessionConnectedData};
+use ran_domain::{
+    AccessLevel, Entity, EntityId, ForwardsTo, HostsListener, Listener, Redirector, SessionChannel,
+    SessionInfo, SessionStatus, UnknownSystem,
+};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{broadcast, Semaphore};
+use tokio::task::JoinHandle;
+use tracing::{error, info, warn};
+
+use crate::external_parser::{ExternalParseRequest, ExternalParser};
+use crate::output_parsers::build_parse_audit;
+use crate::{Campaign, FactCategory, FactOutcome, KnowledgeProvenance, ParseAudit, ParseResult};
+use ran_domain::RelationSummary;
+
+const MAX_CONCURRENT_EXTERNAL_PARSERS: usize = 4;
+const EXTERNAL_PARSER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Lightweight, serialisable snapshot of a domain entity for use in events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntitySummary {
+    pub id: EntityId,
+    pub kind: String,
+    pub name: String,
+    /// Whether this fact was observed, created by the action, or an update to an
+    /// entity already known. Consumers that report "discovered" must check it.
+    #[serde(default)]
+    pub outcome: FactOutcome,
+    /// What sort of news this is. Resolved here rather than at the API edge so
+    /// producers that know more than the entity kind - session attachment - can
+    /// say so, and so no consumer has to re-derive it.
+    #[serde(default)]
+    pub category: FactCategory,
+}
+
+impl EntitySummary {
+    /// Summary for a fact whose category follows from the entity kind, which is
+    /// every fact except the ones a producer classifies explicitly.
+    fn from_kind(id: EntityId, kind: String, name: String, outcome: FactOutcome) -> Self {
+        let category = FactCategory::from_kind(&kind);
+        Self {
+            id,
+            kind,
+            name,
+            outcome,
+            category,
+        }
+    }
+}
+
+/// What just happened to a C2 session, as far as the operation log is concerned.
+///
+/// Only the transitions an operator needs told about are modelled: the first
+/// connect is already reported as an `access-gained` fact, so it is not repeated
+/// here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionLifecycle {
+    /// The shell backing a live session died.
+    Lost,
+    /// A session that had previously died came back on the same backend id.
+    Reestablished,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CampaignEvent {
+    TtpOutput {
+        cmd_id: String,
+        sequence: u64,
+        stdout: String,
+        stderr: String,
+        stdout_bytes: u64,
+        stderr_bytes: u64,
+    },
+    TtpExecuted {
+        cmd_id: String,
+        action_id: String,
+        target_id: String,
+        exec_system_id: String,
+        ttp: Box<Ttp>,
+        args: std::collections::HashMap<String, String>,
+        success: bool,
+        partial: bool,
+        fail_reason: String,
+        results: Vec<String>,
+        exit_code: i32,
+    },
+    FactsChanged {
+        cmd_id: String,
+        new_entities: Vec<EntitySummary>,
+        new_relations: Vec<RelationSummary>,
+    },
+    EntityMerged {
+        from: String,
+        into: String,
+        kind: String,
+    },
+    ParseAudited {
+        cmd_id: String,
+        audits: Vec<ParseAudit>,
+    },
+    /// A live session died or came back. Carried separately from `FactsChanged`
+    /// because it is news about the *session*, not about the entity: the host
+    /// itself is unchanged, and a reconnect to an already-known host would
+    /// otherwise be swallowed as a duplicate fact and never reach the timeline.
+    SessionStateChanged {
+        backend_id: String,
+        entity_id: String,
+        entity_name: String,
+        state: SessionLifecycle,
+    },
+    Reset,
+    PlanStepDispatched {
+        plan_id: String,
+        step_id: String,
+        exec_count: usize,
+    },
+    PlanStepCompleted {
+        plan_id: String,
+        step_id: String,
+        success: bool,
+    },
+    PlanStepSkipped {
+        plan_id: String,
+        step_id: String,
+        reason: String,
+    },
+    PlanStepFailed {
+        plan_id: String,
+        step_id: String,
+        reason: String,
+    },
+    PlanComplete {
+        plan_id: String,
+    },
+}
+
+fn publish_entity_merges_since(
+    campaign_events: &CampaignEventBus,
+    campaign: &Campaign,
+    previous_aliases: &HashMap<EntityId, EntityId>,
+) {
+    let mut recorded = campaign
+        .entity_aliases
+        .iter()
+        .filter(|(stale, preferred)| previous_aliases.get(*stale) != Some(*preferred))
+        .collect::<Vec<_>>();
+    recorded.sort_by(|(left, _), (right, _)| left.0.cmp(&right.0));
+
+    for (stale, _) in recorded {
+        let canonical = campaign.canonical_entity_id(&stale.0);
+        let kind = campaign
+            .get_entities()
+            .into_iter()
+            .find(|entity| entity.entity_id().0 == canonical)
+            .map(|entity| entity.entity_kind().to_string())
+            .unwrap_or_else(|| "Unknown".to_string());
+        let _ = campaign_events.publish(CampaignEvent::EntityMerged {
+            from: stale.0.clone(),
+            into: canonical,
+            kind,
+        });
+    }
+}
+
+#[derive(Clone)]
+pub struct CampaignEventBus {
+    tx: broadcast::Sender<CampaignEvent>,
+}
+
+impl CampaignEventBus {
+    pub fn new(buffer_size: usize) -> Self {
+        let (tx, _rx) = broadcast::channel(buffer_size);
+        Self { tx }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<CampaignEvent> {
+        self.tx.subscribe()
+    }
+
+    pub fn publish(
+        &self,
+        event: CampaignEvent,
+    ) -> Result<usize, Box<broadcast::error::SendError<CampaignEvent>>> {
+        self.tx.send(event).map_err(Box::new)
+    }
+}
+
+pub fn spawn_c2_event_processor(
+    campaign: Arc<RwLock<Campaign>>,
+    c2_events: C2EventBus,
+    campaign_events: CampaignEventBus,
+) -> JoinHandle<()> {
+    spawn_c2_event_processor_with_external_parser(campaign, c2_events, campaign_events, None)
+}
+
+pub fn spawn_c2_event_processor_with_external_parser(
+    campaign: Arc<RwLock<Campaign>>,
+    c2_events: C2EventBus,
+    campaign_events: CampaignEventBus,
+    external_parser: Option<Arc<dyn ExternalParser>>,
+) -> JoinHandle<()> {
+    let mut c2_rx = c2_events.subscribe_campaign();
+    let external_parser_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_EXTERNAL_PARSERS));
+
+    tokio::spawn(async move {
+        loop {
+            match c2_rx.recv().await {
+                Ok(C2Event::TtpOutput {
+                    cmd_id,
+                    sequence,
+                    stdout,
+                    stderr,
+                    stdout_bytes,
+                    stderr_bytes,
+                }) => {
+                    let accepted = match campaign.write() {
+                        Ok(mut guard) => guard.record_in_flight_output(
+                            &cmd_id,
+                            sequence,
+                            &stdout,
+                            &stderr,
+                            stdout_bytes,
+                            stderr_bytes,
+                        ),
+                        Err(_) => {
+                            error!("campaign lock poisoned while recording command output");
+                            false
+                        }
+                    };
+                    if accepted {
+                        let _ = campaign_events.publish(CampaignEvent::TtpOutput {
+                            cmd_id,
+                            sequence,
+                            stdout,
+                            stderr,
+                            stdout_bytes,
+                            stderr_bytes,
+                        });
+                    }
+                }
+                Ok(C2Event::TtpExecuted {
+                    cmd,
+                    event,
+                    partial,
+                }) => {
+                    let action_id = cmd.ttp.id.clone();
+                    let target_id = cmd.target_id.clone();
+                    let result_preview = action_result_preview(&event.results);
+
+                    let (processing, session_entity_summary, session_revived) = {
+                        let mut campaign_guard = match campaign.write() {
+                            Ok(guard) => guard,
+                            Err(_) => {
+                                error!("campaign lock poisoned while processing c2 event");
+                                continue;
+                            }
+                        };
+                        let aliases_before = campaign_guard.entity_aliases.clone();
+
+                        let processing = match campaign_guard
+                            .on_ttp_executed_with_outcome(&cmd, &event, partial)
+                        {
+                            Ok(processing) => processing,
+                            Err(err) => {
+                                error!("failed to process c2 ttp result: {:?}", err);
+                                continue;
+                            }
+                        };
+
+                        // After effects are applied, activate any synchronous session
+                        // that was opened during this TTP execution. The exec-channel
+                        // edge (e.g. k8s.can-exec) now exists so activation will find it.
+                        let mut session_revived = None;
+                        let session_summary = event.session_connected.as_ref().and_then(|s| {
+                            let (summary, revived) =
+                                apply_session_connected(&mut campaign_guard, s);
+                            // Record the hop path that established this session so
+                            // later commands tunneling over it can display the same
+                            // traversal (the session itself routes opaquely).
+                            record_session_path(&mut campaign_guard, &cmd.id, &s.backend_id);
+                            if revived {
+                                session_revived = summary.as_ref().map(|e| {
+                                    (s.backend_id.clone(), e.id.0.clone(), e.name.clone())
+                                });
+                            }
+                            summary
+                        });
+
+                        publish_entity_merges_since(
+                            &campaign_events,
+                            &campaign_guard,
+                            &aliases_before,
+                        );
+
+                        (processing, session_summary, session_revived)
+                    };
+
+                    info!(
+                        cmd_id = %event.id,
+                        action_id = %action_id,
+                        target_id = %target_id,
+                        success = processing.effective_success,
+                        transport_success = event.success,
+                        exit_code = event.exit_code,
+                        fail_reason = %safe_log_output(&processing.effective_fail_reason),
+                        results_count = event.results.len(),
+                        result_preview = %result_preview,
+                        "Action result"
+                    );
+
+                    if let Some((backend_id, entity_id, entity_name)) = session_revived {
+                        info!(%backend_id, %entity_id, "session re-established");
+                        let _ = campaign_events.publish(CampaignEvent::SessionStateChanged {
+                            backend_id,
+                            entity_id,
+                            entity_name,
+                            state: SessionLifecycle::Reestablished,
+                        });
+                    }
+
+                    if processing.parse_audits.is_empty() {
+                        // Only an effect-bearing TTP that emitted no audits is a
+                        // coverage gap. A TTP with no declared effects (e.g.
+                        // execute_shell) has nothing to parse, so silence there
+                        // is expected.
+                        if !cmd.ttp.effects.is_empty() {
+                            warn!(
+                                cmd_id = %cmd.id,
+                                action_id = %action_id,
+                                target_id = %target_id,
+                                "Execution produced no parse audits; parser coverage may be missing"
+                            );
+                        }
+                    } else {
+                        for audit in &processing.parse_audits {
+                            match audit.parse_result {
+                                crate::ParseResult::Parsed => {
+                                    info!(
+                                        cmd_id = %cmd.id,
+                                        effect_id = %audit.effect_id,
+                                        parse_result = ?audit.parse_result,
+                                        inferred_facts_written = audit.inferred_facts_written,
+                                        detail = %safe_log_output(&audit.detail),
+                                        "Parse audit"
+                                    );
+                                }
+                                _ => {
+                                    warn!(
+                                        cmd_id = %cmd.id,
+                                        effect_id = %audit.effect_id,
+                                        parse_result = ?audit.parse_result,
+                                        inferred_facts_written = audit.inferred_facts_written,
+                                        detail = %safe_log_output(&audit.detail),
+                                        "Parse audit indicates parser gap or known failure"
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    let final_audits = processing.parse_audits.clone();
+                    let defer_external_audits = external_parser.is_some()
+                        && final_audits
+                            .iter()
+                            .any(|audit| matches!(audit.parse_result, ParseResult::NoParser));
+
+                    let _ = campaign_events.publish(CampaignEvent::TtpExecuted {
+                        cmd_id: cmd.id.clone(),
+                        action_id: action_id.clone(),
+                        target_id: target_id.clone(),
+                        exec_system_id: cmd.exec_entity().to_string(),
+                        ttp: Box::new(cmd.ttp.clone()),
+                        args: cmd.args.clone(),
+                        // Use the effective success/fail_reason derived by the parser,
+                        // which may override the raw transport-level success when a
+                        // semantic error (e.g. k8s 403 Forbidden) was detected.
+                        success: processing.effective_success,
+                        partial: processing.effective_partial,
+                        fail_reason: processing.effective_fail_reason.clone(),
+                        results: event.results.clone(),
+                        exit_code: event.exit_code,
+                    });
+
+                    let _ = campaign_events.publish(CampaignEvent::FactsChanged {
+                        cmd_id: cmd.id.clone(),
+                        new_entities: processing
+                            .updates
+                            .new_entities
+                            .iter()
+                            .map(|e| {
+                                EntitySummary::from_kind(
+                                    e.entity_id(),
+                                    e.entity_kind().to_string(),
+                                    e.entity_name().to_string(),
+                                    processing.updates.outcome_of(&e.entity_id()),
+                                )
+                            })
+                            .collect(),
+                        new_relations: processing
+                            .discovered_relations
+                            .iter()
+                            .map(RelationSummary::from)
+                            .collect(),
+                    });
+
+                    if !defer_external_audits {
+                        let _ = campaign_events.publish(CampaignEvent::ParseAudited {
+                            cmd_id: cmd.id.clone(),
+                            audits: final_audits.clone(),
+                        });
+                    }
+
+                    // Notify frontend of session activation on the exec-channel edge.
+                    if let Some(entity_summary) = session_entity_summary {
+                        let _ = campaign_events.publish(CampaignEvent::FactsChanged {
+                            cmd_id: cmd.id.clone(),
+                            new_entities: vec![entity_summary],
+                            new_relations: vec![],
+                        });
+                    }
+
+                    if defer_external_audits {
+                        let parser = external_parser
+                            .as_ref()
+                            .expect("external parser checked above")
+                            .clone();
+                        match external_parser_slots.clone().try_acquire_owned() {
+                            Ok(permit) => {
+                                let campaign = campaign.clone();
+                                let campaign_events = campaign_events.clone();
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    run_external_parsers(
+                                        campaign,
+                                        campaign_events,
+                                        parser,
+                                        *cmd,
+                                        event,
+                                        final_audits,
+                                    )
+                                    .await;
+                                });
+                            }
+                            Err(_) => {
+                                warn!(
+                                    cmd_id = %cmd.id,
+                                    limit = MAX_CONCURRENT_EXTERNAL_PARSERS,
+                                    "external parser capacity exhausted; keeping NoParser audits"
+                                );
+                                let _ = campaign_events.publish(CampaignEvent::ParseAudited {
+                                    cmd_id: cmd.id.clone(),
+                                    audits: final_audits,
+                                });
+                            }
+                        }
+                    }
+                }
+                Ok(C2Event::ListenerStarted {
+                    cmd_id,
+                    port,
+                    protocol,
+                }) => {
+                    let mut guard = match campaign.write() {
+                        Ok(g) => g,
+                        Err(_) => {
+                            error!("campaign lock poisoned on ListenerStarted");
+                            continue;
+                        }
+                    };
+                    let c2_id = EntityId::new(c2::BUILTIN_C2_ID);
+                    let listener = Listener::new(port, &protocol);
+                    let listener_id = listener.entity_id();
+                    let relation = HostsListener::new(c2_id.0.clone(), listener_id.0.clone());
+                    guard.upsert_entity(listener.clone(), KnowledgeProvenance::Action);
+                    guard.upsert_relation(&relation, KnowledgeProvenance::Action);
+                    info!(port, %protocol, %listener_id, "listener started; listener entity created");
+                    // Attributed to the command that bound it, so the timeline
+                    // folds the listener into that action instead of showing it
+                    // as an unrelated event that happened to arrive next.
+                    let _ = campaign_events.publish(CampaignEvent::FactsChanged {
+                        cmd_id,
+                        new_entities: vec![EntitySummary::from_kind(
+                            listener_id,
+                            listener.entity_kind().to_string(),
+                            listener.entry().to_string(),
+                            // Binding a port is the action; a listener is never
+                            // something the campaign stumbles upon.
+                            FactOutcome::Created,
+                        )],
+                        new_relations: vec![ran_domain::RelationSummary::from_relation(&relation)],
+                    });
+                }
+                Ok(C2Event::ListenerStopped { cmd_id, port }) => {
+                    let mut guard = match campaign.write() {
+                        Ok(g) => g,
+                        Err(_) => {
+                            error!("campaign lock poisoned on ListenerStopped");
+                            continue;
+                        }
+                    };
+                    // The protocol is not on the event, so drop whichever listener
+                    // holds this port - a port can only be bound once.
+                    let removed = guard.remove_listeners_on_port(port);
+                    // Sessions caught through this listener are separate backends
+                    // and keep running; only the binding is gone.
+                    info!(port, removed, "listener stopped; listener entity removed");
+                    let _ = campaign_events.publish(CampaignEvent::FactsChanged {
+                        cmd_id,
+                        new_entities: vec![],
+                        new_relations: vec![],
+                    });
+                }
+                Ok(C2Event::RedirectorStarted {
+                    cmd_id,
+                    via,
+                    play_id,
+                    remote_port,
+                    listener_port,
+                }) => {
+                    let mut guard = match campaign.write() {
+                        Ok(g) => g,
+                        Err(_) => {
+                            error!("campaign lock poisoned on RedirectorStarted");
+                            continue;
+                        }
+                    };
+                    let redirector = Redirector::new(&via, &play_id, remote_port, listener_port);
+                    let redirector_id = redirector.entity_id();
+                    // Point the redirector at the listener it forwards into, in
+                    // traffic direction. Found by port rather than rebuilt from
+                    // one, because the event carries no protocol and a listener
+                    // is not necessarily tcp.
+                    let listener_id = guard
+                        .entities_of::<Listener>()
+                        .find(|listener| listener.port == listener_port)
+                        .map(|listener| listener.entity_id());
+                    // A rebuilt or re-pointed tunnel keeps the same entity id, so
+                    // it is an update, not a find. `new_entities` is what raises
+                    // `entity-discovered`, and announcing a hop the operator has
+                    // been looking at for an hour as a fresh discovery is a lie.
+                    let already_known = guard.find_entity::<Redirector>(&redirector_id).is_some();
+                    guard.upsert_entity(redirector.clone(), KnowledgeProvenance::Action);
+                    let relation = listener_id
+                        .map(|listener_id| ForwardsTo::new(redirector_id.0.clone(), listener_id.0));
+                    match &relation {
+                        Some(relation) => {
+                            guard.upsert_relation(relation, KnowledgeProvenance::Action)
+                        }
+                        // The TTP requires a Listener target, so this only happens
+                        // if the listener was stopped between spawning labctl and
+                        // handling this event. The redirector is still real, so
+                        // record it - just without an edge to a listener that is
+                        // no longer there.
+                        None => warn!(
+                            listener_port,
+                            "redirector started but no listener holds its target port"
+                        ),
+                    }
+                    info!(
+                        %via,
+                        %play_id,
+                        remote_port,
+                        listener_port,
+                        %redirector_id,
+                        "redirector started; redirector entity created"
+                    );
+                    // Attributed to the command that built it, so the timeline
+                    // folds the redirector into that action instead of showing it
+                    // as an unrelated event that happened to arrive next.
+                    let _ = campaign_events.publish(CampaignEvent::FactsChanged {
+                        cmd_id,
+                        new_entities: vec![EntitySummary::from_kind(
+                            redirector_id,
+                            redirector.entity_kind().to_string(),
+                            // The tool and the hop, not the playground id - see
+                            // `Redirector::label`.
+                            redirector.label().to_string(),
+                            // Standing up a tunnel is the action, so a redirector
+                            // is never something the campaign stumbles upon. But a
+                            // rebuilt or re-pointed one keeps its entity id: the
+                            // process is new, the hop is not.
+                            if already_known {
+                                FactOutcome::Updated
+                            } else {
+                                FactOutcome::Created
+                            },
+                        )],
+                        new_relations: relation
+                            .iter()
+                            .map(|relation| ran_domain::RelationSummary::from_relation(relation))
+                            .collect(),
+                    });
+                }
+                Ok(C2Event::RedirectorStopped {
+                    cmd_id,
+                    play_id,
+                    remote_port,
+                }) => {
+                    let mut guard = match campaign.write() {
+                        Ok(g) => g,
+                        Err(_) => {
+                            error!("campaign lock poisoned on RedirectorStopped");
+                            continue;
+                        }
+                    };
+                    let removed = guard.remove_redirector(&play_id, remote_port);
+                    // Sessions that came in through the tunnel are separate
+                    // backends and keep running; only the forwarding is gone.
+                    info!(
+                        %play_id,
+                        remote_port, removed, "redirector stopped; redirector entity removed"
+                    );
+                    let _ = campaign_events.publish(CampaignEvent::FactsChanged {
+                        cmd_id,
+                        new_entities: vec![],
+                        new_relations: vec![],
+                    });
+                }
+                Ok(C2Event::SessionConnected {
+                    backend_id,
+                    target_entity_id,
+                    hostname,
+                    user,
+                    os,
+                    kind,
+                    port,
+                }) => {
+                    info!(%backend_id, %target_entity_id, %hostname, %user, %os, port, "session connected");
+                    let mut guard = match campaign.write() {
+                        Ok(g) => g,
+                        Err(_) => {
+                            error!("campaign lock poisoned on SessionConnected");
+                            continue;
+                        }
+                    };
+                    let aliases_before = guard.entity_aliases.clone();
+
+                    let resolved_target_id = guard.canonical_entity_id(&target_entity_id);
+                    let host_was_known = guard.get_system_entity(&resolved_target_id).is_some();
+                    let AttachedSession {
+                        entity_id: channel_entity_id,
+                        revived,
+                    } = attach_connected_session(
+                        &mut guard,
+                        &backend_id,
+                        &target_entity_id,
+                        &hostname,
+                        &user,
+                        &os,
+                        ConnectedSessionTransport::new(&kind, port),
+                    );
+
+                    // If the target already has an exec-channel edge, mark it as
+                    // active so the session state lives on the existing relation.
+                    // Only create a SessionChannel when no exec path exists yet
+                    // (e.g. a reverse shell from a completely unknown host).
+                    let has_existing_channel =
+                        guard.activate_session_on_exec_channel(&channel_entity_id, &backend_id);
+
+                    let new_relation_summary = if !has_existing_channel {
+                        let c2_id = EntityId::new(c2::BUILTIN_C2_ID);
+                        let channel = SessionChannel::new(
+                            c2_id.0.clone(),
+                            channel_entity_id.clone(),
+                            &backend_id,
+                        );
+                        guard.insert_relation(&channel);
+                        info!(%backend_id, %channel_entity_id, "no prior exec channel; SessionChannel created");
+                        Some(ran_domain::RelationSummary::from_relation(&channel))
+                    } else {
+                        info!(%backend_id, %channel_entity_id, "session activated on existing exec-channel edge");
+                        None
+                    };
+
+                    let entity_summary =
+                        guard
+                            .get_system_entity(&channel_entity_id)
+                            .map(|e| EntitySummary {
+                                id: e.entity().entity_id(),
+                                kind: e.entity().entity_kind().to_string(),
+                                name: e.entity().entity_name().to_string(),
+                                outcome: if host_was_known {
+                                    FactOutcome::Updated
+                                } else {
+                                    FactOutcome::Observed
+                                },
+                                // A shell landed here. That is news whether or
+                                // not the host was already in the graph, so it
+                                // must not be filed as a discovery - a callback
+                                // from a known host would then be suppressed as
+                                // a mere field update and vanish entirely.
+                                category: FactCategory::AccessGained,
+                            });
+
+                    let entity_name = guard
+                        .get_system_entity(&channel_entity_id)
+                        .map(|e| e.entity().entity_name().to_string())
+                        .unwrap_or_else(|| channel_entity_id.clone());
+
+                    publish_entity_merges_since(&campaign_events, &guard, &aliases_before);
+
+                    let _ = campaign_events.publish(CampaignEvent::FactsChanged {
+                        cmd_id: backend_id.clone(),
+                        new_entities: entity_summary.into_iter().collect(),
+                        new_relations: new_relation_summary.into_iter().collect(),
+                    });
+
+                    // A first connect is already told as an `access-gained`
+                    // fact. Only the comeback needs its own line, because the
+                    // fact it would otherwise ride on repeats an entity the
+                    // timeline has already shown and gets deduplicated away.
+                    if revived {
+                        info!(%backend_id, %channel_entity_id, "session re-established");
+                        let _ = campaign_events.publish(CampaignEvent::SessionStateChanged {
+                            backend_id: backend_id.clone(),
+                            entity_id: channel_entity_id,
+                            entity_name,
+                            state: SessionLifecycle::Reestablished,
+                        });
+                    }
+                }
+                Ok(C2Event::SessionLost {
+                    backend_id,
+                    target_entity_id,
+                }) => {
+                    let mut guard = match campaign.write() {
+                        Ok(g) => g,
+                        Err(_) => {
+                            error!("campaign lock poisoned on SessionLost");
+                            continue;
+                        }
+                    };
+                    update_session_status(
+                        &mut guard,
+                        &target_entity_id,
+                        &backend_id,
+                        SessionStatus::Lost,
+                    );
+                    // Mark any exec-channel edge that carried this session as
+                    // broken rather than clearing it: the edge stays in the
+                    // graph (styled as broken) and keeps its session_id so a
+                    // reconnecting session can recover it, but path-finding
+                    // treats it as non-traversable in the meantime.
+                    let marked = guard.mark_session_broken(&backend_id);
+                    info!(%backend_id, %target_entity_id, marked, "session lost; exec-channel edge(s) marked broken");
+                    let resolved_target_id = guard.canonical_entity_id(&target_entity_id);
+                    let entity_name = guard
+                        .get_system_entity(&resolved_target_id)
+                        .map(|e| e.entity().entity_name().to_string())
+                        .unwrap_or_else(|| resolved_target_id.clone());
+                    drop(guard);
+
+                    let _ = campaign_events.publish(CampaignEvent::FactsChanged {
+                        cmd_id: backend_id.clone(),
+                        new_entities: vec![],
+                        new_relations: vec![],
+                    });
+                    let _ = campaign_events.publish(CampaignEvent::SessionStateChanged {
+                        backend_id,
+                        entity_id: resolved_target_id,
+                        entity_name,
+                        state: SessionLifecycle::Lost,
+                    });
+                }
+                Ok(C2Event::SessionKilled { backend_id }) => {
+                    let mut guard = match campaign.write() {
+                        Ok(g) => g,
+                        Err(_) => {
+                            error!("campaign lock poisoned on SessionKilled");
+                            continue;
+                        }
+                    };
+                    let removed = guard.remove_session_channel(&backend_id);
+                    guard.deactivate_session(&backend_id);
+                    info!(%backend_id, removed, "session killed; c2.session edge(s) removed");
+                    drop(guard);
+                    let _ = campaign_events.publish(CampaignEvent::FactsChanged {
+                        cmd_id: backend_id,
+                        new_entities: vec![],
+                        new_relations: vec![],
+                    });
+                }
+                Err(C2EventRecvError::ProgressLagged(skipped)) => {
+                    warn!(
+                        skipped,
+                        "campaign c2 event processor dropped best-effort progress events"
+                    );
+                }
+                Err(C2EventRecvError::Closed) => {
+                    info!("c2 event bus closed; stopping campaign c2 event processor");
+                    break;
+                }
+            }
+        }
+    })
+}
+
+async fn run_external_parsers(
+    campaign: Arc<RwLock<Campaign>>,
+    campaign_events: CampaignEventBus,
+    parser: Arc<dyn ExternalParser>,
+    cmd: c2::ExecTtp,
+    event: c2::TtpExecuted,
+    mut final_audits: Vec<ParseAudit>,
+) {
+    let no_parser_indices: Vec<usize> = final_audits
+        .iter()
+        .enumerate()
+        .filter(|(_, audit)| matches!(audit.parse_result, ParseResult::NoParser))
+        .map(|(index, _)| index)
+        .collect();
+    let mut external_facts_changed = false;
+
+    for index in no_parser_indices {
+        let audit = &final_audits[index];
+        let request = ExternalParseRequest {
+            effect_id: audit.effect_id.clone(),
+            ttp_id: audit.ttp_id.clone(),
+            target_id: cmd.target_id.clone(),
+            exec_system_id: cmd
+                .execution_environment
+                .as_ref()
+                .and_then(|env| env.system_id.clone())
+                .unwrap_or_default(),
+            args: cmd.args.clone(),
+            results: event.results.clone(),
+            exit_code: event.exit_code,
+            success: event.success,
+        };
+
+        let response =
+            match tokio::time::timeout(EXTERNAL_PARSER_TIMEOUT, parser.try_parse(request)).await {
+                Ok(response) => response,
+                Err(_) => {
+                    warn!(
+                        cmd_id = %cmd.id,
+                        effect_id = %audit.effect_id,
+                        timeout = ?EXTERNAL_PARSER_TIMEOUT,
+                        "external parser timed out"
+                    );
+                    None
+                }
+            };
+
+        if let Some(response) = response {
+            let facts_written = {
+                let mut guard = match campaign.write() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        error!("campaign lock poisoned in external parser");
+                        continue;
+                    }
+                };
+                let (subject, _) = crate::output_parsers::split_effect_subject(&audit.effect_id);
+                match crate::output_parsers::resolve_effect_subject_id(&guard, &cmd, subject)
+                    .ok_or_else(|| match subject {
+                        crate::output_parsers::EffectSubject::Executor => {
+                            "external parser has no physical executor provenance".to_string()
+                        }
+                        crate::output_parsers::EffectSubject::Target => {
+                            "external parser semantic target is not a system entity".to_string()
+                        }
+                    })
+                    .and_then(|subject_id| guard.apply_system_update(&subject_id, &response.system))
+                {
+                    Ok(written) => written,
+                    Err(error) => {
+                        warn!(
+                            effect_id = %audit.effect_id,
+                            %error,
+                            "external parser produced result but target update failed"
+                        );
+                        0
+                    }
+                }
+            };
+            external_facts_changed |= facts_written > 0;
+
+            let detail = if response.detail.is_empty() {
+                format!("parsed by external script ({facts_written} facts written)")
+            } else {
+                response.detail
+            };
+            final_audits[index] = build_parse_audit(
+                &audit.effect_id,
+                &cmd,
+                &event,
+                ParseResult::Parsed,
+                &detail,
+                facts_written,
+            );
+            info!(
+                cmd_id = %cmd.id,
+                effect_id = %final_audits[index].effect_id,
+                facts_written,
+                "external parser handled effect"
+            );
+        }
+    }
+
+    let _ = campaign_events.publish(CampaignEvent::ParseAudited {
+        cmd_id: cmd.id.clone(),
+        audits: final_audits,
+    });
+    if external_facts_changed {
+        let _ = campaign_events.publish(CampaignEvent::FactsChanged {
+            cmd_id: cmd.id,
+            new_entities: Vec::new(),
+            new_relations: Vec::new(),
+        });
+    }
+}
+
+/// Apply a synchronous session connection to the campaign graph after TTP effects
+/// have been processed. Updates the target system entity and activates the
+/// session on any existing exec-channel edge. Returns an entity summary if the
+/// frontend should be notified of entity changes.
+/// Carry the multi-hop traversal of the command that opened a session over to
+/// that session's backend id, so every later command routed over the session
+/// (which resolves to empty graph hops) can replay the same path. No-op when
+/// the establishing command was direct/single-hop.
+fn record_session_path(campaign: &mut Campaign, establishing_cmd_id: &str, backend_id: &str) {
+    let session_backend = if backend_id.starts_with("session/") {
+        backend_id.to_string()
+    } else {
+        format!("session/{}", backend_id)
+    };
+    if let Some(hops) = campaign
+        .command_traversals
+        .get(establishing_cmd_id)
+        .map(|ct| ct.hops.clone())
+    {
+        campaign.session_traversals.insert(session_backend, hops);
+    }
+}
+
+/// The outcome of attaching a connected session: which entity it landed on, and
+/// whether it brought a previously-lost session back rather than opening a new one.
+#[derive(Debug)]
+struct AttachedSession {
+    entity_id: String,
+    /// True when a session with this backend id was already recorded as `Lost`.
+    revived: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ConnectedSessionTransport<'a> {
+    kind: &'a str,
+    port: Option<u16>,
+}
+
+impl<'a> ConnectedSessionTransport<'a> {
+    fn new(kind: &'a str, port: Option<u16>) -> Self {
+        Self { kind, port }
+    }
+}
+
+/// Attach a freshly connected C2 session to the system entity it exits into,
+/// returning that entity's id.
+///
+/// `target_entity_id` is whatever the C2 believed it was connecting to. For a
+/// reverse shell that is derived from the probed hostname and usually names no
+/// entity at all, so an `UnknownSystem` is created for it - and the C2's id is
+/// recorded as an alias of that system, so a later reconnect or status change
+/// still keyed by the C2's id lands on the right entity even after an analyzer
+/// has merged that system into the Pod it turned out to be.
+fn attach_connected_session(
+    campaign: &mut Campaign,
+    backend_id: &str,
+    target_entity_id: &str,
+    hostname: &str,
+    user: &str,
+    os: &str,
+    transport: ConnectedSessionTransport<'_>,
+) -> AttachedSession {
+    let ConnectedSessionTransport {
+        kind: session_kind,
+        port,
+    } = transport;
+    let session_short_id = backend_id
+        .strip_prefix("session/")
+        .unwrap_or(backend_id)
+        .to_string();
+
+    // Resolve the target system entity, following any merge it went through.
+    let resolved_id = campaign.canonical_entity_id(target_entity_id);
+    if let Some(mut sys) = campaign.get_system_entity_mut(&resolved_id) {
+        let system = sys.entity_mut().system_mut();
+        if !os.is_empty() {
+            system.os = Some(os.to_string());
+        }
+        if !user.is_empty() {
+            system.username = Some(user.to_string());
+        }
+        system.access_level = AccessLevel::Exec;
+        // A reconnect comes back on the listener's own backend id: revive that
+        // session instead of pushing a duplicate next to the dead one.
+        let mut revived = false;
+        match system
+            .sessions
+            .iter_mut()
+            .find(|s| s.id == session_short_id)
+        {
+            Some(existing) => {
+                revived = existing.status == SessionStatus::Lost;
+                existing.kind = session_kind.to_string();
+                existing.port = port;
+                existing.status = SessionStatus::Active;
+            }
+            None => system.sessions.push(SessionInfo {
+                id: session_short_id,
+                kind: session_kind.to_string(),
+                port,
+                status: SessionStatus::Active,
+            }),
+        }
+        return AttachedSession {
+            entity_id: resolved_id,
+            revived,
+        };
+    }
+
+    // Kubernetes gives a container its pod name as hostname by default. When
+    // a just-deployed pod calls Ran back before it has another identifying
+    // signal such as a pod IP, attach the session to the known Pod directly.
+    // Hostnames are not globally unique, so only use this correlation when it
+    // identifies exactly one Pod in the campaign.
+    let mut matching_pods = campaign
+        .entities
+        .values::<ran_domain::Pod>()
+        .filter(|pod| pod.entity_name().eq_ignore_ascii_case(hostname))
+        .map(|pod| pod.entity_id().0)
+        .collect::<Vec<_>>();
+    if matching_pods.len() == 1 {
+        let pod_id = matching_pods.remove(0);
+        return attach_connected_session(
+            campaign, backend_id, &pod_id, hostname, user, os, transport,
+        );
+    }
+
+    // Nothing answers to that id - a shell from a host we have never seen.
+    // Create a system for it, named after the hostname it reported.
+    let mut sys = UnknownSystem::new(hostname.to_lowercase());
+    sys.system.os = if os.is_empty() {
+        None
+    } else {
+        Some(os.to_string())
+    };
+    sys.system.username = if user.is_empty() {
+        None
+    } else {
+        Some(user.to_string())
+    };
+    sys.system.access_level = AccessLevel::Exec;
+    sys.system.sessions.push(SessionInfo {
+        id: session_short_id,
+        kind: session_kind.to_string(),
+        port,
+        status: SessionStatus::Active,
+    });
+    let entity_id = sys.entity_id();
+    campaign.upsert_entity(sys, KnowledgeProvenance::Action);
+    campaign.record_entity_alias(&EntityId::new(target_entity_id), &entity_id);
+    AttachedSession {
+        entity_id: entity_id.0,
+        revived: false,
+    }
+}
+
+fn apply_session_connected(
+    campaign: &mut Campaign,
+    data: &SessionConnectedData,
+) -> (Option<EntitySummary>, bool) {
+    let session_short_id = data
+        .backend_id
+        .strip_prefix("session/")
+        .unwrap_or(&data.backend_id)
+        .to_string();
+
+    let mut revived = false;
+    if let Some(mut sys) = campaign.get_system_entity_mut(&data.target_entity_id) {
+        let system = sys.entity_mut().system_mut();
+        if !data.os.is_empty() {
+            system.os = Some(data.os.clone());
+        }
+        if !data.user.is_empty() {
+            system.username = Some(data.user.clone());
+        }
+        system.access_level = AccessLevel::Exec;
+        // Re-running the TTP that opens an exec session comes back on the same
+        // backend id. Revive that entry instead of stacking a second one beside
+        // the dead one, which would leave the UI showing a Lost session forever.
+        match system
+            .sessions
+            .iter_mut()
+            .find(|s| s.id == session_short_id)
+        {
+            Some(existing) => {
+                revived = existing.status == SessionStatus::Lost;
+                existing.status = SessionStatus::Active;
+            }
+            None => system.sessions.push(SessionInfo {
+                id: session_short_id,
+                kind: "kubectl-exec".to_string(),
+                port: None,
+                status: SessionStatus::Active,
+            }),
+        }
+    }
+
+    campaign.activate_session_on_exec_channel(&data.target_entity_id, &data.backend_id);
+
+    let summary = campaign
+        .get_system_entity(&data.target_entity_id)
+        .map(|e| EntitySummary {
+            id: e.entity().entity_id(),
+            kind: e.entity().entity_kind().to_string(),
+            name: e.entity().entity_name().to_string(),
+            // This path resolves an existing system entity and attaches a
+            // session to it, so nothing here is new knowledge about the entity -
+            // but gaining exec access to it is still worth reporting.
+            outcome: FactOutcome::Updated,
+            category: FactCategory::AccessGained,
+        });
+    (summary, revived)
+}
+
+fn update_session_status(
+    campaign: &mut Campaign,
+    target_entity_id: &str,
+    backend_id: &str,
+    status: SessionStatus,
+) {
+    let Some(mut sys) = campaign.get_system_entity_mut(target_entity_id) else {
+        return;
+    };
+    let sessions = &mut sys.entity_mut().system_mut().sessions;
+
+    if let Some(s) = sessions.iter_mut().find(|s| s.backend_id() == backend_id) {
+        // Forward-only status transition.
+        use SessionStatus::*;
+        match (&s.status, &status) {
+            (Connecting, Active) | (Connecting, Lost) | (Active, Lost) => s.status = status,
+            _ => {}
+        }
+    } else if status == SessionStatus::Active {
+        // First time we hear about this session - the shell connected without a
+        // prior listener TTP (e.g. a manually triggered reverse shell).
+        let session_id = backend_id
+            .strip_prefix("session/")
+            .unwrap_or(backend_id)
+            .to_string();
+        sessions.push(SessionInfo {
+            id: session_id,
+            kind: "tcp".to_string(),
+            port: None,
+            status: SessionStatus::Active,
+        });
+    }
+}
+
+#[cfg(test)]
+mod listener_event_tests {
+    use super::*;
+    use armory::{Procedure, Ttp};
+    use c2::{C2EventBus, ExecutionOperation};
+    use std::collections::HashMap;
+    use std::time::Duration;
+    use tokio::sync::{mpsc, Semaphore};
+
+    struct SlowExternalParser {
+        started: mpsc::UnboundedSender<String>,
+        release: Arc<Semaphore>,
+    }
+
+    struct PhysicalProofParser {
+        expected_executor: String,
+    }
+
+    #[async_trait::async_trait]
+    impl ExternalParser for PhysicalProofParser {
+        async fn try_parse(
+            &self,
+            request: ExternalParseRequest,
+        ) -> Option<crate::ExternalParseResponse> {
+            assert_eq!(request.exec_system_id, self.expected_executor);
+            Some(crate::ExternalParseResponse {
+                system: crate::external_parser::SystemFieldUpdates {
+                    env_vars: HashMap::from([("EXTERNAL_PROOF".into(), "1".into())]),
+                    ..Default::default()
+                },
+                detail: "physical executor proof".into(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExternalParser for SlowExternalParser {
+        async fn try_parse(
+            &self,
+            request: ExternalParseRequest,
+        ) -> Option<crate::ExternalParseResponse> {
+            self.started
+                .send(request.ttp_id)
+                .expect("test receiver should remain open");
+            let permit = self.release.acquire().await.expect("semaphore is open");
+            permit.forget();
+            None
+        }
+    }
+
+    /// Drain campaign events until a `FactsChanged` shows up, or give up.
+    async fn next_facts_changed(
+        rx: &mut broadcast::Receiver<CampaignEvent>,
+    ) -> (String, Vec<EntitySummary>) {
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("a FactsChanged should be published")
+                .expect("campaign event bus should stay open");
+            if let CampaignEvent::FactsChanged {
+                cmd_id,
+                new_entities,
+                ..
+            } = event
+            {
+                return (cmd_id, new_entities);
+            }
+        }
+    }
+
+    /// Drain campaign events until a `SessionStateChanged` shows up, or give up.
+    async fn next_session_state(
+        rx: &mut broadcast::Receiver<CampaignEvent>,
+    ) -> (String, String, SessionLifecycle) {
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("a SessionStateChanged should be published")
+                .expect("campaign event bus should stay open");
+            if let CampaignEvent::SessionStateChanged {
+                entity_id,
+                entity_name,
+                state,
+                ..
+            } = event
+            {
+                return (entity_id, entity_name, state);
+            }
+        }
+    }
+
+    fn external_parser_command(id: &str, target_id: &str) -> c2::ExecTtp {
+        c2::ExecTtp {
+            id: id.to_string(),
+            ttp: Ttp {
+                effects: vec!["test.external-parser".to_string()],
+                procedures: vec![Procedure::new("noop", "true")],
+                ..Ttp::new("external-parser-test", "External Parser Test", "Discovery")
+            },
+            procedure: Procedure::new("noop", "true"),
+            operation: ExecutionOperation::Noop,
+            args: HashMap::new(),
+            target_id: target_id.to_string(),
+            exec_chain: vec![target_id.to_string()],
+            exec_system_id: c2::BUILTIN_C2_ID.to_string(),
+            execution_environment: Some(ran_domain::ExecutionEnvironment {
+                system_id: Some(target_id.to_string()),
+                tool: None,
+                auth_identity_id: None,
+            }),
+            transport_environment: None,
+            auth_identity_id: None,
+            started_at_ms: 0,
+            execution_timeout_seconds: c2::DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+            output_transform: None,
+            is_cleanup: false,
+            reasoning: String::new(),
+        }
+    }
+
+    fn successful_execution(id: &str) -> c2::TtpExecuted {
+        c2::TtpExecuted {
+            id: id.to_string(),
+            success: true,
+            results: vec!["unparsed output".to_string()],
+            exit_code: 0,
+            fail_reason: String::new(),
+            session_connected: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn external_system_results_use_executor_provenance_without_target_fallback() {
+        for persisted in [false, true] {
+            let mut initial = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+            let target = ran_domain::Pod::new("resource", "default");
+            let target_id = target.entity_id().0;
+            initial.upsert_entity(target, KnowledgeProvenance::Action);
+            let campaign = Arc::new(RwLock::new(initial));
+            let mut cmd = external_parser_command("proof", &target_id);
+            cmd.execution_environment = persisted.then(|| ran_domain::ExecutionEnvironment {
+                system_id: Some("system/operator-host".into()),
+                tool: None,
+                auth_identity_id: None,
+            });
+            let event = successful_execution(&cmd.id);
+            let audit =
+                crate::output_parsers::build_no_parser_audit("test.external-parser", &cmd, &event);
+            run_external_parsers(
+                campaign.clone(),
+                CampaignEventBus::new(16),
+                Arc::new(PhysicalProofParser {
+                    expected_executor: if persisted {
+                        "system/operator-host".into()
+                    } else {
+                        String::new()
+                    },
+                }),
+                cmd,
+                event,
+                vec![audit],
+            )
+            .await;
+            let guard = campaign.read().unwrap();
+            assert!(!guard
+                .get_system_entity(&target_id)
+                .unwrap()
+                .entity()
+                .system()
+                .env_vars
+                .contains_key("EXTERNAL_PROOF"));
+            assert_eq!(
+                guard
+                    .get_system_entity("system/operator-host")
+                    .unwrap()
+                    .entity()
+                    .system()
+                    .env_vars
+                    .contains_key("EXTERNAL_PROOF"),
+                persisted
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn external_system_results_honor_explicit_target_subject() {
+        let mut initial = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+        let target = ran_domain::Pod::new("resource", "default");
+        let target_id = target.entity_id().0;
+        initial.upsert_entity(target, KnowledgeProvenance::Action);
+        let campaign = Arc::new(RwLock::new(initial));
+        let mut cmd = external_parser_command("target-proof", &target_id);
+        cmd.ttp.effects = vec!["target::test.external-parser".into()];
+        cmd.execution_environment = None;
+        let event = successful_execution(&cmd.id);
+        let audit = crate::output_parsers::build_no_parser_audit(
+            "target::test.external-parser",
+            &cmd,
+            &event,
+        );
+
+        run_external_parsers(
+            campaign.clone(),
+            CampaignEventBus::new(16),
+            Arc::new(PhysicalProofParser {
+                expected_executor: String::new(),
+            }),
+            cmd,
+            event,
+            vec![audit],
+        )
+        .await;
+
+        let guard = campaign.read().unwrap();
+        assert_eq!(
+            guard
+                .get_system_entity(&target_id)
+                .unwrap()
+                .entity()
+                .system()
+                .env_vars
+                .get("EXTERNAL_PROOF")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert!(!guard
+            .get_system_entity("system/operator-host")
+            .unwrap()
+            .entity()
+            .system()
+            .env_vars
+            .contains_key("EXTERNAL_PROOF"));
+    }
+
+    #[tokio::test]
+    async fn slow_external_parser_does_not_block_later_completions() {
+        let mut state = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+        let target = ran_domain::Pod::new("target", "default");
+        let target_id = target.entity_id().0;
+        state.insert_entity(&target);
+        let first = external_parser_command("cmd-first", &target_id);
+        let second = external_parser_command("cmd-second", &target_id);
+        state.add_open_step(first.clone());
+        state.add_open_step(second.clone());
+
+        let campaign = Arc::new(RwLock::new(state));
+        let c2_events = C2EventBus::new(2);
+        let campaign_events = CampaignEventBus::new(16);
+        let mut event_rx = campaign_events.subscribe();
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let parser: Arc<dyn ExternalParser> = Arc::new(SlowExternalParser {
+            started: started_tx,
+            release: release.clone(),
+        });
+        spawn_c2_event_processor_with_external_parser(
+            campaign,
+            c2_events.clone(),
+            campaign_events,
+            Some(parser),
+        );
+
+        c2_events
+            .publish(C2Event::TtpExecuted {
+                cmd: Box::new(first),
+                event: successful_execution("cmd-first"),
+                partial: false,
+            })
+            .await
+            .expect("first completion should queue");
+        tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .expect("first parser should start")
+            .expect("parser start channel should remain open");
+
+        c2_events
+            .publish(C2Event::TtpExecuted {
+                cmd: Box::new(second),
+                event: successful_execution("cmd-second"),
+                partial: false,
+            })
+            .await
+            .expect("second completion should queue");
+
+        let second_completed = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(CampaignEvent::TtpExecuted { cmd_id, .. }) = event_rx.recv().await {
+                    if cmd_id == "cmd-second" {
+                        break;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(
+            second_completed.is_ok(),
+            "the second completion must not wait for the first external parser"
+        );
+
+        release.add_permits(2);
+    }
+
+    /// A session breaking and coming back has to reach the operation timeline in
+    /// its own right. The reconnect rides on an entity the timeline has already
+    /// shown, so an entity fact alone gets deduplicated away and the operator is
+    /// left looking at a graph that still says "broken".
+    #[tokio::test]
+    async fn a_session_breaking_and_returning_is_reported_both_times() {
+        let campaign = Arc::new(RwLock::new(Campaign::bootstrap(
+            "Ran",
+            ran_domain::K8sCluster::new("dev"),
+        )));
+        let c2_events = C2EventBus::new(16);
+        let campaign_events = CampaignEventBus::new(16);
+        let mut rx = campaign_events.subscribe();
+
+        spawn_c2_event_processor(campaign.clone(), c2_events.clone(), campaign_events);
+
+        let backend_id = "session/node-victim-4444";
+        let connected = || C2Event::SessionConnected {
+            backend_id: backend_id.to_string(),
+            target_entity_id: "node/victim".to_string(),
+            hostname: "victim".to_string(),
+            user: "root".to_string(),
+            os: "Linux".to_string(),
+            kind: "tcp".to_string(),
+            port: Some(4444),
+        };
+
+        c2_events.publish(connected()).await.expect("first connect");
+        // The first connect is told as an access-gained fact, not a lifecycle
+        // event, so wait on that before breaking the session.
+        let (_, entities) = next_facts_changed(&mut rx).await;
+        assert_eq!(entities.len(), 1);
+
+        c2_events
+            .publish(C2Event::SessionLost {
+                backend_id: backend_id.to_string(),
+                target_entity_id: "node/victim".to_string(),
+            })
+            .await
+            .expect("session lost");
+
+        let (entity_id, entity_name, state) = next_session_state(&mut rx).await;
+        assert_eq!(state, SessionLifecycle::Lost);
+        assert_eq!(entity_name, "victim");
+        assert_eq!(
+            entity_id, "system/victim",
+            "the event must name the entity the shell exits into, not the C2's guess"
+        );
+        {
+            let guard = campaign.read().expect("campaign lock");
+            assert!(
+                guard.get_relations().iter().any(|r| r.broken),
+                "the exec-channel edge must be marked broken while the shell is gone"
+            );
+        }
+
+        c2_events.publish(connected()).await.expect("reconnect");
+
+        let (entity_id, _, state) = next_session_state(&mut rx).await;
+        assert_eq!(state, SessionLifecycle::Reestablished);
+        assert_eq!(entity_id, "system/victim");
+
+        let guard = campaign.read().expect("campaign lock");
+        assert!(
+            !guard.get_relations().iter().any(|r| r.broken),
+            "the returning shell must clear the break, not leave a dead edge behind"
+        );
+        let sessions = guard
+            .get_system_entity("system/victim")
+            .expect("the foothold system")
+            .entity()
+            .system()
+            .sessions
+            .clone();
+        assert_eq!(
+            sessions.len(),
+            1,
+            "the reconnect must revive the session, not stack a second one: {sessions:?}"
+        );
+        assert_eq!(sessions[0].status, SessionStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn a_killed_session_removes_only_its_session_channel() {
+        let campaign = Arc::new(RwLock::new(Campaign::bootstrap(
+            "Ran",
+            ran_domain::K8sCluster::new("dev"),
+        )));
+        let c2_events = C2EventBus::new(16);
+        let campaign_events = CampaignEventBus::new(16);
+        let mut rx = campaign_events.subscribe();
+        spawn_c2_event_processor(campaign.clone(), c2_events.clone(), campaign_events);
+
+        let backend_id = "session/node-victim-4444";
+        c2_events
+            .publish(C2Event::SessionConnected {
+                backend_id: backend_id.to_string(),
+                target_entity_id: "node/victim".to_string(),
+                hostname: "victim".to_string(),
+                user: "root".to_string(),
+                os: "Linux".to_string(),
+                kind: "tcp".to_string(),
+                port: Some(4444),
+            })
+            .await
+            .expect("session connected");
+        let _ = next_facts_changed(&mut rx).await;
+
+        c2_events
+            .publish(C2Event::SessionKilled {
+                backend_id: backend_id.to_string(),
+            })
+            .await
+            .expect("session killed");
+        let _ = next_facts_changed(&mut rx).await;
+
+        let guard = campaign.read().expect("campaign lock");
+        assert!(
+            !guard
+                .get_relations()
+                .iter()
+                .any(|relation| relation.name == "c2.session"
+                    && relation.session_id.as_deref() == Some(backend_id)),
+            "operator closure must remove the session edge rather than leave it broken"
+        );
+        assert!(
+            guard.get_system_entity("system/victim").is_some(),
+            "facts discovered through the session must remain"
+        );
+        assert!(
+            guard
+                .get_system_entity("system/victim")
+                .expect("the foothold system remains")
+                .entity()
+                .system()
+                .sessions
+                .is_empty(),
+            "operator closure must remove the stored session entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn binding_a_listener_reports_creation_attributed_to_its_command() {
+        let campaign = Arc::new(RwLock::new(Campaign::bootstrap(
+            "Ran",
+            ran_domain::K8sCluster::new("dev"),
+        )));
+        let c2_events = C2EventBus::new(16);
+        let campaign_events = CampaignEventBus::new(16);
+        let mut rx = campaign_events.subscribe();
+
+        spawn_c2_event_processor(campaign.clone(), c2_events.clone(), campaign_events);
+
+        c2_events
+            .publish(C2Event::ListenerStarted {
+                cmd_id: "cmd-42".to_string(),
+                port: 1337,
+                protocol: "tcp".to_string(),
+            })
+            .await
+            .expect("c2 event bus should accept the event");
+
+        let (cmd_id, entities) = next_facts_changed(&mut rx).await;
+
+        // Attributed to the action that bound it, so the timeline folds the
+        // listener into that action instead of showing a row beside it.
+        assert_eq!(cmd_id, "cmd-42");
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].kind, "Listener");
+        assert_eq!(entities[0].name, "tcp/1337");
+        // The operator bound this port; the campaign did not come across it.
+        assert_eq!(entities[0].outcome, FactOutcome::Created);
+    }
+
+    #[tokio::test]
+    async fn stopping_a_listener_is_attributed_to_its_command_too() {
+        let campaign = Arc::new(RwLock::new(Campaign::bootstrap(
+            "Ran",
+            ran_domain::K8sCluster::new("dev"),
+        )));
+        let c2_events = C2EventBus::new(16);
+        let campaign_events = CampaignEventBus::new(16);
+        let mut rx = campaign_events.subscribe();
+
+        spawn_c2_event_processor(campaign.clone(), c2_events.clone(), campaign_events);
+
+        c2_events
+            .publish(C2Event::ListenerStopped {
+                cmd_id: "cmd-stop".to_string(),
+                port: 1337,
+            })
+            .await
+            .expect("c2 event bus should accept the event");
+
+        let (cmd_id, entities) = next_facts_changed(&mut rx).await;
+        assert_eq!(cmd_id, "cmd-stop");
+        assert!(entities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_shell_from_an_unknown_host_is_access_gained_and_a_discovery() {
+        let campaign = Arc::new(RwLock::new(Campaign::bootstrap(
+            "Ran",
+            ran_domain::K8sCluster::new("dev"),
+        )));
+        let c2_events = C2EventBus::new(16);
+        let campaign_events = CampaignEventBus::new(16);
+        let mut rx = campaign_events.subscribe();
+
+        spawn_c2_event_processor(campaign.clone(), c2_events.clone(), campaign_events);
+
+        c2_events
+            .publish(C2Event::SessionConnected {
+                backend_id: "session/worker-1-4444".to_string(),
+                target_entity_id: "node/worker-1".to_string(),
+                hostname: "worker-1".to_string(),
+                user: "root".to_string(),
+                os: "linux".to_string(),
+                kind: "tcp".to_string(),
+                port: Some(4444),
+            })
+            .await
+            .expect("c2 event bus should accept the event");
+
+        let (_, entities) = next_facts_changed(&mut rx).await;
+        assert_eq!(entities.len(), 1);
+        // Never seen before, so it is genuinely new knowledge *and* new access.
+        assert_eq!(entities[0].outcome, FactOutcome::Observed);
+        assert_eq!(entities[0].category, FactCategory::AccessGained);
+    }
+
+    #[tokio::test]
+    async fn a_shell_on_a_known_host_is_still_reported_as_access_gained() {
+        // The regression this guards: the host already exists, so the entity is
+        // only `Updated`. Classified as a discovery it would be filtered out as a
+        // routine field update and the operator would never see the shell land.
+        let mut bootstrapped = Campaign::bootstrap("Ran", ran_domain::K8sCluster::new("dev"));
+        let node = ran_domain::K8sNode::new("worker-1");
+        bootstrapped.insert_entity(&node);
+        let node_id = node.entity_id();
+        let campaign = Arc::new(RwLock::new(bootstrapped));
+
+        let c2_events = C2EventBus::new(16);
+        let campaign_events = CampaignEventBus::new(16);
+        let mut rx = campaign_events.subscribe();
+
+        spawn_c2_event_processor(campaign.clone(), c2_events.clone(), campaign_events);
+
+        c2_events
+            .publish(C2Event::SessionConnected {
+                backend_id: "session/worker-1-4444".to_string(),
+                target_entity_id: node_id.0.clone(),
+                hostname: "worker-1".to_string(),
+                user: "root".to_string(),
+                os: "linux".to_string(),
+                kind: "tcp".to_string(),
+                port: Some(4444),
+            })
+            .await
+            .expect("c2 event bus should accept the event");
+
+        let (_, entities) = next_facts_changed(&mut rx).await;
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].outcome, FactOutcome::Updated);
+        assert_eq!(entities[0].category, FactCategory::AccessGained);
+    }
+
+    #[test]
+    fn categories_not_claimed_by_a_producer_follow_the_entity_kind() {
+        assert_eq!(FactCategory::from_kind("Secret"), FactCategory::Credential);
+        assert_eq!(
+            FactCategory::from_kind("K8sCredential"),
+            FactCategory::Credential
+        );
+        assert_eq!(FactCategory::from_kind("Pod"), FactCategory::Discovery);
+        assert_eq!(FactCategory::from_kind("Listener"), FactCategory::Discovery);
+    }
+}
+
+fn action_result_preview(results: &[String]) -> String {
+    let Some(result) = results.first() else {
+        return String::new();
+    };
+
+    let safe_result = safe_log_output(result);
+    if safe_result != result {
+        return safe_result.to_string();
+    }
+
+    let mut preview: String = result.chars().take(200).collect();
+    if result.chars().count() > 200 {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn safe_log_output(value: &str) -> &str {
+    if contains_jwt(value) || value.to_ascii_lowercase().contains("bearer ") {
+        "[REDACTED: credential-bearing output]"
+    } else {
+        value
+    }
+}
+
+fn contains_jwt(value: &str) -> bool {
+    value
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric()
+                || character == '-'
+                || character == '_'
+                || character == '.')
+        })
+        .any(|candidate| {
+            let mut segments = candidate.split('.');
+            matches!(
+                (segments.next(), segments.next(), segments.next(), segments.next()),
+                (Some(header), Some(payload), Some(signature), None)
+                    if header.len() >= 8 && payload.len() >= 8 && signature.len() >= 8
+            )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    use ran_domain::{K8sCluster, Pod, UnknownSystem};
+
+    use super::*;
+
+    #[test]
+    fn action_result_preview_redacts_service_account_tokens() {
+        let token =
+            "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzeXN0ZW06c2VydmljZWFjY291bnQifQ.signature_value";
+
+        assert_eq!(
+            action_result_preview(&[token.to_string()]),
+            "[REDACTED: credential-bearing output]"
+        );
+        assert_eq!(
+            action_result_preview(&[format!("Authorization: Bearer {token}")]),
+            "[REDACTED: credential-bearing output]"
+        );
+    }
+
+    #[test]
+    fn failure_log_redacts_a_token_echoed_in_an_oci_error() {
+        let token =
+            "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzeXN0ZW06c2VydmljZWFjY291bnQifQ.signature_value";
+        let error =
+            format!("OCI runtime exec failed: exec: \"curl -H 'Authorization: Bearer {token}'\"");
+        assert_eq!(
+            safe_log_output(&error),
+            "[REDACTED: credential-bearing output]"
+        );
+    }
+
+    #[derive(Clone)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log capture lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_execution_redacts_parse_audit_in_event_processor_logs() {
+        let logs = CapturedLogs(Arc::new(Mutex::new(Vec::new())));
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        let mut state = Campaign::bootstrap("Ran", K8sCluster::new("dev"));
+        let target = Pod::new("target", "default");
+        let target_id = target.entity_id().0;
+        state.insert_entity(&target);
+        let procedure = armory::Procedure::new("noop", "true");
+        let cmd = c2::ExecTtp {
+            id: "cmd-audit-redaction".to_string(),
+            ttp: Ttp {
+                effects: vec!["test.failure-audit".to_string()],
+                procedures: vec![procedure.clone()],
+                ..Ttp::new("failure-audit-test", "Failure Audit Test", "Discovery")
+            },
+            procedure,
+            operation: c2::ExecutionOperation::Noop,
+            args: HashMap::new(),
+            target_id: target_id.clone(),
+            exec_chain: vec![target_id.clone()],
+            exec_system_id: c2::BUILTIN_C2_ID.to_string(),
+            execution_environment: Some(ran_domain::ExecutionEnvironment {
+                system_id: Some(target_id),
+                tool: None,
+                auth_identity_id: None,
+            }),
+            transport_environment: None,
+            auth_identity_id: None,
+            started_at_ms: 0,
+            execution_timeout_seconds: c2::DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+            output_transform: None,
+            is_cleanup: false,
+            reasoning: String::new(),
+        };
+        state.add_open_step(cmd.clone());
+
+        let campaign = Arc::new(RwLock::new(state));
+        let c2_events = C2EventBus::new(4);
+        let campaign_events = CampaignEventBus::new(8);
+        let mut event_rx = campaign_events.subscribe();
+        let processor = spawn_c2_event_processor(campaign, c2_events.clone(), campaign_events);
+        let sentinel = "audit-secret-123";
+        c2_events
+            .publish(C2Event::TtpExecuted {
+                cmd: Box::new(cmd),
+                event: c2::TtpExecuted {
+                    id: "cmd-audit-redaction".to_string(),
+                    success: false,
+                    results: Vec::new(),
+                    exit_code: 1,
+                    fail_reason: format!(
+                        "unexpected execution failure: Authorization: Bearer {sentinel}"
+                    ),
+                    session_connected: None,
+                },
+                partial: false,
+            })
+            .await
+            .expect("completion should queue");
+
+        let audits = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(CampaignEvent::ParseAudited { audits, .. }) = event_rx.recv().await {
+                    break audits;
+                }
+            }
+        })
+        .await
+        .expect("failure audit should be published");
+        assert!(audits.iter().any(|audit| audit.detail.contains(sentinel)));
+
+        let output = String::from_utf8(logs.0.lock().expect("log capture lock").clone())
+            .expect("logs should be UTF-8");
+        assert!(output.contains("Parse audit indicates parser gap or known failure"));
+        assert!(output.contains("[REDACTED: credential-bearing output]"));
+        assert!(
+            !output.contains(sentinel),
+            "logs contained the credential: {output}"
+        );
+        processor.abort();
+    }
+
+    #[test]
+    fn action_result_preview_preserves_normal_output_and_unicode_boundaries() {
+        assert_eq!(action_result_preview(&["root".to_string()]), "root");
+
+        let long = "é".repeat(201);
+        assert_eq!(
+            action_result_preview(&[long]),
+            format!("{}...", "é".repeat(200))
+        );
+    }
+
+    /// The variables kubelet injects into every container it starts - enough of
+    /// them for `InClusterPodAnalyzer` to promote the system carrying them.
+    fn kubelet_env() -> Vec<(String, String)> {
+        [
+            ("KUBERNETES_SERVICE_HOST", "10.96.0.1"),
+            ("KUBERNETES_SERVICE_PORT", "443"),
+            ("KUBERNETES_PORT_443_TCP", "tcp://10.96.0.1:443"),
+            ("HOSTNAME", "netshoot"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    /// A campaign whose only foothold is a reverse shell on `netshoot`, after
+    /// reading the container's environment promoted it from an `UnknownSystem`
+    /// to `ns/?/pod/netshoot`. The entity id therefore changed under the C2,
+    /// which still knows that shell by the target id it connected with.
+    fn promoted_foothold() -> Campaign {
+        let mut campaign = Campaign::bootstrap("ran", K8sCluster::new("test-cluster"));
+
+        // The C2 names a reverse-shell target after the hostname it probed, so
+        // this id belongs to no entity in the graph.
+        let system_id = attach_connected_session(
+            &mut campaign,
+            "session/s1",
+            "node/netshoot",
+            "netshoot",
+            "root",
+            "Linux",
+            ConnectedSessionTransport::new("tcp", Some(4444)),
+        );
+        let system_id = system_id.entity_id;
+        assert_eq!(system_id, "system/netshoot");
+
+        // Reading /proc/1/environ over that shell hands us kubelet's variables.
+        campaign
+            .get_system_entity_mut(&system_id)
+            .expect("foothold system")
+            .entity_mut()
+            .system_mut()
+            .env_vars
+            .extend(kubelet_env());
+
+        let facts = crate::rules::run_rules_fixpoint(
+            &campaign,
+            &crate::analyzers::default_rules(),
+            crate::FactsUpdate::default(),
+        );
+        campaign.apply_facts(&facts);
+
+        assert!(
+            campaign
+                .entities
+                .contains::<Pod>(&EntityId::new("ns/?/pod/netshoot")),
+            "fixture expects the foothold to be promoted to a pod"
+        );
+        campaign
+    }
+
+    #[test]
+    fn promotion_publishes_exactly_one_entity_merged_event() {
+        let campaign = promoted_foothold();
+        let previous_aliases = HashMap::from([(
+            EntityId::new("node/netshoot"),
+            EntityId::new("system/netshoot"),
+        )]);
+        let events = CampaignEventBus::new(8);
+        let mut rx = events.subscribe();
+
+        publish_entity_merges_since(&events, &campaign, &previous_aliases);
+
+        match rx.try_recv().expect("promotion event") {
+            CampaignEvent::EntityMerged { from, into, kind } => {
+                assert_eq!(from, "system/netshoot");
+                assert_eq!(into, "ns/?/pod/netshoot");
+                assert_eq!(kind, "Pod");
+            }
+            other => panic!("expected entity merge, got {other:?}"),
+        }
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn callback_from_a_known_pod_attaches_without_a_second_entity() {
+        let mut campaign = Campaign::bootstrap("ran", K8sCluster::new("test-cluster"));
+        let pod = Pod::new("debug-bridge", "default");
+        let pod_id = pod.entity_id().0;
+        campaign.insert_entity(&pod);
+
+        let attached = attach_connected_session(
+            &mut campaign,
+            "session/debug-bridge",
+            "node/debug-bridge",
+            "debug-bridge",
+            "root",
+            "Linux",
+            ConnectedSessionTransport::new("ranplant", Some(4444)),
+        );
+
+        assert_eq!(attached.entity_id, pod_id);
+        assert!(campaign.entities.get::<UnknownSystem>().is_empty());
+        assert_eq!(
+            campaign.entities.get::<Pod>()[&EntityId::new(&pod_id)]
+                .system
+                .sessions[0]
+                .id,
+            "debug-bridge"
+        );
+        assert_eq!(
+            campaign.entities.get::<Pod>()[&EntityId::new(&pod_id)]
+                .system
+                .sessions[0]
+                .kind,
+            "ranplant"
+        );
+    }
+
+    #[test]
+    fn callback_that_precedes_the_deploy_effect_merges_into_the_pod() {
+        let mut campaign = Campaign::bootstrap("ran", K8sCluster::new("test-cluster"));
+        let attached = attach_connected_session(
+            &mut campaign,
+            "session/debug-bridge",
+            "node/debug-bridge",
+            "debug-bridge",
+            "root",
+            "Linux",
+            ConnectedSessionTransport::new("tcp", Some(4444)),
+        );
+        assert_eq!(attached.entity_id, "system/debug-bridge");
+
+        let pod = Pod::new("debug-bridge", "default");
+        let pod_id = pod.entity_id();
+        let mut deploy_facts = crate::FactsUpdate::default();
+        deploy_facts.new_entities.push(Box::new(pod));
+        let facts = crate::rules::run_rules_fixpoint(
+            &campaign,
+            &crate::analyzers::default_rules(),
+            deploy_facts,
+        );
+        campaign.apply_facts(&facts);
+
+        assert!(campaign.entities.get::<UnknownSystem>().is_empty());
+        assert_eq!(
+            campaign.entities.get::<Pod>()[&pod_id].system.sessions[0].id,
+            "debug-bridge"
+        );
+    }
+
+    fn pod_sessions(campaign: &Campaign) -> Vec<SessionInfo> {
+        campaign
+            .entities
+            .find::<Pod>(&EntityId::new("ns/?/pod/netshoot"))
+            .expect("promoted pod")
+            .system
+            .sessions
+            .clone()
+    }
+
+    #[test]
+    fn a_session_status_change_keyed_by_the_pre_merge_id_reaches_the_pod() {
+        let mut campaign = promoted_foothold();
+
+        update_session_status(
+            &mut campaign,
+            "node/netshoot",
+            "session/s1",
+            SessionStatus::Lost,
+        );
+
+        let sessions = pod_sessions(&campaign);
+        assert_eq!(sessions.len(), 1, "sessions were: {:?}", sessions);
+        assert_eq!(
+            sessions[0].status,
+            SessionStatus::Lost,
+            "a status change addressed to the pre-merge id must reach the pod"
+        );
+        assert!(
+            campaign.entities.get::<UnknownSystem>().is_empty(),
+            "the promoted system must not be resurrected"
+        );
+    }
+
+    /// The exec-session path mints a backend id deterministically from the pod
+    /// (`kubectl_exec_backend_id`), so re-running the TTP after the session died
+    /// comes back on the id already recorded. It has to revive that entry: a
+    /// second one pushed beside it leaves the entity panel showing a dead
+    /// session next to the live one, forever.
+    #[test]
+    fn re_opening_an_exec_session_revives_it_instead_of_stacking_a_second() {
+        let mut campaign = Campaign::bootstrap("ran", K8sCluster::new("test-cluster"));
+        campaign.insert_entity(&Pod::new("api", "default"));
+
+        let connected = SessionConnectedData {
+            backend_id: "session/ns-default-pod-api".to_string(),
+            target_entity_id: "ns/default/pod/api".to_string(),
+            hostname: "api".to_string(),
+            user: "root".to_string(),
+            os: "Linux".to_string(),
+        };
+
+        let (_, revived) = apply_session_connected(&mut campaign, &connected);
+        assert!(
+            !revived,
+            "the first connect opens a session, it revives nothing"
+        );
+
+        update_session_status(
+            &mut campaign,
+            "ns/default/pod/api",
+            "session/ns-default-pod-api",
+            SessionStatus::Lost,
+        );
+
+        let (summary, revived) = apply_session_connected(&mut campaign, &connected);
+        assert!(
+            revived,
+            "re-running the TTP on a dead exec session is a revival"
+        );
+        assert_eq!(
+            summary.expect("a session summary").id.0,
+            "ns/default/pod/api"
+        );
+
+        let sessions = campaign
+            .get_system_entity("ns/default/pod/api")
+            .expect("the pod")
+            .entity()
+            .system()
+            .sessions
+            .clone();
+        assert_eq!(
+            sessions.len(),
+            1,
+            "the dead entry must be revived, not left beside a new one: {sessions:?}"
+        );
+        assert_eq!(sessions[0].status, SessionStatus::Active);
+    }
+
+    #[test]
+    fn a_reconnect_keyed_by_the_pre_merge_id_keeps_the_pod_executable() {
+        let mut campaign = promoted_foothold();
+        update_session_status(
+            &mut campaign,
+            "node/netshoot",
+            "session/s1",
+            SessionStatus::Lost,
+        );
+
+        // The shell comes back on the listener's own backend id, still
+        // announcing itself with the target id the C2 captured on first connect.
+        let channel_id = attach_connected_session(
+            &mut campaign,
+            "session/s1",
+            "node/netshoot",
+            "netshoot",
+            "root",
+            "Linux",
+            ConnectedSessionTransport::new("tcp", Some(4444)),
+        );
+
+        assert_eq!(
+            channel_id.entity_id, "ns/?/pod/netshoot",
+            "the reconnect must attach to the pod, not to a fresh system"
+        );
+        assert!(
+            channel_id.revived,
+            "a shell returning on a lost session's backend id is a revival"
+        );
+        assert!(
+            campaign.entities.get::<UnknownSystem>().is_empty(),
+            "the reconnect must not resurrect the pre-merge system"
+        );
+
+        let sessions = pod_sessions(&campaign);
+        assert_eq!(
+            sessions.len(),
+            1,
+            "the reconnect must revive the session, not duplicate it; got: {:?}",
+            sessions
+        );
+        assert_eq!(sessions[0].status, SessionStatus::Active);
+
+        let channel = campaign
+            .resolve_exec_channel("ns/?/pod/netshoot")
+            .expect("the promoted foothold must stay executable");
+        assert_eq!(channel.backend_id, "session/s1");
+    }
+
+    #[test]
+    fn a_connect_to_a_target_that_resolves_records_no_alias() {
+        let mut campaign = Campaign::bootstrap("ran", K8sCluster::new("test-cluster"));
+        campaign.insert_entity(&Pod::new("api", "default"));
+
+        let channel_id = attach_connected_session(
+            &mut campaign,
+            "session/s2",
+            "ns/default/pod/api",
+            "api",
+            "root",
+            "Linux",
+            ConnectedSessionTransport::new("kubectl-exec", None),
+        );
+
+        assert_eq!(channel_id.entity_id, "ns/default/pod/api");
+        assert!(
+            campaign.entity_aliases.is_empty(),
+            "a target that resolves on its own must not record an alias"
+        );
+    }
+}

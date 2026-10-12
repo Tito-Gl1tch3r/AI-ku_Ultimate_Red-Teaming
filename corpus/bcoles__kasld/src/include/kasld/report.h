@@ -1,0 +1,396 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// The report model: one finished description of a run, built once, rendered by
+// every format.
+//
+// A format is a pure function from this model to bytes. It chooses glyphs,
+// colour, column widths, quoting and wrapping -- how a thing LOOKS. It does not
+// choose which items exist, compute or alter a value, assign a grade, or
+// acquire a fact. Everything a format needs to draw is decided here, before any
+// of them run, so two formats cannot describe one run differently.
+//
+// Built from the ENGINE -- estimates and the constraints behind them -- never
+// from what some other format happens to print. A model derived from existing
+// output encodes each renderer's decisions as though they were facts about the
+// target, which is the defect this layer exists to remove.
+//
+// ---
+// <bcoles@gmail.com>
+
+#ifndef KASLD_REPORT_H
+#define KASLD_REPORT_H
+
+#include "constraint.h"
+#include "estimate.h"
+#include "quantity.h"
+
+/* How many excluded sub-ranges an item retains for display. `n_excluded` counts
+ * every hole, so a format can always say how many exist even when it cannot
+ * list them. Sized for the realistic case, which is the count of HOLES rather
+ * than of the constraints describing them: the builder merges overlapping and
+ * abutting exclusions before filling the array, and a live x86_64 run whose 34
+ * exclusion constraints describe 2 disjoint physical holes therefore needs two
+ * entries. Without that merge the same run would overflow any array of a
+ * reasonable size. */
+#define KASLD_REPORT_MAX_EXCLUDED 16
+
+/* What kind of set a resolved window describes.
+ *
+ * The engine has three lattice kinds and the model must express all three, or a
+ * quantity gets flattened into a shape it does not have. RSHAPE_SET exists for
+ * Q_VA_BITS (a paging level is not a location), and it is why the count of
+ * remaining possibilities is called "candidates" everywhere rather than slots
+ * or placements -- those words assume the thing being counted sits somewhere.
+ */
+enum kasld_report_shape {
+  RSHAPE_INTERVAL, /* [lo, hi] on a grid, less any excluded sub-ranges */
+  RSHAPE_SET,      /* an explicit set of admissible values */
+  RSHAPE_FLOOR     /* at least this value; no upper bound is claimed */
+};
+
+/* Where a concrete value came from.
+ *
+ * A base WITNESS states the region's first address. An INTERIOR sample states
+ * only that the region contains that address, so the base lies at or below it
+ * -- a bound, not an answer. Recorded here because by the time a format sees an
+ * address it is only a number, and presenting an interior-derived value as the
+ * base overstates by however far the sample sits above it. */
+/* One excluded sub-range carved out of a window's hull. */
+struct kasld_report_hole {
+  unsigned long lo, hi; /* inclusive */
+};
+
+/* One resolved window over a quantity.
+ *
+ * `lo`/`hi` are the convex HULL. They are not the candidate set: interior holes
+ * are carved and a stride may thin what remains, which is why `candidates` can
+ * be far smaller than the hull's width suggests and cannot be derived from the
+ * endpoints. A format that prints the hull without saying so leaves a reader
+ * unable to reconcile the two numbers beside each other. */
+struct kasld_report_window {
+  int present; /* 0 = this grade resolved nothing for the quantity */
+  enum kasld_report_shape shape;
+
+  unsigned long lo, hi;
+  /* Which edges this shape has: an interval has both, a floor has only `lo`,
+   * and a set has neither because its values are not endpoints. Fixed by the
+   * shape rather than by what the run learned -- an address window is bounded
+   * on both sides from the moment it opens at the architecture's own limits --
+   * so these are carried beside `shape` instead of being re-derived by each
+   * format that has to decide whether to print an edge. */
+  int has_lo, has_hi;
+
+  /* The live value satisfies (v % stride) == stride_offset as well as lying in
+   * the hull. Zero stride means no congruence is known. Reported, not merely
+   * counted: which candidates to skip is directly actionable, and it is a
+   * second reason `candidates` disagrees with the hull's width. */
+  unsigned long stride, stride_offset;
+
+  /* RSHAPE_SET only: the values still admissible, decoded from the estimate's
+   * live-candidate bitmask. A set has no endpoints and no grid, so `lo`/`hi`
+   * and `align_min` say nothing about it -- reading a bitmask as though it were
+   * an address is exactly the flattening this shape exists to prevent. */
+  unsigned long values[KASLD_FINSET_MAX_CANDIDATES];
+  int n_values;
+
+  /* Disjoint and ascending: overlapping and abutting exclusions are merged
+   * into the holes they describe, so a consumer may measure or sum them
+   * without double-counting. */
+  struct kasld_report_hole excluded[KASLD_REPORT_MAX_EXCLUDED];
+  int n_excluded;      /* holes carved, including any past the array */
+  int excluded_listed; /* how many of them the array holds */
+
+  /* Candidates remaining, holes carved and stride applied. Taken from the
+   * engine; never recomputed by a consumer, which could only produce the
+   * hull-blind number. */
+  unsigned long candidates;
+
+  /* The same figure in bits: ceil(log2(candidates)), 0 for none. Carried rather
+   * than left to each format, because converting it is deriving, and a format
+   * that derives is a format that can differ. Ceiling, not floor: the question
+   * is how much brute-force work remains, and 13 candidates is ~4 bits of
+   * worst-case work rather than 3. */
+  int bits;
+};
+
+/* One unknown about the target, with everything proven about it.
+ *
+ * An item is a QUANTITY, not a row. The two windows are two statements about
+ * one unknown, resolved at two confidence floors -- so "grade" is which window
+ * is being read, not a property to store. A format decides whether that becomes
+ * one row or two; the model does not carry a row shape.
+ *
+ * Membership is per machine: an architecture that has no such unknown carries
+ * no item for it, because there is nothing to report. Identical output across
+ * architectures is neither achievable nor wanted -- what is identical is the
+ * vocabulary and the rules, not the contents. */
+struct kasld_report_quantity {
+  enum kasld_quantity q;
+  const char *key;   /* machine name, stable: "virt_image_base" */
+  const char *label; /* human name: "Virtual Image Base" */
+
+  /* The grain candidates are counted on, and a LOWER BOUND: the engine resolves
+   * alignment with C_AT_LEAST_ALIGN and nothing caps it, so the true alignment
+   * may be coarser and the true candidate count correspondingly smaller. The
+   * count is therefore an upper bound -- the conservative direction, since the
+   * residual bounds the target's protection from above. Zero only where the
+   * quantity sits on no modelled grid at all. */
+  unsigned long align_min;
+
+  /* Whether `align_min` is the grain or only a floor under it. Set where the
+   * pitch is fixed by the architecture's own randomization -- there the count
+   * beside it is a count. Clear elsewhere, including on both image bases, where
+   * the alignment is resolved with C_AT_LEAST_ALIGN and a kernel built with a
+   * coarser CONFIG_PHYSICAL_ALIGN has fewer candidates than the row states. A
+   * zero-initialized item claims nothing, which is the safe direction. */
+  int align_exact;
+
+  /* Two denominators, because there are two different "out of how many" and
+   * they are not interchangeable.
+   *
+   * `entropy_top` is an UPPER BOUND on what the kernel chose among, counted at
+   * the finest grain this build can prove. This is the denominator a reader
+   * wants -- "8 of N" means 8 of the places the kernel could have put itself.
+   * It is filled in three tiers, and which one answered is not recorded because
+   * all three are upper bounds and a consumer treats them alike:
+   *
+   *   1. the LEAK-FREE resolution -- the same rules over the same run with
+   *      every observation that locates the kernel withheld, leaving the window
+   *      the machine alone fixes. Where the board's memory map bounds where a
+   *      kernel could have been placed, that is the set it drew from, and this
+   *      is the only tier that can answer for a quantity whose top is an
+   *      address width rather than a window. Rejected where it bounds nothing:
+   *      what is left of the whole address space is not a window.
+   *   2. a window PROVED for this run -- the caller's, derived from evidence
+   *      the builder cannot reach, or a randomization span the architecture
+   *      declares for the quantity.
+   *   3. failing both, and only where the quantity's honest top is a window
+   *      rather than a bound on address width, the set the ENGINE started from
+   *      -- `search_top` below. Wider than any one kernel's window, because a
+   *      top has to span every layout the architecture admits.
+   *
+   * The true figure can be smaller than either, in two ways that do not cancel:
+   *
+   *   - the count divides the window by `align_min`, which is a floor (see
+   *     it), so a kernel aligned more coarsely than this build can prove sat
+   *     on fewer places than are counted here; and
+   *   - a window the model DERIVES rather than reads from the architecture is
+   *     itself deliberately generous. The direct map's comes from the
+   *     RANDOMIZE_MEMORY budget evaluated with the smallest admissible
+   *     direct-map size, because the true size turns on build options this
+   *     binary cannot see.
+   *
+   * Exact only where the window is an architectural constant AND the build
+   * used the architecture's own alignment. The slack runs one way -- never
+   * below the kernel's true count -- so a residual stated against it never
+   * overstates what remains to be searched; what it can overstate is the
+   * entropy the kernel started with, and so how much of it was stripped.
+   *
+   * Nothing decides on this figure: it is presented, never gated. Zero where
+   * neither tier applies: no proved window, and a top that is not a set of
+   * placements. That is the physical image base on every architecture, where
+   * the top is an address width; and it is the virtual one on an architecture
+   * with no KASLR, where the same constants bound where a bootloader may have
+   * put the image rather than a set the kernel drew from. Zero is not the same
+   * as having no candidates.
+   *
+   * `search_top` is what the ENGINE was willing to consider, and is
+   * deliberately wider than any single kernel's window: that window bakes in
+   * build options this binary cannot see, so starting there would let a
+   * legitimately-configured kernel fall outside the resolved window -- the one
+   * direction this tool must never be wrong in. Against a DEFAULT build the
+   * margin is 7 slots on x86_64 (an unknown CONFIG_PHYSICAL_START) and 127x on
+   * riscv64, where two different text layouts must both fit.
+   *
+   * A resolved count CAN exceed `entropy_top`, under either of the first two
+   * tiers. A caller that proved a window tighter than the one the engine
+   * searched leaves the numerator counted over the wider set. The leak-free
+   * window is normally a superset of the resolved one -- it is the same rules
+   * over strictly less evidence -- but a rule that fires on the ABSENCE of an
+   * observation can narrow it where the full evidence did not, so the
+   * relationship is not guaranteed by construction. Under tier 3 the two are
+   * equal by construction and the count cannot pass it. Both fields are carried
+   * so a format can notice the inverted case and present a bare count instead
+   * of an incoherent ratio -- a presentation rule, which is why it lives in the
+   * formats and not here.
+   *
+   * One denominator serves both windows, and a format is not obliged to print
+   * it twice: the set a likely row narrows is the guaranteed row's own count,
+   * which is already on the line above it. The readout states the figure on the
+   * guaranteed row alone for that reason, and the reasoning sits with the
+   * column that makes the choice rather than here.
+   *
+   * Narrowing is `candidates < search_top`: read from the counts, never stored,
+   * because a copy of a derived fact goes stale. */
+  unsigned long entropy_top;
+  unsigned long search_top;
+
+  /* The denominator above, in bits: what the quantity's residual entropy is
+   * measured against. Carried rather than left to each format, for the reason
+   * `bits` is -- converting a count to bits is deriving, and a format that
+   * derives is a format that can differ. Which denominator applies depends on
+   * the KIND of quantity: an interval narrows the window the kernel randomizes
+   * over, a set narrows the values the architecture admits. Zero where the
+   * architecture models no such set, which is not the same as zero bits. */
+  int top_bits;
+
+  struct kasld_report_window guaranteed; /* sound floor: contains the truth */
+  struct kasld_report_window likely; /* all signals: a subset, may be wrong */
+
+  /* The single concrete value, where one was picked. Recorded only where the
+   * resolved window already names one address, so it IS the base: how it was
+   * witnessed cannot change what it means by the time it reaches here. */
+  int has_point;
+  unsigned long point;
+  long slide; /* displacement from the un-randomized base */
+  int has_slide;
+
+  /* The region's _stext, where a component OBSERVED it and the base above is
+   * resolved. Recorded beside the base rather than as a quantity of its own,
+   * because it is not one: nothing searches for it independently.
+   *
+   * Never derived. The obvious derivation -- base plus the architecture's head
+   * gap -- is unsound wherever the gap is non-zero, since every arch header
+   * declaring one declares a RANGE and the constant is only its nominal value.
+   * Suppressed where it equals the base, which is every architecture whose gap
+   * is zero: one address under two names invites a search for a difference that
+   * is not there. */
+  int has_stext;
+  unsigned long stext;
+};
+
+/* What kind of system this is, with respect to randomization.
+ *
+ * A field, not a branch. Formats state it in words and then draw the same items
+ * they always draw -- the posture changes what the values ARE, never which
+ * items exist, so a reader who has seen one posture recognises the next and two
+ * runs across a reboot that changed it remain comparable. */
+enum kasld_posture {
+  RPOSTURE_RANDOMIZED = 0, /* KASLR ran */
+  RPOSTURE_DISABLED,    /* deliberately off: nokaslr, RANDOMIZE_BASE=n, ... */
+  RPOSTURE_UNSUPPORTED, /* the architecture has no KASLR */
+  RPOSTURE_FAILED       /* the stub ran with no randomness to place with */
+};
+
+/* A concrete value picked for a quantity, supplied by the caller.
+ *
+ * Not derivable from the estimates: the headline base is chosen by scanning the
+ * observations and reconciling that pick against the engine, which is the
+ * orchestrator's job. The model records the value; the report keeps it only
+ * where the window it is reconciled against names one address. */
+struct kasld_report_point {
+  int present;
+  unsigned long value;
+  long slide;
+  int has_slide;
+  /* An observed _stext for the same region, or 0. Supplied, not derived: only
+   * the caller sees the observations. */
+  unsigned long stext;
+
+  /* The set this quantity's residual is measured against, where the caller
+   * knows it and the builder cannot. The direct map is the case: its
+   * denominator is the window kernel_randomize_memory() draws from, sized from
+   * engine evidence the builder does not see, and NOT the quantity's honest top
+   * -- an addressable range would read as entropy the kernel never had. Zero
+   * leaves the builder's own answer standing.
+   *
+   * Read whether or not `present` is set: that flag is about the concrete
+   * value, and a denominator is known in runs that resolved no base. */
+  unsigned long entropy_top;
+};
+
+/* The report. Sections are added as the migration proceeds; quantities and
+ * posture are the first, and the rest (target identity, evidence, map,
+ * components, environment, notes) follow the same rule -- decided here, drawn
+ * there. */
+struct kasld_report {
+  enum kasld_posture posture;
+  /* The facts behind this report were read from a redirected tree rather than
+   * from the running system, so the document describes a capture and not the
+   * machine that produced it. Stated rather than left to be inferred: a replay
+   * names the captured kernel throughout, which is correct and which leaves the
+   * document internally consistent with nothing to give it away. Caller-
+   * supplied for the same reason `posture` is -- the estimates do not state it,
+   * and the builder takes plain data so it can be tested without an
+   * environment. */
+  int replay;
+  struct kasld_report_quantity quantities[Q__COUNT];
+  int n_quantities;
+};
+
+/* A read-only view of one resolution: the estimates, and the constraints the
+ * candidate counts and hole carving are taken from.
+ *
+ * Taken as plain data rather than as `struct engine` so the builder is callable
+ * -- and testable -- without the engine-only translation unit. */
+struct kasld_resolution_view {
+  const struct estimate *est; /* Q__COUNT entries */
+  const struct constraint *cs;
+  int n_cs;
+  /* The confidence floor this resolution was run at. Carried with the data
+   * rather than assumed by the builder: the engine is floor-agnostic and the
+   * two-window POLICY -- which floors, and what they mean -- belongs to the
+   * caller that chose them. It is also what the candidate count and the hole
+   * carving must be taken at, so a view describes a resolution completely. */
+  enum kasld_confidence floor;
+};
+
+/* Build the model from the two resolutions the orchestrator holds: the floored
+ * run (guaranteed) and the all-signals run (likely). `likely.est` may be NULL,
+ * in which case every item's likely window is absent. */
+/* `points` is indexed by quantity and may be NULL; entries whose `present` is 0
+ * contribute nothing. `posture` is the caller's, for the same reason the floors
+ * are: it is policy, not something the estimates state. */
+/* The item for a quantity, or NULL where this machine has no such unknown.
+ * Membership is per machine, so a format asks rather than assuming. */
+const struct kasld_report_quantity *
+kasld_report_find(const struct kasld_report *r, enum kasld_quantity q);
+
+/* Whether the all-signals window says anything the proven one does not.
+ *
+ * Every format needs this to decide whether a speculative window is worth
+ * presenting, and it must be one answer: two formats deriving it separately is
+ * how the same run comes to carry a likely window in one and not the other. It
+ * is a query rather than a field because it is derived from the two windows,
+ * and a stored copy of a derived fact goes stale.
+ *
+ * An interval is compared by BOUNDS, not by candidate count: a count can be
+ * absent while the bounds are real, and the two windows are frequently
+ * identical -- the likely resolution simply reaches the same answer -- in which
+ * case presenting it again restates the proven window under a weaker grade. A
+ * set has no endpoints, so it is compared by its count, which for a set is
+ * exact because the values are enumerated rather than counted over a grid. */
+int kasld_report_likely_is_tighter(const struct kasld_report_quantity *it);
+
+/* The quantity's resolved value, into `*out`. Returns 0 -- and leaves `*out`
+ * untouched -- unless a resolution admits exactly this one address.
+ *
+ * The single way to ask "what is this quantity?". A window's edge is NOT the
+ * answer: `lo` is the lowest address the quantity may occupy, and on a window
+ * admitting tens of thousands of placements it is a bound. Reading it as the
+ * value produces an address the kernel never used, and arithmetic on it -- a
+ * direct-map translation, say -- is wrong rather than approximate. Every format
+ * that wants a scalar asks here, so no format has to re-derive when an edge
+ * counts as an answer, and none can get it wrong separately. */
+int kasld_report_value(const struct kasld_report_quantity *it,
+                       unsigned long *out);
+
+/* `config` is a third resolution, optional: the same rules over the same
+ * evidence with every leaked ADDRESS withheld, leaving only what describes the
+ * machine -- the paging width, the build's load address and alignment, how much
+ * RAM is present. What the engine still proves from that is the window the
+ * kernel drew from, so it is the denominator the residual is stated against and
+ * `slots` out of it is exactly what the leaks removed.
+ *
+ * It is counted here rather than by the caller because the count has to be
+ * taken on the same grain as the numerator, and `q_grain` chooses that grain
+ * once, below. NULL where no such resolution was run, which leaves the
+ * denominator to the tiers described at `entropy_top`. */
+void kasld_report_build(struct kasld_resolution_view guaranteed,
+                        struct kasld_resolution_view likely,
+                        const struct kasld_resolution_view *config,
+                        const struct kasld_report_point *points,
+                        enum kasld_posture posture, int replay,
+                        struct kasld_report *out);
+
+#endif /* KASLD_REPORT_H */

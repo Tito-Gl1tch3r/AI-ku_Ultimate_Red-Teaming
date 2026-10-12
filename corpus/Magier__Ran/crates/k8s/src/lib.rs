@@ -1,0 +1,1322 @@
+use std::{collections::HashMap, env, io::Write, path::PathBuf, sync::Arc};
+
+use anyhow::{anyhow, Context, Result};
+use http::{Method, Request};
+use k8s_openapi::api::authorization::v1::{SelfSubjectRulesReview, SelfSubjectRulesReviewSpec};
+use k8s_openapi::api::core::v1::Pod;
+use kube::{
+    api::{AttachParams, ListParams, PostParams},
+    config::{KubeConfigOptions, Kubeconfig},
+    Api, Client as KubeClient, Config,
+};
+use secrecy::ExposeSecret;
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecOutputStream {
+    Stdout,
+    Stderr,
+}
+
+pub type ExecOutputObserver = Arc<dyn Fn(ExecOutputStream, &[u8]) + Send + Sync>;
+
+/// Output from a pod exec command, including both streams and the exit code.
+/// Only infrastructure failures (can't connect, stream errors) produce an `Err`.
+/// A non-zero exit code is returned as `Ok` so callers can surface all output.
+#[derive(Debug, Clone)]
+pub struct PodExecOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+}
+
+async fn drain_exec_stream<R>(
+    reader: Option<R>,
+    stream: ExecOutputStream,
+    observer: Option<ExecOutputObserver>,
+) -> Result<String>
+where
+    R: AsyncRead + Unpin,
+{
+    let Some(mut reader) = reader else {
+        return Ok(String::new());
+    };
+    let mut bytes = Vec::new();
+    let mut buffer = vec![0u8; 8 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .await
+            .context("failed reading pod exec output")?;
+        if read == 0 {
+            break;
+        }
+        let fragment = &buffer[..read];
+        if let Some(observer) = &observer {
+            observer(stream, fragment);
+        }
+        bytes.extend_from_slice(fragment);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunningPod {
+    pub id: String,
+    pub name: String,
+    pub namespace: Option<String>,
+    pub phase: Option<String>,
+    pub ready: Option<bool>,
+    pub state_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetCluster {
+    pub name: String,
+    pub context_name: Option<String>,
+    pub server: Option<String>,
+    #[serde(default)]
+    pub tls_server_name: Option<String>,
+}
+
+/// Context-aware kubeconfig data shared by runtime client construction and
+/// campaign knowledge bootstrap.
+#[derive(Debug, Clone)]
+pub struct ResolvedKubeconfig {
+    kubeconfig: Kubeconfig,
+    source_path: Option<PathBuf>,
+    pub context_name: String,
+    /// `true` when this context is the kubeconfig's `current-context`. Used to
+    /// decide which of several resolved identities is the active one.
+    pub is_current_context: bool,
+    /// Explicit default namespace configured on the selected context.
+    /// Kubernetes' implicit `default` fallback is intentionally not inferred.
+    pub default_namespace: Option<String>,
+    pub cluster_name: String,
+    pub user_name: Option<String>,
+    pub server: Option<String>,
+    pub tls_server_name: Option<String>,
+    pub ca_data: Option<String>,
+    pub token: Option<String>,
+    pub cert_data: Option<String>,
+    pub key_data: Option<String>,
+    pub auth_method: String,
+    pub has_token: bool,
+    pub has_client_certificate: bool,
+    pub has_client_key: bool,
+}
+
+impl ResolvedKubeconfig {
+    pub fn target_cluster(&self) -> TargetCluster {
+        TargetCluster {
+            name: self.cluster_name.clone(),
+            context_name: Some(self.context_name.clone()),
+            server: self.server.clone(),
+            tls_server_name: self.tls_server_name.clone(),
+        }
+    }
+
+    fn options(&self) -> KubeConfigOptions {
+        KubeConfigOptions {
+            context: Some(self.context_name.clone()),
+            cluster: None,
+            user: None,
+        }
+    }
+
+    pub fn source_path(&self) -> Option<&std::path::Path> {
+        self.source_path.as_deref()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StaticKubeconfigCredential {
+    pub context_name: Option<String>,
+    pub endpoint: String,
+    pub tls_server_name: Option<String>,
+    pub ca_data: Option<String>,
+    pub token: Option<String>,
+    pub cert_data: Option<String>,
+    pub key_data: Option<String>,
+}
+
+/// Resolve one context from a kubeconfig file without constructing a client.
+pub fn resolve_kubeconfig(
+    path: impl Into<PathBuf>,
+    context_override: Option<&str>,
+) -> Result<ResolvedKubeconfig> {
+    let path = path.into();
+    let kubeconfig = Kubeconfig::read_from(path.clone())
+        .with_context(|| format!("failed to read kubeconfig at {}", path.display()))?;
+    let mut resolved = resolve_kubeconfig_data(kubeconfig, context_override)
+        .with_context(|| format!("failed to resolve kubeconfig at {}", path.display()))?;
+    resolved.source_path = Some(path);
+    Ok(resolved)
+}
+
+/// Resolve one context from already-loaded kubeconfig data.
+pub fn resolve_kubeconfig_data(
+    kubeconfig: Kubeconfig,
+    context_override: Option<&str>,
+) -> Result<ResolvedKubeconfig> {
+    let context_name = context_override
+        .map(str::to_string)
+        .or_else(|| kubeconfig.current_context.clone())
+        .ok_or_else(|| anyhow!("kubeconfig does not define current-context"))?;
+    let is_current_context = kubeconfig.current_context.as_deref() == Some(context_name.as_str());
+
+    let named_context = kubeconfig
+        .contexts
+        .iter()
+        .find(|ctx| ctx.name == context_name)
+        .ok_or_else(|| anyhow!("context '{}' not found in kubeconfig", context_name))?;
+    let context = named_context
+        .context
+        .as_ref()
+        .ok_or_else(|| anyhow!("context '{}' has no configuration", context_name))?;
+
+    let cluster_name = context.cluster.clone();
+    let cluster = kubeconfig
+        .clusters
+        .iter()
+        .find(|cluster| cluster.name == cluster_name)
+        .and_then(|cluster| cluster.cluster.as_ref())
+        .ok_or_else(|| {
+            anyhow!(
+                "cluster '{}' referenced by context '{}' not found in kubeconfig",
+                cluster_name,
+                context_name
+            )
+        })?;
+
+    let user_name = context.user.clone();
+    let default_namespace = context
+        .namespace
+        .as_deref()
+        .map(str::trim)
+        .filter(|namespace| !namespace.is_empty())
+        .map(str::to_string);
+    let auth = user_name
+        .as_deref()
+        .and_then(|name| kubeconfig.auth_infos.iter().find(|user| user.name == name))
+        .and_then(|user| user.auth_info.as_ref());
+    if user_name.is_some() && auth.is_none() {
+        return Err(anyhow!(
+            "user '{}' referenced by context '{}' not found in kubeconfig",
+            user_name.as_deref().unwrap_or_default(),
+            context_name
+        ));
+    }
+
+    let token = auth
+        .and_then(|a| a.token.as_ref())
+        .map(|value| value.expose_secret().to_string());
+    let cert_data = auth.and_then(|a| a.client_certificate_data.clone());
+    let key_data = auth
+        .and_then(|a| a.client_key_data.as_ref())
+        .map(|value| value.expose_secret().to_string());
+    let has_token = token.is_some() || auth.is_some_and(|a| a.token_file.is_some());
+    let has_client_certificate =
+        cert_data.is_some() || auth.is_some_and(|a| a.client_certificate.is_some());
+    let has_client_key = key_data.is_some() || auth.is_some_and(|a| a.client_key.is_some());
+    let auth_method = match auth {
+        Some(a) if a.exec.is_some() => "exec",
+        Some(a) if a.auth_provider.is_some() => "auth-provider",
+        Some(_) if has_token => "token",
+        Some(_) if has_client_certificate || has_client_key => "client-certificate",
+        Some(a) if a.username.is_some() || a.password.is_some() => "basic",
+        Some(_) => "unknown",
+        None => "anonymous",
+    }
+    .to_string();
+    let server = cluster.server.clone();
+    let tls_server_name = cluster.tls_server_name.clone();
+    let ca_data = cluster.certificate_authority_data.clone();
+
+    Ok(ResolvedKubeconfig {
+        kubeconfig,
+        source_path: None,
+        context_name,
+        is_current_context,
+        default_namespace,
+        cluster_name,
+        user_name,
+        server,
+        tls_server_name,
+        ca_data,
+        token,
+        cert_data,
+        key_data,
+        auth_method,
+        has_token,
+        has_client_certificate,
+        has_client_key,
+    })
+}
+
+/// Parse kubeconfig YAML and resolve its selected context using the same rules
+/// as file-backed runtime configuration.
+pub fn resolve_kubeconfig_yaml(
+    content: &str,
+    context_override: Option<&str>,
+) -> Result<ResolvedKubeconfig> {
+    let kubeconfig: Kubeconfig =
+        serde_yaml::from_str(content).context("failed to parse kubeconfig YAML")?;
+    resolve_kubeconfig_data(kubeconfig, context_override)
+}
+
+/// Resolve **every** context defined in the kubeconfig, not just the current
+/// one. Contexts that cannot be resolved (missing cluster/user) are skipped
+/// rather than failing the whole set. The `is_current_context` flag on each
+/// entry marks which one the kubeconfig selects by default.
+pub fn resolve_all_kubeconfig_contexts(kubeconfig: Kubeconfig) -> Vec<ResolvedKubeconfig> {
+    kubeconfig
+        .contexts
+        .iter()
+        .map(|ctx| ctx.name.clone())
+        .filter_map(|name| resolve_kubeconfig_data(kubeconfig.clone(), Some(&name)).ok())
+        .collect()
+}
+
+/// Read a kubeconfig file and resolve every context it defines. Each entry's
+/// `source_path` is set to `path`.
+pub fn resolve_all_kubeconfig_contexts_from_path(
+    path: impl Into<PathBuf>,
+) -> Result<Vec<ResolvedKubeconfig>> {
+    let path = path.into();
+    let kubeconfig = Kubeconfig::read_from(path.clone())
+        .with_context(|| format!("failed to read kubeconfig at {}", path.display()))?;
+    let mut resolved = resolve_all_kubeconfig_contexts(kubeconfig);
+    for entry in &mut resolved {
+        entry.source_path = Some(path.clone());
+    }
+    Ok(resolved)
+}
+
+/// Parse kubeconfig YAML and resolve every context it defines.
+pub fn resolve_all_kubeconfig_contexts_yaml(content: &str) -> Result<Vec<ResolvedKubeconfig>> {
+    let kubeconfig: Kubeconfig =
+        serde_yaml::from_str(content).context("failed to parse kubeconfig YAML")?;
+    Ok(resolve_all_kubeconfig_contexts(kubeconfig))
+}
+
+fn pod_to_running_pod(pod: &Pod) -> Option<RunningPod> {
+    let name = pod.metadata.name.clone().unwrap_or_default();
+    let namespace = pod.metadata.namespace.clone().unwrap_or_default();
+    let phase = pod.status.as_ref().and_then(|s| s.phase.clone())?;
+    if phase != "Running" {
+        return None;
+    }
+
+    let not_ready_cs = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.container_statuses.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .find(|cs| !cs.ready);
+
+    let (ready, state_reason) = match not_ready_cs {
+        None => (true, None),
+        Some(cs) => {
+            let reason = cs.state.as_ref().and_then(|s| {
+                s.waiting
+                    .as_ref()
+                    .and_then(|w| w.reason.clone())
+                    .or_else(|| s.terminated.as_ref().and_then(|t| t.reason.clone()))
+            });
+            (false, reason)
+        }
+    };
+
+    Some(RunningPod {
+        id: format!("ns/{}/pod/{}", namespace, name),
+        name,
+        namespace: if namespace.is_empty() {
+            None
+        } else {
+            Some(namespace)
+        },
+        phase: Some(phase),
+        ready: Some(ready),
+        state_reason,
+    })
+}
+
+#[derive(Clone)]
+pub struct Client {
+    client: KubeClient,
+    config: Config,
+    kubeconfig_path: Option<PathBuf>,
+    /// Keeps an ephemeral kubeconfig alive for a credential reconstructed from
+    /// captured authentication material. The file is private to this process
+    /// and is removed once the last client clone is dropped.
+    _temporary_kubeconfig: Option<Arc<tempfile::NamedTempFile>>,
+    context_name: Option<String>,
+    api_server: String,
+}
+
+/// Resolve trust in the physical native client environment. Absent controls
+/// inherit kubeconfig settings; explicit controls must never disappear during
+/// request deserialization. A CA file is local to the operator, not the API
+/// resource, and overrides only trust roots without changing auth or endpoint.
+async fn request_tls_config(
+    config: &Config,
+    request: &serde_json::Value,
+) -> Result<Option<Config>> {
+    let verify = match request.get("use_ca") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Bool(value)) => Some(*value),
+        Some(serde_json::Value::String(value)) if value.trim().eq_ignore_ascii_case("true") => {
+            Some(true)
+        }
+        Some(serde_json::Value::String(value)) if value.trim().eq_ignore_ascii_case("false") => {
+            Some(false)
+        }
+        _ => return Err(anyhow!("use_ca must be true or false")),
+    };
+    let ca_path = match request.get("ca_path") {
+        None | Some(serde_json::Value::Null) => "",
+        Some(serde_json::Value::String(value)) => value.trim(),
+        _ => return Err(anyhow!("ca_path must be an operator-local file path")),
+    };
+    if verify.is_none() && ca_path.is_empty() {
+        return Ok(None);
+    }
+    if ca_path.is_empty() && verify == Some(!config.accept_invalid_certs) {
+        // The selected client already enforces this policy. Preserve its
+        // connection pool instead of rebuilding it for every discovery.
+        return Ok(None);
+    }
+    let mut configured = config.clone();
+    configured.accept_invalid_certs = !verify.unwrap_or(true);
+    if !configured.accept_invalid_certs && !ca_path.is_empty() {
+        // Reuse kube's CA parser rather than introducing a second PEM parser.
+        // Only its trust roots are retained; the real client config continues
+        // to own server name, authentication, proxy and timeouts.
+        let trust: Kubeconfig = serde_yaml::from_value(serde_yaml::to_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Config", "current-context": "trust",
+            "clusters": [{"name": "trust", "cluster": {
+                "server": config.cluster_url.to_string(), "certificate-authority": ca_path
+            }}],
+            "contexts": [{"name": "trust", "context": {"cluster": "trust", "user": "trust"}}],
+            "users": [{"name": "trust", "user": {}}]
+        }))?)?;
+        let trust_config = Config::from_custom_kubeconfig(trust, &KubeConfigOptions::default())
+            .await
+            .context("failed to load the explicit operator-local request CA")?;
+        let roots = trust_config
+            .root_cert
+            .filter(|roots| !roots.is_empty())
+            .ok_or_else(|| anyhow!("request CA file contains no certificates"))?;
+        configured.root_cert = Some(roots);
+    }
+    Ok(Some(configured))
+}
+
+fn build_authenticated_http_request(request: &serde_json::Value) -> Result<Request<Vec<u8>>> {
+    #[derive(Deserialize)]
+    struct Spec {
+        authentication: String,
+        url: String,
+        #[serde(default = "default_method")]
+        method: String,
+        #[serde(default)]
+        headers: HashMap<String, String>,
+        #[serde(default)]
+        body: String,
+    }
+    fn default_method() -> String {
+        "GET".to_string()
+    }
+
+    let spec: Spec = serde_json::from_value(request.clone())
+        .context("invalid authenticated Kubernetes HTTP request")?;
+    if spec.authentication.trim().is_empty() {
+        return Err(anyhow!(
+            "Kubernetes HTTP request is missing explicit authentication"
+        ));
+    }
+    if spec
+        .headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("authorization"))
+    {
+        return Err(anyhow!(
+            "Kubernetes HTTP request must not supply its own Authorization header"
+        ));
+    }
+
+    let authored_uri: http::Uri = spec
+        .url
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid Kubernetes HTTP URL '{}'", spec.url.trim()))?;
+    let path = authored_uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .filter(|value| value.starts_with('/'))
+        .ok_or_else(|| anyhow!("Kubernetes HTTP URL must include an absolute API path"))?;
+    let method = Method::from_bytes(spec.method.trim().as_bytes())
+        .with_context(|| format!("invalid Kubernetes HTTP method '{}'", spec.method))?;
+
+    let mut builder = Request::builder().method(method).uri(path);
+    for (name, value) in spec.headers {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(spec.body.into_bytes())
+        .context("failed to build Kubernetes HTTP request")
+}
+
+impl Client {
+    pub async fn from_kubeconfig(kubeconfig: Option<PathBuf>) -> Result<Self> {
+        let path = kubeconfig.unwrap_or_else(default_kubeconfig_path);
+        let resolved = resolve_kubeconfig(path, None)?;
+        Self::from_resolved_kubeconfig(&resolved).await
+    }
+
+    pub async fn from_resolved_kubeconfig(resolved: &ResolvedKubeconfig) -> Result<Self> {
+        let config =
+            Config::from_custom_kubeconfig(resolved.kubeconfig.clone(), &resolved.options())
+                .await
+                .context("failed to load Kubernetes config from kubeconfig")?;
+        let client =
+            KubeClient::try_from(config.clone()).context("failed to create Kubernetes client")?;
+
+        Ok(Self {
+            client,
+            config,
+            kubeconfig_path: resolved.source_path.clone(),
+            _temporary_kubeconfig: None,
+            context_name: Some(resolved.context_name.clone()),
+            api_server: resolved
+                .server
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+        })
+    }
+
+    /// Build a client from static authentication material captured in a
+    /// kubeconfig. Exec plugins, auth providers, and file references cannot be
+    /// replayed because their external dependencies were not captured.
+    pub async fn from_static_credential(credential: StaticKubeconfigCredential) -> Result<Self> {
+        if credential.endpoint.trim().is_empty() {
+            return Err(anyhow!(
+                "captured kubeconfig credential has no API server endpoint"
+            ));
+        }
+        let has_token = credential
+            .token
+            .as_deref()
+            .is_some_and(|value| !value.is_empty());
+        let has_cert_pair = credential
+            .cert_data
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+            && credential
+                .key_data
+                .as_deref()
+                .is_some_and(|value| !value.is_empty());
+        if !has_token && !has_cert_pair {
+            return Err(anyhow!(
+                "captured kubeconfig credential has no replayable token or client certificate and key"
+            ));
+        }
+
+        let context_name = credential
+            .context_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("captured")
+            .to_string();
+        let kubeconfig: Kubeconfig =
+            serde_yaml::from_value(serde_yaml::to_value(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Config",
+                "current-context": context_name,
+                "clusters": [{
+                    "name": "captured",
+                    "cluster": {
+                        "server": credential.endpoint,
+                        "tls-server-name": credential.tls_server_name,
+                        "certificate-authority-data": credential.ca_data,
+                    }
+                }],
+                "contexts": [{
+                    "name": context_name,
+                    "context": { "cluster": "captured", "user": "captured" }
+                }],
+                "users": [{
+                    "name": "captured",
+                    "user": {
+                        "token": credential.token,
+                        "client-certificate-data": credential.cert_data,
+                        "client-key-data": credential.key_data,
+                    }
+                }]
+            }))?)?;
+        let resolved = resolve_kubeconfig_data(kubeconfig, None)?;
+        let mut temporary = tempfile::NamedTempFile::new()
+            .context("failed to create private kubeconfig for captured credential")?;
+        let rendered = serde_yaml::to_string(&resolved.kubeconfig)
+            .context("failed to serialize captured kubeconfig")?;
+        temporary
+            .write_all(rendered.as_bytes())
+            .context("failed to write private kubeconfig for captured credential")?;
+        temporary
+            .flush()
+            .context("failed to flush private kubeconfig for captured credential")?;
+
+        let temporary = Arc::new(temporary);
+        let mut client = Self::from_resolved_kubeconfig(&resolved).await?;
+        client.kubeconfig_path = Some(temporary.path().to_path_buf());
+        client._temporary_kubeconfig = Some(temporary);
+        Ok(client)
+    }
+
+    /// The kubeconfig context this client authenticates as, when known.
+    pub fn context_name(&self) -> Option<&str> {
+        self.context_name.as_deref()
+    }
+
+    /// Path to the kubeconfig file that backs this client, when it is
+    /// file-backed. Used by local-host TTPs (e.g. Read Local Kubeconfig) to
+    /// read the same kubeconfig Ran was configured with.
+    pub fn kubeconfig_path(&self) -> Option<&std::path::Path> {
+        self.kubeconfig_path.as_deref()
+    }
+
+    pub async fn get_running_pods(&self, namespace: Option<&str>) -> Result<Vec<RunningPod>> {
+        let pods = if let Some(ns) = namespace.filter(|v| !v.is_empty()) {
+            let api: Api<Pod> = Api::namespaced(self.client.clone(), ns);
+            api.list(&ListParams::default())
+                .await
+                .with_context(|| format!("failed to list pods in namespace '{}'", ns))?
+                .items
+        } else {
+            let api: Api<Pod> = Api::all(self.client.clone());
+            api.list(&ListParams::default())
+                .await
+                .context("failed to list pods in all namespaces")?
+                .items
+        };
+
+        Ok(pods.iter().filter_map(pod_to_running_pod).collect())
+    }
+
+    /// Return the names of the regular containers currently declared by a Pod.
+    /// This is deliberately a separate read from exec: callers can use it to
+    /// explain an exec rejection without guessing from an opaque upgrade error.
+    pub async fn pod_container_names(&self, namespace: &str, pod: &str) -> Result<Vec<String>> {
+        let api: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        let pod = api
+            .get(pod)
+            .await
+            .with_context(|| format!("failed to get pod '{}/{}'", namespace, pod))?;
+
+        Ok(pod
+            .spec
+            .into_iter()
+            .flat_map(|spec| spec.containers)
+            .map(|container| container.name)
+            .collect())
+    }
+
+    /// Ask Kubernetes which RBAC rules apply to the identity represented by
+    /// this client's kubeconfig. The native response shape is retained so the
+    /// campaign can reuse its existing SelfSubjectRulesReview parser.
+    pub async fn self_subject_rules_review(&self, namespace: &str) -> Result<String> {
+        let reviews: Api<SelfSubjectRulesReview> = Api::all(self.client.clone());
+        let review = SelfSubjectRulesReview {
+            spec: SelfSubjectRulesReviewSpec {
+                namespace: Some(namespace.to_string()),
+            },
+            ..Default::default()
+        };
+        let response = reviews
+            .create(&PostParams::default(), &review)
+            .await
+            .with_context(|| {
+                format!(
+                    "could not complete SelfSubjectRulesReview request to Kubernetes API server '{}' for namespace '{}'",
+                    self.api_server, namespace
+                )
+            })?;
+        serde_json::to_string(&response)
+            .context("failed to serialize SelfSubjectRulesReview response")
+    }
+
+    /// Execute a grounded structured Kubernetes request with this client's
+    /// authentication and TLS configuration. Authentication fields embedded in
+    /// the request description are deliberately ignored.
+    pub async fn execute_request(&self, request: &serde_json::Value) -> Result<String> {
+        let client = self.request_client(request).await?;
+        #[derive(Deserialize)]
+        struct Spec {
+            api: String,
+            resource: String,
+            #[serde(default)]
+            namespace: String,
+            #[serde(default)]
+            cluster_scoped: serde_json::Value,
+            #[serde(default)]
+            query: String,
+            #[serde(default = "default_method")]
+            method: String,
+            #[serde(default)]
+            body: serde_json::Value,
+        }
+        fn default_method() -> String {
+            "GET".to_string()
+        }
+        fn is_true(value: &serde_json::Value) -> bool {
+            value.as_bool().unwrap_or_else(|| {
+                value
+                    .as_str()
+                    .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+            })
+        }
+
+        let spec: Spec = serde_json::from_value(request.clone())
+            .context("invalid structured Kubernetes request")?;
+        let api = spec.api.trim_matches('/');
+        let resource = spec.resource.trim_matches('/');
+        let mut path = if is_true(&spec.cluster_scoped) || spec.namespace.trim().is_empty() {
+            format!("/{api}/{resource}")
+        } else {
+            format!("/{api}/namespaces/{}/{resource}", spec.namespace.trim())
+        };
+        if !spec.query.trim().is_empty() {
+            path.push('?');
+            path.push_str(spec.query.trim());
+        }
+        let method = Method::from_bytes(spec.method.trim().as_bytes())
+            .with_context(|| format!("invalid Kubernetes request method '{}'", spec.method))?;
+        let body = if spec.body.is_null() {
+            Vec::new()
+        } else {
+            serde_json::to_vec(&spec.body).context("failed to encode Kubernetes request body")?
+        };
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .body(body)
+            .context("failed to build Kubernetes request")?;
+        client
+            .request_text(request)
+            .await
+            .context("Kubernetes API request failed")
+    }
+
+    /// Execute a general HTTP-form Kubernetes procedure through this client's
+    /// configured API server, authentication, and TLS stack. The authored URL
+    /// contributes only its path and query; the active kubeconfig selects the
+    /// server and supplies authentication.
+    pub async fn execute_authenticated_http_request(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<String> {
+        let client = self.request_client(request).await?;
+        let request = build_authenticated_http_request(request)?;
+        client
+            .request_text(request)
+            .await
+            .context("Kubernetes HTTP request failed")
+    }
+
+    async fn request_client(&self, request: &serde_json::Value) -> Result<KubeClient> {
+        match request_tls_config(&self.config, request).await? {
+            Some(config) => KubeClient::try_from(config).context("failed to configure request TLS"),
+            None => Ok(self.client.clone()),
+        }
+    }
+
+    /// Run a kubectl procedure on the Ran host. `${K8S_AUTH}` grounding emits
+    /// an explicit `--kubeconfig "$KUBECONFIG"` flag while the actual path is
+    /// supplied only through this process environment.
+    pub async fn execute_kubectl_command(&self, command: &str) -> Result<PodExecOutput> {
+        self.execute_kubectl_command_streaming(command, None).await
+    }
+
+    pub async fn execute_kubectl_command_streaming(
+        &self,
+        command: &str,
+        observer: Option<ExecOutputObserver>,
+    ) -> Result<PodExecOutput> {
+        let kubeconfig = self
+            .kubeconfig_path
+            .as_ref()
+            .ok_or_else(|| anyhow!("active Kubernetes client has no file-backed kubeconfig"))?;
+        let mut process = tokio::process::Command::new("/bin/sh");
+        process
+            .arg("-lc")
+            .arg(command)
+            .env("KUBECONFIG", kubeconfig)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = process
+            .spawn()
+            .context("failed to execute kubectl procedure")?;
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let (stdout, stderr, status) = tokio::try_join!(
+            drain_exec_stream(stdout, ExecOutputStream::Stdout, observer.clone()),
+            drain_exec_stream(stderr, ExecOutputStream::Stderr, observer),
+            async {
+                child
+                    .wait()
+                    .await
+                    .context("failed waiting for kubectl procedure")
+            }
+        )?;
+        Ok(PodExecOutput {
+            stdout,
+            stderr,
+            exit_code: status.code().unwrap_or(1),
+        })
+    }
+
+    pub async fn exec_pod_command(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        command: &str,
+    ) -> Result<PodExecOutput> {
+        self.exec_pod_command_streaming(namespace, pod_name, command, None)
+            .await
+    }
+
+    pub async fn exec_pod_command_streaming(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        command: &str,
+        observer: Option<ExecOutputObserver>,
+    ) -> Result<PodExecOutput> {
+        let command = command.trim();
+        if command.is_empty() {
+            return Err(anyhow!("pod exec command is empty"));
+        }
+
+        let api: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        let command_vec = vec!["/bin/sh", "-lc", command];
+        let attach_params = AttachParams::default()
+            .stdout(true)
+            .stderr(true)
+            .stdin(false)
+            .tty(false);
+
+        let mut attached = api
+            .exec(pod_name, command_vec, &attach_params)
+            .await
+            .with_context(|| {
+                format!("failed to exec command in pod '{}/{}'", namespace, pod_name)
+            })?;
+
+        let stdout = attached.stdout();
+        let stderr = attached.stderr();
+        let status = attached
+            .take_status()
+            .ok_or_else(|| anyhow!("missing pod exec status stream"))?;
+
+        let stdout_observer = observer.clone();
+        let stderr_observer = observer;
+        let (stdout, stderr, status) = tokio::try_join!(
+            drain_exec_stream(stdout, ExecOutputStream::Stdout, stdout_observer),
+            drain_exec_stream(stderr, ExecOutputStream::Stderr, stderr_observer),
+            async { status.await.context("failed to receive pod exec status") }
+        )?;
+
+        let exit_code = if status.status == Some("Success".to_string()) {
+            0
+        } else {
+            parse_exit_code(status.message.as_deref()).unwrap_or(1)
+        };
+
+        Ok(PodExecOutput {
+            stdout,
+            stderr,
+            exit_code,
+        })
+    }
+
+    /// Open a long-lived interactive exec session into a pod and return a
+    /// [`tokio::io::DuplexStream`] that acts as the session's stdin/stdout.
+    ///
+    /// Internally starts `/bin/sh` in the pod with `stdin=true, stdout=true,
+    /// tty=false` and bridges the `AttachedProcess` to the duplex stream via a
+    /// background proxy task.  Dropping the returned stream tears down the
+    /// proxy task and closes the exec channel.
+    pub async fn open_exec_session(
+        &self,
+        namespace: &str,
+        pod: &str,
+        container: Option<&str>,
+    ) -> Result<tokio::io::DuplexStream> {
+        let api: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+
+        let mut params = AttachParams::default()
+            .stdin(true)
+            .stdout(true)
+            .stderr(false)
+            .tty(false);
+        if let Some(c) = container {
+            params = params.container(c);
+        }
+
+        let mut attached = api.exec(pod, ["/bin/sh"], &params).await.with_context(|| {
+            format!(
+                "kubectl exec session failed for pod '{}/{}'",
+                namespace, pod
+            )
+        })?;
+
+        let mut stdin_w = attached
+            .stdin()
+            .ok_or_else(|| anyhow!("kubectl exec: stdin channel unavailable"))?;
+        let stdout_r = attached
+            .stdout()
+            .ok_or_else(|| anyhow!("kubectl exec: stdout channel unavailable"))?;
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+
+        tokio::spawn(async move {
+            let (mut server_rx, mut server_tx) = tokio::io::split(server);
+            let mut stdout_r = stdout_r;
+
+            let copy_in = async {
+                let _ = tokio::io::copy(&mut server_rx, &mut stdin_w).await;
+                // Signal EOF to the shell when the client side closes.
+                let _ = stdin_w.shutdown().await;
+            };
+            let copy_out = tokio::io::copy(&mut stdout_r, &mut server_tx);
+
+            tokio::select! {
+                _ = copy_in => {}
+                _ = copy_out => {}
+            }
+
+            drop(attached);
+        });
+
+        Ok(client)
+    }
+}
+
+fn parse_exit_code(message: Option<&str>) -> Option<i32> {
+    // Kubernetes status message for non-zero exits: "command terminated with exit code N"
+    let msg = message?;
+    let code_str = msg.strip_prefix("command terminated with exit code ")?;
+    code_str.trim().parse().ok()
+}
+
+/// Resolve the kubeconfig file to use when no explicit path is provided.
+///
+/// Follows kubectl's resolution order:
+/// 1. `$KUBECONFIG` if set - may be a list separated by `:` on Unix or `;`
+///    on Windows; the first entry that exists on disk wins. When none of
+///    the listed files exists we fall back to the default (matches
+///    kubectl's behaviour of trying `~/.kube/config` last).
+/// 2. `$HOME/.kube/config`.
+/// 3. `.kube/config` relative to the current directory (last-resort
+///    fallback when `$HOME` is unset).
+///
+/// Callers who need `$KUBECONFIG`'s full multi-file merge semantics must
+/// go through `kube::Config` directly; this helper only picks one file
+/// for actions that read a single kubeconfig (e.g. read-local-kubeconfig).
+pub fn default_kubeconfig_path() -> PathBuf {
+    resolve_default_kubeconfig_path(
+        env::var("KUBECONFIG").ok().as_deref(),
+        env::var("HOME").ok().as_deref(),
+        |p| p.exists(),
+    )
+}
+
+/// Testable core of [`default_kubeconfig_path`]. `path_exists` decides
+/// whether a `$KUBECONFIG` entry counts as present without touching the
+/// real filesystem - so tests can exercise the multi-entry precedence
+/// without racing on process-global env vars.
+fn resolve_default_kubeconfig_path(
+    kubeconfig_env: Option<&str>,
+    home_env: Option<&str>,
+    path_exists: impl Fn(&std::path::Path) -> bool,
+) -> PathBuf {
+    if let Some(value) = kubeconfig_env {
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        for entry in value.split(separator) {
+            let trimmed = entry.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let path = PathBuf::from(trimmed);
+            if path_exists(&path) {
+                return path;
+            }
+        }
+    }
+    if let Some(home) = home_env {
+        return PathBuf::from(home).join(".kube/config");
+    }
+    PathBuf::from(".kube/config")
+}
+
+pub fn kubeconfig_path_or_err(path: Option<PathBuf>) -> Result<PathBuf> {
+    let p = path.unwrap_or_else(default_kubeconfig_path);
+    if !p.exists() {
+        return Err(anyhow!("kubeconfig file not found at {}", p.display()));
+    }
+    Ok(p)
+}
+
+pub fn target_cluster_from_kubeconfig(path: Option<PathBuf>) -> Result<TargetCluster> {
+    let path = kubeconfig_path_or_err(path)?;
+    Ok(resolve_kubeconfig(path, None)?.target_cluster())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[tokio::test]
+    async fn native_request_tls_enforces_explicit_controls_without_mutating_identity() {
+        let mut config = Config::new("https://api.example:6443".parse().unwrap());
+        config.accept_invalid_certs = true;
+        config.tls_server_name = Some("api.internal".into());
+        config.root_cert = Some(vec![vec![9]]);
+        config.auth_info.token = Some("test-token".to_string().into());
+        assert!(request_tls_config(&config, &serde_json::json!({}))
+            .await
+            .unwrap()
+            .is_none());
+        for control in [serde_json::json!(true), serde_json::json!("true")] {
+            let secured = request_tls_config(
+                &config,
+                &serde_json::json!({"use_ca": control, "ca_path": ""}),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(!secured.accept_invalid_certs);
+            assert_eq!(secured.cluster_url, config.cluster_url);
+            assert_eq!(secured.tls_server_name, config.tls_server_name);
+            assert_eq!(secured.root_cert, config.root_cert);
+            assert_eq!(
+                secured.auth_info.token.as_ref().unwrap().expose_secret(),
+                "test-token"
+            );
+            assert!(config.accept_invalid_certs);
+        }
+        let mut secure_config = config.clone();
+        secure_config.accept_invalid_certs = false;
+        let insecure = request_tls_config(&secure_config, &serde_json::json!({"use_ca": false}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(insecure.accept_invalid_certs);
+        for invalid in [
+            serde_json::json!({"use_ca": "maybe"}),
+            serde_json::json!({"ca_path": 123}),
+        ] {
+            assert!(request_tls_config(&config, &invalid).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn native_request_ca_is_operator_local_and_replaces_only_trust_roots() {
+        let mut config = Config::new("https://api.example:6443".parse().unwrap());
+        config.accept_invalid_certs = true;
+        config.tls_server_name = Some("api.internal".into());
+        config.root_cert = Some(vec![vec![9]]);
+        let mut ca = tempfile::NamedTempFile::new().unwrap();
+        // Exercise kube's PEM-to-DER loading, not a certificate handshake.
+        ca.write_all(b"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n")
+            .unwrap();
+        let request = serde_json::json!({"use_ca": true, "ca_path": ca.path()});
+        let secured = request_tls_config(&config, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(secured.root_cert, Some(vec![vec![1, 2, 3]]));
+        assert!(!secured.accept_invalid_certs);
+        assert_eq!(secured.tls_server_name, config.tls_server_name);
+        assert_eq!(secured.cluster_url, config.cluster_url);
+        assert_eq!(config.root_cert, Some(vec![vec![9]]));
+        let missing = ca.path().with_extension("missing");
+        assert!(request_tls_config(
+            &config,
+            &serde_json::json!({"use_ca": true, "ca_path": missing})
+        )
+        .await
+        .is_err());
+        let empty = tempfile::NamedTempFile::new().unwrap();
+        assert!(request_tls_config(
+            &config,
+            &serde_json::json!({"use_ca": true, "ca_path": empty.path()})
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn both_native_request_operations_reject_unavailable_explicit_ca_before_network_io() {
+        let resolved = resolve_kubeconfig_yaml(
+            r#"
+apiVersion: v1
+kind: Config
+current-context: native
+clusters:
+- name: native
+  cluster:
+    server: https://127.0.0.1:1
+    insecure-skip-tls-verify: true
+contexts:
+- name: native
+  context: {cluster: native, user: native}
+users:
+- name: native
+  user: {token: test-token}
+"#,
+            None,
+        )
+        .unwrap();
+        let client = Client::from_resolved_kubeconfig(&resolved).await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let missing_ca = directory.path().join("missing-ca.pem");
+        let error = client
+            .execute_request(&serde_json::json!({
+                "api": "/api/v1", "resource": "nodes/worker/proxy/pods",
+                "cluster_scoped": true, "use_ca": true, "ca_path": missing_ca,
+            }))
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("explicit operator-local request CA"));
+        let error = client
+            .execute_authenticated_http_request(&serde_json::json!({
+                "authentication": "runtime-bound", "url": "https://127.0.0.1:1/api/v1/pods",
+                "use_ca": true, "ca_path": missing_ca,
+            }))
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("explicit operator-local request CA"));
+        assert!(
+            client.config.accept_invalid_certs,
+            "per-request controls must not mutate the shared client"
+        );
+    }
+    use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn exec_stream_forwards_fragments_while_preserving_complete_output() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let observed = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let observed_clone = observed.clone();
+        let observer: ExecOutputObserver = Arc::new(move |stream, bytes| {
+            assert_eq!(stream, ExecOutputStream::Stdout);
+            observed_clone.lock().expect("observer lock").extend(bytes);
+        });
+        tokio::spawn(async move {
+            writer.write_all(b"host one\nhost two\n").await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+
+        let output = drain_exec_stream(Some(reader), ExecOutputStream::Stdout, Some(observer))
+            .await
+            .expect("stream should drain");
+
+        assert_eq!(output, "host one\nhost two\n");
+        assert_eq!(
+            *observed.lock().expect("observer lock"),
+            b"host one\nhost two\n"
+        );
+    }
+
+    #[test]
+    fn default_kubeconfig_prefers_first_existing_kubeconfig_entry() {
+        let present: HashSet<PathBuf> = ["/tmp/second"].iter().map(PathBuf::from).collect();
+        let picked = resolve_default_kubeconfig_path(
+            Some("/tmp/first:/tmp/second:/tmp/third"),
+            Some("/home/op"),
+            |p| present.contains(p),
+        );
+        assert_eq!(picked, PathBuf::from("/tmp/second"));
+    }
+
+    #[test]
+    fn default_kubeconfig_falls_back_to_home_when_no_kubeconfig_entry_exists() {
+        let picked = resolve_default_kubeconfig_path(
+            Some("/tmp/missing-a:/tmp/missing-b"),
+            Some("/home/op"),
+            |_| false,
+        );
+        assert_eq!(picked, PathBuf::from("/home/op/.kube/config"));
+    }
+
+    #[test]
+    fn default_kubeconfig_ignores_empty_kubeconfig_entries() {
+        let present: HashSet<PathBuf> = ["/tmp/real"].iter().map(PathBuf::from).collect();
+        let picked = resolve_default_kubeconfig_path(Some("::/tmp/real:"), Some("/home/op"), |p| {
+            present.contains(p)
+        });
+        assert_eq!(picked, PathBuf::from("/tmp/real"));
+    }
+
+    #[test]
+    fn default_kubeconfig_uses_home_when_kubeconfig_env_unset() {
+        let picked = resolve_default_kubeconfig_path(None, Some("/home/op"), |_| false);
+        assert_eq!(picked, PathBuf::from("/home/op/.kube/config"));
+    }
+
+    #[test]
+    fn default_kubeconfig_final_fallback_is_relative_dot_kube_config() {
+        let picked = resolve_default_kubeconfig_path(None, None, |_| false);
+        assert_eq!(picked, PathBuf::from(".kube/config"));
+    }
+
+    const KUBECONFIG: &str = r#"apiVersion: v1
+kind: Config
+clusters:
+- name: cluster-a
+  cluster:
+    server: https://a.example
+    tls-server-name: 10.96.0.1
+- name: cluster-b
+  cluster:
+    server: https://b.example
+contexts:
+- name: context-a
+  context:
+    cluster: cluster-a
+    user: user-a
+    namespace: default
+- name: context-b
+  context:
+    cluster: cluster-b
+    user: user-b
+    namespace: "   "
+current-context: context-a
+users:
+- name: user-a
+  user:
+    token: secret-a
+- name: user-b
+  user:
+    client-certificate-data: CERT
+    client-key-data: KEY
+"#;
+
+    #[test]
+    fn resolver_uses_current_context_by_default() {
+        let resolved = resolve_kubeconfig_yaml(KUBECONFIG, None).unwrap();
+        assert_eq!(resolved.context_name, "context-a");
+        assert_eq!(resolved.default_namespace.as_deref(), Some("default"));
+        assert_eq!(resolved.cluster_name, "cluster-a");
+        assert_eq!(resolved.user_name.as_deref(), Some("user-a"));
+        assert_eq!(resolved.server.as_deref(), Some("https://a.example"));
+        assert_eq!(resolved.tls_server_name.as_deref(), Some("10.96.0.1"));
+        assert!(resolved.has_token);
+        assert_eq!(resolved.auth_method, "token");
+    }
+
+    #[tokio::test]
+    async fn static_token_credential_builds_an_identity_specific_client() {
+        let client = Client::from_static_credential(StaticKubeconfigCredential {
+            context_name: Some("captured-context".to_string()),
+            endpoint: "https://127.0.0.1:6443".to_string(),
+            tls_server_name: Some("kubernetes.default.svc".to_string()),
+            ca_data: None,
+            token: Some("captured-token".to_string()),
+            cert_data: None,
+            key_data: None,
+        })
+        .await
+        .expect("static credential client");
+
+        assert_eq!(client.context_name(), Some("captured-context"));
+        assert!(client.kubeconfig_path().is_some_and(|path| path.exists()));
+        assert_eq!(client.api_server, "https://127.0.0.1:6443");
+    }
+
+    #[test]
+    fn resolver_honors_context_override() {
+        let resolved = resolve_kubeconfig_yaml(KUBECONFIG, Some("context-b")).unwrap();
+        assert_eq!(resolved.cluster_name, "cluster-b");
+        assert_eq!(resolved.default_namespace, None);
+        assert_eq!(resolved.user_name.as_deref(), Some("user-b"));
+        assert!(resolved.has_client_certificate);
+        assert!(resolved.has_client_key);
+        assert_eq!(resolved.auth_method, "client-certificate");
+    }
+
+    #[test]
+    fn resolver_rejects_missing_context_and_user() {
+        assert!(resolve_kubeconfig_yaml(KUBECONFIG, Some("missing")).is_err());
+        let missing_user = KUBECONFIG.replace("user: user-a", "user: missing");
+        assert!(resolve_kubeconfig_yaml(&missing_user, None).is_err());
+    }
+
+    #[test]
+    fn resolve_all_contexts_returns_every_context_and_flags_current() {
+        let mut resolved = resolve_all_kubeconfig_contexts_yaml(KUBECONFIG).unwrap();
+        resolved.sort_by(|a, b| a.context_name.cmp(&b.context_name));
+        assert_eq!(resolved.len(), 2);
+
+        assert_eq!(resolved[0].context_name, "context-a");
+        assert!(resolved[0].is_current_context);
+        assert_eq!(resolved[0].cluster_name, "cluster-a");
+
+        assert_eq!(resolved[1].context_name, "context-b");
+        assert!(!resolved[1].is_current_context);
+        assert_eq!(resolved[1].cluster_name, "cluster-b");
+    }
+
+    #[test]
+    fn resolve_all_contexts_skips_unresolvable_entries() {
+        // Break context-b's user reference; context-a must still resolve.
+        let broken = KUBECONFIG.replace("user: user-b", "user: missing");
+        let resolved = resolve_all_kubeconfig_contexts_yaml(&broken).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].context_name, "context-a");
+    }
+
+    #[test]
+    fn authenticated_http_request_preserves_method_path_headers_and_body() {
+        let request = build_authenticated_http_request(&serde_json::json!({
+            "authentication": "--kubeconfig \"$KUBECONFIG\"",
+            "method": "POST",
+            "url": "https://ignored.example/apis/authorization.k8s.io/v1/selfsubjectrulesreviews?watch=false",
+            "headers": {"Content-Type": "application/json"},
+            "body": "{\"kind\":\"SelfSubjectRulesReview\"}"
+        }))
+        .unwrap();
+
+        assert_eq!(request.method(), Method::POST);
+        assert_eq!(
+            request.uri().path_and_query().unwrap().as_str(),
+            "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews?watch=false"
+        );
+        assert_eq!(request.headers()["Content-Type"], "application/json");
+        assert_eq!(request.body(), br#"{"kind":"SelfSubjectRulesReview"}"#);
+    }
+
+    #[test]
+    fn authenticated_http_request_rejects_authored_authorization_header() {
+        let result = build_authenticated_http_request(&serde_json::json!({
+            "authentication": "${K8S_AUTH}",
+            "url": "https://cluster.example/api/v1/pods",
+            "headers": {"authorization": "Bearer hidden"}
+        }));
+
+        assert!(result.is_err());
+    }
+}

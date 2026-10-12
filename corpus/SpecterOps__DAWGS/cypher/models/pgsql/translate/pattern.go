@@ -1,0 +1,244 @@
+package translate
+
+import (
+	"github.com/specterops/dawgs/cypher/models/cypher"
+	"github.com/specterops/dawgs/cypher/models/pgsql"
+)
+
+type BindingResult struct {
+	Binding      *BoundIdentifier
+	AlreadyBound bool
+}
+
+func (s *Translator) bindPatternExpression(cypherExpression cypher.Expression, dataType pgsql.DataType) (BindingResult, error) {
+	if cypherBinding, hasCypherBinding, err := extractIdentifierFromCypherExpression(cypherExpression); err != nil {
+		return BindingResult{}, err
+	} else if existingBinding, bound := s.scope.AliasedLookup(cypherBinding); bound {
+		return BindingResult{
+			Binding:      existingBinding,
+			AlreadyBound: true,
+		}, nil
+	} else if binding, err := s.scope.DefineNew(dataType); err != nil {
+		return BindingResult{}, err
+	} else {
+		if hasCypherBinding {
+			s.scope.Alias(cypherBinding, binding)
+		}
+
+		return BindingResult{
+			Binding:      binding,
+			AlreadyBound: false,
+		}, nil
+	}
+}
+
+func (s *Translator) translatePatternPart(patternPart *cypher.PatternPart) error {
+	// We expect this to be a node select if there aren't enough pattern elements for a traversal
+	newPatternPart := s.query.CurrentPart().currentPattern.NewPart()
+	newPatternPart.IsTraversal = len(patternPart.PatternElements) > 1
+	newPatternPart.ShortestPath = patternPart.ShortestPathPattern
+	newPatternPart.AllShortestPaths = patternPart.AllShortestPathsPattern
+	newPatternPart.PathDirectionReversed = patternPart.PathDirectionReversed
+	if target, hasTarget := s.patternTargets[patternPart]; hasTarget {
+		newPatternPart.Target = target
+		newPatternPart.HasTarget = true
+	}
+
+	if cypherBinding, hasCypherSymbol, err := extractIdentifierFromCypherExpression(patternPart); err != nil {
+		return err
+	} else if hasCypherSymbol {
+		if pathBinding, err := s.scope.DefineNew(pgsql.PathComposite); err != nil {
+			return err
+		} else {
+			// Generate an alias for this binding
+			s.scope.Alias(cypherBinding, pathBinding)
+
+			// Propagate the optimizer's pattern reversal so path materialization can restore the
+			// original left-to-right logical order for this bound path.
+			pathBinding.PathDirectionReversed = patternPart.PathDirectionReversed
+
+			// Record the new binding in the traversal pattern being built
+			newPatternPart.PatternBinding = pathBinding
+		}
+	}
+
+	return nil
+}
+
+func (s *Translator) buildPatternPart(part *PatternPart) error {
+	if part.IsTraversal {
+		return s.buildTraversalPatternPart(part)
+	} else {
+		return s.buildNodePatternPart(part)
+	}
+}
+
+func (s *Translator) buildTraversalPattern(traversalStep *TraversalStep, isRootStep bool) error {
+	if isRootStep {
+		if traversalStepQuery, err := s.buildTraversalPatternRoot(traversalStep.Frame, traversalStep); err != nil {
+			return err
+		} else {
+			if selectBody, ok := traversalStepQuery.Body.(pgsql.Select); ok {
+				selectBody.From = append(selectBody.From, unwindFromClauses(s.query.CurrentPart().ConsumeUnwindClauses())...)
+				traversalStepQuery.Body = selectBody
+			}
+
+			s.query.CurrentPart().Model.AddCTE(pgsql.CommonTableExpression{
+				Alias: pgsql.TableAlias{
+					Name: traversalStep.Frame.Binding.Identifier,
+				},
+				Query: traversalStepQuery,
+			})
+		}
+	} else {
+		if traversalStepQuery, err := s.buildTraversalPatternStep(traversalStep.Frame, traversalStep); err != nil {
+			return err
+		} else {
+			s.query.CurrentPart().Model.AddCTE(pgsql.CommonTableExpression{
+				Alias: pgsql.TableAlias{
+					Name: traversalStep.Frame.Binding.Identifier,
+				},
+				Query: traversalStepQuery,
+			})
+		}
+	}
+
+	return nil
+}
+
+func (s *Translator) buildExpansionPattern(traversalStepContext TraversalStepContext, expansion *ExpansionBuilder) error {
+	traversalStep := traversalStepContext.CurrentStep
+
+	if traversalStepContext.IsRootStep {
+		if traversalStepQuery, err := s.buildExpansionPatternRoot(traversalStepContext, expansion); err != nil {
+			return err
+		} else {
+			s.query.CurrentPart().Model.AddCTE(pgsql.CommonTableExpression{
+				Alias: pgsql.TableAlias{
+					Name: traversalStep.Frame.Binding.Identifier,
+				},
+				Query: traversalStepQuery,
+			})
+		}
+	} else {
+		if traversalStepQuery, err := s.buildExpansionPatternStep(traversalStepContext, expansion); err != nil {
+			return err
+		} else {
+			s.query.CurrentPart().Model.AddCTE(pgsql.CommonTableExpression{
+				Alias: pgsql.TableAlias{
+					Name: traversalStep.Frame.Binding.Identifier,
+				},
+				Query: traversalStepQuery,
+			})
+		}
+	}
+
+	return nil
+}
+
+func (s *Translator) buildShortestPathsExpansionPattern(traversalStepContext TraversalStepContext, expansion *ExpansionBuilder, allPaths bool) error {
+	traversalStep := traversalStepContext.CurrentStep
+
+	if traversalStepContext.IsRootStep {
+		expansion.SetUnwindClauses(s.query.CurrentPart().ConsumeUnwindClauses())
+
+		if allPaths {
+			if traversalStep.Expansion.UseBidirectionalSearch {
+				if traversalStepQuery, err := expansion.BuildBiDirectionalAllShortestPathsRoot(); err != nil {
+					return err
+				} else {
+					s.query.CurrentPart().Model.AddCTE(pgsql.CommonTableExpression{
+						Alias: pgsql.TableAlias{
+							Name: traversalStep.Frame.Binding.Identifier,
+						},
+						Query: traversalStepQuery,
+					})
+				}
+			} else if traversalStepQuery, err := expansion.BuildAllShortestPathsRoot(); err != nil {
+				return err
+			} else {
+				s.query.CurrentPart().Model.AddCTE(pgsql.CommonTableExpression{
+					Alias: pgsql.TableAlias{
+						Name: traversalStep.Frame.Binding.Identifier,
+					},
+					Query: traversalStepQuery,
+				})
+			}
+		} else {
+			var (
+				traversalStepQuery pgsql.Query
+				err                error
+			)
+
+			if traversalStep.Expansion.UseBidirectionalSearch {
+				traversalStepQuery, err = expansion.BuildBiDirectionalShortestPathsRoot()
+			} else {
+				traversalStepQuery, err = expansion.BuildShortestPathsRoot()
+			}
+
+			if err != nil {
+				return err
+			}
+
+			s.query.CurrentPart().Model.AddCTE(pgsql.CommonTableExpression{
+				Alias: pgsql.TableAlias{
+					Name: traversalStep.Frame.Binding.Identifier,
+				},
+				Query: traversalStepQuery,
+			})
+		}
+	} else {
+		if traversalStepQuery, err := s.buildExpansionPatternStep(traversalStepContext, expansion); err != nil {
+			return err
+		} else {
+			s.query.CurrentPart().Model.AddCTE(pgsql.CommonTableExpression{
+				Alias: pgsql.TableAlias{
+					Name: traversalStep.Frame.Binding.Identifier,
+				},
+				Query: traversalStepQuery,
+			})
+		}
+	}
+
+	return nil
+}
+
+type TraversalStepContext struct {
+	PreviousStep *TraversalStep
+	CurrentStep  *TraversalStep
+	IsRootStep   bool
+}
+
+func (s *Translator) buildTraversalPatternPart(part *PatternPart) error {
+	for idx, traversalStep := range part.TraversalSteps {
+		var (
+			isRootStep           = idx == 0
+			traversalStepContext = TraversalStepContext{
+				CurrentStep: traversalStep,
+				IsRootStep:  isRootStep,
+			}
+		)
+
+		if idx > 0 {
+			traversalStepContext.PreviousStep = part.TraversalSteps[idx-1]
+		}
+
+		if traversalStep.Expansion != nil {
+			if expansion, err := NewExpansionBuilder(s.translation.Parameters, traversalStep); err != nil {
+				return err
+			} else if part.ShortestPath || part.AllShortestPaths {
+				if err := s.buildShortestPathsExpansionPattern(traversalStepContext, expansion, part.AllShortestPaths); err != nil {
+					return err
+				}
+			} else if err := s.buildExpansionPattern(traversalStepContext, expansion); err != nil {
+				return err
+			}
+		} else if err := s.buildTraversalPattern(traversalStep, isRootStep); err != nil {
+			return err
+		}
+
+		s.allowLimitPushdownForStep(part, idx, traversalStep)
+	}
+
+	return nil
+}

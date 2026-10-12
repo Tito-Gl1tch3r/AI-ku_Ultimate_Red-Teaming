@@ -1,0 +1,286 @@
+import json
+import sys
+from pathlib import Path
+from types import ModuleType
+
+from forensia.ai.prompts.sql_schema import get_allowed_tables
+from forensia.core.case import Case
+from forensia.db.database import CaseDB
+from forensia.db.evidence_lookup import fetch_evidence_records
+from forensia.db.evidence_sources import register_evidence_source
+from forensia.evidence.registry import (
+    _dataset_id,
+    _iter_reg2es_records,
+    admit_registry_datasets,
+    detect_registry_candidate,
+    normalize_registry,
+    register_registry_dataset,
+)
+from forensia.knowledge.coverage import refresh_evidence_coverage
+
+
+def test_registry_detection_requires_regf_and_keeps_logs_as_companions(
+    tmp_path: Path,
+) -> None:
+    primary = tmp_path / "SYSTEM"
+    primary.write_bytes(b"regf" + b"\0" * 8)
+    log = tmp_path / "SYSTEM.LOG1"
+    log.write_bytes(b"transaction")
+    legacy_log = tmp_path / "SYSTEM.LOG"
+    legacy_log.write_bytes(b"legacy-transaction")
+    empty_log = tmp_path / "SYSTEM.LOG2"
+    empty_log.write_bytes(b"")
+    not_hive = tmp_path / "SOFTWARE"
+    not_hive.write_bytes(b"text")
+
+    assert detect_registry_candidate(primary).kind == "primary"
+    assert detect_registry_candidate(not_hive) is None
+    datasets = admit_registry_datasets([primary, log, legacy_log, empty_log])
+    assert len(datasets) == 1
+    assert [item.kind for item in datasets[0].members] == [
+        "primary",
+        "transaction_log",
+        "transaction_log",
+    ]
+    assert empty_log not in {item.path for item in datasets[0].members}
+    orphan = tmp_path / "ORPHAN.LOG1"
+    orphan.write_bytes(b"transaction")
+    assert admit_registry_datasets([orphan]) == ()
+    unrelated = tmp_path / "SYSTEMATIC.LOG1"
+    unrelated.write_bytes(b"transaction")
+    assert len(admit_registry_datasets([primary, unrelated])[0].members) == 1
+
+
+def test_same_directory_does_not_merge_unattributed_hives(tmp_path: Path) -> None:
+    first = tmp_path / "SYSTEM"
+    second = tmp_path / "SOFTWARE"
+    first.write_bytes(b"regf")
+    second.write_bytes(b"regf")
+
+    datasets = admit_registry_datasets([first, second])
+    assert len(datasets) == 2
+
+
+def test_explicit_identity_can_join_hives(tmp_path: Path) -> None:
+    first = tmp_path / "SYSTEM"
+    second = tmp_path / "SOFTWARE"
+    first.write_bytes(b"regf")
+    second.write_bytes(b"regf")
+
+    datasets = admit_registry_datasets(
+        [first, second], identities={first: "host-a/acq-1", second: "host-a/acq-1"}
+    )
+    assert len(datasets) == 1
+    assert len(datasets[0].members) == 2
+
+
+def test_reg2es_chunk_generator_is_flattened_and_closed(
+    monkeypatch, tmp_path: Path
+) -> None:
+    closed = []
+
+    class FakeReg2es:
+        def __init__(self, **kwargs):
+            assert kwargs["error_policy"] == "raise"
+            assert kwargs["input_paths"] == [str(tmp_path / "SYSTEM")]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            closed.append(True)
+
+        def gen_records(self):
+            yield [{"id": 1}, {"id": 2}]
+            yield [{"id": 3}]
+
+    reg2es_module = ModuleType("reg2es")
+    models_module = ModuleType("reg2es.models")
+    model_module = ModuleType("reg2es.models.Reg2es")
+    model_module.Reg2es = FakeReg2es
+    monkeypatch.setitem(sys.modules, "reg2es", reg2es_module)
+    monkeypatch.setitem(sys.modules, "reg2es.models", models_module)
+    monkeypatch.setitem(sys.modules, "reg2es.models.Reg2es", model_module)
+
+    assert list(_iter_reg2es_records([tmp_path / "SYSTEM"])) == [
+        {"id": 1},
+        {"id": 2},
+        {"id": 3},
+    ]
+    assert closed == [True]
+
+
+def test_registry_raw_records_and_parser_timestamps_are_traceable(
+    tmp_path: Path,
+) -> None:
+    case = Case.init(tmp_path / "case")
+    primary = tmp_path / "SYSTEM"
+    primary.write_bytes(b"regf")
+    log = tmp_path / "SYSTEM.LOG"
+    log.write_bytes(b"transaction")
+    raw = case.raw_dir / "registry-test.jsonl"
+    record = (
+        '{"@timestamp":"2020-01-02T03:04:05+00:00",'
+        '"event":{"action":"services"},"registry":{"hive":"HKLM",'
+        '"path":"HKLM\\\\SYSTEM\\\\x","value":"ImagePath"},'
+        '"log":{"file":{"path":"/collection/one/SYSTEM"}},'
+        '"reg2es":{"plugin":{"name":"services"},"source":'
+        '{"hive":"SYSTEM","key_path":"x"}}}\n'
+    )
+    raw.write_text(record + record, encoding="utf-8")
+    dataset = admit_registry_datasets([primary, log])[0]
+    source_id = "a" * 64
+    log_source_id = "b" * 64
+    with CaseDB(case) as db:
+        for member, member_source_id in ((primary, source_id), (log, log_source_id)):
+            register_evidence_source(
+                db,
+                source_id=member_source_id,
+                artifact_family="registry",
+                display_path=member.name,
+                ingest_status="parsed",
+                parser_name="reg2es",
+                parser_version="2.0.0",
+            )
+        register_registry_dataset(
+            db,
+            dataset,
+            source_ids={primary: source_id, log: log_source_id},
+            raw_path=raw,
+        )
+        assert normalize_registry(case, db) == 2
+        assert db.execute(
+            "SELECT source_id, ingest_status, row_count FROM evidence_sources "
+            "ORDER BY source_id"
+        ).fetchall() == [
+            (source_id, "normalized", 2),
+            (log_source_id, "normalized", 0),
+        ]
+        refresh_evidence_coverage(db)
+        artifact = db.execute(
+            "SELECT artifact_id, source_ids, raw_json FROM registry_artifacts"
+        ).fetchone()
+        assert {"registry_artifacts", "registry_timeline"} <= get_allowed_tables(db)
+        resolved = fetch_evidence_records(db, [artifact[0]])[artifact[0]]
+        assert resolved["evidence_id"] == artifact[0]
+        assert resolved["raw"]["event"]["action"] == "services"
+        assert db.execute("SELECT COUNT(*) FROM registry_artifacts").fetchone()[0] == 2
+        first_ids = {
+            row[0]
+            for row in db.execute(
+                "SELECT artifact_id FROM registry_artifacts ORDER BY artifact_id"
+            ).fetchall()
+        }
+        moved_record = record.replace("/collection/one/SYSTEM", "/other/two/SYSTEM")
+        raw.write_text(moved_record + moved_record, encoding="utf-8")
+        assert normalize_registry(case, db) == 2
+        second_ids = {
+            row[0]
+            for row in db.execute(
+                "SELECT artifact_id FROM registry_artifacts ORDER BY artifact_id"
+            ).fetchall()
+        }
+        assert first_ids == second_ids
+        timeline = db.execute(
+            "SELECT artifact_id, timestamp, timestamp_kind FROM registry_timeline"
+        ).fetchone()
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM case_timeline WHERE source = 'registry'"
+            ).fetchone()[0]
+            == 2
+        )
+        coverage = db.execute(
+            "SELECT state, reason_code FROM evidence_coverage "
+            "WHERE source_family = 'registry'"
+        ).fetchone()
+        raw.write_text(moved_record + "not-json\n", encoding="utf-8")
+        assert normalize_registry(case, db) == 0
+        assert db.execute("SELECT COUNT(*) FROM registry_artifacts").fetchone()[0] == 2
+        assert db.execute(
+            "SELECT ingest_status, error_code FROM registry_datasets"
+        ).fetchone() == ("partial", "raw_malformed")
+        assert db.execute(
+            "SELECT ingest_status, error_code FROM evidence_sources "
+            "WHERE source_id = ?",
+            [source_id],
+        ).fetchone() == ("partial", "raw_malformed")
+    assert set(json.loads(artifact[1])) == {source_id, log_source_id}
+    assert '"event"' in artifact[2]
+    assert timeline[0].startswith("registry-")
+    assert str(timeline[2]) == "parser:@timestamp"
+    assert coverage == ("partial", "parser_plugin_completeness_unproven")
+    other_primary = tmp_path / "other" / "SYSTEM"
+    other_primary.parent.mkdir()
+    other_primary.write_bytes(b"regf")
+    other_dataset = admit_registry_datasets([other_primary])[0]
+    primary_dataset = admit_registry_datasets([primary])[0]
+    assert _dataset_id(primary_dataset, {primary: source_id}) == _dataset_id(
+        other_dataset, {other_primary: source_id}
+    )
+
+
+def test_unattributed_source_replacement_supersedes_same_member_path(
+    tmp_path: Path,
+) -> None:
+    case = Case.init(tmp_path / "case")
+    primary = tmp_path / "SYSTEM"
+    primary.write_bytes(b"regf-old")
+    old_source = "old-source"
+    new_source = "new-source"
+    old_raw = case.raw_dir / "registry-old.jsonl"
+    new_raw = case.raw_dir / "registry-new.jsonl"
+    old_raw.write_text('{"event":{"action":"old"}}\n', encoding="utf-8")
+    new_raw.write_text('{"event":{"action":"new"}}\n', encoding="utf-8")
+
+    with CaseDB(case) as db:
+        old_dataset = admit_registry_datasets([primary])[0]
+        register_registry_dataset(
+            db,
+            old_dataset,
+            source_ids={primary: old_source},
+            raw_path=old_raw,
+        )
+        db.execute(
+            "INSERT INTO ingested_files (sha256, path, source_kind, size, ingested_at) "
+            "VALUES (?, ?, 'registry', 1, now())",
+            [old_source, str(primary.resolve())],
+        )
+        assert normalize_registry(case, db) == 1
+        old_artifact = db.execute(
+            "SELECT artifact_id FROM registry_artifacts"
+        ).fetchone()[0]
+
+        primary.write_bytes(b"regf-new")
+        new_dataset = admit_registry_datasets([primary])[0]
+        new_id = register_registry_dataset(
+            db,
+            new_dataset,
+            source_ids={primary: new_source},
+            raw_path=new_raw,
+        )
+        db.execute(
+            "INSERT INTO ingested_files (sha256, path, source_kind, size, ingested_at) "
+            "VALUES (?, ?, 'registry', 1, now())",
+            [new_source, str(primary.resolve())],
+        )
+
+        assert normalize_registry(case, db, source_keys=[new_source[:12]]) == 1
+        assert db.execute("SELECT COUNT(*) FROM registry_datasets").fetchone()[0] == 1
+        assert (
+            db.execute("SELECT dataset_id FROM registry_datasets").fetchone()[0]
+            == new_id
+        )
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM registry_artifacts WHERE artifact_id = ?",
+                [old_artifact],
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM registry_artifacts WHERE dataset_id = ?", [new_id]
+            ).fetchone()[0]
+            == 1
+        )

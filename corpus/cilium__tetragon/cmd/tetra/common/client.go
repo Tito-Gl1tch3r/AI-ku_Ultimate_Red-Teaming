@@ -1,0 +1,137 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Tetragon
+
+package common
+
+import (
+	"context"
+	"fmt"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+
+	"github.com/cilium/tetragon/api/v1/tetragon"
+)
+
+// gRGC A6 - gRPC Retry Design (a.k.a. built in backoff retry)
+// https://github.com/grpc/proposal/blob/master/A6-client-retries.md
+// was implemented by https://github.com/grpc/grpc-go/pull/2111 but unusable
+// for a long time since maxAttempts was limited to hardcoded 5
+// (https://github.com/grpc/grpc-go/issues/4615), recent PR fixed that
+// https://github.com/grpc/grpc-go/pull/7229.
+//
+// It's transparent to the user, to see it in action, make sure the gRPC server
+// is unreachable (do not start tetragon for example), run tetra with:
+// GRPC_GO_LOG_SEVERITY_LEVEL=warning <tetra cmd>
+//
+// Note that logs don't always have the time to be pushed before exit so output
+// might be a bit off but the number of retries is respected (you can debug or
+// synchronously print in the grpc/stream.c:shouldRetry or :withRetry to
+// verify).
+//
+// Also note that the final backoff duration is completely random and chosen
+// between 0 and the final duration that was computed via to the params:
+// https://github.com/grpc/grpc-go/blob/v1.65.0/stream.go#L702
+func RetryPolicy(retries int, service string) string {
+	if retries <= 0 {
+		// An empty service config disables application-level retries.
+		return "{}"
+	}
+	// maxAttempt includes the first call
+	maxAttempt := retries + 1
+	// let's not limit backoff by hardcoding 1h in MaxBackoff
+	// since we need to provide a value >0
+	return fmt.Sprintf(`{
+	"methodConfig": [{
+	  "name": [
+		{"service": "%s"}
+	  ],
+	  "retryPolicy": {
+		  "MaxAttempts": %d,
+		  "InitialBackoff": "1s",
+		  "MaxBackoff": "3600s",
+		  "BackoffMultiplier": 2,
+		  "RetryableStatusCodes": [ "UNAVAILABLE" ]
+	  }
+	}]}`, service, maxAttempt)
+}
+
+// This can be reused for various tetra clients by embedding it in a struct that
+// has a client as a field using the connection.
+type ConnWithContext struct {
+	// Ctx is a combination of the signal context and the timeout context
+	Ctx context.Context
+	// SignalCtx is only the signal context, you might want to use that context
+	// when the command should never timeout (like a stream command)
+	SignalCtx context.Context
+	Conn      *grpc.ClientConn
+	// The signal context is the parent of the timeout context, so cancelling
+	// signal will cancel its child, timeout
+	signalCancel  context.CancelFunc
+	timeoutCancel context.CancelFunc
+}
+
+type ClientWithContext struct {
+	ConnWithContext
+	Client tetragon.FineGuidanceSensorsClient
+}
+
+// Close cleanup resources, it closes the connection and cancel the context
+func (c ConnWithContext) Close() {
+	c.Conn.Close()
+	c.signalCancel()
+	c.timeoutCancel() // this should be a nop
+}
+
+func NewConnWithContext(ctx context.Context, address string, timeout time.Duration, service string) (*ConnWithContext, error) {
+	c := &ConnWithContext{}
+
+	c.SignalCtx, c.signalCancel = signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	c.Ctx, c.timeoutCancel = context.WithTimeout(c.SignalCtx, timeout)
+
+	tlsCreds, err := TLSCredentials(TLS)
+	if err != nil {
+		return nil, fmt.Errorf("building TLS credentials: %w", err)
+	}
+	creds := credentials.TransportCredentials(insecure.NewCredentials())
+	if tlsCreds != nil {
+		creds = tlsCreds
+	}
+	c.Conn, err = grpc.NewClient(address,
+		grpc.WithTransportCredentials(creds),
+		grpc.WithDefaultServiceConfig(RetryPolicy(Retries, service)),
+		grpc.WithMaxCallAttempts(Retries+1), // maxAttempt includes the first call
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(MaxRecvMsgSize)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create gRPC client with address %s: %w", address, err)
+	}
+
+	return c, nil
+}
+
+// NewClientWithDefaultContextAndAddress returns a client to a tetragon
+// server after resolving the server address using helpers, accompanied with an
+// initialized context that can be used for the RPC call, caller must call
+// Close() on the client.
+func NewClientWithDefaultContextAndAddress() (*ClientWithContext, error) {
+	return NewClient(context.Background(), ResolveServerAddress(), Timeout)
+}
+
+func NewClient(ctx context.Context, address string, timeout time.Duration) (*ClientWithContext, error) {
+	ret, err := NewConnWithContext(ctx, address, timeout, "tetragon.FineGuidanceSensors")
+	if err != nil {
+		return nil, err
+	}
+
+	c := &ClientWithContext{
+		ConnWithContext: *ret,
+		Client:          tetragon.NewFineGuidanceSensorsClient(ret.Conn),
+	}
+
+	return c, nil
+}

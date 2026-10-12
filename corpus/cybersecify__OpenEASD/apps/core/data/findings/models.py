@@ -1,0 +1,157 @@
+from django.db import models
+
+
+SEVERITY_CHOICES = [
+    ("critical", "Critical"),
+    ("high", "High"),
+    ("medium", "Medium"),
+    ("low", "Low"),
+    ("info", "Info"),
+]
+
+# SOURCE_CHOICES removed — auto-discovered from tool_meta.produces_findings via registry
+
+STATUS_CHOICES = [
+    ("open", "Open"),
+    ("acknowledged", "Acknowledged"),
+    ("in_progress", "In Progress"),
+    ("resolved", "Resolved"),
+    ("false_positive", "False Positive"),
+    ("accepted", "Accepted Risk"),
+]
+
+# Triage decisions that take an Issue out of the active risk picture: excluded from
+# the report's Issue Register and from the exposure score (register item 7).
+TRIAGED_STATUSES = ["false_positive", "accepted"]
+# Statuses that are still "live" work (shown in the report's open list, eligible for
+# auto-resolve when unseen).
+ACTIVE_STATUSES = ["open", "acknowledged", "in_progress"]
+
+
+class Finding(models.Model):
+    """Unified finding model — replaces per-tool DomainFinding/NmapFinding.
+
+    Tool-specific fields (cve, cvss_score, nse_script, service, etc.)
+    live in the ``extra`` JSONField. Convenience @property accessors
+    are exposed for backward compatibility with templates.
+    """
+
+    session = models.ForeignKey(
+        "scans.ScanSession", on_delete=models.CASCADE, related_name="findings"
+    )
+    source = models.CharField(max_length=50, db_index=True)  # no choices constraint — registry is source of truth
+    check_type = models.CharField(max_length=50, blank=True, db_index=True)
+    # Stable per-rule identity, independent of the human `title` (which gets
+    # reworded). Default `"{source}:{check_type}"` is backfilled at finalize for the
+    # granular tools (1 check_type : 1 rule); coarse tools (domain_security/
+    # domain_probe) and CVE/secret tools set it explicitly per rule at construction.
+    # This is the cross-scan identity `Issue.key` is built from (see issues/rollup).
+    check_id = models.CharField(max_length=100, blank=True, db_index=True)
+    severity = models.CharField(max_length=20, choices=SEVERITY_CHOICES, db_index=True)
+    title = models.CharField(max_length=500)
+    description = models.TextField(blank=True)
+    remediation = models.TextField(blank=True)
+
+    # Optional asset links — only one is typically set per finding
+    subdomain = models.ForeignKey(
+        "assets.Subdomain",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="findings",
+    )
+    ip_address = models.ForeignKey(
+        "assets.IPAddress",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="findings",
+    )
+    port = models.ForeignKey(
+        "assets.Port",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="findings",
+    )
+    url = models.ForeignKey(
+        "web_assets.URL",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="findings",
+    )
+    # Persistent-inventory asset this finding applies to (apps/core/asset_inventory).
+    # Nullable + best-effort: resolved by the inventory rollup at finalize; an
+    # unresolvable target leaves it null and the finding behaves exactly as before.
+    asset = models.ForeignKey(
+        "asset_inventory.Asset",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="findings",
+    )
+
+    # Where the finding applies (string for top-level apex findings)
+    target = models.CharField(max_length=255, blank=True, db_index=True)
+
+    # Tool-specific extras: cve, cvss_score, nse_script, template_id, etc.
+    extra = models.JSONField(default=dict, blank=True)
+
+    discovered_at = models.DateTimeField(auto_now_add=True)
+
+    # Lifecycle tracking
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="open", db_index=True)
+    assigned_to = models.CharField(max_length=150, blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    resolution_note = models.TextField(blank=True)
+
+    # Verification (deterministic re-probe at finalize; see engine/verification).
+    verification_status = models.CharField(
+        max_length=20, default="unverified", db_index=True
+    )
+    verified_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-discovered_at"]
+        indexes = [
+            models.Index(fields=["session", "severity"]),
+            models.Index(fields=["source", "severity"]),
+        ]
+
+    def __str__(self):
+        return f"[{self.severity}] {self.title}"
+
+    # ---------- backward-compatibility accessors ----------
+    @property
+    def cve(self) -> str:
+        return self.extra.get("cve", "") if isinstance(self.extra, dict) else ""
+
+    @property
+    def cvss_score(self):
+        return self.extra.get("cvss_score") if isinstance(self.extra, dict) else None
+
+    @property
+    def service(self) -> str:
+        return self.extra.get("service", "") if isinstance(self.extra, dict) else ""
+
+    @property
+    def version(self) -> str:
+        return self.extra.get("version", "") if isinstance(self.extra, dict) else ""
+
+    @property
+    def port_number(self):
+        return self.extra.get("port_number") if isinstance(self.extra, dict) else None
+
+    @property
+    def address(self) -> str:
+        if isinstance(self.extra, dict) and self.extra.get("address"):
+            return self.extra["address"]
+        if self.target and ":" in self.target:
+            return self.target.rsplit(":", 1)[0]
+        return self.target or ""
+
+    @property
+    def domain(self) -> str:
+        """Backward-compat for DomainFinding.domain."""
+        return self.target

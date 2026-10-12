@@ -1,0 +1,117 @@
+// This file is part of KASLD - https://github.com/bcoles/kasld
+//
+// alloc_node_data() prints the physical address of the NODE_DATA per-node
+// NUMA metadata allocation to dmesg on NUMA-aware kernels:
+//
+//   NODE_DATA(0) allocated [mem 0x33ffd5000-0x33fffffff]
+//
+// The NODE_DATA structure is allocated at the top of each NUMA node's
+// usable memory, so it reveals a physical address near the end of DRAM.
+//
+// Most x86_64 distribution kernels have NUMA enabled, so this message
+// appears even on single-socket systems (using dummy_numa_init).
+//
+// Leak primitive:
+//   Data leaked:      physical address of NODE_DATA allocation (top of DRAM)
+//   Kernel subsystem: mm/numa, arch/x86/mm/numa — alloc_node_data()
+//   Data structure:   NODE_DATA pgdat allocation (physical address range)
+//   Address type:     physical (DRAM)
+//   Method:           parsed (dmesg string)
+//   Status:           unfixed (printed unconditionally on NUMA systems)
+//   Access check:     do_syslog() → check_syslog_permissions(); gated by
+//                     dmesg_restrict
+//   Source:
+//   https://elixir.bootlin.com/linux/v6.12/source/mm/numa.c#L27
+//
+// Mitigations:
+//   Access gated by dmesg_restrict (see dmesg.h for shared access gate
+//   details). Printed unconditionally on NUMA-capable kernels. On
+//   decoupled architectures, physical addresses cannot derive the
+//   virtual text base.
+//
+// Requires:
+// - kernel.dmesg_restrict = 0; or CAP_SYSLOG capabilities; or
+//   readable /var/log/dmesg.
+//
+// References:
+// https://elixir.bootlin.com/linux/v6.12/source/mm/numa.c#L27
+// https://elixir.bootlin.com/linux/v6.1.1/source/arch/x86/mm/numa.c#L185
+// https://elixir.bootlin.com/linux/v6.1.1/source/drivers/base/arch_numa.c#L384
+// ---
+// <bcoles@gmail.com>
+
+#define _GNU_SOURCE
+#include "include/dmesg.h"
+#include "include/kasld/api.h"
+#include "include/kasld/cli.h"
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define range_ctx addr_range
+
+KASLD_EXPLAIN(
+    "Searches dmesg for NODE_DATA() allocation messages that print the "
+    "physical address of NUMA node data structures allocated at the top "
+    "of each node's memory. This reveals the physical DRAM ceiling. "
+    "Access is gated by dmesg_restrict.");
+
+KASLD_META("method:parsed\n"
+           "phase:inference\n"
+           "discloses:physical\n"
+           "source:files\n"
+           "sysctl:dmesg_restrict>=1\n"
+           "bypass:CAP_SYSLOG\n"
+           "fallback:/var/log/dmesg\n");
+
+static int on_match(const char *line, void *ctx) {
+  struct range_ctx *r = ctx;
+
+  /* NODE_DATA(0) allocated [mem 0x33ffd5000-0x33fffffff] */
+  const char *p = strstr(line, "[mem ");
+  if (!p)
+    return 1;
+
+  /* A physical range can exceed a 32-bit build's word on a PAE/LPAE kernel.
+   * Refuse the line: this region is a reserved band, so dropping one narrows
+   * what is excluded rather than widening it, and the aggregate stays sound. */
+  const char *endptr;
+  unsigned long start;
+  if (!kasld_addr_parse(p + 5, 16, &start, &endptr) || !start || *endptr != '-')
+    return 1;
+
+  unsigned long end;
+  if (!kasld_addr_parse(endptr + 1, 16, &end, &endptr) || !end)
+    return 1;
+
+  if (!r->lo || start < r->lo)
+    r->lo = start;
+  if (end > r->hi)
+    r->hi = end;
+
+  return 1; /* continue — may be multiple NUMA nodes */
+}
+
+int main(void) {
+  struct range_ctx r = {0, 0, 0};
+
+  kasld_info("searching dmesg for NODE_DATA allocations ...");
+  int ds = dmesg_search("NODE_DATA(", on_match, &r);
+
+  if (!r.hi) {
+    kasld_err("no NODE_DATA allocation info found in dmesg");
+    if (ds < 0)
+      return KASLD_EXIT_NOPERM;
+    return 0;
+  }
+
+  kasld_info("lowest NODE_DATA physical address:  0x%016lx", r.lo);
+  kasld_info("highest NODE_DATA physical address: 0x%016lx", r.hi);
+
+  kasld_result_sample(KASLD_TYPE_PHYS, REGION_NUMA_NODE, r.hi, NULL,
+                      CONF_PARSED);
+
+  return 0;
+}
