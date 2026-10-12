@@ -1,0 +1,148 @@
+"""Token generation and verification utilities."""
+
+import datetime
+import logging
+from typing import Optional
+
+from fastapi import HTTPException
+from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadSignature
+
+from config.settings import MONITOR_TOKEN_SALT, SECRET_APIKEY, SECURITY_SALT
+from utils.redaction import mask_email
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+DASHBOARD_SESSION_MAX_AGE_HOURS = 12
+DASHBOARD_SESSION_ABSOLUTE_MAX_AGE_HOURS = 12
+
+
+def validate_dashboard_session(datastore_client, email: str, token: str) -> bool:
+    """
+    Validate a dashboard session bearer for an email.
+
+    Accepts the session created by the domain-alert/domain-verify flow
+    (xon_domains_session) and enforces the 12-hour session expiry. An
+    immutable ``created_at`` absolute cap, set once at session creation and
+    never rewritten, is enforced when present so no replay can extend a
+    session past its original lifetime.
+    """
+    if not email or not token:
+        return False
+    try:
+        session_key = datastore_client.key("xon_domains_session", email)
+        session_record = datastore_client.get(session_key)
+        if not session_record or session_record.get("domain_magic") != token:
+            return False
+        magic_timestamp = session_record.get("magic_timestamp")
+        if magic_timestamp is None:
+            return False
+        now = datetime.datetime.utcnow()
+        age = now - magic_timestamp.replace(tzinfo=None)
+        if age > datetime.timedelta(hours=DASHBOARD_SESSION_MAX_AGE_HOURS):
+            return False
+        created_at = session_record.get("created_at")
+        if created_at is not None:
+            absolute_age = now - created_at.replace(tzinfo=None)
+            if absolute_age > datetime.timedelta(
+                hours=DASHBOARD_SESSION_ABSOLUTE_MAX_AGE_HOURS
+            ):
+                return False
+        return True
+    except Exception:  # pylint: disable=broad-except
+        return False
+
+
+async def generate_confirmation_token(email: str) -> str:
+    """
+    Generate a secure confirmation token for email verification.
+    """
+    try:
+        logger.debug(
+            "[TOKEN] Generating confirmation token for email: %s", mask_email(email)
+        )
+        serializer = URLSafeTimedSerializer(SECRET_APIKEY)
+        token = serializer.dumps(email, salt=SECURITY_SALT)
+        logger.debug(
+            "[TOKEN] Successfully generated token for email: %s", mask_email(email)
+        )
+        return token
+    except Exception as e:
+        logger.error(
+            "[TOKEN] Error generating confirmation token: %s", str(e), exc_info=True
+        )
+        raise HTTPException(
+            status_code=500, detail="Error generating confirmation token"
+        ) from e
+
+
+async def confirm_token(token: str, expiration: int = 86400) -> Optional[str]:
+    """
+    Verify and decode a confirmation token.
+
+    Args:
+        token: The token to verify
+        expiration: Token expiration in seconds (default: 24 hours)
+    """
+    try:
+        logger.debug("[TOKEN] Verifying token with expiration: %s", expiration)
+        serializer = URLSafeTimedSerializer(SECRET_APIKEY)
+        email = serializer.loads(token, salt=SECURITY_SALT, max_age=expiration)
+        logger.debug(
+            "[TOKEN] Successfully verified token for email: %s", mask_email(email)
+        )
+        return email
+    except SignatureExpired:
+        logger.warning("[TOKEN] Token expired")
+        return None
+    except BadSignature:
+        logger.error("[TOKEN] Invalid token signature", exc_info=True)
+        return None
+    except Exception as e:
+        logger.error("[TOKEN] Error verifying token: %s", str(e), exc_info=True)
+        return None
+
+
+async def generate_monitor_token(payload: str) -> str:
+    """
+    Generate a signed, purpose-scoped consent token for the monitor flow.
+
+    The payload is the monitor edge identifier ("requester|target"). A distinct
+    salt namespaces these tokens so they cannot be replayed into the alert flow.
+    """
+    try:
+        logger.debug("[TOKEN] Generating monitor token")
+        serializer = URLSafeTimedSerializer(SECRET_APIKEY)
+        token = serializer.dumps(payload, salt=MONITOR_TOKEN_SALT)
+        return token
+    except Exception as e:
+        logger.error(
+            "[TOKEN] Error generating monitor token: %s", str(e), exc_info=True
+        )
+        raise HTTPException(
+            status_code=500, detail="Error generating monitor token"
+        ) from e
+
+
+async def confirm_monitor_token(token: str, expiration: int = 86400) -> Optional[str]:
+    """
+    Verify and decode a monitor consent token.
+
+    Args:
+        token: The token to verify
+        expiration: Token expiration in seconds (default: 24 hours)
+    """
+    try:
+        logger.debug("[TOKEN] Verifying monitor token with expiration: %s", expiration)
+        serializer = URLSafeTimedSerializer(SECRET_APIKEY)
+        payload = serializer.loads(token, salt=MONITOR_TOKEN_SALT, max_age=expiration)
+        return payload
+    except SignatureExpired:
+        logger.warning("[TOKEN] Monitor token expired")
+        return None
+    except BadSignature:
+        logger.error("[TOKEN] Invalid monitor token signature", exc_info=True)
+        return None
+    except Exception as e:
+        logger.error("[TOKEN] Error verifying monitor token: %s", str(e), exc_info=True)
+        return None
